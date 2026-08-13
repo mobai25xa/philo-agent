@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/philo-agent-kernel",
+    "crates/philo-agent-runtime",
+    "crates/philo-cli",
+    "crates/philo-coding-profile",
+    "crates/philo-model",
+    "crates/philo-session",
+    "crates/philo-session-jsonl",
+    "crates/philo-tools",
+    "crates/philo-tools-std",
+    "crates/philo-tui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"

@@ -1,0 +1,17 @@
+[package]
+name = "philo-tools-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# M10 registry dependencies (workspace-layout delta): shell execution and
+# timeouts need tokio process/time; grep and list glob filtering use the
+# mature regex/globset engines models already expect semantically.
+[dependencies]
+philo-tools = { path = "../philo-tools" }
+globset = "0.4"
+regex = "1"
+tokio = { version = "1", features = ["process", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "process", "time"] }

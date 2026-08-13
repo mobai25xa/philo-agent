@@ -1,0 +1,10 @@
+---
+source: crates/philo-tui/src/driver/host_effects.rs
+description: fake requester to confirmation overlay flow
+assertion_line: 380
+expression: frame
+---
+approval required: write workspace file
+path: src/main.rs
+operation: replace
+y allow | n / Esc deny

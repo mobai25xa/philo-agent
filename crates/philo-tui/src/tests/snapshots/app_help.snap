@@ -1,0 +1,23 @@
+---
+source: crates/philo-tui/src/app/state.rs
+description: slash help output remains stable across source layout changes
+assertion_line: 715
+expression: "texts(&appended(&run(&mut app, \"/help\"))).join(\"\\n\")"
+---
+/help
+commands:
+  /help               commands and key bindings
+  /new                start a new session
+  /sessions           pick a session to continue
+  /model <name>       switch the model (idle only)
+  /reasoning <level>  reasoning effort, from the next turn on
+  /image <path>       attach an image to the next message
+  /verbose            toggle the information tier (same as Ctrl+O)
+  /status             session, model, usage and the tool lineup
+  /config             effective configuration and its source layers
+  /quit               leave the session
+keys:
+  Enter submit (queued while busy) | Ctrl+J newline (Shift+Enter where supported)
+  Esc cancel the running turn | Ctrl+C clear input, cancel, or press twice to exit
+  Ctrl+D exit on an empty prompt | Ctrl+O detail tier | Ctrl+L redraw
+  Tab complete a command | Up/Down input history | scrolling stays native

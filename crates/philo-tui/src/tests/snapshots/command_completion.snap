@@ -1,0 +1,7 @@
+---
+source: crates/philo-tui/src/app/state.rs
+description: slash command completion menu
+assertion_line: 884
+expression: "app.completion_line().expect(\"menu is open\")"
+---
+commands: help new sessions model reasoning image verbose status config quit

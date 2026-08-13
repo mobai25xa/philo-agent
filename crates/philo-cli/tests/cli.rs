@@ -1,0 +1,258 @@
+//! Offline black-box checks over the real binary: usage errors exit 2
+//! before any operation starts, and `sessions` lists through the store's
+//! public API. No test here touches the network.
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+fn philo() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_philo"));
+    // Isolate from developer environment.
+    command
+        .env_remove("PHILO_MODEL")
+        .env_remove("PHILO_ENDPOINT")
+        .env_remove("PHILO_PROTOCOL")
+        .env_remove("PHILO_PROVIDER")
+        .env_remove("PHILO_DATA_DIR");
+    command
+}
+
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new() -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "philo-cli-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp root");
+        Self { path }
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stdout_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+// --- Usage errors exit 2 before the operation starts ---------------------------
+
+#[test]
+fn no_arguments_is_a_usage_error() {
+    let output = philo().output().expect("run");
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+}
+
+#[test]
+fn verbose_and_quiet_are_mutually_exclusive() {
+    let output = philo()
+        .args(["--verbose", "--quiet", "hello"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn missing_model_configuration_is_a_usage_error() {
+    let root = TempRoot::new();
+    let output = philo()
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr_text(&output).contains("PHILO_MODEL"),
+        "diagnostic names the missing configuration: {}",
+        stderr_text(&output)
+    );
+}
+
+#[test]
+fn missing_endpoint_is_a_usage_error() {
+    let root = TempRoot::new();
+    let output = philo()
+        .env("PHILO_MODEL", "some-model")
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).contains("PHILO_ENDPOINT"));
+}
+
+#[test]
+fn invalid_reasoning_effort_is_a_usage_error() {
+    let root = TempRoot::new();
+    let output = philo()
+        .env("PHILO_MODEL", "some-model")
+        .env(
+            "PHILO_ENDPOINT",
+            "https://example.invalid/v1/chat/completions",
+        )
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .args(["--reasoning-effort", "extreme", "hello"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).contains("reasoning-effort"));
+}
+
+#[test]
+fn unreadable_image_is_a_usage_error() {
+    let root = TempRoot::new();
+    let output = philo()
+        .env("PHILO_MODEL", "some-model")
+        .env(
+            "PHILO_ENDPOINT",
+            "https://example.invalid/v1/chat/completions",
+        )
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .args(["--image", "definitely-missing.png", "hello"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).contains("cannot read image"));
+}
+
+#[test]
+fn unknown_image_extension_is_a_usage_error() {
+    let root = TempRoot::new();
+    let document = root.path.join("notes.txt");
+    std::fs::write(&document, "not an image").expect("write");
+    let output = philo()
+        .env("PHILO_MODEL", "some-model")
+        .env(
+            "PHILO_ENDPOINT",
+            "https://example.invalid/v1/chat/completions",
+        )
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .arg("--image")
+        .arg(&document)
+        .arg("hello")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).contains("unsupported image extension"));
+}
+
+#[test]
+fn invalid_protocol_is_a_usage_error() {
+    let root = TempRoot::new();
+    let output = philo()
+        .env("PHILO_MODEL", "some-model")
+        .env(
+            "PHILO_ENDPOINT",
+            "https://example.invalid/v1/chat/completions",
+        )
+        .env("PHILO_PROTOCOL", "carrier-pigeon")
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).contains("PHILO_PROTOCOL"));
+}
+
+// --- sessions subcommand ---------------------------------------------------------
+
+#[test]
+fn sessions_on_a_missing_or_empty_root_lists_nothing() {
+    let root = TempRoot::new();
+    let missing = root.path.join("never-created");
+    let output = philo()
+        .args(["sessions", "--data-dir"])
+        .arg(&missing)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_text(&output), "");
+
+    let output = philo()
+        .args(["sessions", "--data-dir"])
+        .arg(&root.path)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_text(&output), "");
+}
+
+#[test]
+fn sessions_lists_ids_written_by_the_real_store() {
+    let root = TempRoot::new();
+    seed_session(&root.path, "alpha");
+    seed_session(&root.path, "beta-2");
+
+    let output = philo()
+        .args(["sessions", "--data-dir"])
+        .arg(&root.path)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_text(&output));
+    assert_eq!(
+        stdout_text(&output),
+        "alpha\nbeta-2\n",
+        "sorted ids on stdout"
+    );
+}
+
+/// Seeds one committed session through the public store API.
+fn seed_session(root: &std::path::Path, id: &str) {
+    use philo_session::{
+        OperationId, SessionEntryKind, SessionId, SessionRevision, SessionStore,
+        SessionTransaction, SessionUserPart, TurnId,
+    };
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    let store = philo_session_jsonl::JsonlSessionStore::open(root).expect("open store");
+    block_on(store.commit(SessionTransaction::linear(
+        SessionId::new(id),
+        SessionRevision::ZERO,
+        vec![
+            SessionEntryKind::OperationStarted {
+                operation_id: OperationId::new("op-1"),
+            },
+            SessionEntryKind::TurnStarted {
+                operation_id: OperationId::new("op-1"),
+                turn_id: TurnId::new("turn-1"),
+            },
+            SessionEntryKind::UserMessage {
+                turn_id: TurnId::new("turn-1"),
+                parts: SessionUserPart::text_parts("hi"),
+            },
+        ],
+    )))
+    .expect("seed commit");
+}

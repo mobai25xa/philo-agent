@@ -1,0 +1,13 @@
+[package]
+name = "philo-agent-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+philo-agent-kernel = { path = "../philo-agent-kernel" }
+philo-session = { path = "../philo-session" }
+philo-tools = { path = "../philo-tools" }
+
+[dev-dependencies]
+philo-session-jsonl = { path = "../philo-session-jsonl" }

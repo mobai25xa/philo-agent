@@ -1,0 +1,17 @@
+---
+source: crates/philo-tui/src/app/transcript.rs
+description: default transcript information tier
+assertion_line: 444
+expression: "render(InfoLevel::Default)"
+---
+lines:
+Notice: notice: a previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
+Reasoning: [reasoning] checking workspace
+Answer: answer line
+Tool: tool read_file({"path":"src/main.rs"})
+Tool:   read_file -> ok: fn main() {}
+Answer: final
+Notice: cancelling (timeout)...
+Notice: turn cancelled (timeout)
+Meta: done (cancelled)
+partial: None

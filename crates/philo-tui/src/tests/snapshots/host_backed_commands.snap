@@ -1,0 +1,29 @@
+---
+source: crates/philo-tui/src/driver/host_effects.rs
+description: host-backed slash command output
+assertion_line: 290
+expression: "output.join(\"\\n\")"
+---
+/new
+new session: fresh
+/model model-b
+model: model-b
+/reasoning high
+reasoning: high (from the next turn on)
+/image shots/diagram.png
+image queued: shots/diagram.png (1 waiting for the next message)
+/verbose
+info level: verbose
+/status
+model model-b | session fresh | idle | verbose
+attachments queued: shots/diagram.png
+tools (3):
+  read_file [read-only]
+  write_file [workspace]
+  shell [system]
+/config
+config (effective):
+  model       = model-b  [project]
+  api_key_env = PHILO_API_KEY  [global]
+/quit
+[exit]

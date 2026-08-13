@@ -1,0 +1,19 @@
+---
+source: crates/philo-tui/src/app/transcript.rs
+description: M11 and dual-channel event vocabulary
+assertion_line: 454
+expression: "event_sequence().iter().map(|event|\nformat!(\"{event:?}\")).collect::<Vec<_>>().join(\"\\n\")"
+---
+OperationStarted { operation_id: OperationId("op-1") }
+PriorTurnSealed { turn_id: TurnId("old-turn") }
+TurnStarted { turn_id: TurnId("turn-1") }
+ModelCallStarted { model_call_id: ModelCallId("call-1") }
+ReasoningDelta { model_call_id: ModelCallId("call-1"), text: "checking workspace\n" }
+TextDelta { delta: "answer line\nfinal" }
+ModelUsageUpdated { model_call_id: ModelCallId("call-1"), usage: TokenUsage { input_tokens: Some(12), output_tokens: Some(7), cache_read_tokens: None, cache_write_tokens: None, reasoning_tokens: None } }
+ToolBatchRequested { tool_batch_id: ToolBatchId("batch-1"), call_count: 1 }
+ToolExecutionStarted { tool_batch_id: ToolBatchId("batch-1"), tool_call_id: ToolCallId("tool-1"), index: 0, tool_name: "read_file", arguments: "{\"path\":\"src/main.rs\"}" }
+ToolExecutionCompleted { tool_batch_id: ToolBatchId("batch-1"), tool_call_id: ToolCallId("tool-1"), index: 0, tool_name: "read_file", result: Success { content: "fn main() {}" }, display: Some(ToolDisplay { detail: "read 12 bytes", facts: [ToolFact { name: "bytes", value: "12" }] }) }
+CancellationRequested { operation_id: OperationId("op-1"), reason: Timeout }
+TurnCancelled { turn_id: TurnId("turn-1"), reason: Timeout }
+OperationSettled { operation_id: OperationId("op-1"), status: Cancelled, durability: Confirmed }

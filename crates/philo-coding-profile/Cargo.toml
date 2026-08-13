@@ -1,0 +1,14 @@
+[package]
+name = "philo-coding-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Scenario assembly layer: owns the coding tool lineup, system prompt, and
+# runtime defaults. Deliberately does NOT depend on philo-model: model
+# selection (CallTarget, credentials) is deployment configuration owned by
+# the composition root.
+[dependencies]
+philo-agent-runtime = { path = "../philo-agent-runtime" }
+philo-tools = { path = "../philo-tools" }
+philo-tools-std = { path = "../philo-tools-std" }

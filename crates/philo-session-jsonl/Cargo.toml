@@ -1,0 +1,17 @@
+[package]
+name = "philo-session-jsonl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# File locking uses the std file-lock API (`File::try_lock`, stable since
+# Rust 1.89): an OS advisory lock released automatically when the process
+# exits, with no extra dependency. This replaces the fd-lock crate suggested
+# in the M5 workspace delta with an equivalent standard-library facility.
+[dependencies]
+philo-session = { path = "../philo-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Content-addressed artifact files (ADR-0002) are named by SHA-256; a
+# reviewed cryptographic implementation is used instead of a hand-rolled one.
+sha2 = "0.10"

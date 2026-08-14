@@ -1,21 +1,22 @@
-//! Execution of the host-backed effects a command produces.
+//! Pure application of completed host requests.
 //!
-//! The state machine in [`crate::app`] stays pure: it decides *what* the
-//! host must be asked, and this module performs the ask, feeds the answer
-//! back into the app state, and returns the transcript lines the shell
-//! appends. Everything here goes through the [`TuiHost`] interface — no
-//! model, store, or profile knowledge.
+//! The driver task registry performs the potentially blocking work. This
+//! module only reduces owned results into App state and follow-up effects.
 
 use philo_agent_runtime::EffectClass;
-use philo_session::SessionId;
+use philo_agent_runtime::{ReasoningEffort, ToolDefinition};
+use philo_session::{SessionContextView, SessionId};
 
-use crate::api::host::TuiHost;
+use crate::api::host::{ConfigEntry, HostError};
 use crate::app::command;
-use crate::app::effect::HostRequest;
+use crate::app::effect::{Effect, HostRequest};
 use crate::app::history;
 use crate::app::overlay::Preview;
 use crate::app::state::App;
 use crate::app::transcript::{LineKind, TranscriptLine};
+
+#[cfg(test)]
+use crate::api::host::TuiHost;
 
 /// Preview rows loaded per session in the picker (the overlay body height).
 const PREVIEW_ROWS: usize = 5;
@@ -27,70 +28,73 @@ fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     }
 }
 
-/// Performs one host request and returns the lines to append.
-pub(crate) async fn execute(
-    app: &mut App,
-    host: &dyn TuiHost,
-    request: HostRequest,
-) -> Vec<TranscriptLine> {
-    match request {
-        HostRequest::NewSession => {
-            let id = host.new_session_id();
-            app.begin_session(&id);
-            vec![line(LineKind::Meta, format!("new session: {id}"))]
-        }
-        HostRequest::OpenSessions => open_sessions(app, host).await,
-        HostRequest::LoadPreview(id) => {
-            load_preview(app, host, &id).await;
-            Vec::new()
-        }
-        HostRequest::SwitchSession(id) => switch_session(app, host, &id).await,
-        HostRequest::RebuildModel(name) => rebuild_model(app, host, name),
-        HostRequest::SetReasoning(effort) => match host.set_reasoning(effort) {
-            Ok(()) => vec![line(
-                LineKind::Meta,
-                format!(
-                    "reasoning: {} (from the next turn on)",
-                    command::reasoning_name(effort)
-                ),
-            )],
-            Err(error) => vec![line(
-                LineKind::Error,
-                format!("error: reasoning not changed: {}", error.message()),
-            )],
-        },
-        HostRequest::ShowConfig => config_lines(host),
-        HostRequest::ShowStatus => status_lines(app, host),
-        HostRequest::Respond(id, response) => {
-            host.confirmations().respond(id, response);
-            Vec::new()
-        }
+/// Owned output of one host task. No variant borrows the App or host.
+pub(crate) enum HostResult {
+    NewSession(String),
+    OpenSessions(Result<Vec<SessionId>, HostError>),
+    Preview {
+        id: SessionId,
+        result: Result<SessionContextView, HostError>,
+    },
+    SwitchSession {
+        id: SessionId,
+        result: Result<SessionContextView, HostError>,
+    },
+    RebuildModel {
+        name: String,
+        result: Result<(), HostError>,
+    },
+    SetReasoning {
+        effort: ReasoningEffort,
+        result: Result<(), HostError>,
+    },
+    ShowConfig(Vec<ConfigEntry>),
+    ShowStatus(Vec<ToolDefinition>),
+}
+
+impl HostResult {
+    /// A successful session transition starts a fresh live Markdown parser.
+    pub(crate) fn resets_session(&self) -> bool {
+        matches!(
+            self,
+            Self::NewSession(_) | Self::SwitchSession { result: Ok(_), .. }
+        )
     }
 }
 
-async fn open_sessions(app: &mut App, host: &dyn TuiHost) -> Vec<TranscriptLine> {
-    match host.list_sessions() {
-        Err(error) => vec![line(
+/// Applies one completed host result through the pure App state machine.
+pub(crate) fn apply(app: &mut App, result: HostResult) -> Vec<Effect> {
+    match result {
+        HostResult::NewSession(id) => {
+            app.begin_session(&id);
+            append(vec![line(LineKind::Meta, format!("new session: {id}"))])
+        }
+        HostResult::OpenSessions(Err(error)) => append(vec![line(
             LineKind::Error,
             format!("error: sessions unavailable: {}", error.message()),
-        )],
-        Ok(sessions) if sessions.is_empty() => vec![line(
+        )]),
+        HostResult::OpenSessions(Ok(sessions)) if sessions.is_empty() => append(vec![line(
             LineKind::Notice,
             "no sessions recorded yet; this one starts with the first message",
-        )],
-        Ok(sessions) => {
+        )]),
+        HostResult::OpenSessions(Ok(sessions)) => {
             app.open_picker(sessions);
-            if let Some(id) = app.claim_preview() {
-                load_preview(app, host, &id).await;
-            }
+            app.claim_preview()
+                .map(|id| vec![Effect::Host(HostRequest::LoadPreview(id))])
+                .unwrap_or_default()
+        }
+        HostResult::Preview { id, result } => {
+            let preview = match result {
+                Ok(view) => Preview::Ready(history::preview_lines(&view, PREVIEW_ROWS)),
+                Err(error) => Preview::Failed(error.message().to_owned()),
+            };
+            app.set_preview(&id, preview);
             Vec::new()
         }
-    }
-}
-
-async fn switch_session(app: &mut App, host: &dyn TuiHost, id: &SessionId) -> Vec<TranscriptLine> {
-    match host.context_view(id).await {
-        Ok(view) => {
+        HostResult::SwitchSession {
+            id,
+            result: Ok(view),
+        } => {
             app.begin_session(id.as_str());
             let mut lines = vec![line(LineKind::Meta, format!("session {}", id.as_str()))];
             let history = history::history_lines(&view);
@@ -99,38 +103,62 @@ async fn switch_session(app: &mut App, host: &dyn TuiHost, id: &SessionId) -> Ve
             } else {
                 lines.extend(history);
             }
-            lines
+            append(lines)
         }
-        Err(error) => vec![line(
+        HostResult::SwitchSession {
+            id,
+            result: Err(error),
+        } => append(vec![line(
             LineKind::Error,
             format!(
                 "error: session {} not opened: {}",
                 id.as_str(),
                 error.message()
             ),
-        )],
-    }
-}
-
-fn rebuild_model(app: &mut App, host: &dyn TuiHost, name: String) -> Vec<TranscriptLine> {
-    match host.rebuild_model(&name) {
-        Ok(()) => {
+        )]),
+        HostResult::RebuildModel {
+            name,
+            result: Ok(()),
+        } => {
             app.status.model.clone_from(&name);
-            vec![line(LineKind::Meta, format!("model: {name}"))]
+            append(vec![line(LineKind::Meta, format!("model: {name}"))])
         }
-        Err(error) => vec![line(
+        HostResult::RebuildModel {
+            result: Err(error), ..
+        } => append(vec![line(
             LineKind::Error,
             format!(
                 "error: model not switched: {}; still on {}",
                 error.message(),
                 app.status.model
             ),
-        )],
+        )]),
+        HostResult::SetReasoning {
+            effort,
+            result: Ok(()),
+        } => append(vec![line(
+            LineKind::Meta,
+            format!(
+                "reasoning: {} (from the next turn on)",
+                command::reasoning_name(effort)
+            ),
+        )]),
+        HostResult::SetReasoning {
+            result: Err(error), ..
+        } => append(vec![line(
+            LineKind::Error,
+            format!("error: reasoning not changed: {}", error.message()),
+        )]),
+        HostResult::ShowConfig(entries) => append(config_lines(entries)),
+        HostResult::ShowStatus(tools) => append(status_lines(app, tools)),
     }
 }
 
-fn config_lines(host: &dyn TuiHost) -> Vec<TranscriptLine> {
-    let entries = host.config_view();
+fn append(lines: Vec<TranscriptLine>) -> Vec<Effect> {
+    vec![Effect::Append(lines)]
+}
+
+fn config_lines(entries: Vec<ConfigEntry>) -> Vec<TranscriptLine> {
     if entries.is_empty() {
         return vec![line(LineKind::Meta, "config: no effective entries")];
     }
@@ -152,12 +180,11 @@ fn config_lines(host: &dyn TuiHost) -> Vec<TranscriptLine> {
     lines
 }
 
-fn status_lines(app: &App, host: &dyn TuiHost) -> Vec<TranscriptLine> {
+fn status_lines(app: &App, tools: Vec<ToolDefinition>) -> Vec<TranscriptLine> {
     let mut lines = vec![line(LineKind::Meta, app.status.line())];
     if let Some(summary) = app.attachments().summary() {
         lines.push(line(LineKind::Meta, summary));
     }
-    let tools = host.tool_definitions();
     if tools.is_empty() {
         lines.push(line(LineKind::Meta, "tools: none"));
         return lines;
@@ -176,19 +203,67 @@ fn status_lines(app: &App, host: &dyn TuiHost) -> Vec<TranscriptLine> {
     lines
 }
 
-async fn load_preview(app: &mut App, host: &dyn TuiHost, id: &SessionId) {
-    let preview = match host.context_view(id).await {
-        Ok(view) => Preview::Ready(history::preview_lines(&view, PREVIEW_ROWS)),
-        Err(error) => Preview::Failed(error.message().to_owned()),
-    };
-    app.set_preview(id, preview);
-}
-
 fn effect_class_name(class: EffectClass) -> &'static str {
     match class {
         EffectClass::ReadOnly => "read-only",
         EffectClass::Workspace => "workspace",
         EffectClass::System => "system",
+    }
+}
+
+/// Compatibility adapter for state/snapshot tests. Production requests are
+/// always executed by `driver::tasks` and never await in the effect loop.
+#[cfg(test)]
+pub(crate) async fn execute(
+    app: &mut App,
+    host: &dyn TuiHost,
+    request: HostRequest,
+) -> Vec<TranscriptLine> {
+    use std::collections::VecDeque;
+
+    let mut requests = VecDeque::from([request]);
+    let mut lines = Vec::new();
+    while let Some(request) = requests.pop_front() {
+        if let HostRequest::Respond(id, response) = request {
+            host.confirmations().respond(id, response);
+            continue;
+        }
+        let result = execute_for_test(host, request).await;
+        for effect in apply(app, result) {
+            match effect {
+                Effect::Append(mut appended) => lines.append(&mut appended),
+                Effect::Host(request) => requests.push_back(request),
+                other => panic!("host result produced an unexpected effect: {other:?}"),
+            }
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+async fn execute_for_test(host: &dyn TuiHost, request: HostRequest) -> HostResult {
+    match request {
+        HostRequest::NewSession => HostResult::NewSession(host.new_session_id()),
+        HostRequest::OpenSessions => HostResult::OpenSessions(host.list_sessions()),
+        HostRequest::LoadPreview(id) => {
+            let result = host.context_view(&id).await;
+            HostResult::Preview { id, result }
+        }
+        HostRequest::SwitchSession(id) => {
+            let result = host.context_view(&id).await;
+            HostResult::SwitchSession { id, result }
+        }
+        HostRequest::RebuildModel(name) => {
+            let result = host.rebuild_model(&name);
+            HostResult::RebuildModel { name, result }
+        }
+        HostRequest::SetReasoning(effort) => HostResult::SetReasoning {
+            effort,
+            result: host.set_reasoning(effort),
+        },
+        HostRequest::ShowConfig => HostResult::ShowConfig(host.config_view()),
+        HostRequest::ShowStatus => HostResult::ShowStatus(host.tool_definitions()),
+        HostRequest::Respond(..) => unreachable!("responses are handled before task execution"),
     }
 }
 

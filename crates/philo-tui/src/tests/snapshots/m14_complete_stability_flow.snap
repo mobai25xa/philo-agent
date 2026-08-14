@@ -1,0 +1,59 @@
+---
+source: crates/philo-tui/src/tests/m14_integration.rs
+expression: "format!(\"HISTORY\\n{history}\\n\\nTOOL\\n{tool_screen}\\n\\nCANCELLING\\n{cancelling_screen}\\n\\nAPPROVAL\\n{approval_screen}\")"
+---
+HISTORY
+Reasoning: [reasoning] checking constraints
+Answer: # Stable output
+Answer: 012345678901234567890123456789012345678901234567890123456789012345678...
+Answer: ```rust
+Answer: fn main() { println!("稳定"); }
+Answer: ```
+Tool:   read_file -> ok: result-result-result-result-result-result-result-r...
+Meta: context compacted
+Answer: after tool
+Answer:  late-but-preserved
+Notice: turn cancelled (user)
+Meta: done (cancelled)
+
+TOOL
+00: | Tool 1/2: read_file {"path":"src/中 ...
+01: 
+02: 
+03: 
+04: 
+05: ┌ Message ─────────────────────────────┐
+06: │| long composer draft 中 文  é 👩‍💻        │
+07: │| long composer draft 中 文  é 👩‍💻        │
+08: │| long composer draft 中 文  é 👩‍💻        │
+09: │| long composer draft                 │
+10: └──────────────────────────────────────┘
+11: session session-m14 | busy | queued 1
+
+CANCELLING
+00: | Cancelling (user)
+01: late-but-preserved
+02: 
+03: 
+04: 
+05: ┌ Message ─────────────────────────────┐
+06: │| long composer draft 中 文  é 👩‍💻        │
+07: │| long composer draft 中 文  é 👩‍💻        │
+08: │| long composer draft 中 文  é 👩‍💻        │
+09: │| long composer draft                 │
+10: └──────────────────────────────────────┘
+11: session session-m14 | busy | queued 1
+
+APPROVAL
+00: ! Approval required
+01: 
+02: approval required: write workspace file
+03: src/中 文 .rs
+04: y allow | n / Esc deny
+05: ┌ Message ─────────────────────────────┐
+06: │| long composer draft 中 文  é 👩‍💻        │
+07: │| long composer draft 中 文  é 👩‍💻        │
+08: │| long composer draft 中 文  é 👩‍💻        │
+09: │| long composer draft                 │
+10: └──────────────────────────────────────┘
+11: session session-m14 | idle

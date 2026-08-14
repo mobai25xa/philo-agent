@@ -6,6 +6,10 @@
 
 use philo_agent_runtime::{AgentEvent, CancelReason, OperationStatus, SettlementDurability};
 
+use super::text;
+
+const DEFAULT_TOOL_SUMMARY_WIDTH: usize = 120;
+
 /// Information tier of the transcript (the TUI has no quiet tier; `Ctrl+O`
 /// toggles between these two).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,11 +205,6 @@ impl Transcript {
                             self.tool_batch_size,
                         ),
                     ));
-                } else {
-                    lines.push(line(
-                        LineKind::Tool,
-                        format!("tool {tool_name}({})", preview(arguments, 60)),
-                    ));
                 }
             }
             AgentEvent::ToolExecutionCompleted {
@@ -253,7 +252,13 @@ impl Transcript {
                             format!("error {code}: {}", preview(message, 80))
                         }
                     };
-                    lines.push(line(LineKind::Tool, format!("  {tool_name} -> {summary}")));
+                    lines.push(line(
+                        LineKind::Tool,
+                        text::truncate(
+                            &format!("  {tool_name} -> {summary}"),
+                            DEFAULT_TOOL_SUMMARY_WIDTH,
+                        ),
+                    ));
                 }
             }
             AgentEvent::AssistantMessageCompleted { message, .. } => {
@@ -280,7 +285,9 @@ impl Transcript {
                 }
             }
             AgentEvent::ContextCompactionStarted => {
-                lines.push(line(LineKind::Notice, "compacting context..."));
+                if verbose {
+                    lines.push(line(LineKind::Notice, "compacting context..."));
+                }
             }
             AgentEvent::ContextCompactionCompleted { covers_up_to } => {
                 let text = if verbose {
@@ -301,12 +308,15 @@ impl Transcript {
             }
             AgentEvent::CancellationRequested { reason, .. } => {
                 lines.extend(self.flush_partial());
-                lines.push(line(
-                    LineKind::Notice,
-                    format!("cancelling ({})...", reason_text(*reason)),
-                ));
+                if verbose {
+                    lines.push(line(
+                        LineKind::Notice,
+                        format!("cancelling ({})...", reason_text(*reason)),
+                    ));
+                }
             }
             AgentEvent::TurnCancelled { reason, .. } => {
+                lines.extend(self.flush_partial());
                 lines.push(line(
                     LineKind::Notice,
                     format!("turn cancelled ({})", reason_text(*reason)),
@@ -363,16 +373,11 @@ fn complete_text_lines(kind: LineKind, text: &str) -> Vec<TranscriptLine> {
         .collect()
 }
 
-/// Single-line preview: newlines collapse, long text truncates on a char
-/// boundary with an ellipsis.
-pub(crate) fn preview(text: &str, max_chars: usize) -> String {
+/// Single-line preview bounded by terminal cells without splitting graphemes.
+pub(crate) fn preview(text: &str, max_width: usize) -> String {
     let flat = text.replace(['\n', '\r'], " ");
     let flat = flat.trim();
-    if flat.chars().count() <= max_chars {
-        return flat.to_owned();
-    }
-    let kept: String = flat.chars().take(max_chars).collect();
-    format!("{kept}...")
+    text::truncate(flat, max_width)
 }
 
 #[cfg(test)]
@@ -488,6 +493,34 @@ mod snapshots {
         );
         assert!(lines.is_empty(), "no reasoning reaches the transcript");
         assert_eq!(transcript.partial(), None);
+    }
+
+    #[test]
+    fn default_tool_started_is_transient_and_completion_is_bounded() {
+        let mut transcript = Transcript::new(true);
+        let started = AgentEvent::ToolExecutionStarted {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("tool"),
+            index: 0,
+            tool_name: "读取文件".repeat(40),
+            arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
+        };
+        assert!(
+            transcript.on_event(&started, InfoLevel::Default).is_empty(),
+            "started belongs only to Activity in default mode"
+        );
+
+        let completed = AgentEvent::ToolExecutionCompleted {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("tool"),
+            index: 0,
+            tool_name: "读取文件".repeat(40),
+            result: ToolResult::success("内容".repeat(100)),
+            display: None,
+        };
+        let lines = transcript.on_event(&completed, InfoLevel::Default);
+        assert_eq!(lines.len(), 1);
+        assert!(text::width(&lines[0].text) <= DEFAULT_TOOL_SUMMARY_WIDTH);
     }
 
     #[test]

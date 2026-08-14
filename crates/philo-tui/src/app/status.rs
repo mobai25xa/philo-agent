@@ -2,6 +2,7 @@
 
 use philo_agent_runtime::TokenUsage;
 
+use super::text;
 use super::transcript::InfoLevel;
 
 /// Everything the status bar shows; the event loop keeps this current.
@@ -51,40 +52,83 @@ impl StatusData {
 
     /// Renders the single status line.
     pub fn line(&self) -> String {
-        let mut parts = vec![
-            format!("model {}", self.model),
-            format!("session {}", self.session),
-            if self.compacting {
-                format!(
-                    "compacting [{}]",
-                    ["|", "/", "-", "\\"][self.compaction_spinner]
-                )
-            } else if self.busy {
-                "busy".to_owned()
-            } else {
-                "idle".to_owned()
-            },
+        self.line_for_width(usize::MAX)
+    }
+
+    /// Responsive status projection. Fields are admitted in preservation
+    /// priority: state, queue, session, model, usage/context, verbose.
+    pub(crate) fn line_for_width(&self, max_width: usize) -> String {
+        let state = if self.compacting {
+            format!(
+                "compacting [{}]",
+                ["|", "/", "-", "\\"][self.compaction_spinner]
+            )
+        } else if self.busy {
+            "busy".to_owned()
+        } else {
+            "idle".to_owned()
+        };
+        let mut fields = vec![
+            (0, 3, format!("model {}", self.model)),
+            (1, 2, format!("session {}", self.session)),
+            (2, 0, state),
         ];
         if self.queued > 0 {
-            parts.push(format!("queued {}", self.queued));
+            fields.push((3, 1, format!("queued {}", self.queued)));
         }
         if let Some(usage) = &self.usage {
             let value =
                 |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
-            let mut tokens = format!(
-                "tokens in {} out {}",
-                value(usage.input_tokens),
-                value(usage.output_tokens)
-            );
+            fields.push((
+                4,
+                4,
+                format!(
+                    "tokens in {} out {}",
+                    value(usage.input_tokens),
+                    value(usage.output_tokens)
+                ),
+            ));
             if let (Some(input), Some(window)) = (usage.input_tokens, self.context_window) {
-                tokens.push_str(&format!(" | ctx {input}/{window}"));
+                fields.push((5, 5, format!("ctx {input}/{window}")));
             }
-            parts.push(tokens);
         }
         if self.level == InfoLevel::Verbose {
-            parts.push("verbose".to_owned());
+            fields.push((6, 6, "verbose".to_owned()));
         }
-        parts.join(" | ")
+
+        let mut admitted: Vec<(usize, String)> = Vec::new();
+        fields.sort_by_key(|(_, priority, _)| *priority);
+        for (order, _, candidate) in fields {
+            let projected_width = admitted
+                .iter()
+                .map(|(_, value)| text::width(value))
+                .sum::<usize>()
+                + text::width(&candidate)
+                + admitted.len() * 3;
+            if projected_width <= max_width {
+                admitted.push((order, candidate));
+            }
+        }
+        admitted.sort_by_key(|(order, _)| *order);
+        let line = admitted
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if line.is_empty() {
+            text::truncate(
+                if self.compacting {
+                    "compacting"
+                } else if self.busy {
+                    "busy"
+                } else {
+                    "idle"
+                },
+                max_width,
+            )
+        } else {
+            line
+        }
     }
 }
 
@@ -111,5 +155,15 @@ mod tests {
             "model gpt-test | session s-1 | busy | queued 2 | \
              tokens in 1200 out 340 | ctx 1200/128000 | verbose"
         );
+    }
+
+    #[test]
+    fn narrow_status_preserves_state_before_secondary_fields() {
+        let mut status = StatusData::new("a-very-long-model", "session-123", InfoLevel::Verbose);
+        status.busy = true;
+        status.queued = 3;
+        let line = status.line_for_width(40);
+        assert_eq!(line, "session session-123 | busy | queued 3");
+        assert!(text::width(&line) <= 40);
     }
 }

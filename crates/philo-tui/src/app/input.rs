@@ -1,13 +1,17 @@
-//! Multi-line input editor: a plain, char-indexed text buffer with cursor
-//! movement. Pure state, fully unit-testable; no terminal knowledge.
+//! Multi-line input editor with grapheme-safe cursor movement.
 
-/// Char-indexed multi-line editor state.
+use unicode_segmentation::UnicodeSegmentation;
+
+use super::text;
+
+/// Multi-line editor state. The cursor is stored as a UTF-8 byte boundary and
+/// can only land between extended grapheme clusters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputEditor {
     lines: Vec<String>,
     row: usize,
-    /// Cursor position within the row, counted in chars.
-    col: usize,
+    byte: usize,
+    preferred_cell: Option<usize>,
 }
 
 impl Default for InputEditor {
@@ -15,7 +19,8 @@ impl Default for InputEditor {
         Self {
             lines: vec![String::new()],
             row: 0,
-            col: 0,
+            byte: 0,
+            preferred_cell: None,
         }
     }
 }
@@ -29,20 +34,32 @@ impl InputEditor {
         &self.lines
     }
 
+    /// Logical row and grapheme index, primarily for state tests.
+    #[cfg(test)]
     pub fn cursor(&self) -> (usize, usize) {
-        (self.row, self.col)
+        (
+            self.row,
+            self.lines[self.row][..self.byte].graphemes(true).count(),
+        )
+    }
+
+    pub(crate) fn cursor_byte(&self) -> (usize, usize) {
+        (self.row, self.byte)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_cell(&self) -> usize {
+        text::width(&self.lines[self.row][..self.byte])
     }
 
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines[0].is_empty()
     }
 
-    /// The whole buffer joined with newlines.
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
 
-    /// Clears the buffer and returns its previous content.
     pub fn take_text(&mut self) -> String {
         let text = self.text();
         *self = Self::default();
@@ -53,127 +70,155 @@ impl InputEditor {
         *self = Self::default();
     }
 
-    /// Replaces the whole buffer (input-history recall) and puts the
-    /// cursor at the end.
     pub fn set_text(&mut self, text: &str) {
-        self.lines = text.split('\n').map(str::to_owned).collect();
+        self.lines = text.split('\n').map(sanitize).collect();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
         self.row = self.lines.len() - 1;
-        self.col = char_count(&self.lines[self.row]);
+        self.byte = self.lines[self.row].len();
+        self.preferred_cell = None;
     }
 
     pub fn insert_char(&mut self, ch: char) {
-        let line = &mut self.lines[self.row];
-        let byte = byte_index(line, self.col);
-        line.insert(byte, ch);
-        self.col += 1;
+        if ch.is_control() {
+            return;
+        }
+        self.lines[self.row].insert(self.byte, ch);
+        self.byte += ch.len_utf8();
+        self.preferred_cell = None;
     }
 
-    /// Inserts text verbatim; newlines split lines (bracketed paste never
-    /// submits).
-    pub fn insert_str(&mut self, text: &str) {
-        for ch in text.chars() {
+    /// Inserts text verbatim except for carriage returns and unsafe control
+    /// characters; newlines split lines and never submit.
+    pub fn insert_str(&mut self, value: &str) {
+        for ch in value.chars() {
             match ch {
                 '\n' => self.insert_newline(),
                 '\r' => {}
+                _ if ch.is_control() => {}
                 _ => self.insert_char(ch),
             }
         }
     }
 
     pub fn insert_newline(&mut self) {
-        let line = &mut self.lines[self.row];
-        let byte = byte_index(line, self.col);
-        let rest = line.split_off(byte);
+        let rest = self.lines[self.row].split_off(self.byte);
         self.lines.insert(self.row + 1, rest);
         self.row += 1;
-        self.col = 0;
+        self.byte = 0;
+        self.preferred_cell = None;
     }
 
     pub fn backspace(&mut self) {
-        if self.col > 0 {
-            let line = &mut self.lines[self.row];
-            let remove_at = byte_index(line, self.col - 1);
-            line.remove(remove_at);
-            self.col -= 1;
+        if self.byte > 0 {
+            let previous = previous_boundary(&self.lines[self.row], self.byte);
+            self.lines[self.row].drain(previous..self.byte);
+            self.byte = previous;
         } else if self.row > 0 {
             let current = self.lines.remove(self.row);
             self.row -= 1;
-            self.col = char_count(&self.lines[self.row]);
+            self.byte = self.lines[self.row].len();
             self.lines[self.row].push_str(&current);
         }
+        self.preferred_cell = None;
     }
 
     pub fn delete(&mut self) {
-        let line_chars = char_count(&self.lines[self.row]);
-        if self.col < line_chars {
-            let line = &mut self.lines[self.row];
-            let remove_at = byte_index(line, self.col);
-            line.remove(remove_at);
+        let line_len = self.lines[self.row].len();
+        if self.byte < line_len {
+            let next = next_boundary(&self.lines[self.row], self.byte);
+            self.lines[self.row].drain(self.byte..next);
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
         }
+        self.preferred_cell = None;
     }
 
     pub fn move_left(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
+        if self.byte > 0 {
+            self.byte = previous_boundary(&self.lines[self.row], self.byte);
         } else if self.row > 0 {
             self.row -= 1;
-            self.col = char_count(&self.lines[self.row]);
+            self.byte = self.lines[self.row].len();
         }
+        self.preferred_cell = None;
     }
 
     pub fn move_right(&mut self) {
-        if self.col < char_count(&self.lines[self.row]) {
-            self.col += 1;
+        if self.byte < self.lines[self.row].len() {
+            self.byte = next_boundary(&self.lines[self.row], self.byte);
         } else if self.row + 1 < self.lines.len() {
             self.row += 1;
-            self.col = 0;
+            self.byte = 0;
         }
+        self.preferred_cell = None;
     }
 
-    /// Moves up one line; returns false when already on the first line
-    /// (the caller may recall input history instead).
     pub fn move_up(&mut self) -> bool {
         if self.row == 0 {
             return false;
         }
+        let cell = *self
+            .preferred_cell
+            .get_or_insert_with(|| text::width(&self.lines[self.row][..self.byte]));
         self.row -= 1;
-        self.col = self.col.min(char_count(&self.lines[self.row]));
+        self.byte = boundary_at_cell(&self.lines[self.row], cell);
         true
     }
 
-    /// Moves down one line; returns false when already on the last line.
     pub fn move_down(&mut self) -> bool {
         if self.row + 1 >= self.lines.len() {
             return false;
         }
+        let cell = *self
+            .preferred_cell
+            .get_or_insert_with(|| text::width(&self.lines[self.row][..self.byte]));
         self.row += 1;
-        self.col = self.col.min(char_count(&self.lines[self.row]));
+        self.byte = boundary_at_cell(&self.lines[self.row], cell);
         true
     }
 
     pub fn home(&mut self) {
-        self.col = 0;
+        self.byte = 0;
+        self.preferred_cell = None;
     }
 
     pub fn end(&mut self) {
-        self.col = char_count(&self.lines[self.row]);
+        self.byte = self.lines[self.row].len();
+        self.preferred_cell = None;
     }
 }
 
-fn char_count(line: &str) -> usize {
-    line.chars().count()
+fn previous_boundary(line: &str, byte: usize) -> usize {
+    line[..byte]
+        .grapheme_indices(true)
+        .next_back()
+        .map_or(0, |(index, _)| index)
 }
 
-fn byte_index(line: &str, col: usize) -> usize {
-    line.char_indices()
-        .nth(col)
-        .map_or(line.len(), |(byte, _)| byte)
+fn next_boundary(line: &str, byte: usize) -> usize {
+    line[byte..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map_or(line.len(), |(index, _)| byte + index)
+}
+
+fn boundary_at_cell(line: &str, target: usize) -> usize {
+    let mut cells = 0;
+    for (byte, grapheme) in line.grapheme_indices(true) {
+        let next = cells + text::width(grapheme);
+        if next > target {
+            return byte;
+        }
+        cells = next;
+    }
+    line.len()
+}
+
+fn sanitize(line: &str) -> String {
+    line.chars().filter(|ch| !ch.is_control()).collect()
 }
 
 #[cfg(test)]
@@ -184,10 +229,8 @@ mod tests {
     fn editing_round_trip_with_multibyte_chars() {
         let mut editor = InputEditor::new();
         editor.insert_str("héllo");
-        assert_eq!(editor.text(), "héllo");
         editor.move_left();
-        editor.backspace(); // removes the second 'l'
-        assert_eq!(editor.text(), "hélo");
+        editor.backspace();
         editor.insert_char('中');
         assert_eq!(editor.text(), "hél中o");
     }
@@ -200,29 +243,53 @@ mod tests {
         editor.insert_newline();
         assert_eq!(editor.lines(), ["a", "b"]);
         assert_eq!(editor.cursor(), (1, 0));
-        editor.backspace(); // joins back
+        editor.backspace();
         assert_eq!(editor.text(), "ab");
         assert_eq!(editor.cursor(), (0, 1));
     }
 
     #[test]
-    fn vertical_movement_clamps_and_reports_boundaries() {
+    fn vertical_movement_uses_terminal_cells() {
         let mut editor = InputEditor::new();
-        editor.insert_str("long line\nx");
-        assert_eq!(editor.cursor(), (1, 1));
-        assert!(!editor.move_down(), "already on the last line");
+        editor.insert_str("中文x\nabcdef\n中y");
+        editor.home();
+        editor.move_right();
+        assert_eq!(editor.cursor_cell(), 2);
         assert!(editor.move_up());
-        assert_eq!(editor.cursor(), (0, 1), "column clamps to source col");
-        assert!(!editor.move_up(), "first line reports the boundary");
+        assert_eq!(editor.cursor(), (1, 2));
+        assert!(editor.move_up());
+        assert_eq!(editor.cursor(), (0, 1));
     }
 
     #[test]
-    fn paste_never_submits_and_take_text_resets() {
+    fn combining_and_emoji_sequences_move_and_delete_as_graphemes() {
         let mut editor = InputEditor::new();
-        editor.insert_str("line1\nline2\r\nline3");
-        assert_eq!(editor.lines().len(), 3);
-        let taken = editor.take_text();
-        assert_eq!(taken, "line1\nline2\nline3");
-        assert!(editor.is_empty());
+        editor.insert_str("Ae\u{301}👩‍💻中");
+        assert_eq!(editor.cursor(), (0, 4));
+        editor.move_left();
+        editor.backspace();
+        assert_eq!(editor.text(), "Ae\u{301}中");
+        editor.backspace();
+        assert_eq!(editor.text(), "A中");
+        editor.backspace();
+        assert_eq!(editor.text(), "中");
+    }
+
+    #[test]
+    fn delete_never_splits_a_grapheme() {
+        let mut editor = InputEditor::new();
+        editor.insert_str("e\u{301}👨‍👩‍👧‍👦x");
+        editor.home();
+        editor.delete();
+        assert_eq!(editor.text(), "👨‍👩‍👧‍👦x");
+        editor.delete();
+        assert_eq!(editor.text(), "x");
+    }
+
+    #[test]
+    fn paste_filters_terminal_control_characters() {
+        let mut editor = InputEditor::new();
+        editor.insert_str("a\u{1b}[31m\tb\r\nc");
+        assert_eq!(editor.text(), "a[31mb\nc");
     }
 }

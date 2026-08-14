@@ -1,0 +1,45 @@
+---
+source: crates/philo-tui/src/render/frame.rs
+expression: snapshot
+---
+40 columns
+| Tool 1/1: read_file {"path":"src/中 ...
+
+
+
+
+┌ Message ─────────────────────────────┐
+│> 中 文  é 👩‍💻  and a long draft that wrap│
+│  s inside the composer               │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+session session-中 文  | busy
+
+80 columns
+| Tool 1/1: read_file {"path":"src/中 文 .rs"}
+
+
+
+
+┌ Message ─────────────────────────────────────────────────────────────────────┐
+│> 中 文  é 👩‍💻  and a long draft that wraps inside the composer                   │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+model gpt-test | session session-中 文  | busy
+
+120 columns
+| Tool 1/1: read_file {"path":"src/中 文 .rs"}
+
+
+
+
+┌ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│> 中 文  é 👩‍💻  and a long draft that wraps inside the composer                                                           │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+model gpt-test | session session-中 文  | busy

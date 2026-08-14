@@ -40,6 +40,7 @@ pub(crate) enum Effect {
     /// Drop the active manual compaction future.
     CancelCompaction,
     Quit,
-    Redraw,
+    /// Explicit terminal recovery (`Ctrl+L`), not ordinary invalidation.
+    HardRedraw,
     Host(HostRequest),
 }

@@ -2,16 +2,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use philo_agent_runtime::{
     AgentError, CompactionError, CompactionReport, OperationHandle, ReasoningEffort, RuntimeFuture,
     SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::SessionContextView;
+use tokio::sync::Notify;
 
 use crate::api::confirmation::ConfirmationChannel;
 use crate::api::host::{ConfigEntry, HostError, TuiHost};
+
+type BlockingGate = Arc<(Mutex<bool>, Condvar)>;
 
 pub(crate) struct FakeHost {
     prompts: Mutex<Vec<(SessionId, UserMessage)>>,
@@ -19,7 +22,14 @@ pub(crate) struct FakeHost {
     sessions: Mutex<Result<Vec<philo_session::SessionId>, String>>,
     views: Mutex<HashMap<String, SessionContextView>>,
     view_calls: Mutex<Vec<String>>,
+    view_gates: Mutex<HashMap<String, Arc<Notify>>>,
+    prompt_gate: Mutex<Option<Arc<Notify>>>,
+    pending_prompts: Arc<AtomicUsize>,
+    prompt_cancellations: Arc<AtomicUsize>,
+    prompt_cancellation_notify: Arc<Notify>,
     model_error: Mutex<Option<String>>,
+    model_calls: Mutex<Vec<String>>,
+    model_gate: Mutex<Option<BlockingGate>>,
     reasoning: Mutex<Vec<ReasoningEffort>>,
     reasoning_error: Mutex<Option<String>>,
     config: Mutex<Vec<ConfigEntry>>,
@@ -37,9 +47,26 @@ enum FakeCompactionScript {
 
 struct PendingCompactionGuard(Arc<AtomicUsize>);
 
+struct PendingPromptGuard {
+    pending: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+    cancellation_notify: Arc<Notify>,
+    completed: bool,
+}
+
 impl Drop for PendingCompactionGuard {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for PendingPromptGuard {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        if !self.completed {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            self.cancellation_notify.notify_one();
+        }
     }
 }
 
@@ -51,7 +78,14 @@ impl Default for FakeHost {
             sessions: Mutex::new(Ok(vec![philo_session::SessionId::new("fake-session")])),
             views: Mutex::default(),
             view_calls: Mutex::default(),
+            view_gates: Mutex::default(),
+            prompt_gate: Mutex::default(),
+            pending_prompts: Arc::new(AtomicUsize::new(0)),
+            prompt_cancellations: Arc::new(AtomicUsize::new(0)),
+            prompt_cancellation_notify: Arc::new(Notify::new()),
             model_error: Mutex::default(),
+            model_calls: Mutex::default(),
+            model_gate: Mutex::default(),
             reasoning: Mutex::default(),
             reasoning_error: Mutex::default(),
             config: Mutex::new(vec![ConfigEntry {
@@ -99,8 +133,70 @@ impl FakeHost {
         self.view_calls.lock().expect("fake host mutex").clone()
     }
 
+    pub(crate) fn delay_view(&self, id: &str) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.view_gates
+            .lock()
+            .expect("fake host mutex")
+            .insert(id.to_owned(), Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) fn delay_prompts(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        *self.prompt_gate.lock().expect("fake host mutex") = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) fn resume_prompts(&self) {
+        if let Some(gate) = self.prompt_gate.lock().expect("fake host mutex").take() {
+            gate.notify_one();
+        }
+    }
+
+    pub(crate) fn prompt_sessions(&self) -> Vec<String> {
+        self.prompts
+            .lock()
+            .expect("fake host mutex")
+            .iter()
+            .map(|(session, _)| session.as_str().to_owned())
+            .collect()
+    }
+
+    pub(crate) fn prompt_cancellations(&self) -> usize {
+        self.prompt_cancellations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn pending_prompts(&self) -> usize {
+        self.pending_prompts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait_for_prompt_cancellation(&self) {
+        if self.prompt_cancellations() == 0 {
+            self.prompt_cancellation_notify.notified().await;
+        }
+    }
+
     pub(crate) fn fail_model(&self, message: &str) {
         *self.model_error.lock().expect("fake host mutex") = Some(message.to_owned());
+    }
+
+    pub(crate) fn delay_models(&self) {
+        *self.model_gate.lock().expect("fake host mutex") =
+            Some(Arc::new((Mutex::new(false), Condvar::new())));
+    }
+
+    pub(crate) fn resume_models(&self) {
+        let Some(gate) = self.model_gate.lock().expect("fake host mutex").take() else {
+            return;
+        };
+        let (ready, condition) = &*gate;
+        *ready.lock().expect("fake model gate") = true;
+        condition.notify_all();
+    }
+
+    pub(crate) fn model_calls(&self) -> Vec<String> {
+        self.model_calls.lock().expect("fake host mutex").clone()
     }
 
     pub(crate) fn reasoning_calls(&self) -> Vec<ReasoningEffort> {
@@ -155,7 +251,24 @@ impl TuiHost for FakeHost {
             .lock()
             .expect("fake host mutex")
             .push((session_id, message));
-        Box::pin(async { Err(AgentError::new("fake host has no runtime")) })
+        let gate = self.prompt_gate.lock().expect("fake host mutex").clone();
+        let pending = Arc::clone(&self.pending_prompts);
+        let cancellations = Arc::clone(&self.prompt_cancellations);
+        let cancellation_notify = Arc::clone(&self.prompt_cancellation_notify);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                pending.fetch_add(1, Ordering::SeqCst);
+                let mut guard = PendingPromptGuard {
+                    pending,
+                    cancellations,
+                    cancellation_notify,
+                    completed: false,
+                };
+                gate.notified().await;
+                guard.completed = true;
+            }
+            Err(AgentError::new("fake host has no runtime"))
+        })
     }
 
     fn compact(
@@ -208,12 +321,33 @@ impl TuiHost for FakeHost {
             .expect("fake host mutex")
             .get(session_id.as_str())
             .cloned();
+        let gate = self
+            .view_gates
+            .lock()
+            .expect("fake host mutex")
+            .get(session_id.as_str())
+            .cloned();
         Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             view.ok_or_else(|| HostError::new("fake host has no history for this session"))
         })
     }
 
-    fn rebuild_model(&self, _name: &str) -> Result<(), HostError> {
+    fn rebuild_model(&self, name: &str) -> Result<(), HostError> {
+        self.model_calls
+            .lock()
+            .expect("fake host mutex")
+            .push(name.to_owned());
+        let gate = self.model_gate.lock().expect("fake host mutex").clone();
+        if let Some(gate) = gate {
+            let (ready, condition) = &*gate;
+            let mut ready = ready.lock().expect("fake model gate");
+            while !*ready {
+                ready = condition.wait(ready).expect("fake model gate");
+            }
+        }
         match self.model_error.lock().expect("fake host mutex").clone() {
             Some(message) => Err(HostError::new(message)),
             None => Ok(()),

@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/tests/m12_flow.rs
-assertion_line: 166
 expression: "output.join(\"\\n\")"
 ---
 Meta: /sessions
@@ -28,8 +27,6 @@ Notice: queued: waiting for the active turn
 Notice: notice: a previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Reasoning: [reasoning] checking
 Answer: answer line
-Tool: tool read({"path":"src/main.rs"})
 Tool:   read -> ok: fn main() {}
-Notice: cancelling (user)...
 Notice: turn cancelled (user)
 Meta: done (cancelled)

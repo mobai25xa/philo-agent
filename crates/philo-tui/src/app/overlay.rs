@@ -13,6 +13,8 @@ use philo_session::SessionId;
 
 use crate::api::confirmation::{ConfirmationId, ConfirmationRequest};
 
+use super::text;
+
 /// Width of the session column in the picker.
 const LIST_WIDTH: usize = 22;
 
@@ -112,7 +114,12 @@ impl SessionPicker {
     }
 
     /// Projects the overlay content for a body of `height` rows.
+    #[cfg(test)]
     pub(crate) fn frame(&self, height: usize) -> OverlayFrame {
+        self.frame_for(height, 80)
+    }
+
+    pub(crate) fn frame_for(&self, height: usize, width: usize) -> OverlayFrame {
         let rows = height.max(1);
         let start = if self.selected >= rows {
             self.selected + 1 - rows
@@ -120,21 +127,38 @@ impl SessionPicker {
             0
         };
         let preview = self.preview_rows();
+        let show_preview = width >= 32;
+        let list_width = if show_preview {
+            LIST_WIDTH.min((width / 2).saturating_sub(3).max(10))
+        } else {
+            width.saturating_sub(2).max(1)
+        };
         let body = (0..rows)
             .map(|offset| {
                 let index = start + offset;
-                let entry = self.sessions.get(index).map_or_else(String::new, |id| {
-                    let marker = if index == self.selected { ">" } else { " " };
-                    format!("{marker} {}", cell(id.as_str(), LIST_WIDTH))
-                });
+                let entry = self.sessions.get(index).map_or_else(
+                    || " ".repeat(list_width + 2),
+                    |id| {
+                        let marker = if index == self.selected { ">" } else { " " };
+                        format!("{marker} {}", cell(id.as_str(), list_width))
+                    },
+                );
+                if !show_preview {
+                    return text::truncate(&entry, width);
+                }
                 let preview_row = preview.get(offset).map_or("", String::as_str);
-                format!("{:<width$} | {preview_row}", entry, width = LIST_WIDTH + 2)
+                let prefix = format!("{entry} | ");
+                let available = width.saturating_sub(text::width(&prefix));
+                format!("{prefix}{}", text::truncate(preview_row, available))
             })
             .collect();
         OverlayFrame {
-            title: format!("sessions ({}/{})", self.selected + 1, self.sessions.len()),
+            title: text::truncate(
+                &format!("sessions ({}/{})", self.selected + 1, self.sessions.len()),
+                width,
+            ),
             body,
-            footer: "Enter switch | Up/Down select | Esc close".to_owned(),
+            footer: text::truncate("Enter switch | Up/Down select | Esc close", width),
         }
     }
 
@@ -167,30 +191,30 @@ impl ConfirmPrompt {
     }
 
     /// Projects the overlay content for a body of `height` rows.
+    #[cfg(test)]
     pub(crate) fn frame(&self, height: usize) -> OverlayFrame {
+        self.frame_for(height, 80)
+    }
+
+    pub(crate) fn frame_for(&self, height: usize, width: usize) -> OverlayFrame {
         let body = self
             .request
             .body
             .lines()
             .take(height.max(1))
-            .map(str::to_owned)
+            .map(|line| text::truncate(line, width))
             .collect();
         OverlayFrame {
-            title: format!("approval required: {}", self.request.title),
+            title: text::truncate(&format!("approval required: {}", self.request.title), width),
             body,
-            footer: "y allow | n / Esc deny".to_owned(),
+            footer: text::truncate("y allow | n / Esc deny", width),
         }
     }
 }
 
-/// Truncates to `width` chars (with an ellipsis) and pads to exactly that.
+/// Truncates and pads to exactly `width` terminal cells.
 fn cell(text: &str, width: usize) -> String {
-    let length = text.chars().count();
-    if length <= width {
-        return format!("{text:<width$}");
-    }
-    let kept: String = text.chars().take(width.saturating_sub(3)).collect();
-    format!("{kept}...")
+    text::pad(text, width)
 }
 
 #[cfg(test)]
@@ -272,5 +296,13 @@ mod tests {
             frame.body[0].starts_with("> session-with-a-very..."),
             "{frame:?}"
         );
+    }
+
+    #[test]
+    fn narrow_picker_omits_preview_and_respects_cell_width() {
+        let picker = SessionPicker::new(vec![SessionId::new("中文-session-name")]);
+        let frame = picker.frame_for(2, 20);
+        assert!(frame.body.iter().all(|line| text::width(line) <= 20));
+        assert!(!frame.body[0].contains(" | "));
     }
 }

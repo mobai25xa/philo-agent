@@ -13,9 +13,11 @@ philo-session = { path = "../philo-session" }
 philo-tools = { path = "../philo-tools" }
 png = "0.18"
 pulldown-cmark = { version = "0.13", default-features = false }
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", features = ["scrolling-regions"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-tokio = { version = "1.53.1", features = ["macros", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 insta = "1.48.0"

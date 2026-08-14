@@ -8,6 +8,7 @@ use philo_session::SessionId;
 use crate::api::confirmation::{ConfirmationId, ConfirmationRequest, ConfirmationResponse};
 
 use super::action::Action;
+use super::activity::{ActivityState, ActivityTone, ActivityView};
 use super::attachment::{Attachments, PendingAttachment};
 use super::command::{self, Command};
 use super::effect::{Effect, HostRequest};
@@ -84,12 +85,17 @@ pub(crate) struct App {
     completion: Option<CompletionMenu>,
     /// Images waiting for the next message (`/image`, `Ctrl+V`).
     attachments: Attachments,
+    /// Changes whenever draft contents are consumed or edited. Background
+    /// media failures may restore only the exact draft generation they left.
+    draft_generation: u64,
     /// `[ui].show_reasoning`, carried across session switches.
     show_reasoning: bool,
     /// Manual compaction has a standalone future owned by the driver.
     manual_compacting: bool,
     /// Automatic compaction belongs to the front operation handle.
     automatic_compacting: bool,
+    /// Ephemeral operation projection; never enters transcript or Session.
+    activity: ActivityState,
 }
 
 impl App {
@@ -109,9 +115,11 @@ impl App {
             confirm: None,
             completion: None,
             attachments: Attachments::default(),
+            draft_generation: 0,
             show_reasoning,
             manual_compacting: false,
             automatic_compacting: false,
+            activity: ActivityState::default(),
         }
     }
 
@@ -132,13 +140,28 @@ impl App {
         if !busy {
             self.automatic_compacting = false;
             self.sync_compacting_status();
+            if !self.manual_compacting {
+                self.activity.clear();
+            }
+        } else if !self.activity.is_active() {
+            self.activity.wait_for_model();
         }
     }
 
-    /// Advances the manual/automatic compaction spinner on redraw ticks.
-    pub(crate) fn on_tick(&mut self) -> Vec<Effect> {
+    /// Whether presentation currently has a time-based animation.
+    pub(crate) fn animation_active(&self) -> bool {
+        self.activity.is_active()
+    }
+
+    /// Advances the manual/automatic compaction spinner. The driver owns
+    /// invalidation; a tick never requests a terminal clear.
+    pub(crate) fn on_tick(&mut self) -> bool {
+        if !self.animation_active() {
+            return false;
+        }
         self.status.advance_spinner();
-        vec![Effect::Redraw]
+        self.activity.advance_spinner();
+        true
     }
 
     /// Applies the terminal result of the driver's manual compaction future.
@@ -147,6 +170,7 @@ impl App {
         result: Result<CompactionReport, CompactionError>,
     ) -> Vec<Effect> {
         self.manual_compacting = false;
+        self.activity.finish_manual_compaction();
         self.sync_compacting_status();
         let line = match result {
             Ok(CompactionReport::Compacted { covers_up_to }) => {
@@ -181,11 +205,35 @@ impl App {
 
     /// The overlay content to paint, if any. The approval prompt wins over
     /// the session picker: an answer is what unblocks the running turn.
+    #[cfg(test)]
     pub fn overlay_frame(&self, height: usize) -> Option<OverlayFrame> {
         if let Some(confirm) = &self.confirm {
             return Some(confirm.frame(height));
         }
         self.picker.as_ref().map(|picker| picker.frame(height))
+    }
+
+    pub(crate) fn overlay_frame_for(&self, height: usize, width: usize) -> Option<OverlayFrame> {
+        if let Some(confirm) = &self.confirm {
+            return Some(confirm.frame_for(height, width));
+        }
+        self.picker
+            .as_ref()
+            .map(|picker| picker.frame_for(height, width))
+    }
+
+    pub(crate) fn activity_view(&self, width: usize) -> Option<ActivityView> {
+        if self.confirm.is_some() {
+            return Some(ActivityView {
+                text: super::text::truncate("! Approval required", width),
+                tone: ActivityTone::Warning,
+            });
+        }
+        self.activity.view(width)
+    }
+
+    pub(crate) fn input_focused(&self) -> bool {
+        self.confirm.is_none() && self.picker.is_none()
     }
 
     /// The completion menu row, while it is open.
@@ -196,7 +244,11 @@ impl App {
     /// Keeps the approval overlay in step with the channel: the front
     /// request opens it, and a vanished one (answered, or auto-denied when
     /// the operation settled) closes it.
-    pub fn sync_confirmation(&mut self, front: Option<(ConfirmationId, ConfirmationRequest)>) {
+    pub fn sync_confirmation(
+        &mut self,
+        front: Option<(ConfirmationId, ConfirmationRequest)>,
+    ) -> bool {
+        let previous = self.confirm.as_ref().map(|prompt| prompt.id);
         match front {
             Some((id, request)) => {
                 if self.confirm.as_ref().is_none_or(|prompt| prompt.id != id) {
@@ -205,6 +257,7 @@ impl App {
             }
             None => self.confirm = None,
         }
+        previous != self.confirm.as_ref().map(|prompt| prompt.id)
     }
 
     /// Starts rendering a different session: fresh transcript and usage,
@@ -213,6 +266,7 @@ impl App {
         self.status.session = session_id.to_owned();
         self.status.usage = None;
         self.transcript = Transcript::new(self.show_reasoning);
+        self.activity.clear();
     }
 
     pub(crate) fn open_picker(&mut self, sessions: Vec<SessionId>) {
@@ -263,23 +317,27 @@ impl App {
         }
         match action {
             Action::InsertChar(ch) => {
+                self.bump_draft_generation();
                 self.history_cursor = None;
                 self.input.insert_char(ch);
                 self.disarm_quit_unless_typing_quit();
                 vec![]
             }
             Action::InsertNewline => {
+                self.bump_draft_generation();
                 self.history_cursor = None;
                 self.input.insert_newline();
                 self.disarm_quit_unless_typing_quit();
                 vec![]
             }
             Action::Backspace => {
+                self.bump_draft_generation();
                 self.input.backspace();
                 self.disarm_quit_unless_typing_quit();
                 vec![]
             }
             Action::Delete => {
+                self.bump_draft_generation();
                 self.input.delete();
                 self.disarm_quit_unless_typing_quit();
                 vec![]
@@ -331,7 +389,7 @@ impl App {
                 }
             }
             Action::ToggleLevel => vec![Effect::Append(vec![self.toggle_level()])],
-            Action::Redraw => vec![Effect::Redraw],
+            Action::Redraw => vec![Effect::HardRedraw],
             Action::Complete => self.complete(),
             Action::Paste => vec![Effect::ReadClipboard],
             Action::None => vec![],
@@ -346,6 +404,7 @@ impl App {
         self.exit_armed = false;
         self.completion = None;
         self.history_cursor = None;
+        self.bump_draft_generation();
         self.input.insert_str(text);
         self.disarm_quit_unless_typing_quit();
         vec![]
@@ -358,6 +417,7 @@ impl App {
         bytes: Vec<u8>,
         origin: &str,
     ) -> Vec<Effect> {
+        self.bump_draft_generation();
         let attachment = PendingAttachment::Image {
             media_type,
             bytes,
@@ -386,13 +446,35 @@ impl App {
     /// Puts a refused message back for editing: the text returns to the
     /// input and the attachments that did resolve stay queued.
     pub(crate) fn restore_draft(&mut self, text: &str, attachments: Vec<PendingAttachment>) {
+        self.bump_draft_generation();
         self.input.set_text(text);
         self.attachments.extend(attachments);
+    }
+
+    /// Identity captured when the driver starts resolving one submitted draft.
+    pub(crate) fn draft_generation(&self) -> u64 {
+        self.draft_generation
+    }
+
+    /// Restores an asynchronously refused send only if the user has not edited
+    /// or submitted another draft in the meantime.
+    pub(crate) fn restore_draft_if_current(
+        &mut self,
+        generation: u64,
+        text: &str,
+        attachments: Vec<PendingAttachment>,
+    ) -> bool {
+        if self.draft_generation != generation {
+            return false;
+        }
+        self.restore_draft(text, attachments);
+        true
     }
 
     /// Projects one agent event into transcript lines and status updates.
     /// Overlays never intercept this path: terminal events must render.
     pub fn on_agent_event(&mut self, event: &AgentEvent) -> Vec<Effect> {
+        self.activity.on_event(event);
         match event {
             AgentEvent::ModelUsageUpdated { usage, .. } => {
                 self.status.usage = Some(*usage);
@@ -480,6 +562,7 @@ impl App {
     fn complete(&mut self) -> Vec<Effect> {
         if let Some(menu) = self.completion.as_mut() {
             let name = menu.cycle();
+            self.bump_draft_generation();
             self.input.set_text(&format!("/{name}"));
             return vec![];
         }
@@ -489,8 +572,12 @@ impl App {
             .collect();
         match candidates.len() {
             0 => {}
-            1 => self.input.set_text(&format!("/{} ", candidates[0])),
+            1 => {
+                self.bump_draft_generation();
+                self.input.set_text(&format!("/{} ", candidates[0]));
+            }
             _ => {
+                self.bump_draft_generation();
                 self.input
                     .set_text(&format!("/{}", command::common_prefix(&candidates)));
                 self.completion = Some(CompletionMenu::new(candidates));
@@ -504,6 +591,7 @@ impl App {
             return vec![];
         }
         let text = self.input.take_text();
+        self.bump_draft_generation();
         self.completion = None;
         self.history_cursor = None;
         self.stash = None;
@@ -617,6 +705,7 @@ impl App {
                     ));
                 } else {
                     self.manual_compacting = true;
+                    self.activity.start_manual_compaction();
                     self.sync_compacting_status();
                     effects.push(Effect::StartCompaction);
                 }
@@ -625,6 +714,7 @@ impl App {
                 lines.push(line(LineKind::Error, "usage: /image <path>"));
             }
             Ok(Command::Image { path: Some(path) }) => {
+                self.bump_draft_generation();
                 self.attachments.push(PendingAttachment::Path(path.clone()));
                 lines.push(line(
                     LineKind::Meta,
@@ -687,6 +777,7 @@ impl App {
 
     fn ctrl_c(&mut self) -> Vec<Effect> {
         if !self.input.is_empty() {
+            self.bump_draft_generation();
             self.input.clear();
             self.history_cursor = None;
             self.exit_armed = false;
@@ -721,6 +812,7 @@ impl App {
 
     fn cancel_manual_compaction(&mut self) -> Vec<Effect> {
         self.manual_compacting = false;
+        self.activity.finish_manual_compaction();
         self.sync_compacting_status();
         vec![
             Effect::CancelCompaction,
@@ -741,6 +833,7 @@ impl App {
             Some(index) => index - 1,
         };
         self.history_cursor = Some(next_index);
+        self.bump_draft_generation();
         self.input.set_text(&self.history[next_index].clone());
     }
 
@@ -750,12 +843,18 @@ impl App {
         };
         if index + 1 < self.history.len() {
             self.history_cursor = Some(index + 1);
+            self.bump_draft_generation();
             self.input.set_text(&self.history[index + 1].clone());
         } else {
             self.history_cursor = None;
             let stash = self.stash.take().unwrap_or_default();
+            self.bump_draft_generation();
             self.input.set_text(&stash);
         }
+    }
+
+    fn bump_draft_generation(&mut self) {
+        self.draft_generation = self.draft_generation.wrapping_add(1);
     }
 }
 

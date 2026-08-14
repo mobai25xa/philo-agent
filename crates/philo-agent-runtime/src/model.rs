@@ -36,6 +36,12 @@ pub enum ModelMessage {
     System {
         content: String,
     },
+    /// Durable summary of an earlier conversation prefix. Adapters map this
+    /// to their provider-neutral instructions channel rather than a user
+    /// message.
+    Summary {
+        text: String,
+    },
     /// The user turn's full multi-part payload, replayed verbatim.
     User {
         parts: Vec<UserPart>,

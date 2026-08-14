@@ -60,6 +60,7 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
         generation: GenerationConfig::default(),
         max_tool_rounds,
         operation_timeout: None,
+        compaction: Default::default(),
     }
 }
 
@@ -140,6 +141,7 @@ fn m5_001_multi_round_loop_succeeds_on_the_jsonl_backend() {
         .messages()
         .iter()
         .map(|message| match message {
+            ContextMessage::Summary { .. } => "summary",
             ContextMessage::User { .. } => "user",
             ContextMessage::AssistantToolCalls { .. } => "calls",
             ContextMessage::ToolResult { .. } => "result",

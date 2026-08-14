@@ -121,6 +121,7 @@ fn session_m3_001_two_rounds_project_interleaved_in_source_order() {
         .messages()
         .iter()
         .map(|message| match message {
+            ContextMessage::Summary { .. } => "summary",
             ContextMessage::User { .. } => "user",
             ContextMessage::AssistantToolCalls { .. } => "calls",
             ContextMessage::ToolResult { .. } => "result",

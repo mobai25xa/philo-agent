@@ -68,6 +68,7 @@ impl OperationHandle {
                 scheduler_inner
                     .queue
                     .retain(|queued| queued != &self.shared.operation_id);
+                scheduler_inner.waiters.remove(&self.shared.operation_id);
                 state.events.push_back(AgentEvent::CancellationRequested {
                     operation_id: self.shared.operation_id.clone(),
                     reason: CancelReason::User,
@@ -79,9 +80,23 @@ impl OperationHandle {
                 });
                 state.phase = OperationPhase::Settled(OperationStatus::Cancelled);
                 state.outcome = Some(OperationOutcome::Cancelled);
-                if let Some(waker) = state.waker.take() {
-                    drop(state);
-                    drop(scheduler_inner);
+                let operation_waker = state.waker.take();
+                let queue_waker =
+                    if scheduler_inner.active.is_none() && scheduler_inner.maintenance.is_none() {
+                        scheduler_inner
+                            .queue
+                            .front()
+                            .and_then(|queued| scheduler_inner.waiters.get(queued))
+                            .cloned()
+                    } else {
+                        None
+                    };
+                drop(state);
+                drop(scheduler_inner);
+                if let Some(waker) = operation_waker {
+                    waker.wake();
+                }
+                if let Some(waker) = queue_waker {
                     waker.wake();
                 }
             }

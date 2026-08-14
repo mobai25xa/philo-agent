@@ -3,12 +3,14 @@
 use crate::engine::{self, EngineContext};
 use crate::operation::{Admission, OperationHandle, OperationShared, Scheduler};
 use crate::{
-    AgentAvailability, AgentError, AgentEvent, IdSource, OperationPhase, RuntimeConfig, SessionId,
-    UserMessage,
+    AgentAvailability, AgentError, AgentEvent, CompactionError, CompactionReport, IdSource,
+    OperationPhase, RuntimeConfig, SessionId, UserMessage,
 };
 use philo_session as session;
 use philo_tools::{ToolPort, ToolRegistry};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 pub struct AgentRuntime {
     model: Arc<dyn crate::ModelPort>,
@@ -17,6 +19,7 @@ pub struct AgentRuntime {
     tools: Arc<dyn ToolPort>,
     config: RuntimeConfig,
     scheduler: Arc<Scheduler>,
+    last_input_tokens: Arc<Mutex<HashMap<SessionId, u64>>>,
 }
 
 impl AgentRuntime {
@@ -51,6 +54,7 @@ impl AgentRuntime {
             tools,
             config,
             scheduler: Scheduler::new(),
+            last_input_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -61,6 +65,20 @@ impl AgentRuntime {
         self.scheduler.availability()
     }
 
+    /// Runs one cancellable, non-operation compaction while holding the
+    /// scheduler's exclusive maintenance lease. Dropping this future drops
+    /// the model stream and releases the lease through RAII.
+    pub async fn compact(
+        &self,
+        session_id: SessionId,
+    ) -> Result<CompactionReport, CompactionError> {
+        let _lease = self
+            .scheduler
+            .acquire_maintenance(&session_id)
+            .map_err(|availability| CompactionError::Unavailable { availability })?;
+        engine::compaction::compact_manually(&self.engine_context(), &session_id).await
+    }
+
     fn engine_context(&self) -> EngineContext {
         EngineContext {
             model: self.model.clone(),
@@ -68,6 +86,7 @@ impl AgentRuntime {
             tools: self.tools.clone(),
             config: self.config.clone(),
             scheduler: self.scheduler.clone(),
+            last_input_tokens: self.last_input_tokens.clone(),
         }
     }
 

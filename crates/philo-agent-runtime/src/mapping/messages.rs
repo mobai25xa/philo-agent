@@ -51,6 +51,9 @@ pub(crate) fn context_messages(context: &session::SessionContextView) -> Vec<Mod
             other => {
                 flush_interrupted_placeholders(&mut output, &mut pending);
                 match other {
+                    session::ContextMessage::Summary { text } => {
+                        output.push(ModelMessage::Summary { text: text.clone() });
+                    }
                     session::ContextMessage::User { parts } => output.push(ModelMessage::User {
                         parts: runtime_parts_from_session(parts),
                     }),

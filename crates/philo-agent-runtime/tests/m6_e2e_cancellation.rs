@@ -70,6 +70,7 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
         generation: GenerationConfig::default(),
         max_tool_rounds,
         operation_timeout: None,
+        compaction: Default::default(),
     }
 }
 

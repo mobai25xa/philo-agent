@@ -1,35 +1,21 @@
-//! Backend-agnostic validation core shared by every session store.
-//!
-//! [`SessionProjection`] owns transaction validation, lifecycle state
-//! derivation, deterministic [`EntryId`] allocation, and the model context
-//! projection. Stores commit through [`SessionProjection::apply`] and rebuild
-//! durable history through [`SessionProjection::replay`]; both paths enforce
-//! exactly the same rules, so no backend can drift or forge history.
-//!
-//! The core is pure: no I/O, no async, and results depend only on inputs.
+//! Operation, turn, and tool-batch lifecycle validation and projection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::entry::{
-    CancelReason, EntryId, NewEntryParent, OperationId, OperationOutcome, SessionCommit,
-    SessionEntry, SessionEntryKind, SessionId, SessionRevision, SessionTransaction,
-    SessionUserPart, ToolBatchId, ToolCallId, TurnFailure, TurnId, TurnOutcome,
+    CancelReason, OperationId, OperationOutcome, SessionEntryKind, SessionUserPart, ToolBatchId,
+    ToolCallId, TurnFailure, TurnId, TurnOutcome,
 };
-use crate::store::{SessionError, SessionValidationError};
+use crate::error::{SessionError, SessionValidationError, validation};
 use crate::tool_entry::ToolResultOutcome;
-use crate::view::{ContextMessage, OpenTurnInfo, SessionContextView, UnfilledBatch};
+use crate::view::{OpenTurnInfo, UnfilledBatch};
 
-/// Validated, replayable state of one session's linear active path.
 #[derive(Clone, Debug, Default)]
-pub struct SessionProjection {
-    revision: SessionRevision,
-    current_leaf: Option<EntryId>,
-    entry_count: usize,
+pub(super) struct LifecycleProjection {
     operations: HashMap<OperationId, OperationRecord>,
     turns: HashMap<TurnId, TurnRecord>,
     /// Turns without a durable terminal outcome, in start order.
     open_turn_ids: Vec<TurnId>,
-    messages: Vec<ContextMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,146 +56,9 @@ impl ToolBatchRecord {
     }
 }
 
-/// Output of a validated [`SessionProjection::apply`]: the committed facts and
-/// the advanced projection.
-#[derive(Clone, Debug)]
-pub struct AppliedTransaction {
-    entries: Vec<SessionEntry>,
-    projection: SessionProjection,
-}
-
-impl AppliedTransaction {
-    /// Returns the entries committed by this transaction, in order.
-    pub fn entries(&self) -> &[SessionEntry] {
-        &self.entries
-    }
-
-    /// Returns the projection advanced past this transaction.
-    pub fn projection(&self) -> &SessionProjection {
-        &self.projection
-    }
-
-    /// Builds the store-facing commit record for this transaction.
-    pub fn commit(&self) -> SessionCommit {
-        SessionCommit {
-            revision: self.projection.revision,
-            entries: self.entries.clone(),
-            current_leaf: self
-                .projection
-                .current_leaf
-                .clone()
-                .expect("a validated nonempty transaction sets a leaf"),
-        }
-    }
-
-    /// Consumes this result, yielding the advanced projection.
-    pub fn into_projection(self) -> SessionProjection {
-        self.projection
-    }
-}
-
-impl SessionProjection {
-    /// Creates the projection of a session with no committed transactions.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Returns the revision after the last applied or replayed transaction.
-    pub fn revision(&self) -> SessionRevision {
-        self.revision
-    }
-
-    /// Returns the current leaf, absent for an empty session.
-    pub fn current_leaf(&self) -> Option<&EntryId> {
-        self.current_leaf.as_ref()
-    }
-
-    /// Validates one transaction against this projection, allocates
-    /// deterministic entry IDs, and returns the committed facts together with
-    /// the advanced projection. `self` is not modified.
-    ///
-    /// Revision-conflict detection against the store's durable revision stays
-    /// a store responsibility; the comparison value must come from
-    /// [`SessionProjection::revision`].
-    pub fn apply(
-        &self,
-        transaction: &SessionTransaction,
-    ) -> Result<AppliedTransaction, SessionError> {
-        if transaction.entries.is_empty() {
-            return validation(SessionValidationError::EmptyTransaction);
-        }
-        if transaction.current_leaf_index != transaction.entries.len() - 1 {
-            return validation(SessionValidationError::InvalidCurrentLeaf);
-        }
-        let mut next = self.clone();
-        next.validate_tool_result_purity(transaction.entries.iter().map(|entry| entry.kind()))?;
-
-        let mut committed: Vec<SessionEntry> = Vec::with_capacity(transaction.entries.len());
-        for (index, new_entry) in transaction.entries.iter().enumerate() {
-            let parent = match (new_entry.parent(), index) {
-                (NewEntryParent::CurrentLeaf, 0) => next.current_leaf.clone(),
-                (NewEntryParent::TransactionEntry(parent_index), current_index)
-                    if current_index > 0 && *parent_index == current_index - 1 =>
-                {
-                    Some(committed[*parent_index].id.clone())
-                }
-                _ => {
-                    return validation(SessionValidationError::InvalidParent {
-                        entry_index: index,
-                    });
-                }
-            };
-            next.accept_entry_kind(new_entry.kind())?;
-            let id = next.allocate_entry_id(&transaction.session_id);
-            next.entry_count += 1;
-            next.project_message(new_entry.kind());
-            committed.push(SessionEntry {
-                id,
-                parent,
-                kind: new_entry.kind().clone(),
-            });
-        }
-        next.current_leaf = Some(committed[transaction.current_leaf_index].id.clone());
-        next.revision = SessionRevision::new(next.revision.get() + 1);
-        Ok(AppliedTransaction {
-            entries: committed,
-            projection: next,
-        })
-    }
-
-    /// Replays the ordered entries of one previously committed transaction,
-    /// advancing this projection by exactly one revision. Validation rules
-    /// match [`SessionProjection::apply`]; broken chains, dangling references,
-    /// or out-of-order facts are rejected.
-    ///
-    /// On error the projection is no longer consistent and must be discarded.
-    pub fn replay(&mut self, entries: &[SessionEntry]) -> Result<(), SessionError> {
-        if entries.is_empty() {
-            return validation(SessionValidationError::EmptyTransaction);
-        }
-        self.validate_tool_result_purity(entries.iter().map(SessionEntry::kind))?;
-        for (index, entry) in entries.iter().enumerate() {
-            let expected_parent = if index == 0 {
-                self.current_leaf.as_ref()
-            } else {
-                Some(&entries[index - 1].id)
-            };
-            if entry.parent() != expected_parent {
-                return validation(SessionValidationError::InvalidParent { entry_index: index });
-            }
-            self.accept_entry_kind(entry.kind())?;
-            self.entry_count += 1;
-            self.project_message(entry.kind());
-        }
-        self.current_leaf = Some(entries.last().expect("entries checked nonempty").id.clone());
-        self.revision = SessionRevision::new(self.revision.get() + 1);
-        Ok(())
-    }
-
-    /// Projects the model-visible context from this projection's state.
-    pub fn context_view(&self, session_id: &SessionId) -> SessionContextView {
-        let open_turns = self
-            .open_turn_ids
+impl LifecycleProjection {
+    pub(super) fn open_turns(&self) -> Vec<OpenTurnInfo> {
+        self.open_turn_ids
             .iter()
             .map(|turn_id| {
                 let turn = self
@@ -231,59 +80,10 @@ impl SessionProjection {
                     unfilled_batch,
                 }
             })
-            .collect();
-        SessionContextView {
-            session_id: session_id.clone(),
-            revision: self.revision,
-            current_leaf: self.current_leaf.clone(),
-            messages: self.messages.clone(),
-            open_turns,
-        }
+            .collect()
     }
 
-    /// Allocates the next deterministic entry ID. The format is a durable
-    /// fact once persisted; readers treat IDs as opaque strings.
-    fn allocate_entry_id(&self, session_id: &SessionId) -> EntryId {
-        EntryId::new(format!(
-            "{}:entry:{}",
-            session_id.as_str(),
-            self.entry_count + 1
-        ))
-    }
-
-    fn project_message(&mut self, kind: &SessionEntryKind) {
-        match kind {
-            SessionEntryKind::UserMessage { parts, .. } => {
-                self.messages.push(ContextMessage::User {
-                    parts: parts.clone(),
-                });
-            }
-            SessionEntryKind::AssistantMessage { content, .. } => {
-                self.messages.push(ContextMessage::Assistant {
-                    content: content.clone(),
-                });
-            }
-            SessionEntryKind::AssistantToolCallBatch {
-                tool_batch_id,
-                calls,
-                ..
-            } => {
-                self.messages.push(ContextMessage::AssistantToolCalls {
-                    tool_batch_id: tool_batch_id.clone(),
-                    calls: calls.clone(),
-                });
-            }
-            SessionEntryKind::ToolResult { result, .. } => {
-                self.messages.push(ContextMessage::ToolResult {
-                    tool_call_id: result.call_id().clone(),
-                    outcome: result.outcome().clone(),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    fn accept_entry_kind(&mut self, kind: &SessionEntryKind) -> Result<(), SessionError> {
+    pub(super) fn accept(&mut self, kind: &SessionEntryKind) -> Result<(), SessionError> {
         match kind {
             SessionEntryKind::OperationStarted { operation_id } => {
                 if self.operations.contains_key(operation_id) {
@@ -363,7 +163,7 @@ impl SessionProjection {
                 let unique = calls
                     .iter()
                     .map(|call| call.id())
-                    .collect::<std::collections::HashSet<_>>()
+                    .collect::<HashSet<_>>()
                     .len()
                     == calls.len();
                 let batch_id_unused = turn
@@ -489,6 +289,7 @@ impl SessionProjection {
                     .expect("active operation was just validated")
                     .outcome = Some(*outcome);
             }
+            SessionEntryKind::Compaction { .. } => {}
         }
         Ok(())
     }
@@ -518,7 +319,7 @@ impl SessionProjection {
     /// durable tool batch of one turn, or contains no tool results at all,
     /// and that an assistant message never lands before the turn's newest
     /// batch is fully resolved.
-    fn validate_tool_result_purity<'a>(
+    pub(super) fn validate_transaction<'a>(
         &self,
         kinds: impl Iterator<Item = &'a SessionEntryKind> + Clone,
     ) -> Result<(), SessionError> {
@@ -629,8 +430,4 @@ impl SessionProjection {
         }
         Ok(())
     }
-}
-
-fn validation<T>(error: SessionValidationError) -> Result<T, SessionError> {
-    Err(SessionError::Validation(error))
 }

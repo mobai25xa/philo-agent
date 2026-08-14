@@ -93,6 +93,17 @@ pub enum AgentEvent {
     PriorTurnSealed {
         turn_id: TurnId,
     },
+    /// Transient: automatic pre-turn context compaction has started.
+    ContextCompactionStarted,
+    /// Transient: the compaction entry committed at the opaque boundary.
+    ContextCompactionCompleted {
+        covers_up_to: String,
+    },
+    /// Transient warning: automatic compaction failed and the turn will
+    /// continue against the uncompressed projection.
+    ContextCompactionFailed {
+        message: String,
+    },
     /// Transient: a cancel request was accepted (invalid cancels publish
     /// nothing). At most once per operation; never written to the Session.
     /// The reason is `User` or `Timeout`; seals never use this channel.

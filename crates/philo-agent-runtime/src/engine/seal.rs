@@ -26,8 +26,45 @@ pub(super) async fn seal_stale_turns(
     session_id: &session::SessionId,
     context: session::SessionContextView,
 ) -> SealOutcome {
+    match seal_stale_turns_with(ctx, session_id, context, |turn_id| {
+        operation.prior_turn_sealed(TurnId::new(turn_id.as_str()));
+    })
+    .await
+    {
+        Ok(context) => SealOutcome::Sealed(operation, context),
+        Err(SealFailure::Commit(error)) => {
+            operation.fail_unconfirmed(session_failure("sealing stale turn", &error));
+            SealOutcome::Settled
+        }
+        Err(SealFailure::Refresh(error)) => {
+            operation.fail_unconfirmed(session_failure("re-reading sealed context", &error));
+            SealOutcome::Settled
+        }
+    }
+}
+
+/// Manual maintenance uses the same seal protocol without operation events.
+pub(super) async fn seal_stale_turns_for_maintenance(
+    ctx: &EngineContext,
+    session_id: &session::SessionId,
+    context: session::SessionContextView,
+) -> Result<session::SessionContextView, SealFailure> {
+    seal_stale_turns_with(ctx, session_id, context, |_| {}).await
+}
+
+pub(super) enum SealFailure {
+    Commit(session::SessionError),
+    Refresh(session::SessionError),
+}
+
+async fn seal_stale_turns_with(
+    ctx: &EngineContext,
+    session_id: &session::SessionId,
+    context: session::SessionContextView,
+    mut on_sealed: impl FnMut(&session::TurnId),
+) -> Result<session::SessionContextView, SealFailure> {
     if context.open_turns().is_empty() {
-        return SealOutcome::Sealed(operation, context);
+        return Ok(context);
     }
     let mut seal_revision = context.revision();
     for open in context.open_turns() {
@@ -62,24 +99,13 @@ pub(super) async fn seal_stale_turns(
                 entries,
             ))
             .await;
-        match commit {
-            Ok(commit) => {
-                seal_revision = commit.revision();
-                operation.prior_turn_sealed(TurnId::new(open.turn_id().as_str()));
-            }
-            Err(error) => {
-                operation.fail_unconfirmed(session_failure("sealing stale turn", &error));
-                return SealOutcome::Settled;
-            }
-        }
+        let commit = commit.map_err(SealFailure::Commit)?;
+        seal_revision = commit.revision();
+        on_sealed(open.turn_id());
     }
     // The snapshot must see the sealed facts: re-read the view.
-    let context = ctx.sessions.context_view(session_id).await;
-    match context {
-        Ok(context) => SealOutcome::Sealed(operation, context),
-        Err(error) => {
-            operation.fail_unconfirmed(session_failure("re-reading sealed context", &error));
-            SealOutcome::Settled
-        }
-    }
+    ctx.sessions
+        .context_view(session_id)
+        .await
+        .map_err(SealFailure::Refresh)
 }

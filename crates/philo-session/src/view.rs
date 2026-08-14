@@ -9,6 +9,8 @@ use crate::tool_entry::{SessionToolCall, ToolResultOutcome};
 /// A model-visible message projected from the active linear path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContextMessage {
+    /// A durable summary replacing an earlier model-visible prefix.
+    Summary { text: String },
     /// A user message carrying the turn's full multi-part payload.
     User { parts: Vec<SessionUserPart> },
     /// A final assistant message.
@@ -81,6 +83,8 @@ pub struct SessionContextView {
     pub(crate) current_leaf: Option<EntryId>,
     pub(crate) messages: Vec<ContextMessage>,
     pub(crate) open_turns: Vec<OpenTurnInfo>,
+    pub(crate) settled_turn_boundaries: Vec<EntryId>,
+    pub(crate) latest_compaction_boundary: Option<EntryId>,
 }
 
 impl SessionContextView {
@@ -108,5 +112,17 @@ impl SessionContextView {
     /// Empty for sessions whose every turn terminated cleanly.
     pub fn open_turns(&self) -> &[OpenTurnInfo] {
         &self.open_turns
+    }
+
+    /// Returns every settled operation entry boundary in source order.
+    /// Entry IDs remain opaque; runtimes use this sequence to choose a
+    /// whole-turn compaction boundary without inspecting identifier syntax.
+    pub fn settled_turn_boundaries(&self) -> &[EntryId] {
+        &self.settled_turn_boundaries
+    }
+
+    /// Returns the boundary of the newest durable compaction, if any.
+    pub fn latest_compaction_boundary(&self) -> Option<&EntryId> {
+        self.latest_compaction_boundary.as_ref()
     }
 }

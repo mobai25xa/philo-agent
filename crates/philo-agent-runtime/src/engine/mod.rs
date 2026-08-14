@@ -5,6 +5,7 @@
 //! IO (`model_call`), tool IO (`tool_batch`), stale-turn sealing (`seal`),
 //! and terminal settlement (`settlement`).
 
+pub(crate) mod compaction;
 mod model_call;
 mod seal;
 mod settlement;
@@ -25,7 +26,9 @@ use philo_agent_kernel as kernel;
 use philo_session as session;
 use philo_tools::ToolPort;
 use settlement::TurnCx;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Owned dependencies threaded into an operation engine so queued operations
 /// can be driven after `prompt()` has returned.
@@ -35,6 +38,24 @@ pub(crate) struct EngineContext {
     pub(crate) tools: Arc<dyn ToolPort>,
     pub(crate) config: RuntimeConfig,
     pub(crate) scheduler: Arc<Scheduler>,
+    pub(crate) last_input_tokens: Arc<Mutex<HashMap<SessionId, u64>>>,
+}
+
+impl EngineContext {
+    pub(crate) fn record_input_tokens(&self, session_id: &SessionId, input_tokens: u64) {
+        self.last_input_tokens
+            .lock()
+            .expect("input usage mutex")
+            .insert(session_id.clone(), input_tokens);
+    }
+
+    pub(crate) fn last_input_tokens(&self, session_id: &SessionId) -> Option<u64> {
+        self.last_input_tokens
+            .lock()
+            .expect("input usage mutex")
+            .get(session_id)
+            .copied()
+    }
 }
 
 /// Drives a claimed operation to settlement and releases the active slot.
@@ -57,10 +78,15 @@ pub(crate) async fn run_queued(
     session_id: SessionId,
     user_message: UserMessage,
 ) {
-    let claimed = std::future::poll_fn(|_| match ctx.scheduler.try_claim_queued(&shared) {
-        QueueClaim::Claimed => std::task::Poll::Ready(true),
-        QueueClaim::SettledInQueue => std::task::Poll::Ready(false),
-        QueueClaim::NotYet => std::task::Poll::Pending,
+    let claimed = std::future::poll_fn(|poll_context| {
+        match ctx
+            .scheduler
+            .try_claim_queued(&shared, poll_context.waker())
+        {
+            QueueClaim::Claimed => std::task::Poll::Ready(true),
+            QueueClaim::SettledInQueue => std::task::Poll::Ready(false),
+            QueueClaim::NotYet => std::task::Poll::Pending,
+        }
     })
     .await;
     if claimed {
@@ -90,6 +116,21 @@ async fn drive(
             seal::SealOutcome::Sealed(operation, context) => (operation, context),
             seal::SealOutcome::Settled => return,
         };
+    // M13 pre-turn maintenance: after all stale turns are sealed and before
+    // TurnStarted / Barrier A, optionally replace an earlier settled prefix
+    // with one durable summary.
+    let (operation, context) = match compaction::maybe_auto_compact(
+        ctx,
+        operation,
+        &session_id,
+        &stored_session_id,
+        context,
+    )
+    .await
+    {
+        compaction::AutoCompactionOutcome::Ready(operation, context) => (operation, context),
+        compaction::AutoCompactionOutcome::Settled => return,
+    };
     operation.turn_started();
     let turn = TurnSnapshot {
         session_id: session_id.clone(),

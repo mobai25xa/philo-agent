@@ -57,7 +57,14 @@ pub(crate) fn map_request(
             )
         })?;
     let mut request = sdk::ModelRequest::new(max_output_tokens);
-    request.generation.temperature = Some(f64::from(snapshot.generation.temperature));
+    // OpenAI reasoning models reject sampling controls such as temperature.
+    // Keep the configured value for baseline requests, but omit it whenever
+    // the caller explicitly selects a reasoning effort.
+    request.generation.temperature = snapshot
+        .generation
+        .reasoning_effort
+        .is_none()
+        .then(|| f64::from(snapshot.generation.temperature));
     request.reasoning = map_reasoning_config(snapshot.generation.reasoning_effort);
 
     // The trailing `replayed.len()` assistant tool-call messages belong to

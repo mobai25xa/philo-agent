@@ -1,5 +1,6 @@
 //! Runtime coordinator for direct answers and the bounded multi-round tool loop.
 
+mod compaction;
 mod config;
 mod engine;
 mod event;
@@ -12,8 +13,10 @@ mod outcome;
 mod runtime;
 mod snapshot;
 
+pub use compaction::{CompactionError, CompactionReport};
 pub use config::{
-    DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ReasoningEffort, RuntimeConfig, ToolChoice,
+    CompactionConfig, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ReasoningEffort, RuntimeConfig,
+    ToolChoice,
 };
 pub use event::AgentEvent;
 pub use ids::{

@@ -48,6 +48,7 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
         generation: GenerationConfig::default(),
         max_tool_rounds,
         operation_timeout,
+        compaction: Default::default(),
     }
 }
 

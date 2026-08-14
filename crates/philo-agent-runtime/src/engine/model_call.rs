@@ -141,6 +141,9 @@ pub(super) async fn run<'a>(
                     });
                 }
                 (false, ModelEvent::UsageUpdated { usage }) => {
+                    if let Some(input_tokens) = usage.input_tokens {
+                        cx.ctx.record_input_tokens(&turn.session_id, input_tokens);
+                    }
                     cx.operation.push(AgentEvent::ModelUsageUpdated {
                         model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
                         usage,

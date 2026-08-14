@@ -53,6 +53,7 @@ fn runtime(
             generation: GenerationConfig::default(),
             max_tool_rounds,
             operation_timeout: None,
+            compaction: Default::default(),
         },
         tools,
     )

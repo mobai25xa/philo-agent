@@ -125,9 +125,12 @@ impl PhiloModelBuilder {
 
     /// Builds the adapter over the default reqwest transport.
     pub fn build(self) -> Result<PhiloModelAdapter, AdapterBuildError> {
-        let transport = ext::ReqwestTransport::builder().build().map_err(|error| {
-            AdapterBuildError::new(format!("transport assembly failed: {error}"))
-        })?;
+        let transport = ext::ReqwestTransport::builder()
+            .proxy_policy(ext::ProxyPolicy::System)
+            .build()
+            .map_err(|error| {
+                AdapterBuildError::new(format!("transport assembly failed: {error}"))
+            })?;
         self.build_with_transport(transport)
     }
 

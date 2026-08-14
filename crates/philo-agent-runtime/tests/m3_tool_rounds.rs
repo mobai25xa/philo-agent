@@ -41,6 +41,7 @@ fn runtime(
             generation: GenerationConfig::default(),
             max_tool_rounds,
             operation_timeout: None,
+            compaction: Default::default(),
         },
         tools,
     )
@@ -66,6 +67,7 @@ fn context_kinds(view: &philo_session::SessionContextView) -> Vec<&'static str> 
     view.messages()
         .iter()
         .map(|message| match message {
+            ContextMessage::Summary { .. } => "summary",
             ContextMessage::User { .. } => "user",
             ContextMessage::AssistantToolCalls { .. } => "calls",
             ContextMessage::ToolResult { .. } => "result",
@@ -350,6 +352,7 @@ fn integration_m3_007_next_prompt_replays_all_rounds_in_source_order() {
         .iter()
         .map(|message| match message {
             ModelMessage::System { .. } => "system",
+            ModelMessage::Summary { .. } => "summary",
             ModelMessage::User { .. } => "user",
             ModelMessage::AssistantToolCalls { .. } => "calls",
             ModelMessage::ToolResult { .. } => "result",

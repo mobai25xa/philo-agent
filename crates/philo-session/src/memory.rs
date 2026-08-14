@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::entry::{SessionCommit, SessionId, SessionTransaction};
+use crate::error::SessionError;
 use crate::projection::SessionProjection;
-use crate::store::{SessionError, SessionFuture, SessionStore};
+use crate::store::{SessionFuture, SessionStore};
 use crate::view::SessionContextView;
 
 /// Thread-safe in-memory implementation of [`SessionStore`].

@@ -19,7 +19,9 @@
 //! (`adr/ADR-0002-image-artifact-persistence.md`).
 
 mod artifact;
+mod error;
 mod schema;
 mod store;
 
-pub use store::{JsonlOpenError, JsonlSessionStore, RecoveryReport};
+pub use error::JsonlOpenError;
+pub use store::{JsonlSessionStore, RecoveryReport};

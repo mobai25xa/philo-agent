@@ -6,7 +6,9 @@ use philo_agent_runtime::ReasoningEffort;
 use philo_model::ModelProtocol;
 
 use super::file::{Layer, Sourced, load_layers};
-use super::resolve::{Verbosity, parse_protocol, parse_reasoning_effort, parse_verbosity};
+use super::resolve::{
+    Verbosity, parse_protocol, parse_reasoning_effort, parse_verbosity, validate_reasoning_effort,
+};
 use crate::args::Cli;
 
 struct TempDir(PathBuf);
@@ -179,6 +181,33 @@ fn value_parsers_cover_the_supported_vocabulary() {
 }
 
 #[test]
+fn reasoning_effort_is_validated_against_the_selected_protocol() {
+    assert!(
+        validate_reasoning_effort(ModelProtocol::OpenAiResponses, ReasoningEffort::High).is_ok()
+    );
+    assert!(
+        validate_reasoning_effort(ModelProtocol::OpenAiChat, ReasoningEffort::VeryHigh).is_ok()
+    );
+    assert!(
+        validate_reasoning_effort(ModelProtocol::AnthropicMessages, ReasoningEffort::Maximum)
+            .is_ok()
+    );
+
+    for protocol in [
+        ModelProtocol::OpenAiChatCompatible,
+        ModelProtocol::OpenAiChatReasoningContent,
+    ] {
+        let error = validate_reasoning_effort(protocol, ReasoningEffort::High)
+            .expect_err("compatible chat profiles do not accept reasoning effort");
+        assert!(error.0.contains("unsupported by protocol"));
+    }
+    assert!(
+        validate_reasoning_effort(ModelProtocol::AnthropicMessages, ReasoningEffort::Minimal)
+            .is_err()
+    );
+}
+
+#[test]
 fn resolved_entries_use_cli_vocabulary_not_tui_types() {
     let cli = Cli::try_parse_from([
         "philo",
@@ -192,6 +221,10 @@ fn resolved_entries_use_cli_vocabulary_not_tui_types() {
     let file = super::file::FileConfig {
         endpoint: Some(Sourced {
             value: "https://example.test".to_owned(),
+            layer: Layer::Global,
+        }),
+        protocol: Some(Sourced {
+            value: "openai-chat".to_owned(),
             layer: Layer::Global,
         }),
         ..super::file::FileConfig::default()

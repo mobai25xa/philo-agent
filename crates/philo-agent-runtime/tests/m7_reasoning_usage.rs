@@ -37,6 +37,7 @@ fn runtime(model: Arc<FakeModel>, sessions: Arc<dyn SessionStore>) -> AgentRunti
             generation: GenerationConfig::default(),
             max_tool_rounds: 0,
             operation_timeout: None,
+            compaction: Default::default(),
         },
     )
 }

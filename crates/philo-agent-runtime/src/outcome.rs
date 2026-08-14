@@ -1,6 +1,6 @@
 //! Phase, status, failure, and outcome vocabulary of one operation.
 
-use crate::{AssistantMessage, OperationId};
+use crate::{AssistantMessage, OperationId, SessionId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelCallPhase {
@@ -98,6 +98,7 @@ pub enum OperationOutcome {
 pub enum AgentAvailability {
     Idle,
     Busy { operation_id: OperationId },
+    Compacting { session_id: SessionId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -34,6 +34,7 @@ fn config() -> RuntimeConfig {
         generation: GenerationConfig::default(),
         max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         operation_timeout: None,
+        compaction: Default::default(),
     }
 }
 

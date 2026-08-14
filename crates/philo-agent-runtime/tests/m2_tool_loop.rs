@@ -41,6 +41,7 @@ fn config() -> RuntimeConfig {
         // M2 semantics are the max_tool_rounds = 1 special case of the M3 loop.
         max_tool_rounds: 1,
         operation_timeout: None,
+        compaction: Default::default(),
     }
 }
 

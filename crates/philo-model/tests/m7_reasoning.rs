@@ -275,7 +275,12 @@ async fn reasoning_effort_maps_into_the_official_openai_request() {
         .await
         .expect("call starts");
     collect_ok(stream).await;
-    assert_eq!(transport.request_bodies()[0]["reasoning_effort"], "low");
+    let body = &transport.request_bodies()[0];
+    assert_eq!(body["reasoning_effort"], "low");
+    assert!(
+        body.get("temperature").is_none(),
+        "reasoning requests omit sampling controls rejected by reasoning models"
+    );
 }
 
 #[tokio::test]
@@ -293,6 +298,11 @@ async fn disabled_reasoning_keeps_the_baseline_request_shape() {
             .get("reasoning_effort")
             .is_none(),
         "None keeps the pre-M7 request shape"
+    );
+    assert_eq!(
+        transport.request_bodies()[0]["temperature"],
+        0.25,
+        "baseline requests keep the configured sampling control"
     );
 }
 

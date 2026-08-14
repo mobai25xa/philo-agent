@@ -53,6 +53,28 @@ impl Default for GenerationConfig {
 /// Default upper bound of tool rounds per turn.
 pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 8;
 
+/// Context compaction policy. Budget resolution belongs to the assembly
+/// root; `None` disables automatic compaction while leaving manual
+/// compaction available.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionConfig {
+    pub context_budget: Option<u64>,
+    pub auto_threshold: f32,
+    pub keep_recent_turns: u32,
+    pub estimate_bytes_per_token: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            context_budget: None,
+            auto_threshold: 0.8,
+            keep_recent_turns: 4,
+            estimate_bytes_per_token: 3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeConfig {
     pub system_prompt: String,
@@ -67,4 +89,6 @@ pub struct RuntimeConfig {
     /// executing tool call runs to completion — with reason `Timeout`.
     /// `None` (the default) disables the timeout entirely.
     pub operation_timeout: Option<std::time::Duration>,
+    /// Pre-turn and manual context-compaction policy (M13).
+    pub compaction: CompactionConfig,
 }

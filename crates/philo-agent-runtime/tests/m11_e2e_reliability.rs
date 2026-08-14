@@ -72,6 +72,7 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
         generation: GenerationConfig::default(),
         max_tool_rounds,
         operation_timeout,
+        compaction: Default::default(),
     }
 }
 
@@ -334,7 +335,9 @@ fn m11_005_timeout_cancellation_lands_on_disk_with_its_reason() {
             FakeToolResult::success("never"),
         ],
     ));
-    let agent = runtime(model, store, tools, 2, Some(Duration::from_millis(50)));
+    // Leave enough headroom for the JSONL tests running in parallel to reach
+    // the gated tool before the timeout window starts testing cancellation.
+    let agent = runtime(model, store, tools, 2, Some(Duration::from_millis(250)));
 
     let handle = block_on(agent.prompt(sid(), UserMessage::new("go"))).unwrap();
     let mut wait = Box::pin(handle.wait());
@@ -346,7 +349,7 @@ fn m11_005_timeout_cancellation_lands_on_disk_with_its_reason() {
             break;
         }
     }
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(300));
     gate.release();
     assert!(matches!(block_on(&mut wait), OperationOutcome::Cancelled));
     drop(wait);

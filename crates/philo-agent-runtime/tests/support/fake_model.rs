@@ -23,6 +23,11 @@ pub enum ModelScript {
 }
 
 impl ModelScript {
+    /// Pure FinalText script used by M13's synthetic summary calls.
+    pub fn summary(text: &str) -> Self {
+        Self::text(&[text])
+    }
+
     pub fn text(deltas: &[&str]) -> Self {
         let mut events = deltas
             .iter()

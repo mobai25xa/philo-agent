@@ -198,6 +198,12 @@ pub enum SessionEntryKind {
         operation_id: OperationId,
         outcome: OperationOutcome,
     },
+    /// Replaces the model-visible prefix through a settled operation with a
+    /// durable summary. Original entries remain unchanged and replayable.
+    Compaction {
+        summary: String,
+        covers_up_to: EntryId,
+    },
 }
 
 /// Parent reference used before transaction entry IDs are allocated.

@@ -1,175 +1,26 @@
-//! On-disk schema v1 record types and their explicit mapping to the
-//! `philo-session` public types.
-//!
-//! These records are owned by this crate: the disk schema never couples to
-//! in-memory type refactorings. Field names and shapes are pinned by the
-//! golden format tests. Entry and parent IDs are persisted as opaque strings.
+//! Explicit conversion between schema v1 records and session domain facts.
 
 use philo_session::{
     CancelReason, EntryId, OperationId, OperationOutcome, SessionEntry, SessionEntryKind,
     SessionToolCall, SessionToolResult, SessionUserPart, ToolBatchId, ToolCallId,
     ToolResultOutcome, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::artifact::sha256_hex;
 
-/// Envelope schema version written by this crate.
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+use super::record::{
+    EntryRecord, FailureKindRecord, FailureRecord, KindRecord, OutcomeRecord, ReasonRecord,
+    ToolCallRecord, ToolOutcomeRecord, ToolResultRecord, UserPartRecord,
+};
 
-/// One committed transaction: exactly one log line.
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct TransactionRecord {
-    pub v: u64,
-    pub revision: u64,
-    pub entries: Vec<EntryRecord>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct EntryRecord {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<String>,
-    pub kind: KindRecord,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum KindRecord {
-    OperationStarted {
-        operation_id: String,
-    },
-    TurnStarted {
-        operation_id: String,
-        turn_id: String,
-    },
-    /// New files always write `parts`; `content` is the pre-M8 legacy shape,
-    /// read as a single text part. Both present or both absent is corrupt.
-    UserMessage {
-        turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parts: Option<Vec<UserPartRecord>>,
-    },
-    AssistantToolCallBatch {
-        turn_id: String,
-        model_call_id: String,
-        tool_batch_id: String,
-        calls: Vec<ToolCallRecord>,
-    },
-    ToolResult {
-        turn_id: String,
-        tool_batch_id: String,
-        result: ToolResultRecord,
-    },
-    AssistantMessage {
-        turn_id: String,
-        content: String,
-    },
-    TurnFailure {
-        turn_id: String,
-        failure: FailureRecord,
-    },
-    /// Cancelled outcomes written since M11 carry a `reason`; legacy lines
-    /// without one are read as user-requested cancellation (the only cancel
-    /// source that existed before reasons were recorded).
-    TurnTerminated {
-        turn_id: String,
-        outcome: OutcomeRecord,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<ReasonRecord>,
-    },
-    OperationSettled {
-        operation_id: String,
-        outcome: OutcomeRecord,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<ReasonRecord>,
-    },
-}
-
-/// One part of a multi-part user message. Image bytes live in a
-/// content-addressed artifact file; the record carries only the reference:
-/// media type, artifact hash, and byte length (verified on both ends).
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum UserPartRecord {
-    Text {
-        text: String,
-    },
-    Image {
-        media_type: String,
-        artifact: String,
-        len: u64,
-    },
-}
-
-/// An artifact newly referenced by the transaction being encoded. The store
-/// must make every pending artifact durable before appending the log line.
+/// An artifact newly referenced by the transaction being encoded.
 #[derive(Debug)]
 pub(crate) struct PendingArtifact {
     pub hash: String,
     pub bytes: Vec<u8>,
 }
 
-/// Resolves an image reference (hash, recorded length) to verified bytes;
-/// the error text describes the integrity failure.
-pub(crate) type ArtifactLoader<'a> = dyn FnMut(&str, u64) -> Result<Vec<u8>, String> + 'a;
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ToolCallRecord {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ToolResultRecord {
-    pub call_id: String,
-    #[serde(flatten)]
-    pub outcome: ToolOutcomeRecord,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum ToolOutcomeRecord {
-    Success { content: String },
-    Error { code: String, message: String },
-    Cancelled,
-    Interrupted,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct FailureRecord {
-    pub kind: FailureKindRecord,
-    pub message: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FailureKindRecord {
-    ModelCall,
-    InvalidModelOutput,
-    Persistence,
-    RuntimeDriver,
-    ToolExecution,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum OutcomeRecord {
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ReasonRecord {
-    User,
-    Timeout,
-    Abandoned,
-}
+type ArtifactLoader<'a> = dyn FnMut(&str, u64) -> Result<Vec<u8>, String> + 'a;
 
 fn encode_reason(reason: CancelReason) -> ReasonRecord {
     match reason {
@@ -179,8 +30,8 @@ fn encode_reason(reason: CancelReason) -> ReasonRecord {
     }
 }
 
-/// Legacy cancelled lines carry no reason: user cancellation was the only
-/// cancel source before reasons were recorded.
+/// Legacy cancelled lines carry no reason because user cancellation was the
+/// only cancel source before reasons were recorded.
 fn decode_reason(reason: Option<ReasonRecord>) -> CancelReason {
     match reason {
         Some(ReasonRecord::User) | None => CancelReason::User,
@@ -200,8 +51,8 @@ pub(crate) fn encode_entry(
     }
 }
 
-/// Decodes one persisted entry, resolving image references through
-/// `load_artifact`.
+/// Decodes one persisted entry, resolving image references through the
+/// supplied artifact loader.
 pub(crate) fn decode_entry(
     record: EntryRecord,
     load_artifact: &mut ArtifactLoader<'_>,
@@ -339,6 +190,13 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
                 reason,
             }
         }
+        SessionEntryKind::Compaction {
+            summary,
+            covers_up_to,
+        } => KindRecord::Compaction {
+            summary: summary.clone(),
+            covers_up_to: covers_up_to.as_str().to_owned(),
+        },
     }
 }
 
@@ -377,7 +235,6 @@ fn decode_kind(
                         }),
                     })
                     .collect::<Result<Vec<_>, String>>()?,
-                // Legacy pre-M8 shape: a plain content string is one text part.
                 (None, Some(content)) => SessionUserPart::text_parts(content),
                 _ => {
                     return Err(
@@ -472,6 +329,13 @@ fn decode_kind(
                     reason: decode_reason(reason),
                 },
             },
+        },
+        KindRecord::Compaction {
+            summary,
+            covers_up_to,
+        } => SessionEntryKind::Compaction {
+            summary,
+            covers_up_to: EntryId::new(covers_up_to),
         },
     })
 }

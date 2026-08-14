@@ -196,14 +196,16 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
     ) {
         Some(picked) => {
             record("reasoning_effort", picked.value.clone(), picked.source);
-            Some(parse_reasoning_effort(&picked.value).map_err(|error| {
-                error.at(&origin(
-                    picked.source,
-                    Some("--reasoning-effort"),
-                    None,
-                    "[defaults].reasoning_effort",
-                ))
-            })?)
+            let value_origin = origin(
+                picked.source,
+                Some("--reasoning-effort"),
+                None,
+                "[defaults].reasoning_effort",
+            );
+            let effort =
+                parse_reasoning_effort(&picked.value).map_err(|error| error.at(&value_origin))?;
+            validate_reasoning_effort(protocol, effort).map_err(|error| error.at(&value_origin))?;
+            Some(effort)
         }
         None => None,
     };
@@ -331,6 +333,37 @@ pub(super) fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, Usa
              very-high | maximum"
         ))),
     }
+}
+
+pub(super) fn validate_reasoning_effort(
+    protocol: ModelProtocol,
+    effort: ReasoningEffort,
+) -> Result<(), UsageError> {
+    let supported = match protocol {
+        ModelProtocol::OpenAiChat | ModelProtocol::OpenAiResponses => true,
+        ModelProtocol::AnthropicMessages => matches!(
+            effort,
+            ReasoningEffort::Low
+                | ReasoningEffort::Medium
+                | ReasoningEffort::High
+                | ReasoningEffort::Maximum
+        ),
+        ModelProtocol::OpenAiChatCompatible | ModelProtocol::OpenAiChatReasoningContent => false,
+    };
+    if supported {
+        return Ok(());
+    }
+
+    let protocol = match protocol {
+        ModelProtocol::AnthropicMessages => "anthropic-messages",
+        ModelProtocol::OpenAiChat => "openai-chat",
+        ModelProtocol::OpenAiChatCompatible => "openai-chat-compatible",
+        ModelProtocol::OpenAiChatReasoningContent => "openai-chat-reasoning-content",
+        ModelProtocol::OpenAiResponses => "openai-responses",
+    };
+    Err(UsageError::new(format!(
+        "reasoning effort is unsupported by protocol '{protocol}'; remove the reasoning setting or choose a protocol that supports it"
+    )))
 }
 
 pub(super) fn parse_verbosity(value: &str) -> Result<Verbosity, UsageError> {

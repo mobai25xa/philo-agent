@@ -10,6 +10,9 @@ pub struct StatusData {
     pub model: String,
     pub session: String,
     pub busy: bool,
+    /// A manual compaction or automatic pre-turn compaction is active.
+    pub compacting: bool,
+    compaction_spinner: usize,
     /// Prompts accepted while another operation was active (M6 FIFO).
     pub queued: usize,
     pub usage: Option<TokenUsage>,
@@ -24,10 +27,25 @@ impl StatusData {
             model: model.into(),
             session: session.into(),
             busy: false,
+            compacting: false,
+            compaction_spinner: 0,
             queued: 0,
             usage: None,
             context_window: None,
             level,
+        }
+    }
+
+    pub fn set_compacting(&mut self, compacting: bool) {
+        self.compacting = compacting;
+        if !compacting {
+            self.compaction_spinner = 0;
+        }
+    }
+
+    pub fn advance_spinner(&mut self) {
+        if self.compacting {
+            self.compaction_spinner = (self.compaction_spinner + 1) % 4;
         }
     }
 
@@ -36,7 +54,12 @@ impl StatusData {
         let mut parts = vec![
             format!("model {}", self.model),
             format!("session {}", self.session),
-            if self.busy {
+            if self.compacting {
+                format!(
+                    "compacting [{}]",
+                    ["|", "/", "-", "\\"][self.compaction_spinner]
+                )
+            } else if self.busy {
                 "busy".to_owned()
             } else {
                 "idle".to_owned()

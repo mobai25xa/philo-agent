@@ -4,7 +4,10 @@ use std::fmt;
 use philo::api::extension as ext;
 use philo::api::extension::ProtocolAdapter;
 use philo::api::stable as sdk;
+use philo_agent_runtime::ReasoningEffort;
 use url::Url;
+
+use crate::headers::{ModelRequestHeaders, default_provider_headers};
 
 use crate::adapter::PhiloModelAdapter;
 
@@ -21,6 +24,9 @@ pub enum ModelProtocol {
     /// OpenAI Chat Completions, conservative compatible shape
     /// (`openai-chat/compatible/v2`) for OpenAI-compatible providers.
     OpenAiChatCompatible,
+    /// OpenAI Chat Completions, conservative compatible shape with official
+    /// reasoning-effort control (`openai-chat/compatible-reasoning-effort-v1`).
+    OpenAiChatCompatibleReasoningEffort,
     /// OpenAI Chat Completions, `reasoning_content` dialect
     /// (`openai-chat/reasoning-content/v1`) for OpenAI-compatible providers
     /// that stream visible reasoning through `delta.reasoning_content`.
@@ -30,11 +36,33 @@ pub enum ModelProtocol {
 }
 
 impl ModelProtocol {
+    /// Returns whether this protocol accepts the requested reasoning-effort
+    /// level.
+    #[must_use]
+    pub const fn supports_reasoning_effort(self, effort: ReasoningEffort) -> bool {
+        match self {
+            Self::OpenAiChat
+            | Self::OpenAiChatCompatibleReasoningEffort
+            | Self::OpenAiResponses => true,
+            Self::AnthropicMessages => matches!(
+                effort,
+                ReasoningEffort::Low
+                    | ReasoningEffort::Medium
+                    | ReasoningEffort::High
+                    | ReasoningEffort::Maximum
+            ),
+            Self::OpenAiChatCompatible | Self::OpenAiChatReasoningContent => false,
+        }
+    }
+
     fn protocol_id(self) -> sdk::ProtocolId {
         let id = match self {
             Self::AnthropicMessages => sdk::ProtocolId::ANTHROPIC_MESSAGES_2023_06_01,
             Self::OpenAiChat => sdk::ProtocolId::OPENAI_CHAT_OPENAI_V1,
             Self::OpenAiChatCompatible => sdk::ProtocolId::OPENAI_CHAT_COMPATIBLE_V2,
+            Self::OpenAiChatCompatibleReasoningEffort => {
+                sdk::ProtocolId::OPENAI_CHAT_COMPATIBLE_REASONING_EFFORT_V1
+            }
             Self::OpenAiChatReasoningContent => sdk::ProtocolId::OPENAI_CHAT_REASONING_CONTENT_V1,
             Self::OpenAiResponses => sdk::ProtocolId::OPENAI_RESPONSES_OPENAI_V1,
         };
@@ -81,6 +109,7 @@ pub struct PhiloModelBuilder {
     model: String,
     endpoint: String,
     api_key_env: Option<String>,
+    request_headers: ModelRequestHeaders,
     retry: Option<sdk::RetryPolicy>,
     timeouts: Option<sdk::TimeoutPolicy>,
 }
@@ -100,6 +129,7 @@ impl PhiloModelBuilder {
             model: model.into(),
             endpoint: endpoint.into(),
             api_key_env: None,
+            request_headers: ModelRequestHeaders::new(),
             retry: None,
             timeouts: None,
         }
@@ -108,6 +138,12 @@ impl PhiloModelBuilder {
     /// Names the environment variable holding the API key.
     pub fn api_key_env(mut self, variable: impl Into<String>) -> Self {
         self.api_key_env = Some(variable.into());
+        self
+    }
+
+    /// Configures validated, non-credential headers for this endpoint binding.
+    pub fn request_headers(mut self, headers: ModelRequestHeaders) -> Self {
+        self.request_headers = headers;
         self
     }
 
@@ -166,6 +202,11 @@ impl PhiloModelBuilder {
                 let envelope = adapter.capabilities().envelope().clone();
                 (client_builder.register_protocol(adapter), envelope)
             }
+            ModelProtocol::OpenAiChatCompatibleReasoningEffort => {
+                let adapter = ext::OpenAiChatAdapter::compatible_reasoning_effort_v1();
+                let envelope = adapter.capabilities().envelope().clone();
+                (client_builder.register_protocol(adapter), envelope)
+            }
             ModelProtocol::OpenAiChatReasoningContent => {
                 let adapter = ext::OpenAiChatAdapter::reasoning_content_v1();
                 let envelope = adapter.capabilities().envelope().clone();
@@ -183,7 +224,8 @@ impl PhiloModelBuilder {
             endpoint,
             ext::CapabilityConstraints::default(),
         )
-        .map_err(|error| AdapterBuildError::new(format!("provider binding invalid: {error}")))?;
+        .map_err(|error| AdapterBuildError::new(format!("provider binding invalid: {error}")))?
+        .with_headers(self.request_headers.provider_headers());
         let model_profile = ext::ModelProfile::new(
             protocol_id.clone(),
             model_name.clone(),
@@ -193,6 +235,7 @@ impl PhiloModelBuilder {
             ext::ModelMetadata::default(),
         );
         let mut provider = ext::ProviderProfile::new(provider_id.clone())
+            .with_default_headers(default_provider_headers())
             .add_binding(binding)
             .map_err(|error| AdapterBuildError::new(format!("provider binding rejected: {error}")))?
             .add_model(model_profile)

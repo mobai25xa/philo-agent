@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentError, OperationHandle, ReasoningEffort, RuntimeFuture, SessionId, ToolDefinition,
-    UserMessage,
+    AgentError, CompactionError, CompactionReport, OperationHandle, ReasoningEffort, RuntimeFuture,
+    SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{SessionContextView, SessionStore};
 use philo_session_jsonl::JsonlSessionStore;
@@ -63,6 +63,13 @@ impl TuiHost for CliHost {
         message: UserMessage,
     ) -> RuntimeFuture<'a, Result<OperationHandle, AgentError>> {
         self.runtime.prompt(session_id, message)
+    }
+
+    fn compact(
+        &self,
+        session_id: SessionId,
+    ) -> RuntimeFuture<'static, Result<CompactionReport, CompactionError>> {
+        self.runtime.compact(session_id)
     }
 
     fn list_sessions(&self) -> Result<Vec<philo_session::SessionId>, HostError> {

@@ -1,0 +1,14 @@
+---
+source: crates/philo-tui/src/tests/m13_compaction.rs
+expression: "format!(\"FIRST\\n{}\\nSTATUS {waiting}\\n{}\\nSTATUS {}\\n\\nSECOND\\n{}\\n{}\\nSTATUS {}\",\nappended(&first).join(\"\\n\"), appended(&completed).join(\"\\n\"),\napp_status_after_success(), appended(&second).join(\"\\n\"),\nappended(&nothing).join(\"\\n\"), app.status.line(),)"
+---
+FIRST
+Meta: /compact
+STATUS model model-a | session s-1 | compacting [|] | tokens in 8000 out 200
+Meta: context compacted through entry-42
+STATUS model model-a | session s-1 | idle
+
+SECOND
+Meta: /compact
+Notice: nothing to compact: no older completed turns are available
+STATUS model model-a | session s-1 | idle

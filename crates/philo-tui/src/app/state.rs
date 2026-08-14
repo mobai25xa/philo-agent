@@ -2,7 +2,7 @@
 //! append-only transcript lines and side-effect requests come out. Pure
 //! state — the event loop owns the terminal and the host.
 
-use philo_agent_runtime::AgentEvent;
+use philo_agent_runtime::{AgentAvailability, AgentEvent, CompactionError, CompactionReport};
 use philo_session::SessionId;
 
 use crate::api::confirmation::{ConfirmationId, ConfirmationRequest, ConfirmationResponse};
@@ -86,6 +86,10 @@ pub(crate) struct App {
     attachments: Attachments,
     /// `[ui].show_reasoning`, carried across session switches.
     show_reasoning: bool,
+    /// Manual compaction has a standalone future owned by the driver.
+    manual_compacting: bool,
+    /// Automatic compaction belongs to the front operation handle.
+    automatic_compacting: bool,
 }
 
 impl App {
@@ -106,6 +110,8 @@ impl App {
             completion: None,
             attachments: Attachments::default(),
             show_reasoning,
+            manual_compacting: false,
+            automatic_compacting: false,
         }
     }
 
@@ -123,6 +129,54 @@ impl App {
     pub fn set_busy(&mut self, busy: bool, queued: usize) {
         self.status.busy = busy;
         self.status.queued = queued;
+        if !busy {
+            self.automatic_compacting = false;
+            self.sync_compacting_status();
+        }
+    }
+
+    /// Advances the manual/automatic compaction spinner on redraw ticks.
+    pub(crate) fn on_tick(&mut self) -> Vec<Effect> {
+        self.status.advance_spinner();
+        vec![Effect::Redraw]
+    }
+
+    /// Applies the terminal result of the driver's manual compaction future.
+    pub(crate) fn finish_manual_compaction(
+        &mut self,
+        result: Result<CompactionReport, CompactionError>,
+    ) -> Vec<Effect> {
+        self.manual_compacting = false;
+        self.sync_compacting_status();
+        let line = match result {
+            Ok(CompactionReport::Compacted { covers_up_to }) => {
+                self.status.usage = None;
+                line(
+                    LineKind::Meta,
+                    format!("context compacted through {covers_up_to}"),
+                )
+            }
+            Ok(CompactionReport::NothingToCompact) => line(
+                LineKind::Notice,
+                "nothing to compact: no older completed turns are available",
+            ),
+            Err(CompactionError::Unavailable { availability }) => {
+                let reason = match availability {
+                    AgentAvailability::Busy { .. } => "a turn is already running",
+                    AgentAvailability::Compacting { .. } => "context compaction is already running",
+                    AgentAvailability::Idle => "the runtime refused maintenance",
+                };
+                line(
+                    LineKind::Error,
+                    format!("error: context compaction was not started: {reason}"),
+                )
+            }
+            Err(error) => line(
+                LineKind::Error,
+                format!("error: context compaction failed: {}", error.message()),
+            ),
+        };
+        vec![Effect::Append(vec![line])]
     }
 
     /// The overlay content to paint, if any. The approval prompt wins over
@@ -260,7 +314,9 @@ impl App {
             }
             Action::Submit => self.submit(),
             Action::Escape => {
-                if self.status.busy {
+                if self.manual_compacting {
+                    self.cancel_manual_compaction()
+                } else if self.status.busy {
                     vec![Effect::CancelActive]
                 } else {
                     vec![]
@@ -337,8 +393,24 @@ impl App {
     /// Projects one agent event into transcript lines and status updates.
     /// Overlays never intercept this path: terminal events must render.
     pub fn on_agent_event(&mut self, event: &AgentEvent) -> Vec<Effect> {
-        if let AgentEvent::ModelUsageUpdated { usage, .. } = event {
-            self.status.usage = Some(*usage);
+        match event {
+            AgentEvent::ModelUsageUpdated { usage, .. } => {
+                self.status.usage = Some(*usage);
+            }
+            AgentEvent::ContextCompactionStarted => {
+                self.automatic_compacting = true;
+                self.sync_compacting_status();
+            }
+            AgentEvent::ContextCompactionCompleted { .. } => {
+                self.automatic_compacting = false;
+                self.status.usage = None;
+                self.sync_compacting_status();
+            }
+            AgentEvent::ContextCompactionFailed { .. } => {
+                self.automatic_compacting = false;
+                self.sync_compacting_status();
+            }
+            _ => {}
         }
         let lines = self.transcript.on_event(event, self.level);
         if lines.is_empty() {
@@ -366,6 +438,7 @@ impl App {
     }
 
     fn on_picker_action(&mut self, action: Action) -> Vec<Effect> {
+        let has_activity = self.has_activity();
         let picker = self.picker.as_mut().expect("session picker is open");
         match action {
             Action::MoveUp | Action::MoveDown => {
@@ -382,10 +455,10 @@ impl App {
                     .unwrap_or_default()
             }
             Action::Submit => {
-                if self.status.busy {
+                if has_activity {
                     return vec![Effect::Append(vec![line(
                         LineKind::Error,
-                        "error: a turn is still running; cancel it with Esc before switching \
+                        "error: the agent is still active; cancel it with Esc before switching \
                          sessions",
                     )])];
                 }
@@ -453,7 +526,12 @@ impl App {
                 format!("> [attached {}]", attachment.label()),
             ));
         }
-        if self.status.busy {
+        if self.status.compacting {
+            lines.push(line(
+                LineKind::Notice,
+                "compacting: the message is queued behind context maintenance",
+            ));
+        } else if self.status.busy {
             lines.push(line(
                 LineKind::Notice,
                 "busy: the message is queued behind the active turn",
@@ -480,10 +558,10 @@ impl App {
                     .map(|text| line(LineKind::Meta, text)),
             ),
             Ok(Command::New) => {
-                if self.status.busy {
+                if self.has_activity() {
                     lines.push(line(
                         LineKind::Error,
-                        "error: a turn is still running; cancel it with Esc before starting a \
+                        "error: the agent is still active; cancel it with Esc before starting a \
                          new session",
                     ));
                 } else {
@@ -495,7 +573,7 @@ impl App {
                 lines.push(line(LineKind::Error, "usage: /model <name>"));
             }
             Ok(Command::Model { name: Some(name) }) => {
-                if self.status.busy {
+                if self.has_activity() {
                     lines.push(line(
                         LineKind::Error,
                         format!(
@@ -525,6 +603,24 @@ impl App {
                     )),
                 }
             }
+            Ok(Command::Compact) => {
+                if self.status.compacting {
+                    lines.push(line(
+                        LineKind::Error,
+                        "error: context compaction is already running; press Esc to cancel it",
+                    ));
+                } else if self.status.busy {
+                    lines.push(line(
+                        LineKind::Error,
+                        "error: context can only be compacted while idle; a turn is still \
+                         running",
+                    ));
+                } else {
+                    self.manual_compacting = true;
+                    self.sync_compacting_status();
+                    effects.push(Effect::StartCompaction);
+                }
+            }
             Ok(Command::Image { path: None }) => {
                 lines.push(line(LineKind::Error, "usage: /image <path>"));
             }
@@ -542,11 +638,11 @@ impl App {
             Ok(Command::Status) => effects.push(Effect::Host(HostRequest::ShowStatus)),
             Ok(Command::Config) => effects.push(Effect::Host(HostRequest::ShowConfig)),
             Ok(Command::Quit) => {
-                if self.status.busy && !quit_armed {
+                if self.has_activity() && !quit_armed {
                     self.quit_armed = true;
                     lines.push(line(
                         LineKind::Notice,
-                        "a turn is still running: press Esc to cancel it, or /quit again to \
+                        "the agent is still active: press Esc to cancel it, or /quit again to \
                          leave anyway",
                     ));
                 } else {
@@ -596,6 +692,10 @@ impl App {
             self.exit_armed = false;
             return vec![];
         }
+        if self.manual_compacting {
+            self.exit_armed = false;
+            return self.cancel_manual_compaction();
+        }
         if self.status.busy {
             self.exit_armed = false;
             return vec![Effect::CancelActive];
@@ -608,6 +708,24 @@ impl App {
             LineKind::Notice,
             "press Ctrl+C again to exit",
         )])]
+    }
+
+    fn has_activity(&self) -> bool {
+        self.status.busy || self.status.compacting
+    }
+
+    fn sync_compacting_status(&mut self) {
+        self.status
+            .set_compacting(self.manual_compacting || self.automatic_compacting);
+    }
+
+    fn cancel_manual_compaction(&mut self) -> Vec<Effect> {
+        self.manual_compacting = false;
+        self.sync_compacting_status();
+        vec![
+            Effect::CancelCompaction,
+            Effect::Append(vec![line(LineKind::Notice, "context compaction cancelled")]),
+        ]
     }
 
     fn history_prev(&mut self) {

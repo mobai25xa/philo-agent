@@ -91,6 +91,10 @@ fn defaults_are_available_and_reasonable() {
     assert_eq!(config.model_target, "provider/model");
     assert_eq!(config.system_prompt, CodingProfile::system_prompt());
     assert_eq!(config.max_tool_rounds, DEFAULT_MAX_TOOL_ROUNDS);
+    assert_eq!(
+        config.compaction,
+        philo_agent_runtime::CompactionConfig::default()
+    );
 }
 
 #[test]

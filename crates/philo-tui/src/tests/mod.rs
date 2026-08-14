@@ -2,6 +2,7 @@
 
 mod attachments;
 mod m12_flow;
+mod m13_compaction;
 pub(crate) mod support;
 
 macro_rules! assert_tui_snapshot {

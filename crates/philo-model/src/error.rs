@@ -59,10 +59,10 @@ pub(crate) fn model_error(error: &PhiloError) -> ModelError {
     // Transport sources carry the actionable OS/DNS/TLS reason that the
     // stable classification cannot express. Only expose the deepest cause,
     // bounded to one line, and redact URL query strings before rendering it.
-    if matches!(error.kind(), philo::api::stable::PhiloErrorKind::Transport) {
-        if let Some(cause) = deepest_cause(error) {
-            write!(message, " cause={cause:?}").expect("writing to String cannot fail");
-        }
+    if matches!(error.kind(), philo::api::stable::PhiloErrorKind::Transport)
+        && let Some(cause) = deepest_cause(error)
+    {
+        write!(message, " cause={cause:?}").expect("writing to String cannot fail");
     }
 
     ModelError::new(message)
@@ -116,9 +116,7 @@ fn redact_url_secrets(value: &str) -> String {
             })
             .unwrap_or(rest.len());
         let (url_tail, suffix) = rest.split_at(token_end);
-        let secret_offset = url_tail
-            .find(|character| matches!(character, '?' | '#'))
-            .unwrap_or(url_tail.len());
+        let secret_offset = url_tail.find(['?', '#']).unwrap_or(url_tail.len());
         let visible_url = &url_tail[..secret_offset];
         let authority_end = visible_url.find('/').unwrap_or(visible_url.len());
         if let Some(user_info_end) = visible_url[..authority_end].rfind('@') {

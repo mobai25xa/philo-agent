@@ -4,6 +4,8 @@
 //! `<workspace>/.philo/config.toml` supplies the project layer. Every value
 //! retains its source so resolution diagnostics and `/config` stay honest.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::UsageError;
@@ -33,6 +35,22 @@ pub(super) struct Sourced<T> {
     pub(super) layer: Layer,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct FileHeader {
+    pub(super) name: String,
+    pub(super) value: String,
+}
+
+impl fmt::Debug for FileHeader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileHeader")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct FileConfig {
     // [deployment]
@@ -43,6 +61,13 @@ pub(super) struct FileConfig {
     pub(super) api_key_env: Option<Sourced<String>>,
     pub(super) data_dir: Option<Sourced<String>>,
     pub(super) context_window: Option<Sourced<i64>>,
+    /// Canonical lowercase header name -> highest-authority configured value.
+    pub(super) headers: BTreeMap<String, Sourced<FileHeader>>,
+    // [compaction]
+    pub(super) compaction_context_budget: Option<Sourced<i64>>,
+    pub(super) compaction_auto_threshold: Option<Sourced<f64>>,
+    pub(super) compaction_keep_recent_turns: Option<Sourced<i64>>,
+    pub(super) compaction_estimate_bytes_per_token: Option<Sourced<i64>>,
     // [defaults]
     pub(super) reasoning_effort: Option<Sourced<String>>,
     pub(super) max_tool_rounds: Option<Sourced<i64>>,
@@ -135,7 +160,10 @@ fn apply(
                 )));
             }
         }
-        if !matches!(section.as_str(), "deployment" | "defaults" | "tools" | "ui") {
+        if !matches!(
+            section.as_str(),
+            "deployment" | "defaults" | "tools" | "ui" | "compaction"
+        ) {
             config.warnings.push(format!(
                 "{}: unknown section [{section}]; ignored",
                 path.display()
@@ -160,6 +188,21 @@ fn apply(
                 ("deployment", "context_window") => {
                     config.context_window = Some(reader.integer()?);
                 }
+                ("deployment", "headers") => {
+                    apply_headers(&mut config.headers, layer, path, value)?;
+                }
+                ("compaction", "context_budget") => {
+                    config.compaction_context_budget = Some(reader.integer()?);
+                }
+                ("compaction", "auto_threshold") => {
+                    config.compaction_auto_threshold = Some(reader.number()?);
+                }
+                ("compaction", "keep_recent_turns") => {
+                    config.compaction_keep_recent_turns = Some(reader.integer()?);
+                }
+                ("compaction", "estimate_bytes_per_token") => {
+                    config.compaction_estimate_bytes_per_token = Some(reader.integer()?);
+                }
                 ("defaults", "reasoning_effort") => {
                     config.reasoning_effort = Some(reader.string()?);
                 }
@@ -178,6 +221,49 @@ fn apply(
                 )),
             }
         }
+    }
+    Ok(())
+}
+
+fn apply_headers(
+    configured: &mut BTreeMap<String, Sourced<FileHeader>>,
+    layer: Layer,
+    path: &Path,
+    value: &toml::Value,
+) -> Result<(), UsageError> {
+    let headers = value.as_table().ok_or_else(|| {
+        UsageError::new(format!(
+            "{}: [deployment].headers must be a table, found {}",
+            path.display(),
+            value.type_str()
+        ))
+    })?;
+    for (name, value) in headers {
+        let canonical = name.to_ascii_lowercase();
+        if SECRET_KEYS.contains(&canonical.as_str()) {
+            return Err(UsageError::new(format!(
+                "{}: [deployment.headers].{name} would store a secret in a file; philo reads credentials from the environment only - set [deployment].api_key_env to the variable name instead",
+                path.display()
+            )));
+        }
+        let reader = Reader {
+            path,
+            layer,
+            section: "deployment.headers",
+            key: name,
+            value,
+        };
+        let value = reader.string()?;
+        configured.insert(
+            canonical,
+            Sourced {
+                value: FileHeader {
+                    name: name.clone(),
+                    value: value.value,
+                },
+                layer,
+            },
+        );
     }
     Ok(())
 }
@@ -255,6 +341,18 @@ impl Reader<'_> {
                 self.key
             )));
         }
+        Ok(Sourced {
+            value,
+            layer: self.layer,
+        })
+    }
+
+    fn number(&self) -> Result<Sourced<f64>, UsageError> {
+        let value = self
+            .value
+            .as_float()
+            .or_else(|| self.value.as_integer().map(|value| value as f64))
+            .ok_or_else(|| self.wrong_type("a number"))?;
         Ok(Sourced {
             value,
             layer: self.layer,

@@ -67,6 +67,7 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
     // Operations queue FIFO (M6); the loop consumes the front handle's
     // events until it settles, then moves on.
     let mut handles: VecDeque<OperationHandle> = VecDeque::new();
+    let mut compaction: Option<events::CompactionFuture> = None;
     let exit = loop {
         // The overlay follows the channel: a queued question opens it, an
         // answered or auto-denied one closes it.
@@ -75,7 +76,13 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
             frame::draw(term_frame, &app, &markdown, shift_enter);
         })?;
 
-        let step = events::next_step(&mut handles, &mut term_events, &mut redraw_tick).await;
+        let step = events::next_step(
+            &mut handles,
+            &mut compaction,
+            &mut term_events,
+            &mut redraw_tick,
+        )
+        .await;
         let effects = match step {
             Step::Agent(Some(event)) => {
                 let effects = app.on_agent_event(&event);
@@ -96,6 +103,12 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                 app.set_busy(!handles.is_empty(), handles.len().saturating_sub(1));
                 Vec::new()
             }
+            Step::Compaction(result) => {
+                compaction.take();
+                let effects = app.finish_manual_compaction(result);
+                app.set_busy(!handles.is_empty(), handles.len().saturating_sub(1));
+                effects
+            }
             Step::Term(Ok(event)) => match event {
                 TermEvent::Key(key) => app.on_action(keymap::interpret(&key)),
                 TermEvent::Paste(text) => app.on_paste(&text),
@@ -104,7 +117,7 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
             },
             Step::Term(Err(error)) => return Err(error),
             Step::TermClosed => break TuiExit::Normal,
-            Step::Tick => vec![Effect::Redraw],
+            Step::Tick => app.on_tick(),
         };
 
         let mut quit = false;
@@ -121,7 +134,14 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                     if resolved.errors.is_empty() {
                         let mut parts = vec![UserPart::Text(text)];
                         parts.extend(resolved.parts);
-                        let lines = submit(&mut app, host.as_ref(), &mut handles, parts).await;
+                        let lines = submit(
+                            &mut app,
+                            host.as_ref(),
+                            &mut handles,
+                            compaction.is_some(),
+                            parts,
+                        )
+                        .await;
                         scrollback::append_history(&mut session, &mut markdown, &lines)?;
                     } else {
                         let lines = media::refusal_lines(&resolved.errors);
@@ -136,6 +156,14 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                     if let Some(handle) = handles.front() {
                         handle.cancel();
                     }
+                }
+                Effect::StartCompaction => {
+                    debug_assert!(compaction.is_none(), "only one manual compaction may run");
+                    compaction = Some(host.compact(SessionId::new(&app.status.session)));
+                }
+                Effect::CancelCompaction => {
+                    compaction.take();
+                    app.set_busy(!handles.is_empty(), handles.len().saturating_sub(1));
                 }
                 Effect::Quit => quit = true,
                 Effect::Redraw => {
@@ -167,6 +195,7 @@ async fn submit(
     app: &mut App,
     host: &dyn TuiHost,
     handles: &mut VecDeque<OperationHandle>,
+    maintenance_active: bool,
     parts: Vec<UserPart>,
 ) -> Vec<TranscriptLine> {
     let message = match UserMessage::from_parts(parts) {
@@ -186,7 +215,12 @@ async fn submit(
     {
         Ok(handle) => {
             handles.push_back(handle);
-            app.set_busy(true, handles.len().saturating_sub(1));
+            let queued = if maintenance_active {
+                handles.len()
+            } else {
+                handles.len().saturating_sub(1)
+            };
+            app.set_busy(true, queued);
             Vec::new()
         }
         Err(error) => vec![TranscriptLine {

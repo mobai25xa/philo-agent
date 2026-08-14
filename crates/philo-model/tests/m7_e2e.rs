@@ -81,6 +81,7 @@ fn runtime_over(
             },
             max_tool_rounds: 2,
             operation_timeout: None,
+            compaction: Default::default(),
         },
         Arc::new(registry),
     )
@@ -229,6 +230,7 @@ async fn m7_e2e_reasoning_flows_replay_and_stay_out_of_the_session() {
         .messages()
         .iter()
         .map(|message| match message {
+            ContextMessage::Summary { .. } => "summary",
             ContextMessage::User { .. } => "user",
             ContextMessage::AssistantToolCalls { .. } => "calls",
             ContextMessage::ToolResult { .. } => "result",

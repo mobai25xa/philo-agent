@@ -248,6 +248,27 @@ impl Renderer {
                     ));
                 }
             }
+            AgentEvent::ContextCompactionStarted => {
+                self.close_reasoning(&mut outputs);
+                if !self.quiet() {
+                    outputs.push(err("compacting context...\n"));
+                }
+            }
+            AgentEvent::ContextCompactionCompleted { covers_up_to } => {
+                self.close_reasoning(&mut outputs);
+                if self.verbose() {
+                    outputs.push(err(format!("context compacted through {covers_up_to}\n")));
+                } else if !self.quiet() {
+                    outputs.push(err("context compacted\n"));
+                }
+            }
+            AgentEvent::ContextCompactionFailed { message } => {
+                self.close_reasoning(&mut outputs);
+                outputs.push(err(format!(
+                    "warning: context compaction failed: {message}; continuing without \
+                     compaction\n"
+                )));
+            }
             AgentEvent::CancellationRequested { reason, .. } => {
                 self.close_reasoning(&mut outputs);
                 self.cancel_reason = Some(*reason);
@@ -742,5 +763,48 @@ mod tests {
         );
         assert_eq!(stderr_text(&outputs), "", "quiet silences the seal notice");
         assert_eq!(stdout_text(&outputs), "answer\n");
+    }
+
+    #[test]
+    fn compaction_events_are_status_lines_and_never_reach_stdout() {
+        let events = [
+            AgentEvent::ContextCompactionStarted,
+            AgentEvent::ContextCompactionCompleted {
+                covers_up_to: "entry-42".to_owned(),
+            },
+        ];
+
+        let mut renderer = Renderer::new(Verbosity::Default);
+        let outputs = render_all(&mut renderer, &events);
+        assert_eq!(stdout_text(&outputs), "");
+        assert_eq!(
+            stderr_text(&outputs),
+            "compacting context...\ncontext compacted\n"
+        );
+
+        let mut renderer = Renderer::new(Verbosity::Verbose);
+        let outputs = render_all(&mut renderer, &events);
+        assert!(stderr_text(&outputs).contains("context compacted through entry-42"));
+    }
+
+    #[test]
+    fn quiet_hides_compaction_progress_but_keeps_failure_warnings() {
+        let mut renderer = Renderer::new(Verbosity::Quiet);
+        let outputs = render_all(
+            &mut renderer,
+            &[
+                AgentEvent::ContextCompactionStarted,
+                AgentEvent::ContextCompactionFailed {
+                    message: "summary model unavailable".to_owned(),
+                },
+            ],
+        );
+
+        assert_eq!(stdout_text(&outputs), "");
+        let stderr = stderr_text(&outputs);
+        assert!(!stderr.contains("compacting context..."));
+        assert!(stderr.contains("warning: context compaction failed"));
+        assert!(stderr.contains("summary model unavailable"));
+        assert!(stderr.contains("continuing without compaction"));
     }
 }

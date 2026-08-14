@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use philo_agent_runtime::ReasoningEffort;
-use philo_model::ModelProtocol;
+use philo_agent_runtime::{CompactionConfig, ReasoningEffort};
+use philo_model::{DEFAULT_USER_AGENT, ModelProtocol, ModelRequestHeaders};
 
 use super::file::{FileConfig, Sourced};
 use crate::args::Cli;
@@ -29,6 +29,7 @@ pub struct Deployment {
     pub endpoint: String,
     /// Name of the environment variable carrying the API key — never the key.
     pub api_key_env: String,
+    pub request_headers: ModelRequestHeaders,
 }
 
 /// One effective non-secret setting shown through the interactive `/config`
@@ -45,6 +46,7 @@ pub struct Settings {
     pub deployment: Deployment,
     pub data_dir: PathBuf,
     pub context_window: Option<u64>,
+    pub compaction: CompactionConfig,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_rounds: Option<u32>,
     pub operation_timeout: Option<Duration>,
@@ -108,6 +110,7 @@ fn pick_integer(flag: Option<i64>, file: Option<&Sourced<i64>>) -> Option<Pick<i
 
 pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageError> {
     let mut entries: Vec<EffectiveSetting> = Vec::new();
+    let (request_headers, header_entries) = resolve_request_headers(file)?;
     let mut record = |key: &str, value: String, source: &str| {
         entries.push(EffectiveSetting {
             key: key.to_owned(),
@@ -188,6 +191,69 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         }
         None => None,
     };
+
+    let context_budget = match from_file(file.compaction_context_budget.as_ref()) {
+        Some(picked) => {
+            record("context_budget", picked.value.to_string(), picked.source);
+            Some(positive_u64("[compaction].context_budget", picked.value)?)
+        }
+        None => match context_window {
+            Some(value) => {
+                let source = file
+                    .context_window
+                    .as_ref()
+                    .map_or("default", |value| value.layer.name());
+                record("context_budget", value.to_string(), source);
+                Some(value)
+            }
+            None => {
+                record("context_budget", "none".to_owned(), "default");
+                None
+            }
+        },
+    };
+
+    let auto_threshold = match from_file(file.compaction_auto_threshold.as_ref()) {
+        Some(picked) => {
+            let value = threshold_f32("[compaction].auto_threshold", picked.value)?;
+            record("auto_threshold", value.to_string(), picked.source);
+            value
+        }
+        None => {
+            let value = CompactionConfig::default().auto_threshold;
+            record("auto_threshold", value.to_string(), "default");
+            value
+        }
+    };
+
+    let keep_recent_turns = match from_file(file.compaction_keep_recent_turns.as_ref()) {
+        Some(picked) => {
+            record("keep_recent_turns", picked.value.to_string(), picked.source);
+            positive_u32("[compaction].keep_recent_turns", picked.value)?
+        }
+        None => {
+            let value = CompactionConfig::default().keep_recent_turns;
+            record("keep_recent_turns", value.to_string(), "default");
+            value
+        }
+    };
+
+    let estimate_bytes_per_token =
+        match from_file(file.compaction_estimate_bytes_per_token.as_ref()) {
+            Some(picked) => {
+                record(
+                    "estimate_bytes_per_token",
+                    picked.value.to_string(),
+                    picked.source,
+                );
+                positive_u32("[compaction].estimate_bytes_per_token", picked.value)?
+            }
+            None => {
+                let value = CompactionConfig::default().estimate_bytes_per_token;
+                record("estimate_bytes_per_token", value.to_string(), "default");
+                value
+            }
+        };
 
     let reasoning_effort = match pick_string(
         cli.reasoning_effort.as_deref(),
@@ -282,6 +348,8 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         }
     };
 
+    entries.extend(header_entries);
+
     Ok(Settings {
         deployment: Deployment {
             provider,
@@ -289,9 +357,16 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             model: model.value,
             endpoint: endpoint.value,
             api_key_env,
+            request_headers,
         },
         data_dir,
         context_window,
+        compaction: CompactionConfig {
+            context_budget,
+            auto_threshold,
+            keep_recent_turns,
+            estimate_bytes_per_token,
+        },
         reasoning_effort,
         max_tool_rounds,
         operation_timeout,
@@ -302,8 +377,56 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
     })
 }
 
+fn resolve_request_headers(
+    file: &FileConfig,
+) -> Result<(ModelRequestHeaders, Vec<EffectiveSetting>), UsageError> {
+    let mut request_headers = ModelRequestHeaders::new();
+    let mut entries = Vec::new();
+    for (canonical, sourced) in &file.headers {
+        request_headers
+            .set(&sourced.value.name, &sourced.value.value)
+            .map_err(|error| {
+                UsageError::new(error.to_string()).at(&format!(
+                    "[deployment.headers].{} in the {} config",
+                    sourced.value.name,
+                    sourced.layer.name()
+                ))
+            })?;
+        entries.push(EffectiveSetting {
+            key: format!("header.{canonical}"),
+            value: if canonical == "user-agent" {
+                sourced.value.value.clone()
+            } else {
+                "<configured>".to_owned()
+            },
+            source: sourced.layer.name().to_owned(),
+        });
+    }
+    if !file.headers.contains_key("user-agent") {
+        entries.push(EffectiveSetting {
+            key: "header.user-agent".to_owned(),
+            value: DEFAULT_USER_AGENT.to_owned(),
+            source: "default".to_owned(),
+        });
+    }
+    Ok((request_headers, entries))
+}
+
 fn positive_u64(key: &str, value: i64) -> Result<u64, UsageError> {
     u64::try_from(value).map_err(|_| UsageError::new(format!("{key} is out of range: {value}")))
+}
+
+fn positive_u32(key: &str, value: i64) -> Result<u32, UsageError> {
+    u32::try_from(value).map_err(|_| UsageError::new(format!("{key} is out of range: {value}")))
+}
+
+fn threshold_f32(key: &str, value: f64) -> Result<f32, UsageError> {
+    if !value.is_finite() || !(0.0 < value && value <= 1.0) {
+        return Err(UsageError::new(format!(
+            "{key} must be greater than 0 and at most 1"
+        )));
+    }
+    Ok(value as f32)
 }
 
 pub(super) fn parse_protocol(value: &str) -> Result<ModelProtocol, UsageError> {
@@ -311,11 +434,15 @@ pub(super) fn parse_protocol(value: &str) -> Result<ModelProtocol, UsageError> {
         "anthropic-messages" => Ok(ModelProtocol::AnthropicMessages),
         "openai-chat" => Ok(ModelProtocol::OpenAiChat),
         "openai-chat-compatible" => Ok(ModelProtocol::OpenAiChatCompatible),
+        "openai-chat-compatible-reasoning-effort" => {
+            Ok(ModelProtocol::OpenAiChatCompatibleReasoningEffort)
+        }
         "openai-chat-reasoning-content" => Ok(ModelProtocol::OpenAiChatReasoningContent),
         "openai-responses" => Ok(ModelProtocol::OpenAiResponses),
         other => Err(UsageError::new(format!(
             "unknown protocol '{other}': expected anthropic-messages | openai-chat | \
-             openai-chat-compatible | openai-chat-reasoning-content | openai-responses"
+             openai-chat-compatible | openai-chat-compatible-reasoning-effort | \
+             openai-chat-reasoning-content | openai-responses"
         ))),
     }
 }
@@ -339,18 +466,7 @@ pub(super) fn validate_reasoning_effort(
     protocol: ModelProtocol,
     effort: ReasoningEffort,
 ) -> Result<(), UsageError> {
-    let supported = match protocol {
-        ModelProtocol::OpenAiChat | ModelProtocol::OpenAiResponses => true,
-        ModelProtocol::AnthropicMessages => matches!(
-            effort,
-            ReasoningEffort::Low
-                | ReasoningEffort::Medium
-                | ReasoningEffort::High
-                | ReasoningEffort::Maximum
-        ),
-        ModelProtocol::OpenAiChatCompatible | ModelProtocol::OpenAiChatReasoningContent => false,
-    };
-    if supported {
+    if protocol.supports_reasoning_effort(effort) {
         return Ok(());
     }
 
@@ -358,6 +474,9 @@ pub(super) fn validate_reasoning_effort(
         ModelProtocol::AnthropicMessages => "anthropic-messages",
         ModelProtocol::OpenAiChat => "openai-chat",
         ModelProtocol::OpenAiChatCompatible => "openai-chat-compatible",
+        ModelProtocol::OpenAiChatCompatibleReasoningEffort => {
+            "openai-chat-compatible-reasoning-effort"
+        }
         ModelProtocol::OpenAiChatReasoningContent => "openai-chat-reasoning-content",
         ModelProtocol::OpenAiResponses => "openai-responses",
     };

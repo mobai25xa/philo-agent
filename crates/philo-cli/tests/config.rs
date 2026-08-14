@@ -148,7 +148,10 @@ fn unknown_keys_warn_and_keep_running() {
     write_config(
         &config_home,
         &format!(
-            "[deployment]\ndata_dir = {}\nfrom_the_future = 1\n[telemetry]\nenabled = true\n",
+            "[deployment]\ndata_dir = {}\nfrom_the_future = 1\n\
+             [compaction]\ncontext_budget = 96000\nauto_threshold = 0.8\n\
+             keep_recent_turns = 4\nestimate_bytes_per_token = 3\nfuture = true\n\
+             [telemetry]\nenabled = true\n",
             literal(&store)
         ),
     );
@@ -165,6 +168,14 @@ fn unknown_keys_warn_and_keep_running() {
     assert!(
         stderr.contains("unknown key [deployment].from_the_future"),
         "{stderr}"
+    );
+    assert!(
+        stderr.contains("unknown key [compaction].future"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown section [compaction]"),
+        "the compaction key domain is recognized: {stderr}"
     );
     assert!(stderr.contains("unknown section [telemetry]"), "{stderr}");
 }
@@ -218,6 +229,32 @@ fn an_invalid_enum_names_the_layer_it_came_from() {
 }
 
 #[test]
+fn an_invalid_compaction_threshold_exits_two_before_starting_an_operation() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    write_config(
+        &config_home,
+        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
+         [compaction]\nauto_threshold = 1.1\n",
+    );
+
+    let output = philo(&config_home)
+        .current_dir(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("[compaction].auto_threshold"), "{stderr}");
+    assert!(stderr.contains("greater than 0 and at most 1"), "{stderr}");
+    assert!(
+        !stderr.contains("session:"),
+        "operation was not started: {stderr}"
+    );
+}
+
+#[test]
 fn a_secret_in_the_config_is_refused_without_echoing_it() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
@@ -260,6 +297,29 @@ fn a_secret_in_the_config_is_refused_without_echoing_it() {
         !stderr.contains("sk-also-must-not-be-used"),
         "a misplaced key never reaches output: {stderr}"
     );
+}
+
+#[test]
+fn a_credential_header_is_refused_without_echoing_its_value() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    write_config(
+        &config_home,
+        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
+         [deployment.headers]\nAuthorization = \"Bearer header-secret\"\n",
+    );
+
+    let output = philo(&config_home)
+        .current_dir(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("authorization"), "{stderr}");
+    assert!(stderr.contains("must not be configured"), "{stderr}");
+    assert!(!stderr.contains("header-secret"), "{stderr}");
 }
 
 #[test]

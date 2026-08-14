@@ -75,6 +75,7 @@ fn runtime(
             },
             max_tool_rounds,
             operation_timeout: None,
+            compaction: Default::default(),
         },
         Arc::new(registry),
     )

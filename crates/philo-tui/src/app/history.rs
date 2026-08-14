@@ -40,6 +40,10 @@ pub(crate) fn preview_lines(view: &SessionContextView, max_lines: usize) -> Vec<
 
 fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
     match message {
+        ContextMessage::Summary { text } => text
+            .split('\n')
+            .map(|text| line(LineKind::Notice, format!("[summary] {text}")))
+            .collect(),
         ContextMessage::User { parts } => parts.iter().map(user_part_line).collect(),
         ContextMessage::Assistant { content } => content
             .split('\n')
@@ -113,6 +117,20 @@ mod tests {
         let lines = history_lines(&view);
         let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(texts, ["> look at this", "> [image image/png, 4 bytes]"]);
+    }
+
+    #[test]
+    fn compacted_history_marks_the_summary_as_prior_context() {
+        let lines = message_lines(&ContextMessage::Summary {
+            text: "earlier request\nearlier answer".to_owned(),
+        });
+        assert_eq!(
+            lines,
+            [
+                line(LineKind::Notice, "[summary] earlier request"),
+                line(LineKind::Notice, "[summary] earlier answer"),
+            ]
+        );
     }
 
     #[test]

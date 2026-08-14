@@ -35,6 +35,10 @@ pub(crate) enum Effect {
     /// `Ctrl+V` outside bracketed paste: read the system clipboard.
     ReadClipboard,
     CancelActive,
+    /// Start a cancellable manual compaction in the driver's select loop.
+    StartCompaction,
+    /// Drop the active manual compaction future.
+    CancelCompaction,
     Quit,
     Redraw,
     Host(HostRequest),

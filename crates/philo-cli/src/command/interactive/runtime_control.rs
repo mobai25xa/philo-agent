@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentError, AgentRuntime, IdSource, ModelPort, OperationHandle, OperationId,
-    ReasoningEffort, RuntimeConfig, RuntimeFuture, SessionId, ToolPort, UserMessage,
+    AgentAvailability, AgentError, AgentRuntime, CompactionError, CompactionReport, IdSource,
+    ModelPort, OperationHandle, OperationId, ReasoningEffort, RuntimeConfig, RuntimeFuture,
+    SessionId, ToolPort, UserMessage,
 };
-use philo_model::PhiloModelAdapter;
 use philo_session_jsonl::JsonlSessionStore;
 use philo_tui::HostError;
 
@@ -129,15 +129,8 @@ impl RuntimeControl {
 
     pub fn rebuild_model(&self, name: &str) -> Result<(), HostError> {
         // Build first: a rejected name must not disturb the serving assembly.
-        let adapter = PhiloModelAdapter::builder(
-            self.deployment.provider.clone(),
-            self.deployment.protocol,
-            name.to_owned(),
-            self.deployment.endpoint.clone(),
-        )
-        .api_key_env(&self.deployment.api_key_env)
-        .build()
-        .map_err(|error| HostError::new(format!("{error}")))?;
+        let adapter = crate::assembly::build_model(&self.deployment, name)
+            .map_err(|error| HostError::new(format!("{error}")))?;
         let model: Arc<dyn ModelPort> = Arc::new(ReasoningModel {
             inner: Arc::new(adapter),
             state: self.reasoning.clone(),
@@ -149,6 +142,14 @@ impl RuntimeControl {
 
     pub fn set_reasoning(&self, effort: ReasoningEffort) {
         self.reasoning.lock().expect("reasoning state lock").next = Some(effort);
+    }
+
+    pub fn compact(
+        &self,
+        session_id: SessionId,
+    ) -> RuntimeFuture<'static, Result<CompactionReport, CompactionError>> {
+        let runtime = self.runtime();
+        Box::pin(async move { runtime.compact(session_id).await })
     }
 
     fn runtime(&self) -> Arc<AgentRuntime> {
@@ -167,8 +168,14 @@ impl RuntimeControl {
         mutate: impl FnOnce(&mut RuntimeConfig),
     ) -> Result<(), HostError> {
         let mut assembly = self.assembly.lock().expect("host assembly lock");
-        if let AgentAvailability::Busy { .. } = assembly.runtime.availability() {
-            return Err(HostError::new("a turn is still running"));
+        match assembly.runtime.availability() {
+            AgentAvailability::Idle => {}
+            AgentAvailability::Busy { .. } => {
+                return Err(HostError::new("a turn is still running"));
+            }
+            AgentAvailability::Compacting { .. } => {
+                return Err(HostError::new("context compaction is still running"));
+            }
         }
         let mut config = assembly.config.clone();
         mutate(&mut config);

@@ -259,6 +259,31 @@ async fn a_cancelled_turn_leaves_no_reasoning_for_the_next_turn() {
 
 // --- M7-004: reasoning-effort mapping and negotiation failure --------------------
 
+#[test]
+fn protocol_capabilities_cover_each_reasoning_effort_level() {
+    let all_efforts = [
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::VeryHigh,
+        ReasoningEffort::Maximum,
+    ];
+    for effort in all_efforts {
+        assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(effort));
+        assert!(
+            ModelProtocol::OpenAiChatCompatibleReasoningEffort.supports_reasoning_effort(effort)
+        );
+        assert!(ModelProtocol::OpenAiResponses.supports_reasoning_effort(effort));
+        assert!(!ModelProtocol::OpenAiChatCompatible.supports_reasoning_effort(effort));
+        assert!(!ModelProtocol::OpenAiChatReasoningContent.supports_reasoning_effort(effort));
+    }
+
+    assert!(ModelProtocol::AnthropicMessages.supports_reasoning_effort(ReasoningEffort::Maximum));
+    assert!(!ModelProtocol::AnthropicMessages.supports_reasoning_effort(ReasoningEffort::Minimal));
+    assert!(!ModelProtocol::AnthropicMessages.supports_reasoning_effort(ReasoningEffort::VeryHigh));
+}
+
 #[tokio::test]
 async fn reasoning_effort_maps_into_the_official_openai_request() {
     let transport =
@@ -281,6 +306,37 @@ async fn reasoning_effort_maps_into_the_official_openai_request() {
         body.get("temperature").is_none(),
         "reasoning requests omit sampling controls rejected by reasoning models"
     );
+}
+
+#[tokio::test]
+async fn compatible_reasoning_effort_profile_uses_the_common_request_shape() {
+    let transport =
+        StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiChatCompatibleReasoningEffort,
+        "stub-model",
+        support::STUB_ENDPOINT,
+    )
+    .build_with_transport(transport.clone())
+    .expect("compatible reasoning-effort adapter assembly");
+    let stream = adapter
+        .start(reasoning_snapshot(
+            "turn-1",
+            1,
+            Some(ReasoningEffort::Low),
+            vec![user("hi")],
+            Vec::new(),
+        ))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+
+    let body = &transport.request_bodies()[0];
+    assert_eq!(body["reasoning_effort"], "low");
+    assert_eq!(body["max_tokens"], 256);
+    assert!(body.get("max_completion_tokens").is_none());
+    assert!(body.get("stream_options").is_none());
 }
 
 #[tokio::test]

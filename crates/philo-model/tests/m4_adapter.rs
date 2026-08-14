@@ -7,12 +7,14 @@ mod support;
 
 use std::time::Duration;
 
-use http::header::AUTHORIZATION;
+use http::header::{AUTHORIZATION, USER_AGENT};
 use philo_agent_runtime::{
     ModelEvent, ModelMessage, ModelPort, ModelToolCall, ModelToolResultOutcome, ToolCallId,
     UserPart,
 };
-use philo_model::{ModelProtocol, PhiloModelAdapter, TimeoutPolicy};
+use philo_model::{
+    DEFAULT_USER_AGENT, ModelProtocol, ModelRequestHeaders, PhiloModelAdapter, TimeoutPolicy,
+};
 use support::{
     StubResponse, StubTransport, adapter_over, collect, collect_ok, read_tool_definition, snapshot,
     sse, text_sse,
@@ -584,11 +586,42 @@ async fn api_key_env_resolves_to_a_bearer_authorization_header() {
     collect_ok(stream).await;
 
     let requests = transport.requests();
+    assert_eq!(requests[0].headers[USER_AGENT], DEFAULT_USER_AGENT);
     let authorization = requests[0]
         .headers
         .get(AUTHORIZATION)
         .expect("authorization header present");
     assert_eq!(authorization.to_str().unwrap(), "Bearer test-secret");
+}
+
+#[tokio::test]
+async fn deployment_headers_override_the_default_user_agent_and_reach_transport() {
+    let transport =
+        StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
+    let headers = ModelRequestHeaders::try_from_iter([
+        ("User-Agent", "configured-agent/1"),
+        ("X-Route", "deployment-a"),
+    ])
+    .expect("valid request headers");
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiChat,
+        "stub-model",
+        support::STUB_ENDPOINT,
+    )
+    .request_headers(headers)
+    .build_with_transport(transport.clone())
+    .expect("adapter assembly");
+
+    let stream = adapter
+        .start(snapshot(vec![user("hi")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+
+    let requests = transport.requests();
+    assert_eq!(requests[0].headers[USER_AGENT], "configured-agent/1");
+    assert_eq!(requests[0].headers["x-route"], "deployment-a");
 }
 
 #[tokio::test]

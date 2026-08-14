@@ -13,12 +13,14 @@
 mod adapter;
 mod assemble;
 mod error;
+mod headers;
 mod replay;
 mod request;
 mod stream;
 
 pub use adapter::PhiloModelAdapter;
 pub use assemble::{AdapterBuildError, ModelProtocol, PhiloModelBuilder};
+pub use headers::{DEFAULT_USER_AGENT, ModelRequestHeaderError, ModelRequestHeaders};
 
 // Assembly-time SDK vocabulary re-exported for adapter callers.
 pub use philo::api::extension::Transport;

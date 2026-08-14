@@ -1,7 +1,5 @@
 ---
 source: crates/philo-tui/src/app/state.rs
-description: slash help output remains stable across source layout changes
-assertion_line: 715
 expression: "texts(&appended(&run(&mut app, \"/help\"))).join(\"\\n\")"
 ---
 /help
@@ -11,6 +9,7 @@ commands:
   /sessions           pick a session to continue
   /model <name>       switch the model (idle only)
   /reasoning <level>  reasoning effort, from the next turn on
+  /compact            summarize older context (idle only)
   /image <path>       attach an image to the next message
   /verbose            toggle the information tier (same as Ctrl+O)
   /status             session, model, usage and the tool lineup

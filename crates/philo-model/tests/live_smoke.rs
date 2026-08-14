@@ -29,6 +29,9 @@ fn live_adapter() -> Option<PhiloModelAdapter> {
     let protocol = match std::env::var("PHILO_M4_LIVE_PROTOCOL").as_deref() {
         Ok("anthropic-messages") => ModelProtocol::AnthropicMessages,
         Ok("openai-chat") => ModelProtocol::OpenAiChat,
+        Ok("openai-chat-compatible-reasoning-effort") => {
+            ModelProtocol::OpenAiChatCompatibleReasoningEffort
+        }
         Ok("openai-chat-reasoning-content") => ModelProtocol::OpenAiChatReasoningContent,
         Ok("openai-responses") => ModelProtocol::OpenAiResponses,
         _ => ModelProtocol::OpenAiChatCompatible,
@@ -53,6 +56,7 @@ fn config(max_tool_rounds: u32, system_prompt: &str) -> RuntimeConfig {
         },
         max_tool_rounds,
         operation_timeout: None,
+        compaction: Default::default(),
     }
 }
 

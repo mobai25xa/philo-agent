@@ -16,7 +16,7 @@ pub struct CommandSpec {
     pub summary: &'static str,
 }
 
-/// The v1 command table (contract-level; ten entries).
+/// The command table (contract-level).
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
@@ -42,6 +42,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "reasoning",
         usage: "/reasoning <level>",
         summary: "reasoning effort, from the next turn on",
+    },
+    CommandSpec {
+        name: "compact",
+        usage: "/compact",
+        summary: "summarize older context (idle only)",
     },
     CommandSpec {
         name: "image",
@@ -82,6 +87,7 @@ pub enum Command {
     Sessions,
     Model { name: Option<String> },
     Reasoning { level: Option<String> },
+    Compact,
     Image { path: Option<String> },
     Verbose,
     Status,
@@ -120,6 +126,7 @@ pub fn parse(input: &str) -> Result<Command, UnknownCommand> {
         "sessions" => Ok(Command::Sessions),
         "model" => Ok(Command::Model { name: argument }),
         "reasoning" => Ok(Command::Reasoning { level: argument }),
+        "compact" => Ok(Command::Compact),
         "image" => Ok(Command::Image { path: argument }),
         "verbose" => Ok(Command::Verbose),
         "status" => Ok(Command::Status),
@@ -234,6 +241,7 @@ mod tests {
                 "sessions",
                 "model",
                 "reasoning",
+                "compact",
                 "image",
                 "verbose",
                 "status",
@@ -262,6 +270,7 @@ mod tests {
                 level: Some("high".to_owned())
             })
         );
+        assert_eq!(parse("/compact"), Ok(Command::Compact));
         assert_eq!(
             parse("/image  a b/c.png "),
             Ok(Command::Image {

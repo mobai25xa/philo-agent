@@ -1,0 +1,12 @@
+---
+source: crates/philo-tui/src/tests/m13_compaction.rs
+expression: "output.join(\"\\n\")"
+---
+Notice: compacting context...
+status: model model-a | session s-1 | compacting [|] | tokens in 9000 out -
+Meta: context compacted
+status: model model-a | session s-1 | busy
+Notice: compacting context...
+Error: warning: context compaction failed: summary model unavailable; continuing without compaction
+partial: Some((Answer, "turn continues"))
+status: model model-a | session s-1 | busy | tokens in 4000 out -

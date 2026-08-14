@@ -279,6 +279,26 @@ impl Transcript {
                     ));
                 }
             }
+            AgentEvent::ContextCompactionStarted => {
+                lines.push(line(LineKind::Notice, "compacting context..."));
+            }
+            AgentEvent::ContextCompactionCompleted { covers_up_to } => {
+                let text = if verbose {
+                    format!("context compacted through {covers_up_to}")
+                } else {
+                    "context compacted".to_owned()
+                };
+                lines.push(line(LineKind::Meta, text));
+            }
+            AgentEvent::ContextCompactionFailed { message } => {
+                lines.push(line(
+                    LineKind::Error,
+                    format!(
+                        "warning: context compaction failed: {message}; continuing without \
+                         compaction"
+                    ),
+                ));
+            }
             AgentEvent::CancellationRequested { reason, .. } => {
                 lines.extend(self.flush_partial());
                 lines.push(line(

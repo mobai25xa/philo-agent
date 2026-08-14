@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use philo_agent_runtime::{IdSource, ModelPort, RuntimeConfig, ToolPort};
 use philo_coding_profile::CodingProfile;
-use philo_model::PhiloModelAdapter;
+use philo_model::{AdapterBuildError, PhiloModelAdapter};
 use philo_session_jsonl::JsonlSessionStore;
 
 use crate::args::Cli;
@@ -48,6 +48,7 @@ impl RunAssembly {
             runtime_config.generation.reasoning_effort = settings.reasoning_effort;
         }
         runtime_config.operation_timeout = settings.operation_timeout;
+        runtime_config.compaction = settings.compaction.clone();
 
         let sessions = Arc::new(
             JsonlSessionStore::open(&settings.data_dir).map_err(|error| {
@@ -55,15 +56,8 @@ impl RunAssembly {
             })?,
         );
         let model: Arc<dyn ModelPort> = Arc::new(
-            PhiloModelAdapter::builder(
-                settings.deployment.provider.clone(),
-                settings.deployment.protocol,
-                settings.deployment.model.clone(),
-                settings.deployment.endpoint.clone(),
-            )
-            .api_key_env(&settings.deployment.api_key_env)
-            .build()
-            .map_err(|error| UsageError::new(format!("model assembly failed: {error}")))?,
+            build_model(&settings.deployment, &settings.deployment.model)
+                .map_err(|error| UsageError::new(format!("model assembly failed: {error}")))?,
         );
         let ids: Arc<dyn IdSource> = Arc::new(ProcessIdSource::new());
         let tools: Arc<dyn ToolPort> = Arc::new(profile.tool_registry());
@@ -77,4 +71,21 @@ impl RunAssembly {
             tools,
         })
     }
+}
+
+/// One model construction path shared by startup and interactive `/model`
+/// rebuilding, so deployment headers and credentials cannot drift.
+pub(crate) fn build_model(
+    deployment: &crate::config::Deployment,
+    model: &str,
+) -> Result<PhiloModelAdapter, AdapterBuildError> {
+    PhiloModelAdapter::builder(
+        deployment.provider.clone(),
+        deployment.protocol,
+        model,
+        deployment.endpoint.clone(),
+    )
+    .api_key_env(&deployment.api_key_env)
+    .request_headers(deployment.request_headers.clone())
+    .build()
 }

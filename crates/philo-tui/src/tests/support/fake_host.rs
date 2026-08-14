@@ -1,11 +1,12 @@
 //! Host double used by state-machine and cross-layer tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use philo_agent_runtime::{
-    AgentError, OperationHandle, ReasoningEffort, RuntimeFuture, SessionId, ToolDefinition,
-    UserMessage,
+    AgentError, CompactionError, CompactionReport, OperationHandle, ReasoningEffort, RuntimeFuture,
+    SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::SessionContextView;
 
@@ -24,6 +25,22 @@ pub(crate) struct FakeHost {
     config: Mutex<Vec<ConfigEntry>>,
     tools: Mutex<Vec<ToolDefinition>>,
     next_session_id: Mutex<String>,
+    compaction_scripts: Mutex<VecDeque<FakeCompactionScript>>,
+    compaction_calls: Mutex<Vec<SessionId>>,
+    compaction_cancellations: Arc<AtomicUsize>,
+}
+
+enum FakeCompactionScript {
+    Ready(Result<CompactionReport, CompactionError>),
+    Pending,
+}
+
+struct PendingCompactionGuard(Arc<AtomicUsize>);
+
+impl Drop for PendingCompactionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for FakeHost {
@@ -44,6 +61,9 @@ impl Default for FakeHost {
             }]),
             tools: Mutex::default(),
             next_session_id: Mutex::new("fake-new-session".to_owned()),
+            compaction_scripts: Mutex::default(),
+            compaction_calls: Mutex::default(),
+            compaction_cancellations: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -98,6 +118,31 @@ impl FakeHost {
     pub(crate) fn set_next_session_id(&self, id: &str) {
         *self.next_session_id.lock().expect("fake host mutex") = id.to_owned();
     }
+
+    pub(crate) fn enqueue_compaction(&self, result: Result<CompactionReport, CompactionError>) {
+        self.compaction_scripts
+            .lock()
+            .expect("fake host mutex")
+            .push_back(FakeCompactionScript::Ready(result));
+    }
+
+    pub(crate) fn enqueue_pending_compaction(&self) {
+        self.compaction_scripts
+            .lock()
+            .expect("fake host mutex")
+            .push_back(FakeCompactionScript::Pending);
+    }
+
+    pub(crate) fn compaction_calls(&self) -> Vec<SessionId> {
+        self.compaction_calls
+            .lock()
+            .expect("fake host mutex")
+            .clone()
+    }
+
+    pub(crate) fn compaction_cancellations(&self) -> usize {
+        self.compaction_cancellations.load(Ordering::SeqCst)
+    }
 }
 
 impl TuiHost for FakeHost {
@@ -111,6 +156,34 @@ impl TuiHost for FakeHost {
             .expect("fake host mutex")
             .push((session_id, message));
         Box::pin(async { Err(AgentError::new("fake host has no runtime")) })
+    }
+
+    fn compact(
+        &self,
+        session_id: SessionId,
+    ) -> RuntimeFuture<'static, Result<CompactionReport, CompactionError>> {
+        self.compaction_calls
+            .lock()
+            .expect("fake host mutex")
+            .push(session_id);
+        let script = self
+            .compaction_scripts
+            .lock()
+            .expect("fake host mutex")
+            .pop_front()
+            .unwrap_or(FakeCompactionScript::Ready(Ok(
+                CompactionReport::NothingToCompact,
+            )));
+        match script {
+            FakeCompactionScript::Ready(result) => Box::pin(async move { result }),
+            FakeCompactionScript::Pending => {
+                let cancellations = self.compaction_cancellations.clone();
+                Box::pin(async move {
+                    let _guard = PendingCompactionGuard(cancellations);
+                    std::future::pending::<Result<CompactionReport, CompactionError>>().await
+                })
+            }
+        }
     }
 
     fn list_sessions(&self) -> Result<Vec<philo_session::SessionId>, HostError> {

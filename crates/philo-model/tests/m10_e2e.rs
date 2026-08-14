@@ -100,6 +100,7 @@ async fn m10_001_truncated_tool_output_is_the_single_source_of_truth() {
             },
             max_tool_rounds: 1,
             operation_timeout: None,
+            compaction: Default::default(),
         },
         Arc::new(registry),
     );

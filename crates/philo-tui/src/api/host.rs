@@ -6,8 +6,8 @@
 //! interaction tests drive the TUI with a fake host.
 
 use philo_agent_runtime::{
-    AgentError, OperationHandle, ReasoningEffort, RuntimeFuture, SessionId, ToolDefinition,
-    UserMessage,
+    AgentError, CompactionError, CompactionReport, OperationHandle, ReasoningEffort, RuntimeFuture,
+    SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::SessionContextView;
 
@@ -55,6 +55,14 @@ pub trait TuiHost: Send + Sync {
         session_id: SessionId,
         message: UserMessage,
     ) -> RuntimeFuture<'a, Result<OperationHandle, AgentError>>;
+
+    /// Starts manual context compaction. The returned future must own the
+    /// host-side dependencies it needs so the driver can keep polling it
+    /// independently and cancel it by dropping it on `Esc`.
+    fn compact(
+        &self,
+        session_id: SessionId,
+    ) -> RuntimeFuture<'static, Result<CompactionReport, CompactionError>>;
 
     /// Enumerates known session ids (read-only).
     fn list_sessions(&self) -> Result<Vec<philo_session::SessionId>, HostError>;

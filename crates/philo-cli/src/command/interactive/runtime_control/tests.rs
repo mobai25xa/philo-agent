@@ -1,8 +1,8 @@
 use philo_agent_runtime::{
-    GenerationConfig, ModelCallSnapshot, ModelError, ModelEventStream, SequentialIdSource,
-    ToolChoice, ToolRegistry,
+    CompactionConfig, CompactionReport, GenerationConfig, ModelCallSnapshot, ModelError,
+    ModelEventStream, SequentialIdSource, ToolChoice, ToolRegistry,
 };
-use philo_model::ModelProtocol;
+use philo_model::{ModelProtocol, ModelRequestHeaders};
 
 use super::*;
 
@@ -34,6 +34,7 @@ fn control(dir: &std::path::Path) -> RuntimeControl {
             model: "model-a".to_owned(),
             endpoint: "https://example.test/v1/chat/completions".to_owned(),
             api_key_env: "PHILO_API_KEY".to_owned(),
+            request_headers: ModelRequestHeaders::default(),
         },
         RuntimeConfig {
             system_prompt: "s".to_owned(),
@@ -46,6 +47,12 @@ fn control(dir: &std::path::Path) -> RuntimeControl {
             },
             max_tool_rounds: 1,
             operation_timeout: None,
+            compaction: CompactionConfig {
+                context_budget: Some(64_000),
+                auto_threshold: 0.7,
+                keep_recent_turns: 6,
+                estimate_bytes_per_token: 4,
+            },
         },
         Arc::new(InertModel),
         Arc::new(JsonlSessionStore::open(dir).expect("open store")),
@@ -66,6 +73,16 @@ fn idle_model_rebuild_replaces_runtime_and_keeps_configuration() {
     assert_eq!(
         control.assembly.lock().expect("lock").config.model_target,
         "model-b"
+    );
+    assert_eq!(
+        control.assembly.lock().expect("lock").config.compaction,
+        CompactionConfig {
+            context_budget: Some(64_000),
+            auto_threshold: 0.7,
+            keep_recent_turns: 6,
+            estimate_bytes_per_token: 4,
+        },
+        "model rebuilding preserves the resolved compaction policy"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -93,5 +110,17 @@ async fn reasoning_is_frozen_per_operation_without_rebuilding() {
         state.operations.get(second.operation_id()),
         Some(&Some(ReasoningEffort::High))
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn compact_future_owns_the_runtime_and_does_not_borrow_the_control() {
+    let dir = temp_dir("owned-compact");
+    let control = control(&dir);
+
+    let future = control.compact(SessionId::new("empty-session"));
+    drop(control);
+
+    assert_eq!(future.await, Ok(CompactionReport::NothingToCompact));
     let _ = std::fs::remove_dir_all(dir);
 }

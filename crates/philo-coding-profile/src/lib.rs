@@ -160,6 +160,7 @@ impl CodingProfile {
             // The operation timeout is deployment configuration, not
             // scenario knowledge: the profile keeps it disabled.
             operation_timeout: None,
+            compaction: Default::default(),
         }
     }
 }

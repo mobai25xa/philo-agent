@@ -20,6 +20,7 @@ pub fn interpret(key: &KeyEvent) -> Action {
         KeyCode::Char('d' | 'D') if ctrl => Action::CtrlD,
         KeyCode::Char('o' | 'O') if ctrl => Action::ToggleLevel,
         KeyCode::Char('l' | 'L') if ctrl => Action::Redraw,
+        KeyCode::Char('v' | 'V') if ctrl => Action::Paste,
         KeyCode::Esc => Action::Escape,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::Delete,
@@ -78,6 +79,11 @@ mod tests {
         assert_eq!(
             interpret(&key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             Action::Redraw
+        );
+        assert_eq!(
+            interpret(&key(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Action::Paste,
+            "terminals that keep Ctrl+V for themselves send a paste event instead"
         );
     }
 

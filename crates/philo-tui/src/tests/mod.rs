@@ -1,5 +1,7 @@
 //! Crate-internal test support and cross-layer fixtures.
 
+mod attachments;
+mod m12_flow;
 pub(crate) mod support;
 
 macro_rules! assert_tui_snapshot {

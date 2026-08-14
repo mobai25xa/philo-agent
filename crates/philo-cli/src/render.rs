@@ -9,17 +9,12 @@ use philo_agent_runtime::{
     AgentEvent, CancelReason, OperationStatus, SettlementDurability, TokenUsage,
 };
 
+use crate::config::Verbosity;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
     Stdout,
     Stderr,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verbosity {
-    Default,
-    Verbose,
-    Quiet,
 }
 
 /// One rendered write: the text goes to the channel exactly as given
@@ -56,6 +51,8 @@ pub struct Renderer {
     /// The cancellation reason observed on this operation (M11), suffixed
     /// onto the terminal line.
     cancel_reason: Option<CancelReason>,
+    /// `[ui].show_reasoning`: when off, reasoning never reaches stderr.
+    show_reasoning: bool,
 }
 
 impl Renderer {
@@ -67,7 +64,14 @@ impl Renderer {
             reasoning_open: false,
             tool_batch_size: 0,
             cancel_reason: None,
+            show_reasoning: true,
         }
+    }
+
+    /// Applies `[ui].show_reasoning` from the configuration chain.
+    pub fn with_reasoning(mut self, show: bool) -> Self {
+        self.show_reasoning = show;
+        self
     }
 
     fn verbose(&self) -> bool {
@@ -98,7 +102,7 @@ impl Renderer {
                 }
             }
             AgentEvent::ReasoningDelta { text, .. } => {
-                if !self.quiet() && !text.is_empty() {
+                if self.show_reasoning && !self.quiet() && !text.is_empty() {
                     if !self.reasoning_open {
                         outputs.push(err("[reasoning] "));
                         self.reasoning_open = true;
@@ -431,6 +435,14 @@ mod tests {
                 "stdout is exactly the answer plus the final newline ({verbosity:?})"
             );
         }
+    }
+
+    #[test]
+    fn show_reasoning_false_drops_the_reasoning_stream() {
+        let mut renderer = Renderer::new(Verbosity::Default).with_reasoning(false);
+        let outputs = render_all(&mut renderer, &[reasoning("hidden"), text("answer")]);
+        assert_eq!(stderr_text(&outputs), "");
+        assert_eq!(stdout_text(&outputs), "answer");
     }
 
     #[test]

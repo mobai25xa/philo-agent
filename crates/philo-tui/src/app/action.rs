@@ -25,5 +25,8 @@ pub(crate) enum Action {
     Redraw,
     /// `Tab`: slash-command completion.
     Complete,
+    /// `Ctrl+V` reached the app: the terminal did not turn it into a
+    /// bracketed paste, so the clipboard has to be read directly.
+    Paste,
     None,
 }

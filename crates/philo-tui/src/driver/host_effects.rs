@@ -154,11 +154,8 @@ fn config_lines(host: &dyn TuiHost) -> Vec<TranscriptLine> {
 
 fn status_lines(app: &App, host: &dyn TuiHost) -> Vec<TranscriptLine> {
     let mut lines = vec![line(LineKind::Meta, app.status.line())];
-    if !app.attachments().is_empty() {
-        lines.push(line(
-            LineKind::Meta,
-            format!("attachments queued: {}", app.attachments().join(", ")),
-        ));
+    if let Some(summary) = app.attachments().summary() {
+        lines.push(line(LineKind::Meta, summary));
     }
     let tools = host.tool_definitions();
     if tools.is_empty() {
@@ -211,7 +208,10 @@ mod tests {
     use crate::tests::support::{FakeHost, session_view, tool};
 
     fn app() -> App {
-        App::new(StatusData::new("model-a", "current", InfoLevel::Default))
+        App::new(
+            StatusData::new("model-a", "current", InfoLevel::Default),
+            true,
+        )
     }
 
     fn type_text(app: &mut App, text: &str) {

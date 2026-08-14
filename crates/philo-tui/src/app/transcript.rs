@@ -55,11 +55,17 @@ pub struct Transcript {
     partial_answer: String,
     partial_reasoning: String,
     tool_batch_size: usize,
+    /// `[ui].show_reasoning`: when off, reasoning deltas are dropped rather
+    /// than rendered dim (the model still receives them).
+    show_reasoning: bool,
 }
 
 impl Transcript {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(show_reasoning: bool) -> Self {
+        Self {
+            show_reasoning,
+            ..Self::default()
+        }
     }
 
     /// The unfinished streaming line for the live row, if any.
@@ -106,6 +112,7 @@ impl Transcript {
                     lines.push(line(LineKind::Answer, completed));
                 }
             }
+            AgentEvent::ReasoningDelta { .. } if !self.show_reasoning => {}
             AgentEvent::ReasoningDelta { text, .. } => {
                 if !self.partial_answer.is_empty() {
                     let answer = std::mem::take(&mut self.partial_answer);
@@ -422,7 +429,7 @@ mod snapshots {
     }
 
     fn render(level: InfoLevel) -> String {
-        let mut transcript = Transcript::new();
+        let mut transcript = Transcript::new(true);
         let mut lines = Vec::new();
         for event in event_sequence() {
             lines.extend(transcript.on_event(&event, level));
@@ -447,6 +454,20 @@ mod snapshots {
     #[test]
     fn verbose_render_snapshot() {
         crate::tests::assert_tui_snapshot!("transcript_verbose", render(InfoLevel::Verbose));
+    }
+
+    #[test]
+    fn reasoning_can_be_switched_off_entirely() {
+        let mut transcript = Transcript::new(false);
+        let lines = transcript.on_event(
+            &AgentEvent::ReasoningDelta {
+                model_call_id: ModelCallId::new("call-1"),
+                text: "thinking\n".to_owned(),
+            },
+            InfoLevel::Verbose,
+        );
+        assert!(lines.is_empty(), "no reasoning reaches the transcript");
+        assert_eq!(transcript.partial(), None);
     }
 
     #[test]

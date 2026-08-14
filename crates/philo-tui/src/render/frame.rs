@@ -7,12 +7,17 @@ use ratatui::widgets::Paragraph;
 use crate::app::state::App;
 use crate::app::transcript::TranscriptLine;
 
-use super::line::styled_line;
+use super::markdown::MarkdownRenderer;
 
 const INPUT_WINDOW: usize = 5;
 const OVERLAY_BODY: usize = 5;
 
-pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, shift_enter: bool) {
+pub(crate) fn draw(
+    frame: &mut ratatui::Frame<'_>,
+    app: &App,
+    markdown: &MarkdownRenderer,
+    shift_enter: bool,
+) {
     use ratatui::style::{Color, Modifier, Style};
 
     let live = app.transcript.partial().map(|(kind, text)| TranscriptLine {
@@ -58,7 +63,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, shift_enter: bool)
     .areas(frame.area());
 
     if let Some(live) = &live {
-        frame.render_widget(Paragraph::new(styled_line(live)), live_area);
+        frame.render_widget(Paragraph::new(markdown.preview(live)), live_area);
     }
 
     let first_visible = cursor_row.saturating_sub(INPUT_WINDOW - 1);
@@ -74,14 +79,18 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, shift_enter: bool)
         .collect();
     frame.render_widget(Paragraph::new(visible), input_area);
 
-    let hint = completion.unwrap_or_else(|| {
-        let newline_hint = if shift_enter {
-            "Shift+Enter/Ctrl+J newline"
-        } else {
-            "Ctrl+J newline"
-        };
-        format!("Enter send | {newline_hint} | Esc cancel | Ctrl+C clear/exit | Ctrl+O detail")
-    });
+    // The completion menu is transient and wins the row; waiting
+    // attachments stay visible until they ride a message.
+    let hint = completion
+        .or_else(|| app.attachments().summary())
+        .unwrap_or_else(|| {
+            let newline_hint = if shift_enter {
+                "Shift+Enter/Ctrl+J newline"
+            } else {
+                "Ctrl+J newline"
+            };
+            format!("Enter send | {newline_hint} | Esc cancel | Ctrl+C clear/exit | Ctrl+O detail")
+        });
     frame.render_widget(
         Paragraph::new(Line::styled(hint, Style::default().fg(Color::DarkGray))),
         hint_area,

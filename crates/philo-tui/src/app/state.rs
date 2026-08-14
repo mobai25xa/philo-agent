@@ -8,6 +8,7 @@ use philo_session::SessionId;
 use crate::api::confirmation::{ConfirmationId, ConfirmationRequest, ConfirmationResponse};
 
 use super::action::Action;
+use super::attachment::{Attachments, PendingAttachment};
 use super::command::{self, Command};
 use super::effect::{Effect, HostRequest};
 use super::input::InputEditor;
@@ -81,16 +82,18 @@ pub(crate) struct App {
     confirm: Option<ConfirmPrompt>,
     /// The command-completion menu, while Tab is cycling.
     completion: Option<CompletionMenu>,
-    /// Image paths registered by `/image` for the next message.
-    attachments: Vec<String>,
+    /// Images waiting for the next message (`/image`, `Ctrl+V`).
+    attachments: Attachments,
+    /// `[ui].show_reasoning`, carried across session switches.
+    show_reasoning: bool,
 }
 
 impl App {
-    pub fn new(status: StatusData) -> Self {
+    pub fn new(status: StatusData, show_reasoning: bool) -> Self {
         let level = status.level;
         Self {
             input: InputEditor::new(),
-            transcript: Transcript::new(),
+            transcript: Transcript::new(show_reasoning),
             status,
             level,
             history: Vec::new(),
@@ -101,7 +104,8 @@ impl App {
             picker: None,
             confirm: None,
             completion: None,
-            attachments: Vec::new(),
+            attachments: Attachments::default(),
+            show_reasoning,
         }
     }
 
@@ -110,8 +114,8 @@ impl App {
         self.level
     }
 
-    /// Image paths waiting for the next message (`/image`).
-    pub fn attachments(&self) -> &[String] {
+    /// Images waiting for the next message (`/image`, `Ctrl+V`).
+    pub fn attachments(&self) -> &Attachments {
         &self.attachments
     }
 
@@ -154,7 +158,7 @@ impl App {
     pub(crate) fn begin_session(&mut self, session_id: &str) {
         self.status.session = session_id.to_owned();
         self.status.usage = None;
-        self.transcript = Transcript::new();
+        self.transcript = Transcript::new(self.show_reasoning);
     }
 
     pub(crate) fn open_picker(&mut self, sessions: Vec<SessionId>) {
@@ -273,6 +277,7 @@ impl App {
             Action::ToggleLevel => vec![Effect::Append(vec![self.toggle_level()])],
             Action::Redraw => vec![Effect::Redraw],
             Action::Complete => self.complete(),
+            Action::Paste => vec![Effect::ReadClipboard],
             Action::None => vec![],
         }
     }
@@ -288,6 +293,45 @@ impl App {
         self.input.insert_str(text);
         self.disarm_quit_unless_typing_quit();
         vec![]
+    }
+
+    /// Queues an image the driver decoded from the clipboard.
+    pub(crate) fn attach_image(
+        &mut self,
+        media_type: String,
+        bytes: Vec<u8>,
+        origin: &str,
+    ) -> Vec<Effect> {
+        let attachment = PendingAttachment::Image {
+            media_type,
+            bytes,
+            origin: origin.to_owned(),
+        };
+        let label = attachment.label();
+        self.attachments.push(attachment);
+        vec![Effect::Append(vec![line(
+            LineKind::Meta,
+            format!(
+                "attached: {label} ({} waiting for the next message)",
+                self.attachments.len()
+            ),
+        )])]
+    }
+
+    /// The clipboard held nothing usable: say so and point at `/image`,
+    /// leaving the draft untouched.
+    pub(crate) fn clipboard_unavailable(&self, reason: &str) -> Vec<Effect> {
+        vec![Effect::Append(vec![line(
+            LineKind::Notice,
+            format!("no image on the clipboard ({reason}); attach a file with /image <path>"),
+        )])]
+    }
+
+    /// Puts a refused message back for editing: the text returns to the
+    /// input and the attachments that did resolve stay queued.
+    pub(crate) fn restore_draft(&mut self, text: &str, attachments: Vec<PendingAttachment>) {
+        self.input.set_text(text);
+        self.attachments.extend(attachments);
     }
 
     /// Projects one agent event into transcript lines and status updates.
@@ -402,13 +446,20 @@ impl App {
             LineKind::User,
             format!("> {}", text.replace('\n', "\n> ")),
         )];
+        let attachments = self.attachments.take();
+        for attachment in &attachments {
+            lines.push(line(
+                LineKind::User,
+                format!("> [attached {}]", attachment.label()),
+            ));
+        }
         if self.status.busy {
             lines.push(line(
                 LineKind::Notice,
                 "busy: the message is queued behind the active turn",
             ));
         }
-        vec![Effect::Append(lines), Effect::Submit(text)]
+        vec![Effect::Append(lines), Effect::Submit { text, attachments }]
     }
 
     #[allow(clippy::too_many_lines)]
@@ -478,7 +529,7 @@ impl App {
                 lines.push(line(LineKind::Error, "usage: /image <path>"));
             }
             Ok(Command::Image { path: Some(path) }) => {
-                self.attachments.push(path.clone());
+                self.attachments.push(PendingAttachment::Path(path.clone()));
                 lines.push(line(
                     LineKind::Meta,
                     format!(
@@ -602,7 +653,7 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(StatusData::new("m", "s", InfoLevel::Default))
+        App::new(StatusData::new("m", "s", InfoLevel::Default), true)
     }
 
     fn type_text(app: &mut App, text: &str) {
@@ -660,7 +711,10 @@ mod tests {
                     kind: LineKind::User,
                     text: "> hello".to_owned(),
                 }]),
-                Effect::Submit("hello".to_owned()),
+                Effect::Submit {
+                    text: "hello".to_owned(),
+                    attachments: Vec::new(),
+                },
             ]
         );
         assert!(app.input.is_empty());
@@ -679,7 +733,13 @@ mod tests {
         let effects = run(&mut app, "next");
         let lines = appended(&effects);
         assert!(lines.iter().any(|line| line.text.contains("queued")));
-        assert_eq!(effects[1], Effect::Submit("next".to_owned()));
+        assert_eq!(
+            effects[1],
+            Effect::Submit {
+                text: "next".to_owned(),
+                attachments: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -795,7 +855,59 @@ mod tests {
             "image queued: shots/a.png (1 waiting for the next message)"
         );
         run(&mut app, "/image shots/b.png");
-        assert_eq!(app.attachments(), ["shots/a.png", "shots/b.png"]);
+        assert_eq!(app.attachments().labels(), ["shots/a.png", "shots/b.png"]);
+    }
+
+    #[test]
+    fn a_clipboard_image_joins_the_queue_and_rides_the_next_message() {
+        let mut app = app();
+        run(&mut app, "/image shots/a.png");
+        let effects = app.attach_image("image/png".to_owned(), vec![0; 2048], "clipboard image");
+        assert_eq!(
+            texts(&appended(&effects)),
+            ["attached: clipboard image (image/png, 2.0 KB) (2 waiting for the next message)"]
+        );
+
+        let effects = run(&mut app, "what is this?");
+        assert_eq!(
+            texts(&appended(&effects)),
+            [
+                "> what is this?",
+                "> [attached shots/a.png]",
+                "> [attached clipboard image (image/png, 2.0 KB)]",
+            ]
+        );
+        let Effect::Submit { attachments, .. } = &effects[1] else {
+            panic!("the message carries its attachments");
+        };
+        assert_eq!(attachments.len(), 2);
+        assert!(app.attachments().is_empty(), "the queue drains on send");
+    }
+
+    #[test]
+    fn a_refused_message_returns_to_the_input_with_its_survivors() {
+        let mut app = app();
+        run(&mut app, "/image missing.png");
+        let effects = run(&mut app, "look");
+        let Effect::Submit { text, attachments } = effects[1].clone() else {
+            panic!("submit carries the draft");
+        };
+        // The driver could not read one of them and hands back the rest.
+        app.restore_draft(&text, attachments[1..].to_vec());
+        assert_eq!(app.input.text(), "look");
+        assert!(app.attachments().is_empty());
+    }
+
+    #[test]
+    fn ctrl_v_asks_the_driver_for_the_clipboard() {
+        let mut app = app();
+        assert_eq!(app.on_action(Action::Paste), vec![Effect::ReadClipboard]);
+        let effects = app.clipboard_unavailable("clipboard is empty");
+        assert_eq!(
+            texts(&appended(&effects)),
+            ["no image on the clipboard (clipboard is empty); attach a file with /image <path>"]
+        );
+        assert!(app.attachments().is_empty());
     }
 
     #[test]

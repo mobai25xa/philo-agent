@@ -1,23 +1,34 @@
 //! Runtime coordinator for direct answers and the bounded multi-round tool loop.
 
-mod driver;
+mod config;
+mod engine;
 mod event;
+mod ids;
+mod mapping;
+mod message;
 mod model;
 mod operation;
+mod outcome;
 mod runtime;
 mod snapshot;
-mod tool;
 
+pub use config::{
+    DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ReasoningEffort, RuntimeConfig, ToolChoice,
+};
 pub use event::AgentEvent;
+pub use ids::{
+    IdSource, ModelCallId, OperationId, SequentialIdSource, SessionId, ToolBatchId, ToolCallId,
+    TurnId,
+};
+pub use message::{AssistantMessage, InvalidUserMessage, UserMessage, UserPart};
 pub use model::{
     ModelError, ModelEvent, ModelEventStream, ModelMessage, ModelPort, ModelToolCall,
     ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
 };
-pub use operation::{
-    AgentAvailability, AgentError, AgentFailure, AgentFailureKind, AssistantMessage, IdSource,
-    InvalidUserMessage, ModelCallId, ModelCallPhase, OperationHandle, OperationId,
-    OperationOutcome, OperationPhase, OperationStatus, RunningToolBatchPhase, SequentialIdSource,
-    SessionId, SettlementDurability, ToolBatchId, ToolCallId, TurnId, UserMessage, UserPart,
+pub use operation::OperationHandle;
+pub use outcome::{
+    AgentAvailability, AgentError, AgentFailure, AgentFailureKind, ModelCallPhase,
+    OperationOutcome, OperationPhase, OperationStatus, RunningToolBatchPhase, SettlementDurability,
 };
 pub use philo_session::CancelReason;
 pub use philo_tools::{
@@ -26,7 +37,4 @@ pub use philo_tools::{
     ToolRegistryBuilder, ToolResult, ToolResultError, ToolSchema, ToolSchemaInput,
 };
 pub use runtime::AgentRuntime;
-pub use snapshot::{
-    DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ModelCallSnapshot, ReasoningEffort, RuntimeConfig,
-    ToolChoice, TurnSnapshot,
-};
+pub use snapshot::{ModelCallSnapshot, TurnSnapshot};

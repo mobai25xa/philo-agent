@@ -1,0 +1,17 @@
+---
+source: crates/philo-tui/src/tests/attachments.rs
+description: attachment queueing, echo on send, and the refusal that returns the draft
+assertion_line: 73
+expression: "rendered.join(\"\\n\")"
+---
+/image shots/diagram.png
+image queued: shots/diagram.png (1 waiting for the next message)
+attached: clipboard image (image/png, 3.4 KB) (2 waiting for the next message)
+[hint row] attachments: shots/diagram.png, clipboard image (image/png, 3.4 KB)
+> compare these two
+> [attached shots/diagram.png]
+> [attached clipboard image (image/png, 3.4 KB)]
+error: cannot read image 'shots/diagram.png': entity not found
+the message was not sent; it is back in the input
+[input] compare these two
+[hint row] attachments: clipboard image (image/png, 3.4 KB)

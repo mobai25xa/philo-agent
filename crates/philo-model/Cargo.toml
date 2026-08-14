@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-philo = "=0.3.0"
+philo = "=0.4.1"
 philo-agent-runtime = { path = "../philo-agent-runtime" }
 # Image bytes hand off to the SDK as `bytes::Bytes` (the SDK's public input type).
 bytes = "1.10"

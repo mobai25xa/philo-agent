@@ -8,6 +8,8 @@ pub struct TuiConfig {
     pub model_name: String,
     /// Initial information tier (`--verbose` maps to verbose rendering).
     pub verbose: bool,
+    /// Whether visible reasoning reaches the transcript at all.
+    pub show_reasoning: bool,
     /// Context-budget hint for the status bar.
     pub context_window: Option<u64>,
 }

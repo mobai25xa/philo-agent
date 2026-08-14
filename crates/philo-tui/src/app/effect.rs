@@ -5,6 +5,7 @@ use philo_session::SessionId;
 
 use crate::api::confirmation::{ConfirmationId, ConfirmationResponse};
 
+use super::attachment::PendingAttachment;
 use super::transcript::TranscriptLine;
 
 /// One host-backed operation requested by a command or overlay.
@@ -25,7 +26,14 @@ pub(crate) enum HostRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Effect {
     Append(Vec<TranscriptLine>),
-    Submit(String),
+    /// Send this message; the driver resolves the attachments into image
+    /// parts first and refuses the send when one cannot be read.
+    Submit {
+        text: String,
+        attachments: Vec<PendingAttachment>,
+    },
+    /// `Ctrl+V` outside bracketed paste: read the system clipboard.
+    ReadClipboard,
     CancelActive,
     Quit,
     Redraw,

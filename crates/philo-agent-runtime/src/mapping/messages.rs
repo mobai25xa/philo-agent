@@ -1,116 +1,9 @@
-use crate::{
-    AgentFailure, AgentFailureKind, ModelMessage, ModelToolCall, ModelToolResultOutcome,
-    ToolCallDelta, ToolCallId, UserPart,
-};
+//! Projections of durable context and in-turn messages into model messages.
+
+use super::parts::{runtime_parts_from_kernel, runtime_parts_from_session};
+use crate::{ModelMessage, ModelToolCall, ModelToolResultOutcome, ToolCallId, TurnSnapshot};
 use philo_agent_kernel as kernel;
 use philo_session as session;
-use std::collections::{HashMap, HashSet};
-
-// Explicit per-field mapping chain for multi-part user payloads: each layer
-// owns its type, and image bytes pass through byte-for-byte.
-
-pub(crate) fn kernel_user_parts(parts: &[UserPart]) -> Vec<kernel::UserPart> {
-    parts
-        .iter()
-        .map(|part| match part {
-            UserPart::Text(text) => kernel::UserPart::Text(text.clone()),
-            UserPart::Image { media_type, bytes } => kernel::UserPart::Image {
-                media_type: media_type.clone(),
-                bytes: bytes.clone(),
-            },
-        })
-        .collect()
-}
-
-pub(crate) fn session_user_parts(parts: &[kernel::UserPart]) -> Vec<session::SessionUserPart> {
-    parts
-        .iter()
-        .map(|part| match part {
-            kernel::UserPart::Text(text) => session::SessionUserPart::Text(text.clone()),
-            kernel::UserPart::Image { media_type, bytes } => session::SessionUserPart::Image {
-                media_type: media_type.clone(),
-                bytes: bytes.clone(),
-            },
-        })
-        .collect()
-}
-
-fn runtime_parts_from_session(parts: &[session::SessionUserPart]) -> Vec<UserPart> {
-    parts
-        .iter()
-        .map(|part| match part {
-            session::SessionUserPart::Text(text) => UserPart::Text(text.clone()),
-            session::SessionUserPart::Image { media_type, bytes } => UserPart::Image {
-                media_type: media_type.clone(),
-                bytes: bytes.clone(),
-            },
-        })
-        .collect()
-}
-
-fn runtime_parts_from_kernel(parts: &[kernel::UserPart]) -> Vec<UserPart> {
-    parts
-        .iter()
-        .map(|part| match part {
-            kernel::UserPart::Text(text) => UserPart::Text(text.clone()),
-            kernel::UserPart::Image { media_type, bytes } => UserPart::Image {
-                media_type: media_type.clone(),
-                bytes: bytes.clone(),
-            },
-        })
-        .collect()
-}
-
-#[derive(Default)]
-pub(crate) struct OutputAssembler {
-    text: String,
-    calls: HashMap<usize, CallParts>,
-    order: Vec<usize>,
-}
-#[derive(Default)]
-struct CallParts {
-    id: String,
-    name: String,
-    arguments: String,
-}
-impl OutputAssembler {
-    pub fn text(&mut self, delta: &str) {
-        self.text.push_str(delta);
-    }
-    pub fn tool(&mut self, delta: ToolCallDelta) {
-        if !self.calls.contains_key(&delta.index) {
-            self.order.push(delta.index);
-        }
-        let parts = self.calls.entry(delta.index).or_default();
-        if let Some(id) = delta.id {
-            parts.id.push_str(&id);
-        }
-        if let Some(name) = delta.name {
-            parts.name.push_str(&name);
-        }
-        parts.arguments.push_str(&delta.arguments);
-    }
-    pub fn finish(self) -> Result<(String, Vec<kernel::KernelToolCall>), AgentFailure> {
-        if !self.calls.is_empty() && !self.text.is_empty() {
-            return Err(invalid("model mixed text and tool calls"));
-        }
-        let mut ids = HashSet::new();
-        let mut calls = Vec::new();
-        for index in self.order {
-            let parts = self.calls.get(&index).expect("recorded call index exists");
-            if parts.id.is_empty() || parts.name.trim().is_empty() || !ids.insert(parts.id.clone())
-            {
-                return Err(invalid("model produced incomplete or duplicate tool calls"));
-            }
-            calls.push(kernel::KernelToolCall::new(
-                kernel::ToolCallId::new(&parts.id),
-                &parts.name,
-                &parts.arguments,
-            ));
-        }
-        Ok((self.text, calls))
-    }
-}
 
 /// Projects durable context messages into model messages, synthesizing an
 /// `Interrupted` placeholder for every dangling tool call (M11).
@@ -200,7 +93,7 @@ fn flush_interrupted_placeholders(output: &mut Vec<ModelMessage>, pending: &mut 
     }
 }
 
-pub(crate) fn turn_messages(messages: Vec<kernel::TurnMessage>) -> Vec<ModelMessage> {
+fn turn_messages(messages: Vec<kernel::TurnMessage>) -> Vec<ModelMessage> {
     messages
         .into_iter()
         .map(|message| match message {
@@ -242,9 +135,16 @@ pub(crate) fn turn_messages(messages: Vec<kernel::TurnMessage>) -> Vec<ModelMess
         .collect()
 }
 
-pub(crate) fn invalid(message: impl Into<String>) -> AgentFailure {
-    AgentFailure::new(AgentFailureKind::InvalidModelOutput, message)
-}
-pub(crate) fn driver(message: impl Into<String>) -> AgentFailure {
-    AgentFailure::new(AgentFailureKind::RuntimeDriver, message)
+/// Assembles the full message list of one model call: system prompt, the
+/// frozen context, then the in-turn messages.
+pub(crate) fn build_messages(
+    turn: &TurnSnapshot,
+    messages: Vec<kernel::TurnMessage>,
+) -> Vec<ModelMessage> {
+    let mut output = vec![ModelMessage::System {
+        content: turn.system_prompt.clone(),
+    }];
+    output.extend(turn.context_messages.clone());
+    output.extend(turn_messages(messages));
+    output
 }

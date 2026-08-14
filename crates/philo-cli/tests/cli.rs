@@ -8,13 +8,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 fn philo() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_philo"));
-    // Isolate from developer environment.
+    // Isolate from developer environment, including any real config file:
+    // the global layer is pointed at a directory that holds none.
     command
         .env_remove("PHILO_MODEL")
         .env_remove("PHILO_ENDPOINT")
         .env_remove("PHILO_PROTOCOL")
         .env_remove("PHILO_PROVIDER")
-        .env_remove("PHILO_DATA_DIR");
+        .env_remove("PHILO_DATA_DIR")
+        .env(
+            "PHILO_CONFIG_HOME",
+            std::env::temp_dir().join(format!("philo-cli-no-config-{}", std::process::id())),
+        )
+        .current_dir(std::env::temp_dir());
     command
 }
 

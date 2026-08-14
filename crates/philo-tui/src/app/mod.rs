@@ -1,6 +1,7 @@
 //! Pure interaction state, semantic actions, effects and projections.
 
 pub(crate) mod action;
+pub(crate) mod attachment;
 pub(crate) mod command;
 pub(crate) mod effect;
 pub(crate) mod history;

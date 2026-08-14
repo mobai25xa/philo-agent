@@ -1,3 +1,5 @@
+//! Tool result mapping into kernel and session vocabularies.
+
 use philo_agent_kernel as kernel;
 use philo_session as session;
 use philo_tools::ToolResult;
@@ -17,6 +19,7 @@ pub(crate) fn kernel_result(
         ),
     }
 }
+
 pub(crate) fn session_result(
     call: &kernel::KernelToolCall,
     result: &ToolResult,

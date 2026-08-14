@@ -8,14 +8,13 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "philo",
     version,
-    about = "Read-only coding agent over the Philo runtime",
-    arg_required_else_help = true
+    about = "Coding agent over the Philo runtime; bare `philo` opens an interactive session"
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// The user message for this turn.
+    /// The user message for this turn; omit it to open an interactive session.
     pub message: Option<String>,
 
     /// Continue this session; an unknown id starts a new session under it.

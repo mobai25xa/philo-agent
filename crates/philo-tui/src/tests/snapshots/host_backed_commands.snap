@@ -16,7 +16,7 @@ image queued: shots/diagram.png (1 waiting for the next message)
 info level: verbose
 /status
 model model-b | session fresh | idle | verbose
-attachments queued: shots/diagram.png
+attachments: shots/diagram.png
 tools (3):
   read_file [read-only]
   write_file [workspace]

@@ -19,8 +19,15 @@ mod request;
 mod stream;
 
 pub use adapter::PhiloModelAdapter;
-pub use assemble::{AdapterBuildError, ModelProtocol, PhiloModelBuilder};
+pub use assemble::{
+    AdapterBuildError, ModelContinuationPolicy, ModelProtocol, PhiloModelBuilder,
+    ServerContinuationSupport,
+};
 pub use headers::{DEFAULT_USER_AGENT, ModelRequestHeaderError, ModelRequestHeaders};
+pub use replay::{
+    FileModelReplayStore, MemoryModelReplayStore, ModelReplayStore, ReplayStoreBlob,
+    ReplayStoreError, ReplayStoreErrorCode, ReplayStorePolicy,
+};
 
 // Assembly-time SDK vocabulary re-exported for adapter callers.
 pub use philo::api::extension::Transport;

@@ -10,13 +10,13 @@ mod tools;
 use philo::api::stable as sdk;
 use philo_agent_runtime::{ModelCallSnapshot, ModelError};
 
-use crate::replay::CachedReasoning;
+use crate::replay::ReplayHistory;
 
 /// Maps an immutable `ModelCallSnapshot` onto a provider-neutral SDK request.
 pub(crate) fn map_request(
     snapshot: &ModelCallSnapshot,
     native_error_status: bool,
-    replayed: &[Vec<CachedReasoning>],
+    replayed: &ReplayHistory,
 ) -> Result<sdk::ModelRequest, ModelError> {
     let mut request = generation::new_request(&snapshot.generation)?;
     messages::map_messages(

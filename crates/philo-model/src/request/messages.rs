@@ -1,7 +1,7 @@
 use philo::api::stable as sdk;
 use philo_agent_runtime::{ModelError, ModelMessage, ModelToolResultOutcome, UserPart};
 
-use crate::replay::CachedReasoning;
+use crate::replay::{CapturedContent, CapturedItem, ReplayHistory};
 
 /// Canonical instructions-channel marker for durable conversation summaries.
 const SUMMARY_INSTRUCTION_PREFIX: &str = "Summary of earlier conversation:\n";
@@ -30,20 +30,12 @@ pub(super) fn map_messages(
     request: &mut sdk::ModelRequest,
     messages: &[ModelMessage],
     native_error_status: bool,
-    replayed: &[Vec<CachedReasoning>],
+    replayed: &ReplayHistory,
 ) -> Result<(), ModelError> {
-    // The trailing `replayed.len()` assistant tool-call messages belong to
-    // the current turn: batch k was produced by logical call k.
-    let total_batches = messages
-        .iter()
-        .filter(|message| matches!(message, ModelMessage::AssistantToolCalls { .. }))
-        .count();
-    let replay_offset = total_batches.saturating_sub(replayed.len());
-    let mut batch_sequence = 0usize;
-
     let mut system_instructions = Vec::new();
     let mut summary_instructions = Vec::new();
-    for message in messages {
+    let mut continuation = None;
+    for (message_index, message) in messages.iter().enumerate() {
         match message {
             ModelMessage::System { content } => system_instructions.push(content.as_str()),
             ModelMessage::Summary { text } => {
@@ -53,30 +45,16 @@ pub(super) fn map_messages(
                 content: map_user_parts(parts)?,
             }),
             ModelMessage::Assistant { content } => {
-                request.messages.push(sdk::Message::Assistant {
-                    content: vec![sdk::ResponseItem::new(
-                        sdk::BlockId::new(0),
-                        0,
-                        sdk::AssistantContent::Text {
-                            text: content.clone(),
-                        },
-                        sdk::ReplayRequirement::None,
-                        None,
-                    )],
-                });
+                request.messages.push(map_assistant_text(
+                    content,
+                    replayed.items_for(message_index),
+                )?);
             }
             ModelMessage::AssistantToolCalls { calls } => {
-                let reasoning_items: &[CachedReasoning] = if batch_sequence >= replay_offset {
-                    replayed
-                        .get(batch_sequence - replay_offset)
-                        .map_or(&[], Vec::as_slice)
-                } else {
-                    &[]
-                };
-                batch_sequence += 1;
-                request
-                    .messages
-                    .push(map_assistant_tool_calls(calls, reasoning_items)?);
+                request.messages.push(map_assistant_tool_calls(
+                    calls,
+                    replayed.items_for(message_index),
+                )?);
             }
             ModelMessage::ToolResult {
                 tool_call_id,
@@ -86,6 +64,9 @@ pub(super) fn map_messages(
                 outcome,
                 native_error_status,
             )?),
+        }
+        if let Some(handle) = replayed.continuation_after(message_index) {
+            continuation = Some((handle.clone(), request.messages.len()));
         }
     }
 
@@ -99,29 +80,25 @@ pub(super) fn map_messages(
     if !instructions.is_empty() {
         request.instructions = Some(instructions);
     }
+    if let Some((handle, message_start)) = continuation
+        && message_start < request.messages.len()
+    {
+        request.continuation = Some(sdk::ResponseContinuation::continue_from(
+            handle,
+            message_start,
+        ));
+    }
     Ok(())
 }
 
 fn map_assistant_tool_calls(
     calls: &[philo_agent_runtime::ModelToolCall],
-    reasoning_items: &[CachedReasoning],
+    replay_items: &[CapturedItem],
 ) -> Result<sdk::Message, ModelError> {
-    // Reasoning items replay first, then the tool calls, with contiguous
-    // zero-based indices and response-unique block IDs.
-    let mut items = Vec::with_capacity(reasoning_items.len() + calls.len());
-    for reasoning in reasoning_items {
-        let position = items.len();
-        items.push(sdk::ResponseItem::new(
-            sdk::BlockId::new(position as u64),
-            u32::try_from(position).map_err(|_| history_error("reasoning index"))?,
-            sdk::AssistantContent::Reasoning {
-                kind: reasoning.kind,
-                text: reasoning.text.clone(),
-            },
-            reasoning.replay_requirement,
-            reasoning.replay_token.clone(),
-        ));
+    if !replay_items.is_empty() {
+        return map_replayed_assistant(replay_items, None, calls);
     }
+    let mut items = Vec::with_capacity(calls.len());
     for call in calls {
         let id = sdk::ToolCallId::new(call.tool_call_id.as_str())
             .map_err(|_| history_error("tool call id"))?;
@@ -140,6 +117,69 @@ fn map_assistant_tool_calls(
             sdk::AssistantContent::ToolCall(tool_call),
             sdk::ReplayRequirement::None,
             None,
+        ));
+    }
+    Ok(sdk::Message::Assistant { content: items })
+}
+
+fn map_assistant_text(
+    content: &str,
+    replay_items: &[CapturedItem],
+) -> Result<sdk::Message, ModelError> {
+    if !replay_items.is_empty() {
+        return map_replayed_assistant(replay_items, Some(content), &[]);
+    }
+    Ok(sdk::Message::Assistant {
+        content: vec![sdk::ResponseItem::new(
+            sdk::BlockId::new(0),
+            0,
+            sdk::AssistantContent::Text {
+                text: content.to_owned(),
+            },
+            sdk::ReplayRequirement::None,
+            None,
+        )],
+    })
+}
+
+fn map_replayed_assistant(
+    replay_items: &[CapturedItem],
+    text: Option<&str>,
+    calls: &[philo_agent_runtime::ModelToolCall],
+) -> Result<sdk::Message, ModelError> {
+    let mut items = Vec::with_capacity(replay_items.len());
+    for item in replay_items {
+        let content = match &item.content {
+            CapturedContent::Reasoning { kind, text } => sdk::AssistantContent::Reasoning {
+                kind: *kind,
+                text: text.clone(),
+            },
+            CapturedContent::Text { .. } => sdk::AssistantContent::Text {
+                text: text
+                    .ok_or_else(|| history_error("replayed text item binding"))?
+                    .to_owned(),
+            },
+            CapturedContent::ToolCall { call_id } => {
+                let call = calls
+                    .iter()
+                    .find(|call| call.tool_call_id.as_str() == call_id)
+                    .ok_or_else(|| history_error("replayed tool call binding"))?;
+                let id = sdk::ToolCallId::new(call.tool_call_id.as_str())
+                    .map_err(|_| history_error("tool call id"))?;
+                let name = sdk::ToolName::new(call.name.as_str())
+                    .map_err(|_| history_error("tool call name"))?;
+                let tool_call = sdk::ToolCall::from_raw(id.clone(), name.clone(), &call.arguments)
+                    .or_else(|_| sdk::ToolCall::from_raw(id, name, "{}"))
+                    .map_err(|_| history_error("tool call arguments"))?;
+                sdk::AssistantContent::ToolCall(tool_call)
+            }
+        };
+        items.push(sdk::ResponseItem::new(
+            sdk::BlockId::new(u64::from(item.index)),
+            item.index,
+            content,
+            item.replay_requirement,
+            item.replay_token.clone(),
         ));
     }
     Ok(sdk::Message::Assistant { content: items })

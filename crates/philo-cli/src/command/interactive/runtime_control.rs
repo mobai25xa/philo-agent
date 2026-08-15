@@ -11,6 +11,7 @@ use philo_agent_runtime::{
     ModelPort, OperationHandle, OperationId, ReasoningEffort, RuntimeConfig, RuntimeFuture,
     SessionId, ToolPort, UserMessage,
 };
+use philo_model::ModelReplayStore;
 use philo_session_jsonl::JsonlSessionStore;
 use philo_tui::HostError;
 
@@ -61,6 +62,7 @@ impl ModelPort for ReasoningModel {
 pub(super) struct RuntimeControl {
     assembly: Mutex<Assembly>,
     deployment: Deployment,
+    replay_store: Arc<dyn ModelReplayStore>,
     sessions: Arc<JsonlSessionStore>,
     ids: Arc<dyn IdSource>,
     tools: Arc<dyn ToolPort>,
@@ -72,6 +74,7 @@ impl RuntimeControl {
         deployment: Deployment,
         config: RuntimeConfig,
         model: Arc<dyn ModelPort>,
+        replay_store: Arc<dyn ModelReplayStore>,
         sessions: Arc<JsonlSessionStore>,
         ids: Arc<dyn IdSource>,
         tools: Arc<dyn ToolPort>,
@@ -98,6 +101,7 @@ impl RuntimeControl {
                 model,
             }),
             deployment,
+            replay_store,
             sessions,
             ids,
             tools,
@@ -129,8 +133,9 @@ impl RuntimeControl {
 
     pub fn rebuild_model(&self, name: &str) -> Result<(), HostError> {
         // Build first: a rejected name must not disturb the serving assembly.
-        let adapter = crate::assembly::build_model(&self.deployment, name)
-            .map_err(|error| HostError::new(format!("{error}")))?;
+        let adapter =
+            crate::assembly::build_model(&self.deployment, name, self.replay_store.clone())
+                .map_err(|error| HostError::new(format!("{error}")))?;
         let model: Arc<dyn ModelPort> = Arc::new(ReasoningModel {
             inner: Arc::new(adapter),
             state: self.reasoning.clone(),

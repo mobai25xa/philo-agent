@@ -36,11 +36,14 @@ pub(super) async fn run<'a>(
         model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
     });
     let request = ModelCallSnapshot {
+        session_id: turn.session_id.clone(),
+        context_fingerprint: cx.current_leaf.as_str().to_owned(),
+        persist_replay: true,
         operation_id: cx.operation.operation_id().clone(),
         turn_id: cx.operation.turn_id().clone(),
         model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
         model_call_index,
-        session_revision: turn.session_revision,
+        session_revision: cx.revision,
         messages: build_messages(turn, messages),
         tools: if tools_allowed {
             turn.tools.clone()

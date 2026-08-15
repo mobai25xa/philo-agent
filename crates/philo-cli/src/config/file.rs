@@ -61,6 +61,8 @@ pub(super) struct FileConfig {
     pub(super) api_key_env: Option<Sourced<String>>,
     pub(super) data_dir: Option<Sourced<String>>,
     pub(super) context_window: Option<Sourced<i64>>,
+    pub(super) continuation: Option<Sourced<String>>,
+    pub(super) response_continuation_support: Option<Sourced<String>>,
     /// Canonical lowercase header name -> highest-authority configured value.
     pub(super) headers: BTreeMap<String, Sourced<FileHeader>>,
     // [compaction]
@@ -187,6 +189,12 @@ fn apply(
                 ("deployment", "data_dir") => config.data_dir = Some(reader.string()?),
                 ("deployment", "context_window") => {
                     config.context_window = Some(reader.integer()?);
+                }
+                ("deployment", "continuation") => {
+                    config.continuation = Some(reader.string()?);
+                }
+                ("deployment", "response_continuation_support") => {
+                    config.response_continuation_support = Some(reader.string()?);
                 }
                 ("deployment", "headers") => {
                     apply_headers(&mut config.headers, layer, path, value)?;

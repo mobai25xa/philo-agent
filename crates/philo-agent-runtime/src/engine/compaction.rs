@@ -201,6 +201,11 @@ async fn generate_summary(
         parts: vec![UserPart::Text(SUMMARY_INSTRUCTION.to_owned())],
     });
     let request = ModelCallSnapshot {
+        session_id: session_id.clone(),
+        context_fingerprint: context
+            .current_leaf()
+            .map_or_else(|| "empty".to_owned(), |leaf| leaf.as_str().to_owned()),
+        persist_replay: false,
         operation_id: OperationId::new(format!("{synthetic_prefix}:operation")),
         turn_id: TurnId::new(format!("{synthetic_prefix}:turn")),
         model_call_id: ModelCallId::new(format!("{synthetic_prefix}:call")),

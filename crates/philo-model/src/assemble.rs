@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use philo::api::extension as ext;
 use philo::api::extension::ProtocolAdapter;
@@ -8,8 +9,32 @@ use philo_agent_runtime::ReasoningEffort;
 use url::Url;
 
 use crate::headers::{ModelRequestHeaders, default_provider_headers};
+use crate::replay::ModelReplayStore;
 
 use crate::adapter::PhiloModelAdapter;
+
+/// Conversation continuation policy for one model deployment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModelContinuationPolicy {
+    /// Keep provider requests stateless and reconstruct the full history from
+    /// the private local replay sidecar.
+    #[default]
+    StatelessLocalReplay,
+    /// Prefer a target-bound `previous_response_id` chain, with one local
+    /// stateless fallback when the provider reports that the chain vanished.
+    PreferPreviousResponseIdWithLocalFallback,
+}
+
+/// Evidence source declaring that a deployment supports stored Responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ServerContinuationSupport {
+    #[default]
+    Disabled,
+    /// The official OpenAI Responses endpoint. Assembly verifies its host.
+    OfficialOpenAi,
+    /// A compatible endpoint whose operator explicitly declared support.
+    CompatibleDeclared,
+}
 
 /// Built-in protocol selection for the standard assembly.
 ///
@@ -31,7 +56,8 @@ pub enum ModelProtocol {
     /// (`openai-chat/reasoning-content/v1`) for OpenAI-compatible providers
     /// that stream visible reasoning through `delta.reasoning_content`.
     OpenAiChatReasoningContent,
-    /// OpenAI Responses (`openai-responses/v1`).
+    /// OpenAI Responses with persistent replay fallback
+    /// (`openai-responses/openai-v2`).
     OpenAiResponses,
 }
 
@@ -64,7 +90,7 @@ impl ModelProtocol {
                 sdk::ProtocolId::OPENAI_CHAT_COMPATIBLE_REASONING_EFFORT_V1
             }
             Self::OpenAiChatReasoningContent => sdk::ProtocolId::OPENAI_CHAT_REASONING_CONTENT_V1,
-            Self::OpenAiResponses => sdk::ProtocolId::OPENAI_RESPONSES_OPENAI_V1,
+            Self::OpenAiResponses => sdk::ProtocolId::OPENAI_RESPONSES_OPENAI_V2,
         };
         sdk::ProtocolId::new(id).expect("built-in protocol id is valid")
     }
@@ -110,6 +136,9 @@ pub struct PhiloModelBuilder {
     endpoint: String,
     api_key_env: Option<String>,
     request_headers: ModelRequestHeaders,
+    replay_store: Option<Arc<dyn ModelReplayStore>>,
+    continuation_policy: ModelContinuationPolicy,
+    continuation_support: ServerContinuationSupport,
     retry: Option<sdk::RetryPolicy>,
     timeouts: Option<sdk::TimeoutPolicy>,
 }
@@ -130,6 +159,9 @@ impl PhiloModelBuilder {
             endpoint: endpoint.into(),
             api_key_env: None,
             request_headers: ModelRequestHeaders::new(),
+            replay_store: None,
+            continuation_policy: ModelContinuationPolicy::default(),
+            continuation_support: ServerContinuationSupport::default(),
             retry: None,
             timeouts: None,
         }
@@ -144,6 +176,25 @@ impl PhiloModelBuilder {
     /// Configures validated, non-credential headers for this endpoint binding.
     pub fn request_headers(mut self, headers: ModelRequestHeaders) -> Self {
         self.request_headers = headers;
+        self
+    }
+
+    /// Injects the provider replay sidecar used for restart-safe history.
+    pub fn replay_store(mut self, store: Arc<dyn ModelReplayStore>) -> Self {
+        self.replay_store = Some(store);
+        self
+    }
+
+    /// Selects whether the deployment may use provider-stored response
+    /// continuation. The default is fully stateless local replay.
+    pub fn continuation_policy(mut self, policy: ModelContinuationPolicy) -> Self {
+        self.continuation_policy = policy;
+        self
+    }
+
+    /// Declares the deployment-specific support source for stored Responses.
+    pub fn server_continuation_support(mut self, support: ServerContinuationSupport) -> Self {
+        self.continuation_support = support;
         self
     }
 
@@ -185,6 +236,37 @@ impl PhiloModelBuilder {
             .map_err(|error| AdapterBuildError::new(format!("invalid endpoint url: {error}")))?;
         let protocol_id = self.protocol.protocol_id();
 
+        if self.continuation_support != ServerContinuationSupport::Disabled
+            && self.protocol != ModelProtocol::OpenAiResponses
+        {
+            return Err(AdapterBuildError::new(
+                "server response continuation requires the OpenAI Responses protocol",
+            ));
+        }
+        if self.continuation_policy
+            == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
+            && self.continuation_support == ServerContinuationSupport::Disabled
+        {
+            return Err(AdapterBuildError::new(
+                "previous_response_id continuation requires an explicit server support declaration",
+            ));
+        }
+        if self.continuation_policy
+            == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
+            && self.protocol != ModelProtocol::OpenAiResponses
+        {
+            return Err(AdapterBuildError::new(
+                "previous_response_id continuation requires the OpenAI Responses protocol",
+            ));
+        }
+        if self.continuation_support == ServerContinuationSupport::OfficialOpenAi
+            && endpoint.host_str() != Some("api.openai.com")
+        {
+            return Err(AdapterBuildError::new(
+                "official OpenAI continuation support requires the api.openai.com endpoint host",
+            ));
+        }
+
         let client_builder = sdk::PhiloClient::builder().transport(transport);
         let (client_builder, envelope) = match self.protocol {
             ModelProtocol::AnthropicMessages => {
@@ -213,19 +295,21 @@ impl PhiloModelBuilder {
                 (client_builder.register_protocol(adapter), envelope)
             }
             ModelProtocol::OpenAiResponses => {
-                let adapter = ext::OpenAiResponsesAdapter::default();
+                let adapter = ext::OpenAiResponsesAdapter::openai_v2();
                 let envelope = adapter.capabilities().envelope().clone();
                 (client_builder.register_protocol(adapter), envelope)
             }
         };
 
-        let binding = ext::ProviderBinding::new(
-            protocol_id.clone(),
-            endpoint,
-            ext::CapabilityConstraints::default(),
-        )
-        .map_err(|error| AdapterBuildError::new(format!("provider binding invalid: {error}")))?
-        .with_headers(self.request_headers.provider_headers());
+        let mut constraints = ext::CapabilityConstraints::default();
+        if self.continuation_support == ServerContinuationSupport::Disabled {
+            constraints
+                .disabled
+                .insert(sdk::Capability::ResponseContinuation);
+        }
+        let binding = ext::ProviderBinding::new(protocol_id.clone(), endpoint, constraints)
+            .map_err(|error| AdapterBuildError::new(format!("provider binding invalid: {error}")))?
+            .with_headers(self.request_headers.provider_headers());
         let model_profile = ext::ModelProfile::new(
             protocol_id.clone(),
             model_name.clone(),
@@ -257,9 +341,15 @@ impl PhiloModelBuilder {
         let client = client_builder
             .build()
             .map_err(|error| AdapterBuildError::new(format!("client assembly failed: {error}")))?;
-        Ok(PhiloModelAdapter::new(
+        let target = sdk::CallTarget::new(provider_id, protocol_id, model_name);
+        let replay_store = self
+            .replay_store
+            .unwrap_or_else(|| Arc::new(crate::replay::MemoryModelReplayStore::default()));
+        Ok(PhiloModelAdapter::with_configuration(
             client,
-            sdk::CallTarget::new(provider_id, protocol_id, model_name),
+            target,
+            replay_store,
+            self.continuation_policy,
         ))
     }
 }

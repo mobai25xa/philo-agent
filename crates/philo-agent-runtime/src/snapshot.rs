@@ -18,6 +18,15 @@ pub struct TurnSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelCallSnapshot {
+    /// Session owning this call. Model adapters use it only to scope
+    /// provider replay sidecars; it is not sent to the provider.
+    pub session_id: SessionId,
+    /// Opaque active-path leaf before this call. It prevents replay state
+    /// from one context branch being treated as state for another branch.
+    pub context_fingerprint: String,
+    /// Whether this call produces assistant history that must be persisted.
+    /// Synthetic maintenance calls set this to false.
+    pub persist_replay: bool,
     pub operation_id: OperationId,
     pub turn_id: TurnId,
     pub model_call_id: ModelCallId,

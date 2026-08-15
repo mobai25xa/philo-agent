@@ -1850,10 +1850,14 @@ dependencies = [
  "philo",
  "philo-agent-runtime",
  "philo-session",
+ "philo-session-jsonl",
  "philo-tools",
  "philo-tools-std",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
  "url",
 ]
 

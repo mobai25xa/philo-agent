@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use clap::Parser;
 use philo_agent_runtime::ReasoningEffort;
-use philo_model::ModelProtocol;
+use philo_model::{ModelContinuationPolicy, ModelProtocol, ServerContinuationSupport};
 
 use super::file::{Layer, Sourced, load_layers};
 use super::resolve::{
-    Verbosity, parse_protocol, parse_reasoning_effort, parse_verbosity, validate_reasoning_effort,
+    Verbosity, parse_continuation_policy, parse_continuation_support, parse_protocol,
+    parse_reasoning_effort, parse_verbosity, validate_reasoning_effort,
 };
 use crate::args::Cli;
 
@@ -161,6 +162,8 @@ fn every_section_reads_its_key_domain() {
          api_key_env = \"MY_KEY_VAR\"\n\
          data_dir = \"/tmp/sessions\"\n\
          context_window = 128000\n\
+         continuation = \"prefer-previous-response-id\"\n\
+         response_continuation_support = \"official-openai\"\n\
          [compaction]\n\
          context_budget = 96000\n\
          auto_threshold = 0.75\n\
@@ -180,6 +183,17 @@ fn every_section_reads_its_key_domain() {
     let config = load_layers(Some(&path), None).expect("loads");
     assert_eq!(config.api_key_env.expect("api key env").value, "MY_KEY_VAR");
     assert_eq!(config.context_window.expect("window").value, 128_000);
+    assert_eq!(
+        config.continuation.expect("continuation").value,
+        "prefer-previous-response-id"
+    );
+    assert_eq!(
+        config
+            .response_continuation_support
+            .expect("continuation support")
+            .value,
+        "official-openai"
+    );
     assert_eq!(
         config
             .compaction_context_budget
@@ -290,8 +304,69 @@ fn value_parsers_cover_the_supported_vocabulary() {
         ModelProtocol::OpenAiChatCompatibleReasoningEffort
     );
     assert!(parse_protocol("grpc").is_err());
+    assert_eq!(
+        parse_continuation_policy("prefer-previous-response-id").unwrap(),
+        ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
+    );
+    assert_eq!(
+        parse_continuation_support("compatible-declared").unwrap(),
+        ServerContinuationSupport::CompatibleDeclared
+    );
+    assert!(parse_continuation_policy("automatic").is_err());
+    assert!(parse_continuation_support("inferred").is_err());
     assert_eq!(parse_verbosity("quiet").unwrap(), Verbosity::Quiet);
     assert!(parse_verbosity("loud").is_err());
+}
+
+#[test]
+fn continuation_is_stateless_by_default_and_requires_explicit_support() {
+    let settings =
+        super::resolve::resolve(&resolvable_cli(), &deployment_file()).expect("defaults resolve");
+    assert_eq!(
+        settings.deployment.continuation_policy,
+        ModelContinuationPolicy::StatelessLocalReplay
+    );
+    assert_eq!(
+        settings.deployment.continuation_support,
+        ServerContinuationSupport::Disabled
+    );
+    for (key, value) in [
+        ("continuation", "stateless-local-replay"),
+        ("response_continuation_support", "disabled"),
+    ] {
+        assert!(settings.entries.iter().any(|entry| {
+            entry.key == key && entry.value == value && entry.source == "default"
+        }));
+    }
+
+    let mut missing_support = deployment_file();
+    missing_support.protocol = Some(Sourced {
+        value: "openai-responses".to_owned(),
+        layer: Layer::Project,
+    });
+    missing_support.continuation = Some(Sourced {
+        value: "prefer-previous-response-id".to_owned(),
+        layer: Layer::Project,
+    });
+    let error = super::resolve::resolve(&resolvable_cli(), &missing_support)
+        .err()
+        .expect("support declaration is mandatory");
+    assert!(error.0.contains("requires an explicit"));
+
+    missing_support.response_continuation_support = Some(Sourced {
+        value: "compatible-declared".to_owned(),
+        layer: Layer::Project,
+    });
+    let settings = super::resolve::resolve(&resolvable_cli(), &missing_support)
+        .expect("explicit compatible declaration resolves");
+    assert_eq!(
+        settings.deployment.continuation_policy,
+        ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
+    );
+    assert_eq!(
+        settings.deployment.continuation_support,
+        ServerContinuationSupport::CompatibleDeclared
+    );
 }
 
 #[test]

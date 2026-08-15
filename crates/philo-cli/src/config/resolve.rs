@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use philo_agent_runtime::{CompactionConfig, ReasoningEffort};
-use philo_model::{DEFAULT_USER_AGENT, ModelProtocol, ModelRequestHeaders};
+use philo_model::{
+    DEFAULT_USER_AGENT, ModelContinuationPolicy, ModelProtocol, ModelRequestHeaders,
+    ServerContinuationSupport,
+};
 
 use super::file::{FileConfig, Sourced};
 use crate::args::Cli;
@@ -30,6 +33,8 @@ pub struct Deployment {
     /// Name of the environment variable carrying the API key — never the key.
     pub api_key_env: String,
     pub request_headers: ModelRequestHeaders,
+    pub continuation_policy: ModelContinuationPolicy,
+    pub continuation_support: ServerContinuationSupport,
 }
 
 /// One effective non-secret setting shown through the interactive `/config`
@@ -169,6 +174,55 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             "philo-cli".to_owned()
         }
     };
+
+    let continuation_policy = match from_file(file.continuation.as_ref()) {
+        Some(picked) => {
+            record("continuation", picked.value.clone(), picked.source);
+            parse_continuation_policy(&picked.value).map_err(|error| {
+                error.at(&origin(
+                    picked.source,
+                    None,
+                    None,
+                    "[deployment].continuation",
+                ))
+            })?
+        }
+        None => {
+            record(
+                "continuation",
+                "stateless-local-replay".to_owned(),
+                "default",
+            );
+            ModelContinuationPolicy::StatelessLocalReplay
+        }
+    };
+
+    let continuation_support = match from_file(file.response_continuation_support.as_ref()) {
+        Some(picked) => {
+            record(
+                "response_continuation_support",
+                picked.value.clone(),
+                picked.source,
+            );
+            parse_continuation_support(&picked.value).map_err(|error| {
+                error.at(&origin(
+                    picked.source,
+                    None,
+                    None,
+                    "[deployment].response_continuation_support",
+                ))
+            })?
+        }
+        None => {
+            record(
+                "response_continuation_support",
+                "disabled".to_owned(),
+                "default",
+            );
+            ServerContinuationSupport::Disabled
+        }
+    };
+    validate_continuation_configuration(protocol, continuation_policy, continuation_support)?;
 
     let api_key_env = match pick_string(None, None, file.api_key_env.as_ref()) {
         Some(picked) => {
@@ -358,6 +412,8 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             endpoint: endpoint.value,
             api_key_env,
             request_headers,
+            continuation_policy,
+            continuation_support,
         },
         data_dir,
         context_window,
@@ -445,6 +501,54 @@ pub(super) fn parse_protocol(value: &str) -> Result<ModelProtocol, UsageError> {
              openai-chat-reasoning-content | openai-responses"
         ))),
     }
+}
+
+pub(super) fn parse_continuation_policy(
+    value: &str,
+) -> Result<ModelContinuationPolicy, UsageError> {
+    match value {
+        "stateless-local-replay" => Ok(ModelContinuationPolicy::StatelessLocalReplay),
+        "prefer-previous-response-id" => {
+            Ok(ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback)
+        }
+        other => Err(UsageError::new(format!(
+            "unknown continuation policy '{other}': expected stateless-local-replay | prefer-previous-response-id"
+        ))),
+    }
+}
+
+pub(super) fn parse_continuation_support(
+    value: &str,
+) -> Result<ServerContinuationSupport, UsageError> {
+    match value {
+        "disabled" => Ok(ServerContinuationSupport::Disabled),
+        "official-openai" => Ok(ServerContinuationSupport::OfficialOpenAi),
+        "compatible-declared" => Ok(ServerContinuationSupport::CompatibleDeclared),
+        other => Err(UsageError::new(format!(
+            "unknown response continuation support '{other}': expected disabled | official-openai | compatible-declared"
+        ))),
+    }
+}
+
+fn validate_continuation_configuration(
+    protocol: ModelProtocol,
+    policy: ModelContinuationPolicy,
+    support: ServerContinuationSupport,
+) -> Result<(), UsageError> {
+    if support != ServerContinuationSupport::Disabled && protocol != ModelProtocol::OpenAiResponses
+    {
+        return Err(UsageError::new(
+            "[deployment].response_continuation_support requires protocol = \"openai-responses\"",
+        ));
+    }
+    if policy == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
+        && support == ServerContinuationSupport::Disabled
+    {
+        return Err(UsageError::new(
+            "prefer-previous-response-id requires an explicit [deployment].response_continuation_support declaration",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, UsageError> {

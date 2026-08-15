@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use philo::api::stable as sdk;
-use philo_agent_runtime::{ModelError, ModelEvent, ModelEventStream, RuntimeFuture, TokenUsage};
+use philo_agent_runtime::{
+    ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream, RuntimeFuture, TokenUsage,
+};
 
 use crate::error::model_error;
-use crate::replay::{CachedReasoning, ReplayChannel};
+use crate::replay::{CapturedContent, CapturedItem, ReplayCoordinator};
 
 /// Normalizes the SDK event stream into the runtime `ModelEvent` vocabulary.
 ///
@@ -15,31 +17,44 @@ use crate::replay::{CachedReasoning, ReplayChannel};
 /// keep that order and carry the stable call id exactly once. Visible
 /// reasoning deltas surface as transient `ReasoningDelta` events while opaque
 /// (redacted) reasoning produces no event at all; every finished reasoning
-/// block is captured verbatim into the turn's replay side channel. Usage
-/// updates map onto the runtime `TokenUsage`. Structured-output events and
-/// block start/finish boundaries are dropped. `ResponseFinished` maps to the
-/// unique `Completed` and commits the captured reasoning to the channel; a
-/// mid-stream SDK error terminates the stream as a `ModelError` without a
-/// later `Completed`.
+/// block and every other replayable response item is collected for the
+/// replay sidecar. Usage updates map onto the runtime `TokenUsage`.
+/// Structured-output events and block start/finish boundaries are dropped.
+/// `ResponseFinished` snapshots and atomically commits the collected items
+/// before yielding the unique `Completed`; a mid-stream SDK error terminates
+/// without a sidecar commit or later `Completed`.
 pub(crate) struct NormalizedStream {
     call: sdk::ModelCall,
+    client: sdk::PhiloClient,
+    target: sdk::CallTarget,
+    text: HashMap<sdk::BlockId, TextEntry>,
     tools: HashMap<sdk::BlockId, ToolEntry>,
     next_tool_index: usize,
     reasoning: HashMap<sdk::BlockId, ReasoningEntry>,
-    captured: Vec<CachedReasoning>,
-    channel: Arc<ReplayChannel>,
-    turn_key: String,
-    call_index: u32,
+    captured: Vec<CapturedItem>,
+    replay: Arc<ReplayCoordinator>,
+    request: ModelCallSnapshot,
+    response_id: Option<String>,
+    retain_response_id: bool,
     done: bool,
 }
 
 struct ToolEntry {
     index: usize,
+    response_index: u32,
     call_id: String,
+    replay_requirement: sdk::ReplayRequirement,
     announced: bool,
 }
 
+struct TextEntry {
+    index: u32,
+    replay_requirement: sdk::ReplayRequirement,
+    text: String,
+}
+
 struct ReasoningEntry {
+    index: u32,
     kind: sdk::ReasoningKind,
     replay_requirement: sdk::ReplayRequirement,
     text: String,
@@ -48,19 +63,25 @@ struct ReasoningEntry {
 impl NormalizedStream {
     pub(crate) fn new(
         call: sdk::ModelCall,
-        channel: Arc<ReplayChannel>,
-        turn_key: String,
-        call_index: u32,
+        client: sdk::PhiloClient,
+        target: sdk::CallTarget,
+        replay: Arc<ReplayCoordinator>,
+        request: ModelCallSnapshot,
+        retain_response_id: bool,
     ) -> Self {
         Self {
             call,
+            client,
+            target,
+            text: HashMap::new(),
             tools: HashMap::new(),
             next_tool_index: 0,
             reasoning: HashMap::new(),
             captured: Vec::new(),
-            channel,
-            turn_key,
-            call_index,
+            replay,
+            request,
+            response_id: None,
+            retain_response_id,
             done: false,
         }
     }
@@ -127,16 +148,50 @@ impl ModelEventStream for NormalizedStream {
                 };
                 match event {
                     sdk::ModelEvent::ResponseStarted { metadata } => {
+                        if self.retain_response_id {
+                            self.response_id = metadata.response_id().map(ToOwned::to_owned);
+                        }
                         return Some(Ok(ModelEvent::ResponseStarted {
                             response_model: metadata.response_model().map(ToOwned::to_owned),
                             response_id: metadata.response_id().map(ToOwned::to_owned),
                         }));
                     }
-                    sdk::ModelEvent::TextDelta { delta, .. } => {
+                    sdk::ModelEvent::TextStarted {
+                        block_id,
+                        index,
+                        replay_requirement,
+                    } => {
+                        self.text.insert(
+                            block_id,
+                            TextEntry {
+                                index,
+                                replay_requirement,
+                                text: String::new(),
+                            },
+                        );
+                    }
+                    sdk::ModelEvent::TextDelta { block_id, delta } => {
+                        if let Some(entry) = self.text.get_mut(&block_id) {
+                            entry.text.push_str(&delta);
+                        }
                         return Some(Ok(ModelEvent::TextDelta(delta)));
+                    }
+                    sdk::ModelEvent::TextFinished {
+                        block_id,
+                        replay_token,
+                    } => {
+                        if let Some(entry) = self.text.remove(&block_id) {
+                            self.captured.push(CapturedItem {
+                                index: entry.index,
+                                content: CapturedContent::Text { text: entry.text },
+                                replay_requirement: entry.replay_requirement,
+                                replay_token,
+                            });
+                        }
                     }
                     sdk::ModelEvent::ReasoningStarted {
                         block_id,
+                        index,
                         kind,
                         replay_requirement,
                         ..
@@ -144,6 +199,7 @@ impl ModelEventStream for NormalizedStream {
                         self.reasoning.insert(
                             block_id,
                             ReasoningEntry {
+                                index,
                                 kind,
                                 replay_requirement,
                                 text: String::new(),
@@ -174,9 +230,12 @@ impl ModelEventStream for NormalizedStream {
                             // to replay; skip it rather than build an item
                             // the SDK would reject.
                             if text.is_some() || !visible(entry.kind) {
-                                self.captured.push(CachedReasoning {
-                                    kind: entry.kind,
-                                    text,
+                                self.captured.push(CapturedItem {
+                                    index: entry.index,
+                                    content: CapturedContent::Reasoning {
+                                        kind: entry.kind,
+                                        text,
+                                    },
                                     replay_requirement: entry.replay_requirement,
                                     replay_token,
                                 });
@@ -189,7 +248,10 @@ impl ModelEventStream for NormalizedStream {
                         }));
                     }
                     sdk::ModelEvent::ToolCallStarted {
-                        block_id, call_id, ..
+                        block_id,
+                        index: response_index,
+                        call_id,
+                        replay_requirement,
                     } => {
                         let index = self.next_tool_index;
                         self.next_tool_index += 1;
@@ -197,7 +259,9 @@ impl ModelEventStream for NormalizedStream {
                             block_id,
                             ToolEntry {
                                 index,
+                                response_index,
                                 call_id: call_id.as_str().to_owned(),
+                                replay_requirement,
                                 announced: false,
                             },
                         );
@@ -216,30 +280,43 @@ impl ModelEventStream for NormalizedStream {
                         }
                         return Some(event);
                     }
-                    sdk::ModelEvent::ToolCallFinished { block_id, .. } => {
+                    sdk::ModelEvent::ToolCallFinished {
+                        block_id,
+                        replay_token,
+                    } => {
                         // Guarantee the stable id was surfaced at least once so
                         // a registered call can never silently vanish.
-                        if let Some(entry) = self.tools.get_mut(&block_id)
-                            && !entry.announced
-                        {
-                            entry.announced = true;
-                            return Some(Ok(ModelEvent::ToolCallDelta {
+                        if let Some(entry) = self.tools.remove(&block_id) {
+                            let fallback = (!entry.announced).then(|| ModelEvent::ToolCallDelta {
                                 index: entry.index,
                                 id: Some(entry.call_id.clone()),
                                 name: None,
                                 arguments: String::new(),
-                            }));
+                            });
+                            self.captured.push(CapturedItem {
+                                index: entry.response_index,
+                                content: CapturedContent::ToolCall {
+                                    call_id: entry.call_id,
+                                },
+                                replay_requirement: entry.replay_requirement,
+                                replay_token,
+                            });
+                            if let Some(fallback) = fallback {
+                                return Some(Ok(fallback));
+                            }
                         }
                     }
                     sdk::ModelEvent::ResponseFinished { .. } => {
                         self.done = true;
-                        // Commit this call's reasoning to the turn's replay
-                        // side channel exactly once, at normal completion.
-                        self.channel.record(
-                            &self.turn_key,
-                            self.call_index,
+                        if let Err(error) = self.replay.commit(
+                            &self.client,
+                            &self.target,
+                            &self.request,
+                            self.response_id.take(),
                             std::mem::take(&mut self.captured),
-                        );
+                        ) {
+                            return Some(Err(error));
+                        }
                         return Some(Ok(ModelEvent::Completed));
                     }
                     // Text/StructuredOutput block boundaries and structured

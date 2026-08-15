@@ -18,6 +18,7 @@ pub(super) struct TurnCx<'a> {
     pub(super) operation: OperationPublisher,
     pub(super) session_id: session::SessionId,
     pub(super) revision: session::SessionRevision,
+    pub(super) current_leaf: session::EntryId,
     pub(super) state: kernel::KernelState,
 }
 

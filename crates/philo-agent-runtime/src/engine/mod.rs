@@ -207,6 +207,7 @@ async fn drive(
         operation,
         session_id: stored_session_id,
         revision: start_commit.revision(),
+        current_leaf: start_commit.current_leaf().clone(),
         state: started.next_state,
     };
     let mut effect = started.effect.expect("BeginTurn always requests model");
@@ -306,6 +307,7 @@ async fn drive(
                     }
                 };
                 cx.revision = batch_commit.revision();
+                cx.current_leaf = batch_commit.current_leaf().clone();
                 cx.state = completed.next_state;
                 cx.operation.push(AgentEvent::ToolBatchRequested {
                     tool_batch_id: crate::ToolBatchId::new(batch_id.as_str()),

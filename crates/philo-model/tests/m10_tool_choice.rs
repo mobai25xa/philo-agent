@@ -16,6 +16,9 @@ fn snapshot_with_choice(
     tools: Vec<philo_agent_runtime::ToolDefinition>,
 ) -> ModelCallSnapshot {
     ModelCallSnapshot {
+        session_id: philo_agent_runtime::SessionId::new("session-1"),
+        context_fingerprint: "session-1:entry:1".to_owned(),
+        persist_replay: true,
         operation_id: OperationId::new("operation-1"),
         turn_id: TurnId::new("turn-1"),
         model_call_id: ModelCallId::new("model-call-1"),

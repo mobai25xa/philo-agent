@@ -2,7 +2,10 @@ use philo_agent_runtime::{
     CompactionConfig, CompactionReport, GenerationConfig, ModelCallSnapshot, ModelError,
     ModelEventStream, SequentialIdSource, ToolChoice, ToolRegistry,
 };
-use philo_model::{ModelProtocol, ModelRequestHeaders};
+use philo_model::{
+    MemoryModelReplayStore, ModelContinuationPolicy, ModelProtocol, ModelRequestHeaders,
+    ServerContinuationSupport,
+};
 
 use super::*;
 
@@ -35,6 +38,8 @@ fn control(dir: &std::path::Path) -> RuntimeControl {
             endpoint: "https://example.test/v1/chat/completions".to_owned(),
             api_key_env: "PHILO_API_KEY".to_owned(),
             request_headers: ModelRequestHeaders::default(),
+            continuation_policy: ModelContinuationPolicy::StatelessLocalReplay,
+            continuation_support: ServerContinuationSupport::Disabled,
         },
         RuntimeConfig {
             system_prompt: "s".to_owned(),
@@ -55,6 +60,7 @@ fn control(dir: &std::path::Path) -> RuntimeControl {
             },
         },
         Arc::new(InertModel),
+        Arc::new(MemoryModelReplayStore::default()),
         Arc::new(JsonlSessionStore::open(dir).expect("open store")),
         Arc::new(SequentialIdSource::default()),
         Arc::new(ToolRegistry::empty()),

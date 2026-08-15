@@ -212,6 +212,9 @@ pub fn text_sse(response_id: &str, response_model: &str, deltas: &[&str]) -> Vec
 
 pub fn snapshot(messages: Vec<ModelMessage>, tools: Vec<ToolDefinition>) -> ModelCallSnapshot {
     ModelCallSnapshot {
+        session_id: philo_agent_runtime::SessionId::new("session-1"),
+        context_fingerprint: "session-1:entry:1".to_owned(),
+        persist_replay: true,
         operation_id: OperationId::new("operation-1"),
         turn_id: TurnId::new("turn-1"),
         model_call_id: ModelCallId::new("model-call-1"),
@@ -239,6 +242,9 @@ pub fn reasoning_snapshot(
     tools: Vec<ToolDefinition>,
 ) -> ModelCallSnapshot {
     ModelCallSnapshot {
+        session_id: philo_agent_runtime::SessionId::new("session-1"),
+        context_fingerprint: format!("session-1:{turn_id}:{model_call_index}"),
+        persist_replay: true,
         operation_id: OperationId::new("operation-1"),
         turn_id: TurnId::new(turn_id),
         model_call_id: ModelCallId::new(format!("{turn_id}:model-call:{model_call_index}")),

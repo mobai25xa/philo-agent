@@ -113,5 +113,6 @@ pub(super) async fn run<'a>(
         });
     }
     cx.revision = results_commit.revision();
+    cx.current_leaf = results_commit.current_leaf().clone();
     Some((cx, results))
 }

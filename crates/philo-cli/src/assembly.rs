@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use philo_agent_runtime::{IdSource, ModelPort, RuntimeConfig, ToolPort};
 use philo_coding_profile::CodingProfile;
-use philo_model::{AdapterBuildError, PhiloModelAdapter};
+use philo_model::{AdapterBuildError, FileModelReplayStore, ModelReplayStore, PhiloModelAdapter};
 use philo_session_jsonl::JsonlSessionStore;
 
 use crate::args::Cli;
@@ -20,6 +20,7 @@ pub struct RunAssembly {
     pub settings: Settings,
     pub runtime_config: RuntimeConfig,
     pub sessions: Arc<JsonlSessionStore>,
+    pub replay_store: Arc<dyn ModelReplayStore>,
     pub model: Arc<dyn ModelPort>,
     pub ids: Arc<dyn IdSource>,
     pub tools: Arc<dyn ToolPort>,
@@ -55,9 +56,18 @@ impl RunAssembly {
                 UsageError::new(format!("cannot open the session store: {error}"))
             })?,
         );
+        let replay_store: Arc<dyn ModelReplayStore> = Arc::new(
+            FileModelReplayStore::open(&settings.data_dir).map_err(|error| {
+                UsageError::new(format!("cannot open the model replay sidecar: {error}"))
+            })?,
+        );
         let model: Arc<dyn ModelPort> = Arc::new(
-            build_model(&settings.deployment, &settings.deployment.model)
-                .map_err(|error| UsageError::new(format!("model assembly failed: {error}")))?,
+            build_model(
+                &settings.deployment,
+                &settings.deployment.model,
+                replay_store.clone(),
+            )
+            .map_err(|error| UsageError::new(format!("model assembly failed: {error}")))?,
         );
         let ids: Arc<dyn IdSource> = Arc::new(ProcessIdSource::new());
         let tools: Arc<dyn ToolPort> = Arc::new(profile.tool_registry());
@@ -66,6 +76,7 @@ impl RunAssembly {
             settings,
             runtime_config,
             sessions,
+            replay_store,
             model,
             ids,
             tools,
@@ -78,6 +89,7 @@ impl RunAssembly {
 pub(crate) fn build_model(
     deployment: &crate::config::Deployment,
     model: &str,
+    replay_store: Arc<dyn ModelReplayStore>,
 ) -> Result<PhiloModelAdapter, AdapterBuildError> {
     PhiloModelAdapter::builder(
         deployment.provider.clone(),
@@ -87,5 +99,8 @@ pub(crate) fn build_model(
     )
     .api_key_env(&deployment.api_key_env)
     .request_headers(deployment.request_headers.clone())
+    .replay_store(replay_store)
+    .continuation_policy(deployment.continuation_policy)
+    .server_continuation_support(deployment.continuation_support)
     .build()
 }

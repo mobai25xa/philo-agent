@@ -1,4 +1,4 @@
-//! M4-007 live smoke: opt-in real-API checks, never a CI gate.
+//! opt-in live smoke: real-API checks, never a CI gate.
 //!
 //! Both tests are `#[ignore]` and additionally require explicit environment
 //! configuration. Run them with:

@@ -1,4 +1,4 @@
-//! M9-010 live smoke: opt-in real-API checks over the actual binary, never
+//! Opt-in live smoke: real-API checks over the actual binary, never
 //! a CI gate. Configure the deployment and run with `--ignored`:
 //!
 //! ```text

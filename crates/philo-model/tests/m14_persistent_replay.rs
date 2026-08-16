@@ -691,6 +691,7 @@ fn runtime(
             model_target: "stub-model".to_owned(),
             generation: GenerationConfig::default(),
             max_tool_rounds: 1,
+            max_parallel_tool_calls: 1,
             operation_timeout: None,
             compaction: Default::default(),
         },

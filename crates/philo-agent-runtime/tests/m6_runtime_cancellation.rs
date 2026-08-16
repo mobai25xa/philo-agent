@@ -52,6 +52,7 @@ fn runtime(
             model_target: "fake".to_owned(),
             generation: GenerationConfig::default(),
             max_tool_rounds,
+            max_parallel_tool_calls: 1,
             operation_timeout: None,
             compaction: Default::default(),
         },
@@ -396,7 +397,10 @@ fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
     assert!(poll_once(&mut wait).is_pending(), "call-1 is executing");
     assert_eq!(
         victim.phase(),
-        OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing { index: 0 })
+        OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+            in_flight: 1,
+            completed: 0,
+        })
     );
     victim.cancel();
     tool_gate.release();

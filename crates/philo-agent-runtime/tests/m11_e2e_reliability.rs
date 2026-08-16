@@ -71,6 +71,7 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
         model_target: "fake".to_owned(),
         generation: GenerationConfig::default(),
         max_tool_rounds,
+        max_parallel_tool_calls: 1,
         operation_timeout,
         compaction: Default::default(),
     }
@@ -344,7 +345,10 @@ fn m11_005_timeout_cancellation_lands_on_disk_with_its_reason() {
     loop {
         assert!(poll_once(&mut wait).is_pending());
         if handle.phase()
-            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing { index: 0 })
+            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                in_flight: 1,
+                completed: 0,
+            })
         {
             break;
         }

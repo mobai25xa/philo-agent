@@ -182,6 +182,30 @@ fn unknown_keys_warn_and_keep_running() {
 }
 
 #[test]
+fn an_invalid_parallel_tool_cap_exits_two() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    write_config(
+        &config_home,
+        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
+         [defaults]\nmax_parallel_tool_calls = 0\n",
+    );
+
+    let output = philo(&config_home)
+        .current_dir(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr_text(&output).contains("must be a positive integer"),
+        "{}",
+        stderr_text(&output)
+    );
+}
+
+#[test]
 fn an_invalid_value_is_a_usage_error() {
     let root = TempRoot::new();
     let config_home = root.dir("home");

@@ -47,6 +47,7 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
         model_target: "fake".to_owned(),
         generation: GenerationConfig::default(),
         max_tool_rounds,
+        max_parallel_tool_calls: 1,
         operation_timeout,
         compaction: Default::default(),
     }
@@ -437,7 +438,10 @@ fn operation_timeout_cancels_mid_batch_with_reason_timeout() {
             "the gated call keeps the operation running"
         );
         if handle.phase()
-            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing { index: 0 })
+            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                in_flight: 1,
+                completed: 0,
+            })
         {
             break;
         }
@@ -503,7 +507,10 @@ fn user_cancel_wins_the_race_and_keeps_reason_user() {
     loop {
         assert!(poll_once(&mut wait).is_pending());
         if handle.phase()
-            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing { index: 0 })
+            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                in_flight: 1,
+                completed: 0,
+            })
         {
             break;
         }

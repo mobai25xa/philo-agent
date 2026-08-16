@@ -50,7 +50,9 @@
 
 use std::path::PathBuf;
 
-use philo_agent_runtime::{GenerationConfig, RuntimeConfig, ToolChoice};
+use philo_agent_runtime::{
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, GenerationConfig, RuntimeConfig, ToolChoice,
+};
 use philo_tools::ToolRegistry;
 use philo_tools_std::{EditTool, GrepTool, ListTool, ReadTool, ShellTool, WriteTool};
 
@@ -157,6 +159,7 @@ impl CodingProfile {
             model_target: model_target.into(),
             generation: Self::generation_defaults(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+            max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             // The operation timeout is deployment configuration, not
             // scenario knowledge: the profile keeps it disabled.
             operation_timeout: None,

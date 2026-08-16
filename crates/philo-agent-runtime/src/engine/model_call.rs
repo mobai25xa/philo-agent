@@ -52,6 +52,7 @@ pub(super) async fn run<'a>(
         },
         model_target: turn.model_target.clone(),
         generation: turn.generation.clone(),
+        max_parallel_tool_calls: turn.max_parallel_tool_calls,
     };
     let started = cx.ctx.model.start(request).await;
     let mut stream = match started {

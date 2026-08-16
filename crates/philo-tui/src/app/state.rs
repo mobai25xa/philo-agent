@@ -128,6 +128,11 @@ impl App {
         self.level
     }
 
+    #[cfg(test)]
+    pub(crate) fn shows_reasoning(&self) -> bool {
+        self.show_reasoning
+    }
+
     /// Images waiting for the next message (`/image`, `Ctrl+V`).
     pub fn attachments(&self) -> &Attachments {
         &self.attachments
@@ -297,6 +302,9 @@ impl App {
 
     /// Handles one interpreted key action.
     pub fn on_action(&mut self, action: Action) -> Vec<Effect> {
+        if let Action::ConfigReload(notice) = action {
+            return self.apply_config_notice(notice);
+        }
         if self.confirm.is_some() {
             return self.on_confirm_action(action);
         }
@@ -392,7 +400,77 @@ impl App {
             Action::Redraw => vec![Effect::HardRedraw],
             Action::Complete => self.complete(),
             Action::Paste => vec![Effect::ReadClipboard],
+            Action::ConfigReload(_) => unreachable!("config notices are handled first"),
             Action::None => vec![],
+        }
+    }
+
+    fn apply_config_notice(
+        &mut self,
+        notice: crate::api::types::ConfigReloadNotice,
+    ) -> Vec<Effect> {
+        use crate::api::types::ConfigReloadNotice;
+        match notice {
+            ConfigReloadNotice::Applied {
+                show_reasoning,
+                verbose,
+                context_window,
+                model_name,
+                runtime_pending,
+                warnings,
+            } => {
+                self.show_reasoning = show_reasoning;
+                self.transcript.set_show_reasoning(show_reasoning);
+                self.status.context_window = context_window;
+                self.status.model = model_name;
+                self.level = if verbose {
+                    InfoLevel::Verbose
+                } else {
+                    InfoLevel::Default
+                };
+                self.status.level = self.level;
+                let mut lines = Vec::new();
+                if runtime_pending {
+                    let first = !self.status.config_reload_pending;
+                    self.status.config_reload_pending = true;
+                    if first {
+                        lines.push(line(LineKind::Notice, "config: will apply after idle"));
+                    }
+                } else {
+                    self.status.config_reload_pending = false;
+                    lines.push(line(LineKind::Meta, "config reloaded"));
+                }
+                lines.extend(
+                    warnings
+                        .into_iter()
+                        .map(|warning| line(LineKind::Notice, format!("warning: {warning}"))),
+                );
+                vec![Effect::Append(lines)]
+            }
+            ConfigReloadNotice::Failed {
+                message,
+                clear_pending,
+            } => {
+                if clear_pending {
+                    self.status.config_reload_pending = false;
+                }
+                vec![Effect::Append(vec![line(
+                    LineKind::Error,
+                    format!("warning: {message}"),
+                )])]
+            }
+            ConfigReloadNotice::Pending => {
+                let first = !self.status.config_reload_pending;
+                self.status.config_reload_pending = true;
+                if first {
+                    vec![Effect::Append(vec![line(
+                        LineKind::Notice,
+                        "config: will apply after idle",
+                    )])]
+                } else {
+                    vec![]
+                }
+            }
         }
     }
 
@@ -1477,5 +1555,49 @@ mod tests {
             usage,
         });
         assert_eq!(app.status.usage, Some(usage));
+    }
+
+    #[test]
+    fn config_reload_applies_show_reasoning_and_reports_success() {
+        use crate::api::types::ConfigReloadNotice;
+        let mut app = app();
+        let effects = app.on_action(Action::ConfigReload(ConfigReloadNotice::Applied {
+            show_reasoning: false,
+            verbose: false,
+            context_window: Some(8_000),
+            model_name: "model-b".to_owned(),
+            runtime_pending: false,
+            warnings: Vec::new(),
+        }));
+        assert!(!app.shows_reasoning());
+        assert_eq!(app.status.model, "model-b");
+        assert_eq!(app.status.context_window, Some(8_000));
+        assert!(!app.status.config_reload_pending);
+        assert_eq!(texts(&appended(&effects)), ["config reloaded"]);
+    }
+
+    #[test]
+    fn config_reload_pending_is_visible_and_not_repeated() {
+        use crate::api::types::ConfigReloadNotice;
+        let mut app = app();
+        app.set_busy(true, 0);
+        let first = app.on_action(Action::ConfigReload(ConfigReloadNotice::Pending));
+        assert!(app.status.config_reload_pending);
+        assert_eq!(texts(&appended(&first)), ["config: will apply after idle"]);
+        let second = app.on_action(Action::ConfigReload(ConfigReloadNotice::Pending));
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn config_reload_failure_is_an_error_line() {
+        use crate::api::types::ConfigReloadNotice;
+        let mut app = app();
+        let effects = app.on_action(Action::ConfigReload(ConfigReloadNotice::Failed {
+            message: "config not reloaded: invalid TOML".to_owned(),
+            clear_pending: false,
+        }));
+        let lines = appended(&effects);
+        assert_eq!(lines[0].kind, LineKind::Error);
+        assert!(lines[0].text.contains("invalid TOML"));
     }
 }

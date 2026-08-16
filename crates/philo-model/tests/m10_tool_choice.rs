@@ -35,6 +35,7 @@ fn snapshot_with_choice(
             reasoning_effort: None,
             tool_choice,
         },
+        max_parallel_tool_calls: 1,
     }
 }
 
@@ -90,6 +91,21 @@ async fn required_none_and_specific_map_directly() {
     for body in &bodies {
         assert_eq!(body["parallel_tool_calls"], false);
     }
+}
+
+#[tokio::test]
+async fn a_frozen_cap_above_one_unlocks_parallel_tool_calls() {
+    let transport = StubTransport::new([StubResponse::Sse(text_sse("r", "m", &["ok"]))]);
+    let adapter = adapter_over(transport.clone());
+    let mut request = snapshot_with_choice(ToolChoice::Auto, vec![read_tool_definition()]);
+    request.max_parallel_tool_calls = 8;
+    let stream = adapter.start(request).await.expect("call starts");
+    collect_ok(stream).await;
+
+    assert_eq!(
+        transport.request_bodies()[0]["parallel_tool_calls"], true,
+        "a frozen cap greater than one sends Allow"
+    );
 }
 
 #[tokio::test]

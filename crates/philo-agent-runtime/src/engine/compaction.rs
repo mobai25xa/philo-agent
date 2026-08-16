@@ -215,6 +215,7 @@ async fn generate_summary(
         tools: Vec::new(),
         model_target: ctx.config.model_target.clone(),
         generation: ctx.config.generation.clone(),
+        max_parallel_tool_calls: ctx.config.max_parallel_tool_calls.max(1),
     };
     let mut stream = ctx.model.start(request).await.map_err(|error| {
         SummaryFailure::Failed(CompactionError::Model {

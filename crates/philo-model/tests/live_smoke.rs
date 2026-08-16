@@ -87,6 +87,7 @@ fn config(max_tool_rounds: u32, system_prompt: &str) -> RuntimeConfig {
             tool_choice: philo_agent_runtime::ToolChoice::Auto,
         },
         max_tool_rounds,
+        max_parallel_tool_calls: 1,
         operation_timeout: None,
         compaction: Default::default(),
     }

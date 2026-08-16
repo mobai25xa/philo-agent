@@ -33,6 +33,7 @@ fn config() -> RuntimeConfig {
         model_target: "fake".to_owned(),
         generation: GenerationConfig::default(),
         max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+        max_parallel_tool_calls: 1,
         operation_timeout: None,
         compaction: Default::default(),
     }

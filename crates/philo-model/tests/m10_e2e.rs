@@ -99,6 +99,7 @@ async fn m10_001_truncated_tool_output_is_the_single_source_of_truth() {
                 tool_choice: philo_agent_runtime::ToolChoice::Auto,
             },
             max_tool_rounds: 1,
+            max_parallel_tool_calls: 1,
             operation_timeout: None,
             compaction: Default::default(),
         },

@@ -5,6 +5,7 @@ pub(super) fn map_tools(
     request: &mut sdk::ModelRequest,
     choice: &ToolChoice,
     tools: &[ToolDefinition],
+    max_parallel_tool_calls: u32,
 ) -> Result<(), ModelError> {
     if tools.is_empty() {
         // Tool disabling wins: the frozen configuration has no effect on a
@@ -16,9 +17,11 @@ pub(super) fn map_tools(
             request.tools.push(map_tool(tool)?);
         }
     }
-    // Kernel serial invariant: parallel tool calls stay locked off and are
-    // never exposed through configuration.
-    request.parallel_tool_calls = sdk::ParallelToolCalls::Forbid;
+    request.parallel_tool_calls = if max_parallel_tool_calls > 1 {
+        sdk::ParallelToolCalls::Allow
+    } else {
+        sdk::ParallelToolCalls::Forbid
+    };
     Ok(())
 }
 

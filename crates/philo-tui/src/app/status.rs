@@ -20,6 +20,8 @@ pub struct StatusData {
     /// Context-budget hint: the configured or capability-derived window.
     pub context_window: Option<u64>,
     pub level: InfoLevel,
+    /// A parsed config change is waiting for Idle before Runtime apply.
+    pub config_reload_pending: bool,
 }
 
 impl StatusData {
@@ -34,6 +36,7 @@ impl StatusData {
             usage: None,
             context_window: None,
             level,
+            config_reload_pending: false,
         }
     }
 
@@ -58,7 +61,7 @@ impl StatusData {
     /// Responsive status projection. Fields are admitted in preservation
     /// priority: state, queue, session, model, usage/context, verbose.
     pub(crate) fn line_for_width(&self, max_width: usize) -> String {
-        let state = if self.compacting {
+        let mut state = if self.compacting {
             format!(
                 "compacting [{}]",
                 ["|", "/", "-", "\\"][self.compaction_spinner]
@@ -68,6 +71,9 @@ impl StatusData {
         } else {
             "idle".to_owned()
         };
+        if self.config_reload_pending {
+            state.push_str("; reload pending");
+        }
         let mut fields = vec![
             (0, 3, format!("model {}", self.model)),
             (1, 2, format!("session {}", self.session)),
@@ -119,8 +125,12 @@ impl StatusData {
             text::truncate(
                 if self.compacting {
                     "compacting"
+                } else if self.busy && self.config_reload_pending {
+                    "busy; reload pending"
                 } else if self.busy {
                     "busy"
+                } else if self.config_reload_pending {
+                    "idle; reload pending"
                 } else {
                     "idle"
                 },
@@ -165,5 +175,14 @@ mod tests {
         let line = status.line_for_width(40);
         assert_eq!(line, "session session-123 | busy | queued 3");
         assert!(text::width(&line) <= 40);
+    }
+
+    #[test]
+    fn pending_reload_is_visible_on_the_status_line() {
+        let mut status = StatusData::new("gpt-test", "s-1", InfoLevel::Default);
+        status.busy = true;
+        status.config_reload_pending = true;
+        assert!(status.line().contains("reload pending"));
+        assert!(status.line().contains("busy"));
     }
 }

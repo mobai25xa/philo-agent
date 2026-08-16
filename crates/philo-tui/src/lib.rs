@@ -19,7 +19,7 @@ mod render;
 mod tests;
 
 pub use api::{
-    ConfigEntry, ConfirmationChannel, ConfirmationRequest, ConfirmationResponse, HostError,
-    TuiConfig, TuiExit, TuiHost,
+    ConfigEntry, ConfigReloadNotice, ConfirmationChannel, ConfirmationRequest,
+    ConfirmationResponse, HostError, TuiConfig, TuiExit, TuiHost,
 };
 pub use driver::run;

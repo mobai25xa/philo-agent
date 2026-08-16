@@ -29,6 +29,7 @@ pub(crate) fn map_request(
         &mut request,
         &snapshot.generation.tool_choice,
         &snapshot.tools,
+        snapshot.max_parallel_tool_calls,
     )?;
     Ok(request)
 }

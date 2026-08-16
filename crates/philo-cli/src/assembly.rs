@@ -45,6 +45,9 @@ impl RunAssembly {
         if let Some(rounds) = settings.max_tool_rounds {
             runtime_config.max_tool_rounds = rounds;
         }
+        if let Some(parallel) = settings.max_parallel_tool_calls {
+            runtime_config.max_parallel_tool_calls = parallel;
+        }
         if settings.reasoning_effort.is_some() {
             runtime_config.generation.reasoning_effort = settings.reasoning_effort;
         }
@@ -106,4 +109,48 @@ pub(crate) fn build_model(
         builder = builder.chat_reasoning_format(format);
     }
     builder.build()
+}
+
+/// Maps resolved settings onto a RuntimeConfig the same way [`RunAssembly::prepare`]
+/// does, without opening stores or building a model.
+pub(crate) fn runtime_config_for(
+    cli: &Cli,
+    settings: &Settings,
+    model_target: &str,
+) -> Result<RuntimeConfig, UsageError> {
+    let workspace_root = std::env::current_dir().map_err(|error| {
+        UsageError::new(format!("cannot resolve the working directory: {error}"))
+    })?;
+    let mut profile = CodingProfile::new(workspace_root);
+    if let Some(seconds) = settings.shell_timeout_secs {
+        profile = profile.with_shell_timeout_secs(seconds);
+    }
+    let mut runtime_config = profile.runtime_config(model_target);
+    if let Some(system) = &cli.system {
+        runtime_config.system_prompt = system.clone();
+    }
+    if let Some(rounds) = settings.max_tool_rounds {
+        runtime_config.max_tool_rounds = rounds;
+    }
+    if let Some(parallel) = settings.max_parallel_tool_calls {
+        runtime_config.max_parallel_tool_calls = parallel;
+    }
+    if settings.reasoning_effort.is_some() {
+        runtime_config.generation.reasoning_effort = settings.reasoning_effort;
+    }
+    runtime_config.operation_timeout = settings.operation_timeout;
+    runtime_config.compaction = settings.compaction.clone();
+    Ok(runtime_config)
+}
+
+/// Rebuilds the coding ToolPort from resolved settings (shell timeout).
+pub(crate) fn tool_port_for(settings: &Settings) -> Result<Arc<dyn ToolPort>, UsageError> {
+    let workspace_root = std::env::current_dir().map_err(|error| {
+        UsageError::new(format!("cannot resolve the working directory: {error}"))
+    })?;
+    let mut profile = CodingProfile::new(workspace_root);
+    if let Some(seconds) = settings.shell_timeout_secs {
+        profile = profile.with_shell_timeout_secs(seconds);
+    }
+    Ok(Arc::new(profile.tool_registry()))
 }

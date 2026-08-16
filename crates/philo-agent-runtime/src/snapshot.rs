@@ -14,6 +14,8 @@ pub struct TurnSnapshot {
     pub generation: GenerationConfig,
     pub tools: Vec<ToolDefinition>,
     pub max_tool_rounds: u32,
+    /// Concurrent invoke cap frozen for this turn; `1` is the serial path.
+    pub max_parallel_tool_calls: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,4 +40,6 @@ pub struct ModelCallSnapshot {
     pub tools: Vec<ToolDefinition>,
     pub model_target: String,
     pub generation: GenerationConfig,
+    /// Frozen concurrent invoke cap; adapters send `Allow` when this is `> 1`.
+    pub max_parallel_tool_calls: u32,
 }

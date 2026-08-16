@@ -141,6 +141,7 @@ async fn drive(
         generation: ctx.config.generation.clone(),
         tools: ctx.tools.definitions(),
         max_tool_rounds: ctx.config.max_tool_rounds,
+        max_parallel_tool_calls: ctx.config.max_parallel_tool_calls.max(1),
     };
     // Explicit runtime -> kernel mapping; both layers enforce the same
     // structural rules, so a constructed UserMessage always converts.
@@ -313,7 +314,14 @@ async fn drive(
                     tool_batch_id: crate::ToolBatchId::new(batch_id.as_str()),
                     call_count: calls.len(),
                 });
-                let step = tool_batch::run(cx, &tool_effect_id, &batch_id, &calls).await;
+                let step = tool_batch::run(
+                    cx,
+                    &tool_effect_id,
+                    &batch_id,
+                    &calls,
+                    turn.max_parallel_tool_calls,
+                )
+                .await;
                 let Some((next_cx, results)) = step else {
                     return;
                 };

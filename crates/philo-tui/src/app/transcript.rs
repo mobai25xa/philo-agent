@@ -72,6 +72,15 @@ impl Transcript {
         }
     }
 
+    /// Applies `[ui].show_reasoning` from a config reload without rebuilding
+    /// the rest of the transcript.
+    pub fn set_show_reasoning(&mut self, show_reasoning: bool) {
+        self.show_reasoning = show_reasoning;
+        if !show_reasoning {
+            self.partial_reasoning.clear();
+        }
+    }
+
     /// The unfinished streaming line for the live row, if any.
     pub fn partial(&self) -> Option<(LineKind, &str)> {
         if !self.partial_answer.is_empty() {

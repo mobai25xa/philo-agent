@@ -13,6 +13,8 @@ use philo_agent_runtime::{
     AgentEvent, CompactionError, CompactionReport, OperationHandle, RuntimeFuture,
 };
 
+use crate::api::types::ConfigReloadNotice;
+
 use super::tasks::{PendingTasks, TaskCompletion};
 
 pub(crate) type CompactionFuture =
@@ -27,6 +29,7 @@ pub(crate) enum Step {
     FrameDeadline,
     AnimationDeadline,
     ConfirmationPoll,
+    ConfigNotice(ConfigReloadNotice),
 }
 
 pub(crate) enum AgentItem {
@@ -48,6 +51,7 @@ pub(crate) async fn next_step(
     frame_deadline: Option<tokio::time::Instant>,
     animation_deadline: Option<tokio::time::Instant>,
     confirmation_poll: Option<tokio::time::Instant>,
+    config_notices: &mut Option<tokio::sync::mpsc::UnboundedReceiver<ConfigReloadNotice>>,
 ) -> Step {
     tokio::select! {
         event = next_agent_event(handles) => Step::Agent(event),
@@ -60,6 +64,7 @@ pub(crate) async fn next_step(
         _ = wait_for(frame_deadline) => Step::FrameDeadline,
         _ = wait_for(animation_deadline) => Step::AnimationDeadline,
         _ = wait_for(confirmation_poll) => Step::ConfirmationPoll,
+        notice = next_config_notice(config_notices) => Step::ConfigNotice(notice),
     }
 }
 
@@ -139,6 +144,21 @@ async fn next_agent_event(handles: &mut VecDeque<OperationHandle>) -> Option<Age
 
 async fn next_terminal_event(term_events: &mut EventStream) -> Option<std::io::Result<TermEvent>> {
     poll_fn(|cx| Pin::new(&mut *term_events).poll_next(cx)).await
+}
+
+async fn next_config_notice(
+    notices: &mut Option<tokio::sync::mpsc::UnboundedReceiver<ConfigReloadNotice>>,
+) -> ConfigReloadNotice {
+    match notices.as_mut() {
+        Some(rx) => match rx.recv().await {
+            Some(notice) => notice,
+            None => {
+                *notices = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]

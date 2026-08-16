@@ -8,23 +8,22 @@ use philo_agent_runtime::{
 };
 use philo_session::{SessionContextView, SessionStore};
 use philo_session_jsonl::JsonlSessionStore;
-use philo_tui::{ConfigEntry, ConfirmationChannel, HostError, TuiHost};
+use philo_tui::{ConfigEntry, ConfigReloadNotice, ConfirmationChannel, HostError, TuiHost};
 
-use super::runtime_control::RuntimeControl;
+use super::runtime_control::{ApplyError, ApplyResult, DisplayState, RuntimeControl};
 use crate::assembly::RunAssembly;
-use crate::config::Settings;
+use crate::config::{ResolveFlags, Settings, Verbosity};
+use crate::error::UsageError;
 use crate::ids::fresh_session_id;
 
 pub struct CliHost {
     runtime: RuntimeControl,
     sessions: Arc<JsonlSessionStore>,
-    tools: Arc<dyn philo_agent_runtime::ToolPort>,
-    entries: Vec<crate::config::EffectiveSetting>,
     confirmations: ConfirmationChannel,
 }
 
 impl CliHost {
-    pub fn new(assembly: RunAssembly) -> Self {
+    pub fn new(assembly: RunAssembly, flags: ResolveFlags) -> Self {
         let RunAssembly {
             settings,
             runtime_config,
@@ -34,27 +33,89 @@ impl CliHost {
             ids,
             tools,
         } = assembly;
-        let Settings {
-            deployment,
-            entries,
-            ..
-        } = settings;
         let runtime = RuntimeControl::new(
-            deployment,
+            settings.deployment.clone(),
             runtime_config,
             model,
             replay_store,
             sessions.clone(),
             ids,
-            tools.clone(),
+            tools,
+            flags,
+            &settings,
         );
         Self {
             runtime,
             sessions,
-            tools,
-            entries,
             confirmations: ConfirmationChannel::default(),
         }
+    }
+
+    pub fn on_reloaded_files(
+        &self,
+        result: Result<(Settings, Vec<String>), UsageError>,
+    ) -> Option<ConfigReloadNotice> {
+        match result {
+            Err(error) => Some(ConfigReloadNotice::Failed {
+                message: format!("config not reloaded: {}", error.0),
+                clear_pending: false,
+            }),
+            Ok((settings, warnings)) => match self.runtime.apply_settings(settings) {
+                Ok(ApplyResult::Unchanged) => None,
+                Ok(ApplyResult::Applied {
+                    display,
+                    runtime_pending,
+                }) => Some(applied_notice(display, runtime_pending, warnings)),
+                Err(ApplyError::DataDir) => Some(ConfigReloadNotice::Failed {
+                    message: "config not reloaded: data_dir cannot be changed without restarting"
+                        .to_owned(),
+                    clear_pending: false,
+                }),
+                Err(ApplyError::Assembly(message)) => Some(ConfigReloadNotice::Failed {
+                    message: format!("config not reloaded: {message}"),
+                    clear_pending: true,
+                }),
+            },
+        }
+    }
+
+    pub fn on_watch_poll(&self) -> Option<ConfigReloadNotice> {
+        match self.runtime.flush_pending() {
+            Ok(None) | Ok(Some(ApplyResult::Unchanged)) => None,
+            Ok(Some(ApplyResult::Applied {
+                display,
+                runtime_pending,
+            })) => Some(applied_notice(display, runtime_pending, Vec::new())),
+            Err(ApplyError::DataDir) => Some(ConfigReloadNotice::Failed {
+                message: "config not reloaded: data_dir cannot be changed without restarting"
+                    .to_owned(),
+                clear_pending: false,
+            }),
+            Err(ApplyError::Assembly(message)) => Some(ConfigReloadNotice::Failed {
+                message: format!("config not reloaded: {message}"),
+                clear_pending: true,
+            }),
+        }
+    }
+}
+
+fn applied_notice(
+    display: DisplayState,
+    runtime_pending: bool,
+    warnings: Vec<String>,
+) -> ConfigReloadNotice {
+    let warnings = if display.verbosity == Verbosity::Quiet {
+        Vec::new()
+    } else {
+        warnings
+    };
+    ConfigReloadNotice::Applied {
+        show_reasoning: display.show_reasoning,
+        verbose: display.verbosity == Verbosity::Verbose,
+        context_window: display.context_window,
+        model_name: display.model_name,
+        runtime_pending,
+        warnings,
     }
 }
 
@@ -103,18 +164,19 @@ impl TuiHost for CliHost {
     }
 
     fn config_view(&self) -> Vec<ConfigEntry> {
-        self.entries
-            .iter()
+        self.runtime
+            .config_entries()
+            .into_iter()
             .map(|entry| ConfigEntry {
-                key: entry.key.clone(),
-                value: entry.value.clone(),
-                source: entry.source.clone(),
+                key: entry.key,
+                value: entry.value,
+                source: entry.source,
             })
             .collect()
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.definitions()
+        self.runtime.tool_definitions()
     }
 
     fn new_session_id(&self) -> String {

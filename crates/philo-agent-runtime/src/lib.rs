@@ -15,8 +15,8 @@ mod snapshot;
 
 pub use compaction::{CompactionError, CompactionReport};
 pub use config::{
-    CompactionConfig, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ReasoningEffort, RuntimeConfig,
-    ToolChoice,
+    CompactionConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig,
+    ReasoningEffort, RuntimeConfig, ToolChoice,
 };
 pub use event::AgentEvent;
 pub use ids::{

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use philo_agent_runtime::{CompactionConfig, ReasoningEffort};
 use philo_model::{
-    ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol, ModelRequestHeaders,
-    DEFAULT_USER_AGENT,
+    ChatReasoningFormat, DEFAULT_USER_AGENT, ModelCompat, ModelContinuationPolicy, ModelProtocol,
+    ModelRequestHeaders,
 };
 
 use super::file::{FileConfig, Sourced};
@@ -55,6 +55,7 @@ pub struct Settings {
     pub compaction: CompactionConfig,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_rounds: Option<u32>,
+    pub max_parallel_tool_calls: Option<u32>,
     pub operation_timeout: Option<Duration>,
     pub shell_timeout_secs: Option<u64>,
     pub verbosity: Verbosity,
@@ -354,6 +355,23 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         None => None,
     };
 
+    let max_parallel_tool_calls = match pick_integer(None, file.max_parallel_tool_calls.as_ref()) {
+        Some(picked) => {
+            record(
+                "max_parallel_tool_calls",
+                picked.value.to_string(),
+                picked.source,
+            );
+            Some(u32::try_from(picked.value).map_err(|_| {
+                UsageError::new(format!(
+                    "max_parallel_tool_calls is out of range: {}",
+                    picked.value
+                ))
+            })?)
+        }
+        None => None,
+    };
+
     let operation_timeout = match from_file(file.operation_timeout_secs.as_ref()) {
         Some(picked) => {
             record(
@@ -437,6 +455,7 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         },
         reasoning_effort,
         max_tool_rounds,
+        max_parallel_tool_calls,
         operation_timeout,
         shell_timeout_secs,
         verbosity,

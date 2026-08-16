@@ -5,10 +5,10 @@ use clap::Parser;
 use philo_agent_runtime::ReasoningEffort;
 use philo_model::{ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol};
 
-use super::file::{load_layers, Layer, Sourced};
+use super::file::{Layer, Sourced, load_layers};
 use super::resolve::{
-    parse_compat, parse_continuation_policy, parse_protocol, parse_reasoning_effort,
-    parse_reasoning_format, parse_verbosity, validate_reasoning_effort, Verbosity,
+    Verbosity, parse_compat, parse_continuation_policy, parse_protocol, parse_reasoning_effort,
+    parse_reasoning_format, parse_verbosity, validate_reasoning_effort,
 };
 use crate::args::Cli;
 
@@ -108,10 +108,12 @@ fn deployment_headers_merge_case_insensitively_and_keep_per_header_sources() {
             && entry.source == "project"
     }));
     for key in ["header.x-project", "header.x-route"] {
-        assert!(settings
-            .entries
-            .iter()
-            .any(|entry| { entry.key == key && entry.value == "<configured>" }));
+        assert!(
+            settings
+                .entries
+                .iter()
+                .any(|entry| { entry.key == key && entry.value == "<configured>" })
+        );
     }
     let debug = format!("{:?}", settings.deployment);
     assert!(!debug.contains("global-route"));
@@ -171,6 +173,7 @@ fn every_section_reads_its_key_domain() {
          [defaults]\n\
          reasoning_effort = \"high\"\n\
          max_tool_rounds = 12\n\
+         max_parallel_tool_calls = 4\n\
          operation_timeout_secs = 300\n\
          [tools]\n\
          shell_timeout_secs = 90\n\
@@ -220,6 +223,7 @@ fn every_section_reads_its_key_domain() {
         4
     );
     assert_eq!(config.max_tool_rounds.expect("rounds").value, 12);
+    assert_eq!(config.max_parallel_tool_calls.expect("parallel").value, 4);
     assert_eq!(config.shell_timeout_secs.expect("shell").value, 90);
     assert!(!config.show_reasoning.expect("reasoning").value);
 }
@@ -235,16 +239,31 @@ fn unknown_keys_warn_but_invalid_values_fail() {
     assert_eq!(config.warnings.len(), 2);
 
     let wrong = dir.write("wrong.toml", "[deployment]\nmodel = 42\n");
-    assert!(load_layers(Some(&wrong), None)
-        .expect_err("wrong type")
-        .0
-        .contains("must be a string, found integer"));
+    assert!(
+        load_layers(Some(&wrong), None)
+            .expect_err("wrong type")
+            .0
+            .contains("must be a string, found integer")
+    );
 
     let zero = dir.write("zero.toml", "[defaults]\nmax_tool_rounds = 0\n");
-    assert!(load_layers(Some(&zero), None)
-        .expect_err("non-positive")
-        .0
-        .contains("must be a positive integer"));
+    assert!(
+        load_layers(Some(&zero), None)
+            .expect_err("non-positive")
+            .0
+            .contains("must be a positive integer")
+    );
+
+    let parallel_zero = dir.write(
+        "parallel-zero.toml",
+        "[defaults]\nmax_parallel_tool_calls = 0\n",
+    );
+    assert!(
+        load_layers(Some(&parallel_zero), None)
+            .expect_err("parallel cap must be at least 1")
+            .0
+            .contains("must be a positive integer")
+    );
 }
 
 #[test]
@@ -450,27 +469,33 @@ fn reasoning_format_is_chat_only_and_shown_when_set() {
 
 #[test]
 fn reasoning_effort_is_validated_against_compat_and_format() {
-    assert!(validate_reasoning_effort(
-        ModelProtocol::OpenAiChat,
-        ModelCompat::Compatible,
-        None,
-        ReasoningEffort::High,
-    )
-    .is_ok());
-    assert!(validate_reasoning_effort(
-        ModelProtocol::OpenAiChat,
-        ModelCompat::Compatible,
-        Some(ChatReasoningFormat::EffortOnly),
-        ReasoningEffort::Minimal,
-    )
-    .is_ok());
-    assert!(validate_reasoning_effort(
-        ModelProtocol::OpenAiResponses,
-        ModelCompat::Official,
-        None,
-        ReasoningEffort::VeryHigh,
-    )
-    .is_ok());
+    assert!(
+        validate_reasoning_effort(
+            ModelProtocol::OpenAiChat,
+            ModelCompat::Compatible,
+            None,
+            ReasoningEffort::High,
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_reasoning_effort(
+            ModelProtocol::OpenAiChat,
+            ModelCompat::Compatible,
+            Some(ChatReasoningFormat::EffortOnly),
+            ReasoningEffort::Minimal,
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_reasoning_effort(
+            ModelProtocol::OpenAiResponses,
+            ModelCompat::Official,
+            None,
+            ReasoningEffort::VeryHigh,
+        )
+        .is_ok()
+    );
 
     for format in [ChatReasoningFormat::None, ChatReasoningFormat::ContentOnly] {
         let error = validate_reasoning_effort(
@@ -516,10 +541,36 @@ fn resolved_entries_use_cli_vocabulary_not_tui_types() {
     };
 
     let settings = super::resolve::resolve(&cli, &file).expect("resolves");
-    assert!(settings
-        .entries
-        .iter()
-        .any(|entry| entry.key == "model" && entry.source == "flag"));
+    assert!(
+        settings
+            .entries
+            .iter()
+            .any(|entry| entry.key == "model" && entry.source == "flag")
+    );
+}
+
+#[test]
+fn max_parallel_tool_calls_defaults_to_unset_and_accepts_a_positive_file_value() {
+    let settings =
+        super::resolve::resolve(&resolvable_cli(), &deployment_file()).expect("defaults resolve");
+    assert_eq!(settings.max_parallel_tool_calls, None);
+    assert!(
+        settings
+            .entries
+            .iter()
+            .all(|entry| entry.key != "max_parallel_tool_calls")
+    );
+
+    let mut file = deployment_file();
+    file.max_parallel_tool_calls = Some(Sourced {
+        value: 8,
+        layer: Layer::Project,
+    });
+    let settings = super::resolve::resolve(&resolvable_cli(), &file).expect("resolves");
+    assert_eq!(settings.max_parallel_tool_calls, Some(8));
+    assert!(settings.entries.iter().any(|entry| {
+        entry.key == "max_parallel_tool_calls" && entry.value == "8" && entry.source == "project"
+    }));
 }
 
 fn resolvable_cli() -> Cli {
@@ -675,4 +726,99 @@ fn compaction_layers_merge_key_by_key() {
             layer: Layer::Project,
         }
     );
+}
+
+fn watch_flags() -> super::watch::ResolveFlags {
+    super::watch::ResolveFlags {
+        model: None,
+        data_dir: None,
+        system: None,
+        max_tool_rounds: None,
+        reasoning_effort: None,
+        verbose: false,
+        quiet: false,
+    }
+}
+
+#[test]
+fn load_and_resolve_do_not_start_a_watch_task() {
+    assert_eq!(super::watch::active_watch_count(), 0);
+    let _ = super::LoadedConfig::load();
+    assert_eq!(
+        super::watch::active_watch_count(),
+        0,
+        "single-shot only calls load/resolve and must not start a watch"
+    );
+}
+
+#[test]
+fn watched_paths_match_startup_discovery() {
+    let dir = TempDir::new();
+    let workspace = dir.0.join("workspace");
+    let paths = super::watch::WatchedPaths::from_locations(Some(&dir.0), &workspace);
+    assert_eq!(paths.global, Some(dir.0.join("config.toml")));
+    assert_eq!(paths.project, workspace.join(".philo").join("config.toml"));
+}
+
+#[test]
+fn file_stamps_change_when_the_project_toml_appears() {
+    let dir = TempDir::new();
+    let project = dir.0.join(".philo");
+    std::fs::create_dir_all(&project).expect("create project config dir");
+    let project_file = project.join("config.toml");
+    let paths = super::watch::WatchedPaths {
+        global: None,
+        project: project_file.clone(),
+    };
+    let before = super::watch::FileStamps::capture(&paths);
+    assert!(before.project.is_none());
+    std::fs::write(&project_file, "[ui]\nshow_reasoning = false\n").expect("write");
+    let after = super::watch::FileStamps::capture(&paths);
+    assert!(after.project.is_some());
+    assert_ne!(before, after);
+}
+
+#[test]
+fn reload_from_layers_applies_project_show_reasoning() {
+    let dir = TempDir::new();
+    let project = dir.write(
+        "project.toml",
+        "[deployment]\nmodel = \"m\"\nendpoint = \"https://example.test\"\n\
+         [ui]\nshow_reasoning = false\n",
+    );
+    let (settings, _) =
+        super::watch::reload_from_layers(&watch_flags(), None, Some(&project)).expect("reload");
+    assert!(!settings.show_reasoning);
+}
+
+#[test]
+fn corrupt_toml_is_a_reload_error() {
+    let dir = TempDir::new();
+    let project = dir.write("broken.toml", "[[[not valid");
+    match super::watch::reload_from_layers(&watch_flags(), None, Some(&project)) {
+        Err(error) => assert!(error.0.contains("invalid TOML")),
+        Ok(_) => panic!("corrupt toml must not resolve"),
+    }
+}
+
+#[tokio::test]
+async fn spawned_watch_is_tracked_until_drop() {
+    let dir = TempDir::new();
+    let paths = super::watch::WatchedPaths {
+        global: None,
+        project: dir.0.join("missing.toml"),
+    };
+    let task = super::watch::spawn_with(
+        paths,
+        super::watch::WatchIntervals {
+            poll: std::time::Duration::from_millis(20),
+            debounce: std::time::Duration::from_millis(5),
+        },
+        || Err(crate::error::UsageError::new("unused")),
+        |_| {},
+        || {},
+    );
+    assert_eq!(super::watch::active_watch_count(), 1);
+    drop(task);
+    assert_eq!(super::watch::active_watch_count(), 0);
 }

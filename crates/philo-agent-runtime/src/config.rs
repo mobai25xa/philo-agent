@@ -53,6 +53,9 @@ impl Default for GenerationConfig {
 /// Default upper bound of tool rounds per turn.
 pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 8;
 
+/// Default upper bound of concurrent tool invocations in one batch.
+pub const DEFAULT_MAX_PARALLEL_TOOL_CALLS: u32 = 8;
+
 /// Context compaction policy. Budget resolution belongs to the assembly
 /// root; `None` disables automatic compaction while leaving manual
 /// compaction available.
@@ -82,6 +85,9 @@ pub struct RuntimeConfig {
     pub generation: GenerationConfig,
     /// Upper bound of tool rounds frozen into every turn; `0` never exposes tools.
     pub max_tool_rounds: u32,
+    /// Upper bound of concurrent `ToolPort::invoke` calls in one batch.
+    /// Frozen into every turn; minimum `1` uses the serial path.
+    pub max_parallel_tool_calls: u32,
     /// Operation-level automatic cancellation (M11). Timing starts when the
     /// operation is dequeued and actually starts driving (`Queued` waiting
     /// is excluded). On expiry the runtime requests cancellation exactly

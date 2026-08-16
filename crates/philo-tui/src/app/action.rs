@@ -28,5 +28,7 @@ pub(crate) enum Action {
     /// `Ctrl+V` reached the app: the terminal did not turn it into a
     /// bracketed paste, so the clipboard has to be read directly.
     Paste,
+    /// Composition-root config reload notice. Not produced by the keymap.
+    ConfigReload(crate::api::types::ConfigReloadNotice),
     None,
 }

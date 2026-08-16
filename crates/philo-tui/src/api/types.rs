@@ -1,8 +1,27 @@
 //! Public launch configuration and exit result.
 
+/// A composition-root notice about config reload. The TUI never opens
+/// files or environment variables; it only displays these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigReloadNotice {
+    Applied {
+        show_reasoning: bool,
+        verbose: bool,
+        context_window: Option<u64>,
+        model_name: String,
+        runtime_pending: bool,
+        warnings: Vec<String>,
+    },
+    Failed {
+        message: String,
+        clear_pending: bool,
+    },
+    Pending,
+}
+
 /// Deployment inputs for one interactive session (from the composition
 /// root's configuration chain).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TuiConfig {
     pub session_id: String,
     pub model_name: String,
@@ -12,6 +31,8 @@ pub struct TuiConfig {
     pub show_reasoning: bool,
     /// Context-budget hint for the status bar.
     pub context_window: Option<u64>,
+    /// Optional notices from the composition-root watcher.
+    pub config_notices: Option<tokio::sync::mpsc::UnboundedReceiver<ConfigReloadNotice>>,
 }
 
 /// How the interactive session ended.

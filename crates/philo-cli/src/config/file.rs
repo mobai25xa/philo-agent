@@ -74,6 +74,7 @@ pub(super) struct FileConfig {
     // [defaults]
     pub(super) reasoning_effort: Option<Sourced<String>>,
     pub(super) max_tool_rounds: Option<Sourced<i64>>,
+    pub(super) max_parallel_tool_calls: Option<Sourced<i64>>,
     pub(super) operation_timeout_secs: Option<Sourced<i64>>,
     // [tools]
     pub(super) shell_timeout_secs: Option<Sourced<i64>>,
@@ -225,6 +226,9 @@ fn apply(
                     config.reasoning_effort = Some(reader.string()?);
                 }
                 ("defaults", "max_tool_rounds") => config.max_tool_rounds = Some(reader.integer()?),
+                ("defaults", "max_parallel_tool_calls") => {
+                    config.max_parallel_tool_calls = Some(reader.integer()?);
+                }
                 ("defaults", "operation_timeout_secs") => {
                     config.operation_timeout_secs = Some(reader.integer()?);
                 }

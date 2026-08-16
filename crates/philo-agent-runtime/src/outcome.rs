@@ -11,7 +11,10 @@ pub enum ModelCallPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunningToolBatchPhase {
     Preparing,
-    Executing { index: usize },
+    /// Concurrent execution of the current batch. `in_flight` is the number
+    /// of `ToolPort::invoke` calls that have started and not yet returned;
+    /// `completed` is how many have already returned a model-facing result.
+    Executing { in_flight: usize, completed: usize },
     CommittingResults,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

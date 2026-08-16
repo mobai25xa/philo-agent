@@ -230,6 +230,7 @@ pub fn snapshot(messages: Vec<ModelMessage>, tools: Vec<ToolDefinition>) -> Mode
             reasoning_effort: None,
             tool_choice: philo_agent_runtime::ToolChoice::Auto,
         },
+        max_parallel_tool_calls: 1,
     }
 }
 
@@ -260,6 +261,7 @@ pub fn reasoning_snapshot(
             reasoning_effort: effort,
             tool_choice: philo_agent_runtime::ToolChoice::Auto,
         },
+        max_parallel_tool_calls: 1,
     }
 }
 

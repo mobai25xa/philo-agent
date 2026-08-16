@@ -25,13 +25,18 @@ enum ActivityKind {
     Responding,
     Reasoning,
     Tool {
-        name: String,
-        arguments: String,
-        index: usize,
+        running: Vec<RunningTool>,
         total: usize,
     },
     Compacting,
     Cancelling(CancelReason),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunningTool {
+    name: String,
+    arguments: String,
+    index: usize,
 }
 
 impl ActivityKind {
@@ -90,20 +95,26 @@ impl ActivityState {
             ActivityKind::Waiting(label) => ((*label).to_owned(), ActivityTone::Normal),
             ActivityKind::Responding => ("Writing response".to_owned(), ActivityTone::Normal),
             ActivityKind::Reasoning => ("Reasoning".to_owned(), ActivityTone::Reasoning),
-            ActivityKind::Tool {
-                name,
-                arguments,
-                index,
-                total,
-            } => (
-                format!(
-                    "Tool {}/{}: {name} {}",
-                    index + 1,
-                    (*total).max(index + 1),
-                    preview(arguments, max_width.saturating_sub(20))
-                ),
-                ActivityTone::Tool,
-            ),
+            ActivityKind::Tool { running, total } => {
+                let total = (*total).max(running.last().map_or(0, |tool| tool.index + 1));
+                let label = match running.as_slice() {
+                    [tool] => format!(
+                        "Tool {}/{total}: {} {}",
+                        tool.index + 1,
+                        tool.name,
+                        preview(&tool.arguments, max_width.saturating_sub(20))
+                    ),
+                    _ => {
+                        let names = running
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("Tools {}/{total}: {names}", running.len())
+                    }
+                };
+                (label, ActivityTone::Tool)
+            }
             ActivityKind::Compacting => ("Compacting context".to_owned(), ActivityTone::Normal),
             ActivityKind::Cancelling(reason) => (
                 format!("Cancelling ({})", reason_text(*reason)),
@@ -139,15 +150,48 @@ impl ActivityState {
                 arguments,
                 index,
                 ..
-            } => self.set(ActivityKind::Tool {
-                name: tool_name.clone(),
-                arguments: arguments.clone(),
-                index: *index,
-                total: self.tool_batch_size,
-            }),
-            AgentEvent::ToolExecutionCompleted { .. } => {
-                if matches!(self.current, Some(ActivityKind::Tool { .. })) {
-                    self.replace(ActivityKind::Waiting("Waiting for model"));
+            } => {
+                let mut running = match &self.current {
+                    Some(ActivityKind::Tool { running, .. }) => running.clone(),
+                    _ => Vec::new(),
+                };
+                if let Some(existing) = running.iter_mut().find(|tool| tool.index == *index) {
+                    existing.name = tool_name.clone();
+                    existing.arguments = arguments.clone();
+                } else {
+                    running.push(RunningTool {
+                        name: tool_name.clone(),
+                        arguments: arguments.clone(),
+                        index: *index,
+                    });
+                    running.sort_by_key(|tool| tool.index);
+                }
+                self.set(ActivityKind::Tool {
+                    running,
+                    total: self.tool_batch_size,
+                });
+            }
+            AgentEvent::ToolExecutionCompleted { index, .. } => {
+                let next = match &self.current {
+                    Some(ActivityKind::Tool { running, total }) => {
+                        let running: Vec<_> = running
+                            .iter()
+                            .filter(|tool| tool.index != *index)
+                            .cloned()
+                            .collect();
+                        if running.is_empty() {
+                            Some(ActivityKind::Waiting("Waiting for model"))
+                        } else {
+                            Some(ActivityKind::Tool {
+                                running,
+                                total: *total,
+                            })
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    self.replace(next);
                 }
             }
             AgentEvent::ContextCompactionCompleted { .. }
@@ -236,6 +280,42 @@ mod tests {
             durability: SettlementDurability::Confirmed,
         });
         assert!(!state.is_active());
+    }
+
+    #[test]
+    fn concurrent_tool_starts_stay_visible_together() {
+        let mut state = ActivityState::default();
+        state.on_event(&AgentEvent::ToolBatchRequested {
+            tool_batch_id: ToolBatchId::new("batch"),
+            call_count: 3,
+        });
+        state.on_event(&AgentEvent::ToolExecutionStarted {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("call-1"),
+            index: 0,
+            tool_name: "read_file".to_owned(),
+            arguments: "{\"path\":\"a.rs\"}".to_owned(),
+        });
+        state.on_event(&AgentEvent::ToolExecutionStarted {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("call-2"),
+            index: 1,
+            tool_name: "grep".to_owned(),
+            arguments: "{\"pattern\":\"fn\"}".to_owned(),
+        });
+        let view = state.view(80).expect("parallel activity");
+        assert!(view.text.contains("Tools 2/3: read_file, grep"), "{view:?}");
+
+        state.on_event(&AgentEvent::ToolExecutionCompleted {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("call-1"),
+            index: 0,
+            tool_name: "read_file".to_owned(),
+            result: ToolResult::success("ok"),
+            display: None,
+        });
+        let remaining = state.view(80).expect("one still running");
+        assert!(remaining.text.contains("Tool 2/3: grep"), "{remaining:?}");
     }
 
     #[test]

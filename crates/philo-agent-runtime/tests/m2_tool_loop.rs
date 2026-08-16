@@ -40,6 +40,7 @@ fn config() -> RuntimeConfig {
         generation: GenerationConfig::default(),
         // M2 semantics are the max_tool_rounds = 1 special case of the M3 loop.
         max_tool_rounds: 1,
+        max_parallel_tool_calls: 1,
         operation_timeout: None,
         compaction: Default::default(),
     }

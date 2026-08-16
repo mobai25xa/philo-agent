@@ -6,6 +6,7 @@
 
 mod file;
 mod resolve;
+mod watch;
 
 #[cfg(test)]
 mod tests;
@@ -16,6 +17,7 @@ use crate::args::Cli;
 use crate::error::UsageError;
 
 pub use resolve::{Deployment, EffectiveSetting, Settings, Verbosity};
+pub use watch::{ResolveFlags, WatchIntervals, spawn};
 
 /// Loaded global/project file layers. Raw keys and source bookkeeping remain
 /// private to the configuration implementation.

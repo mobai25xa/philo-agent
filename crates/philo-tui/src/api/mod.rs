@@ -6,4 +6,4 @@ pub mod types;
 
 pub use confirmation::{ConfirmationChannel, ConfirmationRequest, ConfirmationResponse};
 pub use host::{ConfigEntry, HostError, TuiHost};
-pub use types::{TuiConfig, TuiExit};
+pub use types::{ConfigReloadNotice, TuiConfig, TuiExit};

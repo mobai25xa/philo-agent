@@ -12,7 +12,7 @@ use philo_tui::{TuiConfig, TuiExit};
 use self::host::CliHost;
 use crate::args::Cli;
 use crate::assembly::RunAssembly;
-use crate::config::{LoadedConfig, Verbosity};
+use crate::config::{LoadedConfig, ResolveFlags, Verbosity, WatchIntervals};
 use crate::error::UsageError;
 use crate::ids::fresh_session_id;
 
@@ -37,15 +37,39 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
     }
 
     let session_id = cli.session.clone().unwrap_or_else(fresh_session_id);
+    let flags = ResolveFlags::from_cli(&cli);
+    let tui_config_model = settings.deployment.model.clone();
+    let tui_verbose = settings.verbosity == Verbosity::Verbose;
+    let tui_show_reasoning = settings.show_reasoning;
+    let tui_context_window = settings.context_window;
+    let assembly = RunAssembly::prepare(&cli, settings)?;
+    let host = Arc::new(CliHost::new(assembly, flags.clone()));
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+    let watch_host = Arc::clone(&host);
+    let poll_host = Arc::clone(&host);
+    let poll_tx = notice_tx.clone();
+    let _watch = crate::config::spawn(
+        flags,
+        WatchIntervals::default(),
+        move |result| {
+            if let Some(notice) = watch_host.on_reloaded_files(result) {
+                let _ = notice_tx.send(notice);
+            }
+        },
+        move || {
+            if let Some(notice) = poll_host.on_watch_poll() {
+                let _ = poll_tx.send(notice);
+            }
+        },
+    )?;
     let tui_config = TuiConfig {
         session_id,
-        model_name: settings.deployment.model.clone(),
-        verbose: settings.verbosity == Verbosity::Verbose,
-        show_reasoning: settings.show_reasoning,
-        context_window: settings.context_window,
+        model_name: tui_config_model,
+        verbose: tui_verbose,
+        show_reasoning: tui_show_reasoning,
+        context_window: tui_context_window,
+        config_notices: Some(notice_rx),
     };
-    let assembly = RunAssembly::prepare(&cli, settings)?;
-    let host = Arc::new(CliHost::new(assembly));
 
     match philo_tui::run(host, tui_config).await {
         Ok(TuiExit::Normal) => Ok(ExitCode::SUCCESS),

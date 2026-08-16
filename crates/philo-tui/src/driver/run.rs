@@ -69,6 +69,7 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
     // events until it settles, then moves on.
     let mut handles: VecDeque<OperationHandle> = VecDeque::new();
     let mut compaction: Option<events::CompactionFuture> = None;
+    let mut config_notices = config.config_notices;
     let mut exit_requested = false;
 
     let exit = loop {
@@ -100,6 +101,7 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
             scheduler.frame_deadline(),
             scheduler.animation_deadline(),
             confirmation_poll,
+            &mut config_notices,
         )
         .await;
         let event_time = Instant::now();
@@ -194,6 +196,10 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                 scheduler.invalidate_immediate(event_time);
                 exit_requested = true;
                 Vec::new()
+            }
+            Step::ConfigNotice(notice) => {
+                scheduler.invalidate_background(event_time);
+                app.on_action(crate::app::action::Action::ConfigReload(notice))
             }
             Step::FrameDeadline | Step::ConfirmationPoll => Vec::new(),
             Step::AnimationDeadline => {

@@ -8,16 +8,21 @@ use std::sync::Arc;
 use http::StatusCode;
 use philo_agent_runtime::{ModelEvent, ModelMessage, ModelPort};
 use philo_model::{
-    MemoryModelReplayStore, ModelContinuationPolicy, ModelProtocol, ModelReplayStore,
-    PhiloModelAdapter, ServerContinuationSupport,
+    MemoryModelReplayStore, ModelCompat, ModelContinuationPolicy, ModelProtocol, ModelReplayStore,
+    PhiloModelAdapter,
 };
 use serde_json::Value;
 use support::{StubResponse, StubTransport, collect, collect_ok, reasoning_snapshot};
 
-const RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
+const STUB_RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
+const OFFICIAL_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MINIMAL_RESPONSE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../philo/crates/philo/tests/fixtures/openai_responses/stream/minimal.sse"
+));
+const COMPAT_MINIMAL_RESPONSE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../philo/crates/philo/tests/fixtures/openai_responses/stream/compat-minimal.sse"
 ));
 
 fn user(text: &str) -> ModelMessage {
@@ -30,27 +35,47 @@ fn snapshot(turn: &str, messages: Vec<ModelMessage>) -> philo_agent_runtime::Mod
     reasoning_snapshot(turn, 1, None, messages, Vec::new())
 }
 
-fn adapter(
+fn official_adapter(
     transport: StubTransport,
     store: Arc<dyn ModelReplayStore>,
     model: &str,
     policy: ModelContinuationPolicy,
 ) -> PhiloModelAdapter {
-    let mut builder = PhiloModelAdapter::builder(
+    let endpoint = if policy == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback {
+        OFFICIAL_RESPONSES_ENDPOINT
+    } else {
+        STUB_RESPONSES_ENDPOINT
+    };
+    PhiloModelAdapter::builder(
         "stub-provider",
         ModelProtocol::OpenAiResponses,
         model,
-        RESPONSES_ENDPOINT,
+        endpoint,
     )
+    .compat(ModelCompat::Official)
     .replay_store(store)
-    .continuation_policy(policy);
-    if policy == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback {
-        builder =
-            builder.server_continuation_support(ServerContinuationSupport::CompatibleDeclared);
-    }
-    builder
-        .build_with_transport(transport)
-        .expect("Responses adapter assembly")
+    .continuation_policy(policy)
+    .build_with_transport(transport)
+    .expect("official Responses adapter assembly")
+}
+
+fn compatible_adapter(
+    transport: StubTransport,
+    store: Arc<dyn ModelReplayStore>,
+    model: &str,
+    policy: ModelContinuationPolicy,
+) -> PhiloModelAdapter {
+    PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiResponses,
+        model,
+        STUB_RESPONSES_ENDPOINT,
+    )
+    .compat(ModelCompat::Compatible)
+    .replay_store(store)
+    .continuation_policy(policy)
+    .build_with_transport(transport)
+    .expect("compatible Responses adapter assembly")
 }
 
 fn unavailable_previous_response() -> Vec<u8> {
@@ -67,7 +92,7 @@ fn unavailable_previous_response() -> Vec<u8> {
 #[tokio::test]
 async fn default_policy_remains_stateless_and_sends_the_full_history() {
     let transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
-    let model = adapter(
+    let model = official_adapter(
         transport.clone(),
         Arc::new(MemoryModelReplayStore::default()),
         "stub-model",
@@ -91,7 +116,7 @@ async fn default_policy_remains_stateless_and_sends_the_full_history() {
 async fn completed_response_continues_across_adapter_instances_with_only_new_input() {
     let store: Arc<dyn ModelReplayStore> = Arc::new(MemoryModelReplayStore::default());
     let first_transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
-    let first = adapter(
+    let first = official_adapter(
         first_transport.clone(),
         store.clone(),
         "stub-model",
@@ -107,7 +132,7 @@ async fn completed_response_continues_across_adapter_instances_with_only_new_inp
     assert_eq!(first_transport.request_bodies()[0]["store"], true);
 
     let second_transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
-    let second = adapter(
+    let second = official_adapter(
         second_transport.clone(),
         store,
         "stub-model",
@@ -141,7 +166,7 @@ async fn completed_response_continues_across_adapter_instances_with_only_new_inp
 #[tokio::test]
 async fn target_switch_starts_a_new_full_chain_without_reusing_the_old_id() {
     let store: Arc<dyn ModelReplayStore> = Arc::new(MemoryModelReplayStore::default());
-    let first = adapter(
+    let first = official_adapter(
         StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]),
         store.clone(),
         "model-a",
@@ -156,7 +181,7 @@ async fn target_switch_starts_a_new_full_chain_without_reusing_the_old_id() {
     .await;
 
     let transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
-    let switched = adapter(
+    let switched = official_adapter(
         transport.clone(),
         store,
         "model-b",
@@ -194,7 +219,7 @@ async fn unavailable_chain_falls_back_once_and_does_not_reactivate_the_old_id() 
         StubResponse::Sse(MINIMAL_RESPONSE.to_vec()),
         StubResponse::Sse(MINIMAL_RESPONSE.to_vec()),
     ]);
-    let model = adapter(
+    let model = official_adapter(
         transport.clone(),
         store.clone(),
         "stub-model",
@@ -228,7 +253,7 @@ async fn unavailable_chain_falls_back_once_and_does_not_reactivate_the_old_id() 
         content: "hello".to_owned(),
     });
     third_history.push(user("third"));
-    let restarted = adapter(
+    let restarted = official_adapter(
         transport.clone(),
         store.clone(),
         "stub-model",
@@ -269,7 +294,7 @@ async fn unavailable_chain_falls_back_once_and_does_not_reactivate_the_old_id() 
 #[tokio::test]
 async fn changed_prefix_and_incomplete_response_never_activate_a_stale_id() {
     let store: Arc<dyn ModelReplayStore> = Arc::new(MemoryModelReplayStore::default());
-    let first = adapter(
+    let first = official_adapter(
         StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]),
         store.clone(),
         "stub-model",
@@ -284,7 +309,7 @@ async fn changed_prefix_and_incomplete_response_never_activate_a_stale_id() {
     .await;
 
     let changed_transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
-    let changed = adapter(
+    let changed = official_adapter(
         changed_transport.clone(),
         store.clone(),
         "stub-model",
@@ -319,7 +344,7 @@ async fn changed_prefix_and_incomplete_response_never_activate_a_stale_id() {
         StubResponse::Sse(MINIMAL_RESPONSE[..terminal].to_vec()),
         StubResponse::Sse(MINIMAL_RESPONSE.to_vec()),
     ]);
-    let incomplete = adapter(
+    let incomplete = official_adapter(
         incomplete_transport.clone(),
         Arc::new(MemoryModelReplayStore::default()),
         "stub-model",
@@ -359,38 +384,93 @@ async fn changed_prefix_and_incomplete_response_never_activate_a_stale_id() {
     assert_eq!(after["input"].as_array().expect("input").len(), 3);
 }
 
+#[tokio::test]
+async fn compatible_continuation_uses_reconstruct_fixture_not_official_lifecycle() {
+    let store: Arc<dyn ModelReplayStore> = Arc::new(MemoryModelReplayStore::default());
+    let first_transport = StubTransport::new([StubResponse::Sse(COMPAT_MINIMAL_RESPONSE.to_vec())]);
+    let first = compatible_adapter(
+        first_transport.clone(),
+        store.clone(),
+        "stub-model",
+        ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback,
+    );
+    collect_ok(
+        first
+            .start(snapshot("turn-1", vec![user("first")]))
+            .await
+            .expect("first call starts"),
+    )
+    .await;
+    let first_body = &first_transport.request_bodies()[0];
+    assert_eq!(first_body["store"], true);
+    assert!(first_body.get("truncation").is_none());
+    assert!(first_body.get("previous_response_id").is_none());
+
+    let second_transport = StubTransport::new([StubResponse::Sse(COMPAT_MINIMAL_RESPONSE.to_vec())]);
+    let second = compatible_adapter(
+        second_transport.clone(),
+        store,
+        "stub-model",
+        ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback,
+    );
+    collect_ok(
+        second
+            .start(snapshot(
+                "turn-2",
+                vec![
+                    user("first"),
+                    ModelMessage::Assistant {
+                        content: "hello".to_owned(),
+                    },
+                    user("second"),
+                ],
+            ))
+            .await
+            .expect("continued call starts"),
+    )
+    .await;
+
+    let body = &second_transport.request_bodies()[0];
+    assert_eq!(body["store"], true);
+    assert_eq!(body["previous_response_id"], "resp-fixture");
+    let input = body["input"].as_array().expect("input");
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["content"][0]["text"], "second");
+    assert!(input.iter().all(|item| item["type"] != "reasoning"));
+}
+
 #[test]
-fn support_declaration_is_validated_at_assembly() {
+fn continuation_assembly_is_validated() {
     let official_on_compatible_host = PhiloModelAdapter::builder(
         "provider",
         ModelProtocol::OpenAiResponses,
         "model",
-        RESPONSES_ENDPOINT,
+        STUB_RESPONSES_ENDPOINT,
     )
+    .compat(ModelCompat::Official)
     .continuation_policy(ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback)
-    .server_continuation_support(ServerContinuationSupport::OfficialOpenAi)
     .build_with_transport(StubTransport::new([]));
     assert!(
         official_on_compatible_host
             .err()
-            .expect("official support must verify its endpoint host")
+            .expect("official prefer must verify its endpoint host")
             .message()
             .contains("api.openai.com")
     );
 
-    let missing_declaration = PhiloModelAdapter::builder(
+    let chat_with_prefer = PhiloModelAdapter::builder(
         "provider",
-        ModelProtocol::OpenAiResponses,
+        ModelProtocol::OpenAiChat,
         "model",
-        RESPONSES_ENDPOINT,
+        "https://stub.invalid/v1/chat/completions",
     )
     .continuation_policy(ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback)
     .build_with_transport(StubTransport::new([]));
     assert!(
-        missing_declaration
+        chat_with_prefer
             .err()
-            .expect("support declaration is mandatory")
+            .expect("prefer continuation is Responses-only")
             .message()
-            .contains("explicit server support declaration")
+            .contains("OpenAI Responses protocol")
     );
 }

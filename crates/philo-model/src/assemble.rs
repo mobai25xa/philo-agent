@@ -25,74 +25,105 @@ pub enum ModelContinuationPolicy {
     PreferPreviousResponseIdWithLocalFallback,
 }
 
-/// Evidence source declaring that a deployment supports stored Responses.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ServerContinuationSupport {
-    #[default]
-    Disabled,
-    /// The official OpenAI Responses endpoint. Assembly verifies its host.
-    OfficialOpenAi,
-    /// A compatible endpoint whose operator explicitly declared support.
-    CompatibleDeclared,
-}
-
 /// Built-in protocol selection for the standard assembly.
 ///
 /// Provider and protocol choice is runtime configuration expressed through
-/// the SDK `CallTarget`; no per-vendor crate exists.
+/// the SDK `CallTarget`. Chat / Responses provider differences live on
+/// [`ModelCompat`] (and an optional Chat [`ChatReasoningFormat`]), not on
+/// extra protocol variants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProtocol {
-    /// Anthropic Messages (`anthropic-messages/2023-06-01`).
-    AnthropicMessages,
-    /// OpenAI Chat Completions, official OpenAI shape (`openai-chat/openai/v1`).
+    /// OpenAI Chat Completions (`openai-chat/v2`).
     OpenAiChat,
-    /// OpenAI Chat Completions, conservative compatible shape
-    /// (`openai-chat/compatible/v2`) for OpenAI-compatible providers.
-    OpenAiChatCompatible,
-    /// OpenAI Chat Completions, conservative compatible shape with official
-    /// reasoning-effort control (`openai-chat/compatible-reasoning-effort-v1`).
-    OpenAiChatCompatibleReasoningEffort,
-    /// OpenAI Chat Completions, `reasoning_content` dialect
-    /// (`openai-chat/reasoning-content/v1`) for OpenAI-compatible providers
-    /// that stream visible reasoning through `delta.reasoning_content`.
-    OpenAiChatReasoningContent,
-    /// OpenAI Responses with persistent replay fallback
-    /// (`openai-responses/openai-v2`).
+    /// OpenAI Responses (`openai-responses/v2`).
     OpenAiResponses,
 }
 
 impl ModelProtocol {
-    /// Returns whether this protocol accepts the requested reasoning-effort
-    /// level.
+    /// Returns the public configuration name for this protocol.
     #[must_use]
-    pub const fn supports_reasoning_effort(self, effort: ReasoningEffort) -> bool {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::OpenAiChat
-            | Self::OpenAiChatCompatibleReasoningEffort
-            | Self::OpenAiResponses => true,
-            Self::AnthropicMessages => matches!(
-                effort,
-                ReasoningEffort::Low
-                    | ReasoningEffort::Medium
-                    | ReasoningEffort::High
-                    | ReasoningEffort::Maximum
+            Self::OpenAiChat => "openai-chat",
+            Self::OpenAiResponses => "openai-responses",
+        }
+    }
+
+    /// Returns whether the assembled protocol × compat × Chat reasoning
+    /// format accepts the requested reasoning-effort level.
+    ///
+    /// Chat supports all six levels when the effective format is
+    /// `EffortOnly` or `EffortAndContent`. Responses supports all six
+    /// levels only with official compat. An omitted Chat format follows
+    /// the SDK preset (`EffortAndContent` for both `default()` and
+    /// `compatible()`).
+    #[must_use]
+    pub const fn supports_reasoning_effort(
+        self,
+        compat: ModelCompat,
+        chat_reasoning_format: Option<ChatReasoningFormat>,
+        effort: ReasoningEffort,
+    ) -> bool {
+        let _ = effort;
+        match self {
+            Self::OpenAiChat => matches!(
+                effective_chat_reasoning_format(chat_reasoning_format),
+                ChatReasoningFormat::EffortOnly | ChatReasoningFormat::EffortAndContent
             ),
-            Self::OpenAiChatCompatible | Self::OpenAiChatReasoningContent => false,
+            Self::OpenAiResponses => matches!(compat, ModelCompat::Official),
         }
     }
 
     fn protocol_id(self) -> sdk::ProtocolId {
         let id = match self {
-            Self::AnthropicMessages => sdk::ProtocolId::ANTHROPIC_MESSAGES_2023_06_01,
-            Self::OpenAiChat => sdk::ProtocolId::OPENAI_CHAT_OPENAI_V1,
-            Self::OpenAiChatCompatible => sdk::ProtocolId::OPENAI_CHAT_COMPATIBLE_V2,
-            Self::OpenAiChatCompatibleReasoningEffort => {
-                sdk::ProtocolId::OPENAI_CHAT_COMPATIBLE_REASONING_EFFORT_V1
-            }
-            Self::OpenAiChatReasoningContent => sdk::ProtocolId::OPENAI_CHAT_REASONING_CONTENT_V1,
-            Self::OpenAiResponses => sdk::ProtocolId::OPENAI_RESPONSES_OPENAI_V2,
+            Self::OpenAiChat => sdk::ProtocolId::OPENAI_CHAT_V2,
+            Self::OpenAiResponses => sdk::ProtocolId::OPENAI_RESPONSES_V2,
         };
         sdk::ProtocolId::new(id).expect("built-in protocol id is valid")
+    }
+}
+
+/// Explicit Chat / Responses compatibility preset. Unknown third-party
+/// deployments default to [`Compatible`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModelCompat {
+    Official,
+    #[default]
+    Compatible,
+}
+
+impl ModelCompat {
+    /// Returns the public configuration name for this compat preset.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Official => "official",
+            Self::Compatible => "compatible",
+        }
+    }
+}
+
+/// Optional Chat-only override of `OpenAiChatReasoningFormat`.
+///
+/// Omitted at assembly time, the value follows the selected compat preset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatReasoningFormat {
+    None,
+    EffortOnly,
+    ContentOnly,
+    EffortAndContent,
+}
+
+impl ChatReasoningFormat {
+    /// Returns the public configuration name for this Chat reasoning format.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::EffortOnly => "effort-only",
+            Self::ContentOnly => "content-only",
+            Self::EffortAndContent => "effort-and-content",
+        }
     }
 }
 
@@ -137,8 +168,9 @@ pub struct PhiloModelBuilder {
     api_key_env: Option<String>,
     request_headers: ModelRequestHeaders,
     replay_store: Option<Arc<dyn ModelReplayStore>>,
+    compat: ModelCompat,
+    chat_reasoning_format: Option<ChatReasoningFormat>,
     continuation_policy: ModelContinuationPolicy,
-    continuation_support: ServerContinuationSupport,
     retry: Option<sdk::RetryPolicy>,
     timeouts: Option<sdk::TimeoutPolicy>,
 }
@@ -160,8 +192,9 @@ impl PhiloModelBuilder {
             api_key_env: None,
             request_headers: ModelRequestHeaders::new(),
             replay_store: None,
+            compat: ModelCompat::default(),
+            chat_reasoning_format: None,
             continuation_policy: ModelContinuationPolicy::default(),
-            continuation_support: ServerContinuationSupport::default(),
             retry: None,
             timeouts: None,
         }
@@ -185,16 +218,25 @@ impl PhiloModelBuilder {
         self
     }
 
+    /// Selects the Chat / Responses compat preset. The default is compatible.
+    pub fn compat(mut self, compat: ModelCompat) -> Self {
+        self.compat = compat;
+        self
+    }
+
+    /// Overrides Chat `reasoning_format` on top of the selected compat preset.
+    ///
+    /// Omit this setter to keep the preset default. Setting it on Responses
+    /// fails assembly.
+    pub fn chat_reasoning_format(mut self, format: ChatReasoningFormat) -> Self {
+        self.chat_reasoning_format = Some(format);
+        self
+    }
+
     /// Selects whether the deployment may use provider-stored response
     /// continuation. The default is fully stateless local replay.
     pub fn continuation_policy(mut self, policy: ModelContinuationPolicy) -> Self {
         self.continuation_policy = policy;
-        self
-    }
-
-    /// Declares the deployment-specific support source for stored Responses.
-    pub fn server_continuation_support(mut self, support: ServerContinuationSupport) -> Self {
-        self.continuation_support = support;
         self
     }
 
@@ -235,31 +277,21 @@ impl PhiloModelBuilder {
         let endpoint = Url::parse(&self.endpoint)
             .map_err(|error| AdapterBuildError::new(format!("invalid endpoint url: {error}")))?;
         let protocol_id = self.protocol.protocol_id();
+        let prefers_continuation = self.continuation_policy
+            == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback;
 
-        if self.continuation_support != ServerContinuationSupport::Disabled
-            && self.protocol != ModelProtocol::OpenAiResponses
-        {
-            return Err(AdapterBuildError::new(
-                "server response continuation requires the OpenAI Responses protocol",
-            ));
-        }
-        if self.continuation_policy
-            == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
-            && self.continuation_support == ServerContinuationSupport::Disabled
-        {
-            return Err(AdapterBuildError::new(
-                "previous_response_id continuation requires an explicit server support declaration",
-            ));
-        }
-        if self.continuation_policy
-            == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
-            && self.protocol != ModelProtocol::OpenAiResponses
-        {
+        if prefers_continuation && self.protocol != ModelProtocol::OpenAiResponses {
             return Err(AdapterBuildError::new(
                 "previous_response_id continuation requires the OpenAI Responses protocol",
             ));
         }
-        if self.continuation_support == ServerContinuationSupport::OfficialOpenAi
+        if self.chat_reasoning_format.is_some() && self.protocol != ModelProtocol::OpenAiChat {
+            return Err(AdapterBuildError::new(
+                "reasoning_format is only valid for the OpenAI Chat protocol",
+            ));
+        }
+        if prefers_continuation
+            && self.compat == ModelCompat::Official
             && endpoint.host_str() != Some("api.openai.com")
         {
             return Err(AdapterBuildError::new(
@@ -268,41 +300,31 @@ impl PhiloModelBuilder {
         }
 
         let client_builder = sdk::PhiloClient::builder().transport(transport);
-        let (client_builder, envelope) = match self.protocol {
-            ModelProtocol::AnthropicMessages => {
-                let adapter = ext::AnthropicMessagesAdapter::default();
-                let envelope = adapter.capabilities().envelope().clone();
-                (client_builder.register_protocol(adapter), envelope)
-            }
+        let (client_builder, envelope, model_compat) = match self.protocol {
             ModelProtocol::OpenAiChat => {
-                let adapter = ext::OpenAiChatAdapter::openai_v1();
+                let compat = chat_compat(self.compat, self.chat_reasoning_format);
+                let adapter = ext::OpenAiChatAdapter::with_compat(compat.clone());
                 let envelope = adapter.capabilities().envelope().clone();
-                (client_builder.register_protocol(adapter), envelope)
-            }
-            ModelProtocol::OpenAiChatCompatible => {
-                let adapter = ext::OpenAiChatAdapter::compatible_v2();
-                let envelope = adapter.capabilities().envelope().clone();
-                (client_builder.register_protocol(adapter), envelope)
-            }
-            ModelProtocol::OpenAiChatCompatibleReasoningEffort => {
-                let adapter = ext::OpenAiChatAdapter::compatible_reasoning_effort_v1();
-                let envelope = adapter.capabilities().envelope().clone();
-                (client_builder.register_protocol(adapter), envelope)
-            }
-            ModelProtocol::OpenAiChatReasoningContent => {
-                let adapter = ext::OpenAiChatAdapter::reasoning_content_v1();
-                let envelope = adapter.capabilities().envelope().clone();
-                (client_builder.register_protocol(adapter), envelope)
+                (
+                    client_builder.register_protocol(adapter),
+                    envelope,
+                    ext::ProtocolCompat::from(compat),
+                )
             }
             ModelProtocol::OpenAiResponses => {
-                let adapter = ext::OpenAiResponsesAdapter::openai_v2();
+                let compat = responses_compat(self.compat, prefers_continuation);
+                let adapter = ext::OpenAiResponsesAdapter::with_compat(compat.clone());
                 let envelope = adapter.capabilities().envelope().clone();
-                (client_builder.register_protocol(adapter), envelope)
+                (
+                    client_builder.register_protocol(adapter),
+                    envelope,
+                    ext::ProtocolCompat::from(compat),
+                )
             }
         };
 
         let mut constraints = ext::CapabilityConstraints::default();
-        if self.continuation_support == ServerContinuationSupport::Disabled {
+        if !prefers_continuation {
             constraints
                 .disabled
                 .insert(sdk::Capability::ResponseContinuation);
@@ -314,10 +336,12 @@ impl PhiloModelBuilder {
             protocol_id.clone(),
             model_name.clone(),
             ext::ModelCapabilities::new(envelope),
+            ext::CapabilityConstraints::default(),
             sdk::CapabilityKnowledge::Complete,
             sdk::CapabilitySource::new("philo-model assembly").expect("static source is valid"),
             ext::ModelMetadata::default(),
-        );
+        )
+        .with_compat(model_compat);
         let mut provider = ext::ProviderProfile::new(provider_id.clone())
             .with_default_headers(default_provider_headers())
             .add_binding(binding)
@@ -351,5 +375,47 @@ impl PhiloModelBuilder {
             replay_store,
             self.continuation_policy,
         ))
+    }
+}
+
+const fn effective_chat_reasoning_format(
+    chat_reasoning_format: Option<ChatReasoningFormat>,
+) -> ChatReasoningFormat {
+    match chat_reasoning_format {
+        Some(format) => format,
+        // Both `OpenAiChatCompat::default()` and `compatible()` use EffortAndContent.
+        None => ChatReasoningFormat::EffortAndContent,
+    }
+}
+
+fn chat_compat(compat: ModelCompat, format: Option<ChatReasoningFormat>) -> ext::OpenAiChatCompat {
+    let preset = match compat {
+        ModelCompat::Official => ext::OpenAiChatCompat::default(),
+        ModelCompat::Compatible => ext::OpenAiChatCompat::compatible(),
+    };
+    match format {
+        None => preset,
+        Some(ChatReasoningFormat::None) => {
+            preset.with_reasoning_format(ext::OpenAiChatReasoningFormat::None)
+        }
+        Some(ChatReasoningFormat::EffortOnly) => {
+            preset.with_reasoning_format(ext::OpenAiChatReasoningFormat::EffortOnly)
+        }
+        Some(ChatReasoningFormat::ContentOnly) => preset
+            .with_reasoning_format(ext::OpenAiChatReasoningFormat::ContentOnly)
+            .with_unknown_fields(ext::OpenAiChatUnknownFieldPolicy::Reject),
+        Some(ChatReasoningFormat::EffortAndContent) => {
+            preset.with_reasoning_format(ext::OpenAiChatReasoningFormat::EffortAndContent)
+        }
+    }
+}
+
+fn responses_compat(compat: ModelCompat, prefers_continuation: bool) -> ext::OpenAiResponsesCompat {
+    match (compat, prefers_continuation) {
+        (ModelCompat::Official, _) => ext::OpenAiResponsesCompat::default(),
+        (ModelCompat::Compatible, false) => ext::OpenAiResponsesCompat::compatible(),
+        (ModelCompat::Compatible, true) => {
+            ext::OpenAiResponsesCompat::compatible().with_continuation(true)
+        }
     }
 }

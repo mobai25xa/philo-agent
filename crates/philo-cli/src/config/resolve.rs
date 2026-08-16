@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use philo_agent_runtime::{CompactionConfig, ReasoningEffort};
 use philo_model::{
-    DEFAULT_USER_AGENT, ModelContinuationPolicy, ModelProtocol, ModelRequestHeaders,
-    ServerContinuationSupport,
+    ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol, ModelRequestHeaders,
+    DEFAULT_USER_AGENT,
 };
 
 use super::file::{FileConfig, Sourced};
@@ -33,8 +33,9 @@ pub struct Deployment {
     /// Name of the environment variable carrying the API key — never the key.
     pub api_key_env: String,
     pub request_headers: ModelRequestHeaders,
+    pub compat: ModelCompat,
+    pub chat_reasoning_format: Option<ChatReasoningFormat>,
     pub continuation_policy: ModelContinuationPolicy,
-    pub continuation_support: ServerContinuationSupport,
 }
 
 /// One effective non-secret setting shown through the interactive `/config`
@@ -159,9 +160,43 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             })?
         }
         None => {
-            record("protocol", "openai-chat-compatible".to_owned(), "default");
-            ModelProtocol::OpenAiChatCompatible
+            record("protocol", "openai-chat".to_owned(), "default");
+            ModelProtocol::OpenAiChat
         }
+    };
+
+    let compat = match pick_string(None, Some("PHILO_COMPAT"), file.compat.as_ref()) {
+        Some(picked) => {
+            record("compat", picked.value.clone(), picked.source);
+            parse_compat(&picked.value).map_err(|error| {
+                error.at(&origin(
+                    picked.source,
+                    None,
+                    Some("PHILO_COMPAT"),
+                    "[deployment].compat",
+                ))
+            })?
+        }
+        None => {
+            record("compat", "compatible".to_owned(), "default");
+            ModelCompat::Compatible
+        }
+    };
+
+    let chat_reasoning_format = match from_file(file.reasoning_format.as_ref()) {
+        Some(picked) => {
+            record("reasoning_format", picked.value.clone(), picked.source);
+            let format = parse_reasoning_format(&picked.value).map_err(|error| {
+                error.at(&origin(
+                    picked.source,
+                    None,
+                    None,
+                    "[deployment].reasoning_format",
+                ))
+            })?;
+            Some(format)
+        }
+        None => None,
     };
 
     let provider = match pick_string(None, Some("PHILO_PROVIDER"), file.provider.as_ref()) {
@@ -197,32 +232,7 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         }
     };
 
-    let continuation_support = match from_file(file.response_continuation_support.as_ref()) {
-        Some(picked) => {
-            record(
-                "response_continuation_support",
-                picked.value.clone(),
-                picked.source,
-            );
-            parse_continuation_support(&picked.value).map_err(|error| {
-                error.at(&origin(
-                    picked.source,
-                    None,
-                    None,
-                    "[deployment].response_continuation_support",
-                ))
-            })?
-        }
-        None => {
-            record(
-                "response_continuation_support",
-                "disabled".to_owned(),
-                "default",
-            );
-            ServerContinuationSupport::Disabled
-        }
-    };
-    validate_continuation_configuration(protocol, continuation_policy, continuation_support)?;
+    validate_protocol_axes(protocol, chat_reasoning_format, continuation_policy)?;
 
     let api_key_env = match pick_string(None, None, file.api_key_env.as_ref()) {
         Some(picked) => {
@@ -324,7 +334,8 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             );
             let effort =
                 parse_reasoning_effort(&picked.value).map_err(|error| error.at(&value_origin))?;
-            validate_reasoning_effort(protocol, effort).map_err(|error| error.at(&value_origin))?;
+            validate_reasoning_effort(protocol, compat, chat_reasoning_format, effort)
+                .map_err(|error| error.at(&value_origin))?;
             Some(effort)
         }
         None => None,
@@ -412,8 +423,9 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             endpoint: endpoint.value,
             api_key_env,
             request_headers,
+            compat,
+            chat_reasoning_format,
             continuation_policy,
-            continuation_support,
         },
         data_dir,
         context_window,
@@ -487,18 +499,49 @@ fn threshold_f32(key: &str, value: f64) -> Result<f32, UsageError> {
 
 pub(super) fn parse_protocol(value: &str) -> Result<ModelProtocol, UsageError> {
     match value {
-        "anthropic-messages" => Ok(ModelProtocol::AnthropicMessages),
         "openai-chat" => Ok(ModelProtocol::OpenAiChat),
-        "openai-chat-compatible" => Ok(ModelProtocol::OpenAiChatCompatible),
-        "openai-chat-compatible-reasoning-effort" => {
-            Ok(ModelProtocol::OpenAiChatCompatibleReasoningEffort)
-        }
-        "openai-chat-reasoning-content" => Ok(ModelProtocol::OpenAiChatReasoningContent),
         "openai-responses" => Ok(ModelProtocol::OpenAiResponses),
+        "openai-chat-compatible" => Err(UsageError::new(
+            "protocol 'openai-chat-compatible' is no longer accepted; use protocol=openai-chat \
+             and compat=compatible. For the old compatible-v2 behavior also set \
+             reasoning_format=none",
+        )),
+        "openai-chat-compatible-reasoning-effort" => Err(UsageError::new(
+            "protocol 'openai-chat-compatible-reasoning-effort' is no longer accepted; use \
+             protocol=openai-chat and compat=compatible with reasoning_format=effort-only",
+        )),
+        "openai-chat-reasoning-content" => Err(UsageError::new(
+            "protocol 'openai-chat-reasoning-content' is no longer accepted; use \
+             protocol=openai-chat and compat=compatible with reasoning_format=content-only",
+        )),
+        "anthropic-messages" => Err(UsageError::new(
+            "protocol 'anthropic-messages' is not supported in this version",
+        )),
         other => Err(UsageError::new(format!(
-            "unknown protocol '{other}': expected anthropic-messages | openai-chat | \
-             openai-chat-compatible | openai-chat-compatible-reasoning-effort | \
-             openai-chat-reasoning-content | openai-responses"
+            "unknown protocol '{other}': expected openai-chat | openai-responses"
+        ))),
+    }
+}
+
+pub(super) fn parse_compat(value: &str) -> Result<ModelCompat, UsageError> {
+    match value {
+        "official" => Ok(ModelCompat::Official),
+        "compatible" => Ok(ModelCompat::Compatible),
+        other => Err(UsageError::new(format!(
+            "unknown compat '{other}': expected official | compatible"
+        ))),
+    }
+}
+
+pub(super) fn parse_reasoning_format(value: &str) -> Result<ChatReasoningFormat, UsageError> {
+    match value {
+        "none" => Ok(ChatReasoningFormat::None),
+        "effort-only" => Ok(ChatReasoningFormat::EffortOnly),
+        "content-only" => Ok(ChatReasoningFormat::ContentOnly),
+        "effort-and-content" => Ok(ChatReasoningFormat::EffortAndContent),
+        other => Err(UsageError::new(format!(
+            "unknown reasoning_format '{other}': expected none | effort-only | content-only | \
+             effort-and-content"
         ))),
     }
 }
@@ -517,35 +560,21 @@ pub(super) fn parse_continuation_policy(
     }
 }
 
-pub(super) fn parse_continuation_support(
-    value: &str,
-) -> Result<ServerContinuationSupport, UsageError> {
-    match value {
-        "disabled" => Ok(ServerContinuationSupport::Disabled),
-        "official-openai" => Ok(ServerContinuationSupport::OfficialOpenAi),
-        "compatible-declared" => Ok(ServerContinuationSupport::CompatibleDeclared),
-        other => Err(UsageError::new(format!(
-            "unknown response continuation support '{other}': expected disabled | official-openai | compatible-declared"
-        ))),
-    }
-}
-
-fn validate_continuation_configuration(
+fn validate_protocol_axes(
     protocol: ModelProtocol,
+    chat_reasoning_format: Option<ChatReasoningFormat>,
     policy: ModelContinuationPolicy,
-    support: ServerContinuationSupport,
 ) -> Result<(), UsageError> {
-    if support != ServerContinuationSupport::Disabled && protocol != ModelProtocol::OpenAiResponses
-    {
+    if chat_reasoning_format.is_some() && protocol != ModelProtocol::OpenAiChat {
         return Err(UsageError::new(
-            "[deployment].response_continuation_support requires protocol = \"openai-responses\"",
+            "reasoning_format is only valid for the OpenAI Chat protocol",
         ));
     }
     if policy == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
-        && support == ServerContinuationSupport::Disabled
+        && protocol != ModelProtocol::OpenAiResponses
     {
         return Err(UsageError::new(
-            "prefer-previous-response-id requires an explicit [deployment].response_continuation_support declaration",
+            "prefer-previous-response-id requires the OpenAI Responses protocol",
         ));
     }
     Ok(())
@@ -568,24 +597,18 @@ pub(super) fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, Usa
 
 pub(super) fn validate_reasoning_effort(
     protocol: ModelProtocol,
+    compat: ModelCompat,
+    chat_reasoning_format: Option<ChatReasoningFormat>,
     effort: ReasoningEffort,
 ) -> Result<(), UsageError> {
-    if protocol.supports_reasoning_effort(effort) {
+    if protocol.supports_reasoning_effort(compat, chat_reasoning_format, effort) {
         return Ok(());
     }
-
-    let protocol = match protocol {
-        ModelProtocol::AnthropicMessages => "anthropic-messages",
-        ModelProtocol::OpenAiChat => "openai-chat",
-        ModelProtocol::OpenAiChatCompatible => "openai-chat-compatible",
-        ModelProtocol::OpenAiChatCompatibleReasoningEffort => {
-            "openai-chat-compatible-reasoning-effort"
-        }
-        ModelProtocol::OpenAiChatReasoningContent => "openai-chat-reasoning-content",
-        ModelProtocol::OpenAiResponses => "openai-responses",
-    };
     Err(UsageError::new(format!(
-        "reasoning effort is unsupported by protocol '{protocol}'; remove the reasoning setting or choose a protocol that supports it"
+        "reasoning effort is unsupported by protocol '{}' with compat '{}'; remove the \
+         reasoning setting or choose a protocol that supports it",
+        protocol.as_str(),
+        compat.as_str()
     )))
 }
 

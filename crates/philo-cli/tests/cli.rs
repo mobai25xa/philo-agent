@@ -14,6 +14,7 @@ fn philo() -> Command {
         .env_remove("PHILO_MODEL")
         .env_remove("PHILO_ENDPOINT")
         .env_remove("PHILO_PROTOCOL")
+        .env_remove("PHILO_COMPAT")
         .env_remove("PHILO_PROVIDER")
         .env_remove("PHILO_DATA_DIR")
         .env(
@@ -178,6 +179,28 @@ fn invalid_protocol_is_a_usage_error() {
         .expect("run");
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr_text(&output).contains("PHILO_PROTOCOL"));
+}
+
+#[test]
+fn retired_protocol_env_is_a_usage_error() {
+    let root = TempRoot::new();
+    let output = philo()
+        .env("PHILO_MODEL", "some-model")
+        .env(
+            "PHILO_ENDPOINT",
+            "https://example.invalid/v1/chat/completions",
+        )
+        .env("PHILO_PROTOCOL", "openai-chat-compatible")
+        .args(["--data-dir"])
+        .arg(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("PHILO_PROTOCOL"), "{stderr}");
+    assert!(stderr.contains("protocol=openai-chat"), "{stderr}");
+    assert!(stderr.contains("compat=compatible"), "{stderr}");
 }
 
 // --- sessions subcommand ---------------------------------------------------------

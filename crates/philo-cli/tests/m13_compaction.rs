@@ -105,6 +105,7 @@ fn isolated_philo(config_home: &Path) -> Command {
         .env_remove("PHILO_MODEL")
         .env_remove("PHILO_ENDPOINT")
         .env_remove("PHILO_PROTOCOL")
+        .env_remove("PHILO_COMPAT")
         .env_remove("PHILO_PROVIDER")
         .env_remove("PHILO_DATA_DIR")
         .env_remove("HTTP_PROXY")

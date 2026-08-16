@@ -91,7 +91,7 @@ pub(crate) fn build_model(
     model: &str,
     replay_store: Arc<dyn ModelReplayStore>,
 ) -> Result<PhiloModelAdapter, AdapterBuildError> {
-    PhiloModelAdapter::builder(
+    let mut builder = PhiloModelAdapter::builder(
         deployment.provider.clone(),
         deployment.protocol,
         model,
@@ -100,7 +100,10 @@ pub(crate) fn build_model(
     .api_key_env(&deployment.api_key_env)
     .request_headers(deployment.request_headers.clone())
     .replay_store(replay_store)
-    .continuation_policy(deployment.continuation_policy)
-    .server_continuation_support(deployment.continuation_support)
-    .build()
+    .compat(deployment.compat)
+    .continuation_policy(deployment.continuation_policy);
+    if let Some(format) = deployment.chat_reasoning_format {
+        builder = builder.chat_reasoning_format(format);
+    }
+    builder.build()
 }

@@ -44,6 +44,7 @@ fn philo(config_home: &Path) -> Command {
         .env_remove("PHILO_MODEL")
         .env_remove("PHILO_ENDPOINT")
         .env_remove("PHILO_PROTOCOL")
+        .env_remove("PHILO_COMPAT")
         .env_remove("PHILO_PROVIDER")
         .env_remove("PHILO_DATA_DIR")
         .env("PHILO_CONFIG_HOME", config_home);
@@ -226,6 +227,64 @@ fn an_invalid_enum_names_the_layer_it_came_from() {
         stderr.contains("[defaults].reasoning_effort in the global config"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_retired_protocol_name_is_a_usage_error() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    write_config(
+        &config_home,
+        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
+         protocol = \"openai-chat-compatible\"\n",
+    );
+
+    let output = philo(&config_home)
+        .current_dir(&root.path)
+        .arg("hello")
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("openai-chat-compatible"), "{stderr}");
+    assert!(stderr.contains("protocol=openai-chat"), "{stderr}");
+    assert!(stderr.contains("compat=compatible"), "{stderr}");
+    assert!(
+        !stderr.contains("unknown key"),
+        "retired names are hard errors: {stderr}"
+    );
+}
+
+#[test]
+fn response_continuation_support_is_a_usage_error_not_a_warning() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    let store = root.dir("store");
+    seed_session(&store, "alpha");
+    write_config(
+        &config_home,
+        &format!(
+            "[deployment]\ndata_dir = {}\nresponse_continuation_support = \"official-openai\"\n",
+            literal(&store)
+        ),
+    );
+
+    let output = philo(&config_home)
+        .current_dir(&root.path)
+        .arg("sessions")
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_text(&output);
+    assert!(stderr.contains("removed"), "{stderr}");
+    assert!(stderr.contains("prefer-previous-response-id"), "{stderr}");
+    assert!(
+        !stderr.contains("unknown key"),
+        "the retired key must not be ignored: {stderr}"
+    );
+    assert_eq!(stdout_text(&output), "");
 }
 
 #[test]

@@ -4,7 +4,8 @@
 //! ```text
 //! set PHILO_MODEL=some-model
 //! set PHILO_ENDPOINT=https://api.example.com/v1/chat/completions
-//! set PHILO_PROTOCOL=openai-chat-compatible   (optional)
+//! set PHILO_PROTOCOL=openai-chat              (optional; default)
+//! set PHILO_COMPAT=compatible                 (optional; default)
 //! set PHILO_API_KEY=<secret>
 //! cargo test -p philo-cli --test live_smoke -- --ignored
 //! ```

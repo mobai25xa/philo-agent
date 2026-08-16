@@ -1,11 +1,8 @@
 //! MODEL-003: reasoning normalization, the same-turn replay side channel,
 //! reasoning-effort mapping, and usage forwarding (M7-001 ~ M7-005).
 //!
-//! Reasoning coverage targets the OpenAI-compatible baseline: the
-//! `reasoning_content` chat dialect streams visible reasoning, and the
-//! official OpenAI shape carries the effort control. Protocols with signed
-//! or opaque reasoning (Anthropic thinking, OpenAI Responses) follow later
-//! milestones as the SDK evolves.
+//! Reasoning coverage targets OpenAI Chat: `ContentOnly` streams visible
+//! `reasoning_content`, and effort-capable formats carry the effort control.
 
 mod support;
 
@@ -13,7 +10,7 @@ use philo_agent_runtime::{
     ModelEvent, ModelMessage, ModelPort, ModelToolCall, ModelToolResultOutcome, ReasoningEffort,
     ToolCallId, UserPart,
 };
-use philo_model::{ModelProtocol, PhiloModelAdapter};
+use philo_model::{ChatReasoningFormat, ModelCompat, ModelProtocol, PhiloModelAdapter};
 use support::{
     StubResponse, StubTransport, adapter_over, collect_ok, read_tool_definition,
     reasoning_snapshot, snapshot, sse, text_sse,
@@ -25,15 +22,17 @@ fn user(content: &str) -> ModelMessage {
     }
 }
 
-fn reasoning_content_adapter(transport: StubTransport) -> PhiloModelAdapter {
+fn content_only_adapter(transport: StubTransport) -> PhiloModelAdapter {
     PhiloModelAdapter::builder(
         "stub-provider",
-        ModelProtocol::OpenAiChatReasoningContent,
+        ModelProtocol::OpenAiChat,
         "stub-model",
         support::STUB_ENDPOINT,
     )
+    .compat(ModelCompat::Compatible)
+    .chat_reasoning_format(ChatReasoningFormat::ContentOnly)
     .build_with_transport(transport)
-    .expect("reasoning-content adapter assembly")
+    .expect("content-only adapter assembly")
 }
 
 /// Call one: two visible reasoning deltas, then one `read` tool call.
@@ -71,7 +70,7 @@ fn second_call_messages() -> Vec<ModelMessage> {
 #[tokio::test]
 async fn reasoning_stream_normalizes_to_transient_reasoning_events() {
     let transport = StubTransport::new([StubResponse::Sse(reasoning_tool_call_body())]);
-    let adapter = reasoning_content_adapter(transport);
+    let adapter = content_only_adapter(transport);
     let stream = adapter
         .start(reasoning_snapshot(
             "turn-1",
@@ -118,7 +117,7 @@ async fn same_turn_second_call_replays_the_reasoning_state() {
         StubResponse::Sse(reasoning_tool_call_body()),
         StubResponse::Sse(text_sse("resp-2", "stub-r1", &["done"])),
     ]);
-    let adapter = reasoning_content_adapter(transport.clone());
+    let adapter = content_only_adapter(transport.clone());
 
     let first = adapter
         .start(reasoning_snapshot(
@@ -170,7 +169,7 @@ async fn a_new_turn_first_call_never_replays_stale_state() {
         StubResponse::Sse(reasoning_tool_call_body()),
         StubResponse::Sse(text_sse("resp-2", "stub-r1", &["next answer"])),
     ]);
-    let adapter = reasoning_content_adapter(transport.clone());
+    let adapter = content_only_adapter(transport.clone());
 
     // Turn 1 call 1 caches reasoning state...
     let first = adapter
@@ -220,7 +219,7 @@ async fn a_cancelled_turn_leaves_no_reasoning_for_the_next_turn() {
         StubResponse::Sse(sse(&[head])),
         StubResponse::Sse(text_sse("resp-2", "stub-r1", &["fresh"])),
     ]);
-    let adapter = reasoning_content_adapter(transport.clone());
+    let adapter = content_only_adapter(transport.clone());
 
     let mut first = adapter
         .start(reasoning_snapshot(
@@ -270,18 +269,47 @@ fn protocol_capabilities_cover_each_reasoning_effort_level() {
         ReasoningEffort::Maximum,
     ];
     for effort in all_efforts {
-        assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(effort));
-        assert!(
-            ModelProtocol::OpenAiChatCompatibleReasoningEffort.supports_reasoning_effort(effort)
-        );
-        assert!(ModelProtocol::OpenAiResponses.supports_reasoning_effort(effort));
-        assert!(!ModelProtocol::OpenAiChatCompatible.supports_reasoning_effort(effort));
-        assert!(!ModelProtocol::OpenAiChatReasoningContent.supports_reasoning_effort(effort));
+        assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(
+            ModelCompat::Official,
+            None,
+            effort
+        ));
+        assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(
+            ModelCompat::Compatible,
+            None,
+            effort
+        ));
+        assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(
+            ModelCompat::Compatible,
+            Some(ChatReasoningFormat::EffortOnly),
+            effort
+        ));
+        assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(
+            ModelCompat::Compatible,
+            Some(ChatReasoningFormat::EffortAndContent),
+            effort
+        ));
+        assert!(!ModelProtocol::OpenAiChat.supports_reasoning_effort(
+            ModelCompat::Compatible,
+            Some(ChatReasoningFormat::None),
+            effort
+        ));
+        assert!(!ModelProtocol::OpenAiChat.supports_reasoning_effort(
+            ModelCompat::Compatible,
+            Some(ChatReasoningFormat::ContentOnly),
+            effort
+        ));
+        assert!(ModelProtocol::OpenAiResponses.supports_reasoning_effort(
+            ModelCompat::Official,
+            None,
+            effort
+        ));
+        assert!(!ModelProtocol::OpenAiResponses.supports_reasoning_effort(
+            ModelCompat::Compatible,
+            None,
+            effort
+        ));
     }
-
-    assert!(ModelProtocol::AnthropicMessages.supports_reasoning_effort(ReasoningEffort::Maximum));
-    assert!(!ModelProtocol::AnthropicMessages.supports_reasoning_effort(ReasoningEffort::Minimal));
-    assert!(!ModelProtocol::AnthropicMessages.supports_reasoning_effort(ReasoningEffort::VeryHigh));
 }
 
 #[tokio::test]
@@ -314,12 +342,14 @@ async fn compatible_reasoning_effort_profile_uses_the_common_request_shape() {
         StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
     let adapter = PhiloModelAdapter::builder(
         "stub-provider",
-        ModelProtocol::OpenAiChatCompatibleReasoningEffort,
+        ModelProtocol::OpenAiChat,
         "stub-model",
         support::STUB_ENDPOINT,
     )
+    .compat(ModelCompat::Compatible)
+    .chat_reasoning_format(ChatReasoningFormat::EffortOnly)
     .build_with_transport(transport.clone())
-    .expect("compatible reasoning-effort adapter assembly");
+    .expect("compatible effort-only adapter assembly");
     let stream = adapter
         .start(reasoning_snapshot(
             "turn-1",
@@ -365,15 +395,17 @@ async fn disabled_reasoning_keeps_the_baseline_request_shape() {
 #[tokio::test]
 async fn unsupported_reasoning_effort_is_a_configuration_model_error() {
     let transport = StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub", &["never"]))]);
-    // The conservative compatible profile has no reasoning control at all.
+    // Chat + Compatible + None sends neither reasoning field.
     let adapter = PhiloModelAdapter::builder(
         "stub-provider",
-        ModelProtocol::OpenAiChatCompatible,
+        ModelProtocol::OpenAiChat,
         "stub-model",
         support::STUB_ENDPOINT,
     )
+    .compat(ModelCompat::Compatible)
+    .chat_reasoning_format(ChatReasoningFormat::None)
     .build_with_transport(transport.clone())
-    .expect("compatible adapter assembly");
+    .expect("compatible none-format adapter assembly");
 
     let error = adapter
         .start(reasoning_snapshot(
@@ -404,7 +436,7 @@ async fn reasoning_dialect_usage_maps_onto_token_usage() {
     let head = r#"{"id":"resp-1","object":"chat.completion.chunk","model":"stub-r1","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}"#;
     let finish = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"completion_tokens_details":{"reasoning_tokens":2}}}"#;
     let transport = StubTransport::new([StubResponse::Sse(sse(&[head, finish, "[DONE]"]))]);
-    let adapter = reasoning_content_adapter(transport);
+    let adapter = content_only_adapter(transport);
     let stream = adapter
         .start(reasoning_snapshot(
             "turn-1",

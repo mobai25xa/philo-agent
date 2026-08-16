@@ -1,7 +1,7 @@
 //! INTEGRATION-007: reasoning and observability end to end through
 //! production public APIs over the OpenAI-compatible baseline.
 //!
-//! AgentRuntime + philo-model (`reasoning_content` dialect, stub transport) +
+//! AgentRuntime + philo-model (Chat + Compatible + ContentOnly, stub transport) +
 //! philo-tools-std + a real ToolRegistry + MemorySessionStore.
 
 mod support;
@@ -15,7 +15,7 @@ use philo_agent_runtime::{
     OperationOutcome, ReasoningEffort, RuntimeConfig, SequentialIdSource, SessionId,
     SettlementDurability, ToolRegistry, UserMessage,
 };
-use philo_model::{ModelProtocol, PhiloModelAdapter};
+use philo_model::{ChatReasoningFormat, ModelCompat, ModelProtocol, PhiloModelAdapter};
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore};
 use philo_tools_std::ReadTool;
 use support::{StubResponse, StubTransport, sse, text_sse};
@@ -48,18 +48,20 @@ impl Drop for TempRoot {
 }
 
 fn runtime_over(
-    protocol: ModelProtocol,
     transport: StubTransport,
     sessions: Arc<MemorySessionStore>,
     root: &TempRoot,
     reasoning_effort: Option<ReasoningEffort>,
+    chat_reasoning_format: ChatReasoningFormat,
 ) -> AgentRuntime {
     let adapter = PhiloModelAdapter::builder(
         "stub-provider",
-        protocol,
+        ModelProtocol::OpenAiChat,
         "stub-model",
         support::STUB_ENDPOINT,
     )
+    .compat(ModelCompat::Compatible)
+    .chat_reasoning_format(chat_reasoning_format)
     .build_with_transport(transport)
     .expect("adapter assembly");
     let registry = ToolRegistry::builder()
@@ -147,11 +149,11 @@ async fn m7_e2e_reasoning_flows_replay_and_stay_out_of_the_session() {
     ]);
     let sessions = Arc::new(MemorySessionStore::new());
     let agent = runtime_over(
-        ModelProtocol::OpenAiChatReasoningContent,
         transport.clone(),
         sessions.clone(),
         &root,
         None,
+        ChatReasoningFormat::ContentOnly,
     );
 
     let mut handle = agent
@@ -297,11 +299,11 @@ async fn m7_e2e_unsupported_effort_settles_the_operation_failed() {
     let transport = StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub", &["never"]))]);
     let sessions = Arc::new(MemorySessionStore::new());
     let agent = runtime_over(
-        ModelProtocol::OpenAiChatCompatible,
         transport.clone(),
         sessions.clone(),
         &root,
         Some(ReasoningEffort::High),
+        ChatReasoningFormat::None,
     );
 
     let handle = agent

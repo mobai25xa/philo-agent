@@ -18,7 +18,7 @@ use philo_agent_runtime::{
     GenerationConfig, ModelCallId, ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream,
     ModelMessage, OperationId, ToolDefinition, TurnId,
 };
-use philo_model::{ModelProtocol, PhiloModelAdapter};
+use philo_model::{ModelCompat, ModelProtocol, PhiloModelAdapter};
 
 /// Observes whether the HTTP response body stream has been dropped, proving
 /// that dropping the normalized event stream aborts the underlying call.
@@ -175,6 +175,7 @@ pub fn adapter_over(transport: StubTransport) -> PhiloModelAdapter {
         "stub-model",
         STUB_ENDPOINT,
     )
+    .compat(ModelCompat::Official)
     .build_with_transport(transport)
     .expect("stub adapter assembly succeeds")
 }

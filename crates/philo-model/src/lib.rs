@@ -20,8 +20,8 @@ mod stream;
 
 pub use adapter::PhiloModelAdapter;
 pub use assemble::{
-    AdapterBuildError, ModelContinuationPolicy, ModelProtocol, PhiloModelBuilder,
-    ServerContinuationSupport,
+    AdapterBuildError, ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol,
+    PhiloModelBuilder,
 };
 pub use headers::{DEFAULT_USER_AGENT, ModelRequestHeaderError, ModelRequestHeaders};
 pub use replay::{

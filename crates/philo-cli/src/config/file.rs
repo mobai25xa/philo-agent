@@ -62,7 +62,8 @@ pub(super) struct FileConfig {
     pub(super) data_dir: Option<Sourced<String>>,
     pub(super) context_window: Option<Sourced<i64>>,
     pub(super) continuation: Option<Sourced<String>>,
-    pub(super) response_continuation_support: Option<Sourced<String>>,
+    pub(super) compat: Option<Sourced<String>>,
+    pub(super) reasoning_format: Option<Sourced<String>>,
     /// Canonical lowercase header name -> highest-authority configured value.
     pub(super) headers: BTreeMap<String, Sourced<FileHeader>>,
     // [compaction]
@@ -193,8 +194,17 @@ fn apply(
                 ("deployment", "continuation") => {
                     config.continuation = Some(reader.string()?);
                 }
+                ("deployment", "compat") => config.compat = Some(reader.string()?),
+                ("deployment", "reasoning_format") => {
+                    config.reasoning_format = Some(reader.string()?);
+                }
                 ("deployment", "response_continuation_support") => {
-                    config.response_continuation_support = Some(reader.string()?);
+                    return Err(UsageError::new(format!(
+                        "{}: [deployment].response_continuation_support has been removed; \
+                         for OpenAI Responses continuation set [deployment].compat and \
+                         continuation = \"prefer-previous-response-id\"",
+                        path.display()
+                    )));
                 }
                 ("deployment", "headers") => {
                     apply_headers(&mut config.headers, layer, path, value)?;

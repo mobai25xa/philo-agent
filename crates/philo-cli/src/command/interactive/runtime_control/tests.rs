@@ -3,8 +3,8 @@ use philo_agent_runtime::{
     ModelEventStream, SequentialIdSource, ToolChoice, ToolRegistry,
 };
 use philo_model::{
-    MemoryModelReplayStore, ModelContinuationPolicy, ModelProtocol, ModelRequestHeaders,
-    ServerContinuationSupport,
+    MemoryModelReplayStore, ModelCompat, ModelContinuationPolicy, ModelProtocol,
+    ModelRequestHeaders,
 };
 
 use super::*;
@@ -33,13 +33,14 @@ fn control(dir: &std::path::Path) -> RuntimeControl {
     RuntimeControl::new(
         Deployment {
             provider: "test".to_owned(),
-            protocol: ModelProtocol::OpenAiChatCompatible,
+            protocol: ModelProtocol::OpenAiChat,
             model: "model-a".to_owned(),
             endpoint: "https://example.test/v1/chat/completions".to_owned(),
             api_key_env: "PHILO_API_KEY".to_owned(),
             request_headers: ModelRequestHeaders::default(),
+            compat: ModelCompat::Compatible,
+            chat_reasoning_format: None,
             continuation_policy: ModelContinuationPolicy::StatelessLocalReplay,
-            continuation_support: ServerContinuationSupport::Disabled,
         },
         RuntimeConfig {
             system_prompt: "s".to_owned(),

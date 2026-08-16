@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use clap::Parser;
 use philo_agent_runtime::ReasoningEffort;
-use philo_model::{ModelContinuationPolicy, ModelProtocol, ServerContinuationSupport};
+use philo_model::{ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol};
 
-use super::file::{Layer, Sourced, load_layers};
+use super::file::{load_layers, Layer, Sourced};
 use super::resolve::{
-    Verbosity, parse_continuation_policy, parse_continuation_support, parse_protocol,
-    parse_reasoning_effort, parse_verbosity, validate_reasoning_effort,
+    parse_compat, parse_continuation_policy, parse_protocol, parse_reasoning_effort,
+    parse_reasoning_format, parse_verbosity, validate_reasoning_effort, Verbosity,
 };
 use crate::args::Cli;
 
@@ -108,12 +108,10 @@ fn deployment_headers_merge_case_insensitively_and_keep_per_header_sources() {
             && entry.source == "project"
     }));
     for key in ["header.x-project", "header.x-route"] {
-        assert!(
-            settings
-                .entries
-                .iter()
-                .any(|entry| { entry.key == key && entry.value == "<configured>" })
-        );
+        assert!(settings
+            .entries
+            .iter()
+            .any(|entry| { entry.key == key && entry.value == "<configured>" }));
     }
     let debug = format!("{:?}", settings.deployment);
     assert!(!debug.contains("global-route"));
@@ -163,7 +161,8 @@ fn every_section_reads_its_key_domain() {
          data_dir = \"/tmp/sessions\"\n\
          context_window = 128000\n\
          continuation = \"prefer-previous-response-id\"\n\
-         response_continuation_support = \"official-openai\"\n\
+         compat = \"official\"\n\
+         reasoning_format = \"effort-only\"\n\
          [compaction]\n\
          context_budget = 96000\n\
          auto_threshold = 0.75\n\
@@ -187,12 +186,10 @@ fn every_section_reads_its_key_domain() {
         config.continuation.expect("continuation").value,
         "prefer-previous-response-id"
     );
+    assert_eq!(config.compat.expect("compat").value, "official");
     assert_eq!(
-        config
-            .response_continuation_support
-            .expect("continuation support")
-            .value,
-        "official-openai"
+        config.reasoning_format.expect("reasoning format").value,
+        "effort-only"
     );
     assert_eq!(
         config
@@ -238,20 +235,16 @@ fn unknown_keys_warn_but_invalid_values_fail() {
     assert_eq!(config.warnings.len(), 2);
 
     let wrong = dir.write("wrong.toml", "[deployment]\nmodel = 42\n");
-    assert!(
-        load_layers(Some(&wrong), None)
-            .expect_err("wrong type")
-            .0
-            .contains("must be a string, found integer")
-    );
+    assert!(load_layers(Some(&wrong), None)
+        .expect_err("wrong type")
+        .0
+        .contains("must be a string, found integer"));
 
     let zero = dir.write("zero.toml", "[defaults]\nmax_tool_rounds = 0\n");
-    assert!(
-        load_layers(Some(&zero), None)
-            .expect_err("non-positive")
-            .0
-            .contains("must be a positive integer")
-    );
+    assert!(load_layers(Some(&zero), None)
+        .expect_err("non-positive")
+        .0
+        .contains("must be a positive integer"));
 }
 
 #[test]
@@ -296,111 +289,207 @@ fn value_parsers_cover_the_supported_vocabulary() {
     }
     assert!(parse_reasoning_effort("extreme").is_err());
     assert_eq!(
-        parse_protocol("openai-chat-reasoning-content").unwrap(),
-        ModelProtocol::OpenAiChatReasoningContent
+        parse_protocol("openai-chat").unwrap(),
+        ModelProtocol::OpenAiChat
     );
     assert_eq!(
-        parse_protocol("openai-chat-compatible-reasoning-effort").unwrap(),
-        ModelProtocol::OpenAiChatCompatibleReasoningEffort
+        parse_protocol("openai-responses").unwrap(),
+        ModelProtocol::OpenAiResponses
     );
     assert!(parse_protocol("grpc").is_err());
+    assert_eq!(parse_compat("official").unwrap(), ModelCompat::Official);
+    assert_eq!(parse_compat("compatible").unwrap(), ModelCompat::Compatible);
+    assert!(parse_compat("detect").is_err());
+    assert_eq!(
+        parse_reasoning_format("content-only").unwrap(),
+        ChatReasoningFormat::ContentOnly
+    );
+    assert!(parse_reasoning_format("both").is_err());
     assert_eq!(
         parse_continuation_policy("prefer-previous-response-id").unwrap(),
         ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
     );
-    assert_eq!(
-        parse_continuation_support("compatible-declared").unwrap(),
-        ServerContinuationSupport::CompatibleDeclared
-    );
     assert!(parse_continuation_policy("automatic").is_err());
-    assert!(parse_continuation_support("inferred").is_err());
     assert_eq!(parse_verbosity("quiet").unwrap(), Verbosity::Quiet);
     assert!(parse_verbosity("loud").is_err());
 }
 
 #[test]
-fn continuation_is_stateless_by_default_and_requires_explicit_support() {
+fn retired_protocol_names_fail_with_migration_text() {
+    let compatible = parse_protocol("openai-chat-compatible").expect_err("old dialect");
+    assert!(compatible.0.contains("protocol=openai-chat"));
+    assert!(compatible.0.contains("compat=compatible"));
+    assert!(compatible.0.contains("reasoning_format=none"));
+
+    let effort =
+        parse_protocol("openai-chat-compatible-reasoning-effort").expect_err("old effort dialect");
+    assert!(effort.0.contains("protocol=openai-chat"));
+    assert!(effort.0.contains("compat=compatible"));
+    assert!(effort.0.contains("reasoning_format=effort-only"));
+
+    let content = parse_protocol("openai-chat-reasoning-content").expect_err("old content dialect");
+    assert!(content.0.contains("protocol=openai-chat"));
+    assert!(content.0.contains("compat=compatible"));
+    assert!(content.0.contains("reasoning_format=content-only"));
+
+    let anthropic = parse_protocol("anthropic-messages").expect_err("anthropic is unsupported");
+    assert!(anthropic.0.contains("not supported"));
+    assert!(!anthropic.0.contains("openai-chat"));
+    assert!(!anthropic.0.contains("openai-responses"));
+}
+
+#[test]
+fn response_continuation_support_is_a_hard_error() {
+    let dir = TempDir::new();
+    let path = dir.write(
+        "old-support.toml",
+        "[deployment]\nmodel = \"m\"\nresponse_continuation_support = \"official-openai\"\n",
+    );
+    let error = load_layers(Some(&path), None).expect_err("old key is refused");
+    assert!(error.0.contains("removed"), "{error:?}");
+    assert!(error.0.contains("prefer-previous-response-id"), "{error:?}");
+    assert!(!error.0.contains("unknown key"), "{error:?}");
+}
+
+#[test]
+fn defaults_are_chat_compatible_and_stateless() {
     let settings =
         super::resolve::resolve(&resolvable_cli(), &deployment_file()).expect("defaults resolve");
+    assert_eq!(settings.deployment.protocol, ModelProtocol::OpenAiChat);
+    assert_eq!(settings.deployment.compat, ModelCompat::Compatible);
+    assert_eq!(settings.deployment.chat_reasoning_format, None);
     assert_eq!(
         settings.deployment.continuation_policy,
         ModelContinuationPolicy::StatelessLocalReplay
     );
-    assert_eq!(
-        settings.deployment.continuation_support,
-        ServerContinuationSupport::Disabled
-    );
     for (key, value) in [
+        ("protocol", "openai-chat"),
+        ("compat", "compatible"),
         ("continuation", "stateless-local-replay"),
-        ("response_continuation_support", "disabled"),
     ] {
-        assert!(settings.entries.iter().any(|entry| {
-            entry.key == key && entry.value == value && entry.source == "default"
-        }));
+        assert!(
+            settings.entries.iter().any(|entry| {
+                entry.key == key && entry.value == value && entry.source == "default"
+            }),
+            "{key}={value} from default"
+        );
     }
+    assert!(settings.entries.iter().all(
+        |entry| entry.key != "reasoning_format" && entry.key != "response_continuation_support"
+    ));
+}
 
-    let mut missing_support = deployment_file();
-    missing_support.protocol = Some(Sourced {
-        value: "openai-responses".to_owned(),
-        layer: Layer::Project,
-    });
-    missing_support.continuation = Some(Sourced {
+#[test]
+fn prefer_continuation_is_responses_only_and_needs_no_support_key() {
+    let mut chat_prefer = deployment_file();
+    chat_prefer.continuation = Some(Sourced {
         value: "prefer-previous-response-id".to_owned(),
         layer: Layer::Project,
     });
-    let error = super::resolve::resolve(&resolvable_cli(), &missing_support)
+    let error = super::resolve::resolve(&resolvable_cli(), &chat_prefer)
         .err()
-        .expect("support declaration is mandatory");
-    assert!(error.0.contains("requires an explicit"));
+        .expect("Chat + prefer fails at resolve");
+    assert!(error.0.contains("OpenAI Responses protocol"), "{error:?}");
 
-    missing_support.response_continuation_support = Some(Sourced {
-        value: "compatible-declared".to_owned(),
+    let mut responses_prefer = deployment_file();
+    responses_prefer.protocol = Some(Sourced {
+        value: "openai-responses".to_owned(),
         layer: Layer::Project,
     });
-    let settings = super::resolve::resolve(&resolvable_cli(), &missing_support)
-        .expect("explicit compatible declaration resolves");
+    responses_prefer.continuation = Some(Sourced {
+        value: "prefer-previous-response-id".to_owned(),
+        layer: Layer::Project,
+    });
+    let settings = super::resolve::resolve(&resolvable_cli(), &responses_prefer)
+        .expect("Responses + prefer is the continuation declaration");
     assert_eq!(
         settings.deployment.continuation_policy,
         ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback
     );
-    assert_eq!(
-        settings.deployment.continuation_support,
-        ServerContinuationSupport::CompatibleDeclared
-    );
+    assert_eq!(settings.deployment.compat, ModelCompat::Compatible);
+    assert!(settings.entries.iter().any(|entry| {
+        entry.key == "continuation"
+            && entry.value == "prefer-previous-response-id"
+            && entry.source == "project"
+    }));
 }
 
 #[test]
-fn reasoning_effort_is_validated_against_the_selected_protocol() {
-    assert!(
-        validate_reasoning_effort(ModelProtocol::OpenAiResponses, ReasoningEffort::High).is_ok()
-    );
-    assert!(
-        validate_reasoning_effort(ModelProtocol::OpenAiChat, ReasoningEffort::VeryHigh).is_ok()
-    );
-    assert!(
-        validate_reasoning_effort(
-            ModelProtocol::OpenAiChatCompatibleReasoningEffort,
-            ReasoningEffort::Minimal,
-        )
-        .is_ok()
-    );
-    assert!(
-        validate_reasoning_effort(ModelProtocol::AnthropicMessages, ReasoningEffort::Maximum)
-            .is_ok()
-    );
+fn reasoning_format_is_chat_only_and_shown_when_set() {
+    let mut responses = deployment_file();
+    responses.protocol = Some(Sourced {
+        value: "openai-responses".to_owned(),
+        layer: Layer::Project,
+    });
+    responses.reasoning_format = Some(Sourced {
+        value: "none".to_owned(),
+        layer: Layer::Project,
+    });
+    let error = super::resolve::resolve(&resolvable_cli(), &responses)
+        .err()
+        .expect("reasoning_format is Chat-only");
+    assert!(error.0.contains("reasoning_format"), "{error:?}");
+    assert!(error.0.contains("OpenAI Chat"), "{error:?}");
 
-    for protocol in [
-        ModelProtocol::OpenAiChatCompatible,
-        ModelProtocol::OpenAiChatReasoningContent,
-    ] {
-        let error = validate_reasoning_effort(protocol, ReasoningEffort::High)
-            .expect_err("compatible chat profiles do not accept reasoning effort");
+    let mut chat = deployment_file();
+    chat.reasoning_format = Some(Sourced {
+        value: "content-only".to_owned(),
+        layer: Layer::Project,
+    });
+    let settings = super::resolve::resolve(&resolvable_cli(), &chat).expect("Chat format resolves");
+    assert_eq!(
+        settings.deployment.chat_reasoning_format,
+        Some(ChatReasoningFormat::ContentOnly)
+    );
+    assert!(settings.entries.iter().any(|entry| {
+        entry.key == "reasoning_format"
+            && entry.value == "content-only"
+            && entry.source == "project"
+    }));
+}
+
+#[test]
+fn reasoning_effort_is_validated_against_compat_and_format() {
+    assert!(validate_reasoning_effort(
+        ModelProtocol::OpenAiChat,
+        ModelCompat::Compatible,
+        None,
+        ReasoningEffort::High,
+    )
+    .is_ok());
+    assert!(validate_reasoning_effort(
+        ModelProtocol::OpenAiChat,
+        ModelCompat::Compatible,
+        Some(ChatReasoningFormat::EffortOnly),
+        ReasoningEffort::Minimal,
+    )
+    .is_ok());
+    assert!(validate_reasoning_effort(
+        ModelProtocol::OpenAiResponses,
+        ModelCompat::Official,
+        None,
+        ReasoningEffort::VeryHigh,
+    )
+    .is_ok());
+
+    for format in [ChatReasoningFormat::None, ChatReasoningFormat::ContentOnly] {
+        let error = validate_reasoning_effort(
+            ModelProtocol::OpenAiChat,
+            ModelCompat::Compatible,
+            Some(format),
+            ReasoningEffort::High,
+        )
+        .expect_err("none/content-only reject effort");
         assert!(error.0.contains("unsupported by protocol"));
     }
-    assert!(
-        validate_reasoning_effort(ModelProtocol::AnthropicMessages, ReasoningEffort::Minimal)
-            .is_err()
-    );
+    let error = validate_reasoning_effort(
+        ModelProtocol::OpenAiResponses,
+        ModelCompat::Compatible,
+        None,
+        ReasoningEffort::High,
+    )
+    .expect_err("compatible Responses reject effort");
+    assert!(error.0.contains("unsupported by protocol"));
 }
 
 #[test]
@@ -427,12 +516,10 @@ fn resolved_entries_use_cli_vocabulary_not_tui_types() {
     };
 
     let settings = super::resolve::resolve(&cli, &file).expect("resolves");
-    assert!(
-        settings
-            .entries
-            .iter()
-            .any(|entry| entry.key == "model" && entry.source == "flag")
-    );
+    assert!(settings
+        .entries
+        .iter()
+        .any(|entry| entry.key == "model" && entry.source == "flag"));
 }
 
 fn resolvable_cli() -> Cli {

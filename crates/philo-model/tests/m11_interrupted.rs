@@ -8,7 +8,6 @@ use philo_agent_runtime::{
     ModelEvent, ModelMessage, ModelPort, ModelToolCall, ModelToolResultOutcome, ToolCallId,
     UserPart,
 };
-use philo_model::{ModelProtocol, PhiloModelAdapter};
 use support::{
     StubResponse, StubTransport, adapter_over, collect_ok, read_tool_definition, snapshot, text_sse,
 };
@@ -75,59 +74,6 @@ async fn interrupted_history_replays_canonical_text_without_native_error_status(
         assert_eq!(message["role"], "tool");
         assert_eq!(message["tool_call_id"], call_id);
         assert_eq!(message["content"][0]["text"], INTERRUPTED_TEXT);
-    }
-}
-
-#[tokio::test]
-async fn anthropic_renders_interrupted_with_the_native_error_status() {
-    let body = concat!(
-        "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"id":"msg-1","model":"stub-claude","usage":{"input_tokens":1}}}"#,
-        "\n\n",
-        "event: content_block_start\n",
-        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
-        "\n\n",
-        "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
-        "\n\n",
-        "event: content_block_stop\n",
-        r#"data: {"type":"content_block_stop","index":0}"#,
-        "\n\n",
-        "event: message_delta\n",
-        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
-        "\n\n",
-        "event: message_stop\n",
-        r#"data: {"type":"message_stop"}"#,
-        "\n\n",
-    );
-    let transport = StubTransport::new([StubResponse::Sse(body.as_bytes().to_vec())]);
-    let adapter = PhiloModelAdapter::builder(
-        "stub-provider",
-        ModelProtocol::AnthropicMessages,
-        "stub-model",
-        "https://stub.invalid/v1/messages",
-    )
-    .build_with_transport(transport.clone())
-    .expect("anthropic adapter assembly");
-    let stream = adapter
-        .start(snapshot(
-            sealed_turn_history(),
-            vec![read_tool_definition()],
-        ))
-        .await
-        .expect("replay with interrupted marks passes validation");
-    let events = collect_ok(stream).await;
-    assert!(events.contains(&ModelEvent::Completed));
-
-    let request = &transport.request_bodies()[0];
-    let results = &request["messages"][2];
-    assert_eq!(results["role"], "user");
-    for (index, call_id) in [(0, "call-1"), (1, "call-2")] {
-        let result = &results["content"][index];
-        assert_eq!(result["type"], "tool_result");
-        assert_eq!(result["tool_use_id"], call_id);
-        assert_eq!(result["is_error"], true, "native error status is used");
-        assert_eq!(result["content"][0]["text"], INTERRUPTED_TEXT);
     }
 }
 

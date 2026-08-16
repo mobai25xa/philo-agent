@@ -14,7 +14,7 @@ use philo_agent_runtime::{
     ToolCallId, ToolRegistry, UserMessage, UserPart,
 };
 use philo_model::{
-    FileModelReplayStore, MemoryModelReplayStore, ModelProtocol, ModelReplayStore,
+    FileModelReplayStore, MemoryModelReplayStore, ModelCompat, ModelProtocol, ModelReplayStore,
     PhiloModelAdapter, ReplayStoreBlob, ReplayStoreError, ReplayStoreErrorCode, ReplayStorePolicy,
 };
 use philo_session::SessionStore;
@@ -214,6 +214,7 @@ fn response_adapter(
         model,
         RESPONSES_ENDPOINT,
     )
+    .compat(ModelCompat::Official)
     .replay_store(store)
     .build_with_transport(transport)
     .expect("Responses adapter assembly")

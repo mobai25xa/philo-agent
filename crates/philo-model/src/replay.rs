@@ -752,7 +752,10 @@ impl ReplayCoordinator {
             expires_at_unix_secs: expires,
             items: stored_items,
         };
-        if !has_snapshot {
+        if !has_snapshot && generation.response_id.is_none() {
+            // Chat ContentOnly and other no-token assemblies stay
+            // process-local. Responses Reconstruct + prefer still has a
+            // response ID to persist for previous_response_id.
             self.transient
                 .lock()
                 .map_err(|_| ModelError::new("transient model replay state is unavailable"))?
@@ -1335,7 +1338,18 @@ mod tests {
         .expect("V1 replay generation remains readable");
 
         assert_eq!(generation.schema_version, GENERATION_SCHEMA_V1);
+        assert_eq!(generation.protocol, "openai-responses/openai-v2");
         assert!(generation.continuation_prefix_digest.is_none());
         assert!(generation.invalidates_generation.is_none());
+
+        let current_target = sdk::CallTarget::new(
+            sdk::ProviderId::new("provider").expect("provider"),
+            sdk::ProtocolId::new(sdk::ProtocolId::OPENAI_RESPONSES_V2).expect("protocol"),
+            sdk::ModelName::new("model").expect("model"),
+        );
+        assert!(
+            !generation.target_matches(&current_target),
+            "old sidecar protocol IDs must not alias onto openai-responses/v2"
+        );
     }
 }

@@ -6,7 +6,9 @@
 //! ```text
 //! set PHILO_M4_LIVE_ENDPOINT=https://api.example.com/v1/chat/completions
 //! set PHILO_M4_LIVE_MODEL=some-model
-//! set PHILO_M4_LIVE_PROTOCOL=openai-chat-compatible   (optional)
+//! set PHILO_M4_LIVE_PROTOCOL=openai-chat              (optional; openai-chat | openai-responses)
+//! set PHILO_M4_LIVE_COMPAT=compatible                 (optional; official | compatible)
+//! set PHILO_M4_LIVE_REASONING_FORMAT=content-only     (optional; Chat only)
 //! set PHILO_M4_LIVE_API_KEY=<secret>
 //! cargo test -p philo-model --test live_smoke -- --ignored
 //! ```
@@ -17,31 +19,61 @@ use philo_agent_runtime::{
     AgentRuntime, GenerationConfig, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
     ToolRegistry, UserMessage,
 };
-use philo_model::{ModelProtocol, PhiloModelAdapter};
+use philo_model::{ChatReasoningFormat, ModelCompat, ModelProtocol, PhiloModelAdapter};
 use philo_session::MemorySessionStore;
 use philo_tools_std::ReadTool;
 
 const API_KEY_VAR: &str = "PHILO_M4_LIVE_API_KEY";
 
+fn live_protocol() -> ModelProtocol {
+    match std::env::var("PHILO_M4_LIVE_PROTOCOL") {
+        Err(_) => ModelProtocol::OpenAiChat,
+        Ok(value) => match value.as_str() {
+            "openai-chat" => ModelProtocol::OpenAiChat,
+            "openai-responses" => ModelProtocol::OpenAiResponses,
+            other => panic!(
+                "PHILO_M4_LIVE_PROTOCOL must be openai-chat or openai-responses, got {other:?}"
+            ),
+        },
+    }
+}
+
+fn live_compat() -> ModelCompat {
+    match std::env::var("PHILO_M4_LIVE_COMPAT") {
+        Err(_) => ModelCompat::Compatible,
+        Ok(value) => match value.as_str() {
+            "official" => ModelCompat::Official,
+            "compatible" => ModelCompat::Compatible,
+            other => panic!("PHILO_M4_LIVE_COMPAT must be official or compatible, got {other:?}"),
+        },
+    }
+}
+
+fn live_reasoning_format() -> Option<ChatReasoningFormat> {
+    match std::env::var("PHILO_M4_LIVE_REASONING_FORMAT") {
+        Err(_) => None,
+        Ok(value) => Some(match value.as_str() {
+            "none" => ChatReasoningFormat::None,
+            "effort-only" => ChatReasoningFormat::EffortOnly,
+            "content-only" => ChatReasoningFormat::ContentOnly,
+            "effort-and-content" => ChatReasoningFormat::EffortAndContent,
+            other => panic!(
+                "PHILO_M4_LIVE_REASONING_FORMAT must be none, effort-only, content-only, or effort-and-content, got {other:?}"
+            ),
+        }),
+    }
+}
+
 fn live_adapter() -> Option<PhiloModelAdapter> {
     let endpoint = std::env::var("PHILO_M4_LIVE_ENDPOINT").ok()?;
     let model = std::env::var("PHILO_M4_LIVE_MODEL").ok()?;
-    let protocol = match std::env::var("PHILO_M4_LIVE_PROTOCOL").as_deref() {
-        Ok("anthropic-messages") => ModelProtocol::AnthropicMessages,
-        Ok("openai-chat") => ModelProtocol::OpenAiChat,
-        Ok("openai-chat-compatible-reasoning-effort") => {
-            ModelProtocol::OpenAiChatCompatibleReasoningEffort
-        }
-        Ok("openai-chat-reasoning-content") => ModelProtocol::OpenAiChatReasoningContent,
-        Ok("openai-responses") => ModelProtocol::OpenAiResponses,
-        _ => ModelProtocol::OpenAiChatCompatible,
-    };
-    Some(
-        PhiloModelAdapter::builder("live-provider", protocol, model, endpoint)
-            .api_key_env(API_KEY_VAR)
-            .build()
-            .expect("live adapter assembly"),
-    )
+    let mut builder = PhiloModelAdapter::builder("live-provider", live_protocol(), model, endpoint)
+        .compat(live_compat())
+        .api_key_env(API_KEY_VAR);
+    if let Some(format) = live_reasoning_format() {
+        builder = builder.chat_reasoning_format(format);
+    }
+    Some(builder.build().expect("live adapter assembly"))
 }
 
 fn config(max_tool_rounds: u32, system_prompt: &str) -> RuntimeConfig {
@@ -133,8 +165,8 @@ async fn live_tool_round_reads_a_real_file() {
 
 /// M7-007 live leg: a real reasoning model completes one tool round with
 /// visible reasoning streamed as transient events. Point the target at a
-/// `reasoning_content` provider (for example set
-/// `PHILO_M4_LIVE_PROTOCOL=openai-chat-reasoning-content`).
+/// Chat provider that emits `reasoning_content` (for example set
+/// `PHILO_M4_LIVE_REASONING_FORMAT=content-only`).
 #[tokio::test]
 #[ignore = "live smoke is opt-in: configure PHILO_M4_LIVE_* and run with --ignored"]
 async fn live_reasoning_tool_round_streams_transient_reasoning() {

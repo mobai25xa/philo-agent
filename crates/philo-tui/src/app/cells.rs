@@ -1,9 +1,10 @@
-//! Sealed transcript cells, a replaceable unsealed tail, and the wrap slice.
+//! Ordered transcript cells with an in-place open cursor, and the wrap slice.
 //!
 //! `TranscriptLine` is the Step-1 cell. Wrapped rows are derived at the
-//! current width and are never the source of truth. `cells()` is sealed-only;
-//! the display list is sealed followed by unsealed. Wrap rows are cached
-//! per width: a width change rebuilds, appends only wrap new sealed cells.
+//! current width and are never the source of truth. In-progress Answer/Think
+//! is a real cell at its insertion point (`open` is always the last index).
+//! Wrap rows are cached per width: the closed prefix is stable; a width
+//! change rebuilds everything; the open cell is always rewrapped.
 
 use std::cell::{Ref, RefCell};
 
@@ -13,7 +14,7 @@ use super::transcript::{LineKind, TranscriptLine};
 #[derive(Clone, Debug)]
 struct WrapCache {
     width: usize,
-    sealed_upto: usize,
+    closed_upto: usize,
     rows: Vec<Vec<String>>,
 }
 
@@ -21,7 +22,7 @@ impl Default for WrapCache {
     fn default() -> Self {
         Self {
             width: usize::MAX,
-            sealed_upto: 0,
+            closed_upto: 0,
             rows: Vec::new(),
         }
     }
@@ -33,75 +34,117 @@ impl WrapCache {
     }
 }
 
-/// Canonical history for one TUI session: append-only sealed cells plus a
-/// replaceable unsealed tail for in-progress answer/think.
+/// Canonical history for one TUI session: one ordered cell list plus an
+/// optional in-place open cursor on the last cell.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TranscriptStore {
     cells: Vec<TranscriptLine>,
-    unsealed: Vec<TranscriptLine>,
+    open: Option<usize>,
     cache: RefCell<WrapCache>,
 }
 
 impl TranscriptStore {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.cells.clear();
-        self.unsealed.clear();
+        self.open = None;
         self.cache.borrow_mut().invalidate();
     }
 
-    pub(crate) fn append(&mut self, lines: impl IntoIterator<Item = TranscriptLine>) {
-        self.cells.extend(lines);
-    }
-
-    /// Sealed cells only. In-progress streaming lives in [`unsealed`].
-    pub(crate) fn cells(&self) -> &[TranscriptLine] {
+    /// All cells, including the open cell when one exists.
+    #[cfg(test)]
+    pub fn cells(&self) -> &[TranscriptLine] {
         &self.cells
     }
 
-    pub(crate) fn unsealed(&self) -> &[TranscriptLine] {
-        &self.unsealed
+    /// Same ordered list as the store cells (including the open cell).
+    pub fn display_cells(&self) -> Vec<TranscriptLine> {
+        self.cells.clone()
     }
 
-    pub(crate) fn replace_unsealed(&mut self, cells: Vec<TranscriptLine>) {
-        self.unsealed = cells;
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
     }
 
-    /// Sealed cells followed by the unsealed tail. Unsealed indices start
-    /// at `cells().len()`.
-    pub(crate) fn display_cells(&self) -> Vec<TranscriptLine> {
-        if self.unsealed().is_empty() {
-            return self.cells().to_vec();
-        }
-        let mut display = Vec::with_capacity(self.cells().len() + self.unsealed().len());
-        display.extend_from_slice(self.cells());
-        display.extend_from_slice(self.unsealed());
-        display
+    pub fn display_len(&self) -> usize {
+        self.cells.len()
     }
 
-    /// True only when both sealed and unsealed cells are empty.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.unsealed.is_empty()
+    pub fn display_kind(&self, index: usize) -> LineKind {
+        self.cells[index].kind
     }
 
-    pub(crate) fn display_len(&self) -> usize {
-        self.cells.len() + self.unsealed.len()
+    #[cfg(test)]
+    pub fn open_index(&self) -> Option<usize> {
+        self.open
     }
 
-    pub(crate) fn display_kind(&self, index: usize) -> LineKind {
-        if index < self.cells.len() {
-            self.cells[index].kind
-        } else {
-            self.unsealed[index - self.cells.len()].kind
-        }
+    #[cfg(test)]
+    pub fn has_open(&self) -> bool {
+        self.open.is_some()
     }
 
-    /// Rebuild wrap rows when the width changes; only wrap newly sealed
-    /// cells and the current unsealed tail.
+    pub(crate) fn open_kind(&self) -> Option<LineKind> {
+        self.open.map(|idx| self.cells[idx].kind)
+    }
+
+    /// Close any open cell, then append already-finished cells.
+    pub fn push_closed(&mut self, lines: impl IntoIterator<Item = TranscriptLine>) {
+        self.close_open();
+        self.cells.extend(lines);
+    }
+
+    /// Close any open cell, then push a new last cell and mark it open.
+    pub fn begin(&mut self, kind: LineKind, text: impl Into<String>) {
+        self.close_open();
+        self.cells.push(TranscriptLine {
+            kind,
+            text: text.into(),
+        });
+        self.open = Some(self.cells.len() - 1);
+        self.assert_open_last();
+    }
+
+    /// Append to the open cell. Panics if nothing is open.
+    pub fn write_open(&mut self, text: &str) {
+        let idx = self.open.expect("write_open requires an open cell");
+        debug_assert_eq!(
+            idx,
+            self.cells.len() - 1,
+            "open cursor must be the last cell"
+        );
+        self.cells[idx].text.push_str(text);
+    }
+
+    pub fn close_open(&mut self) {
+        self.open = None;
+    }
+
+    /// Remove the open cell so a line-oriented think remainder can be rewritten.
+    pub(crate) fn take_open(&mut self) -> Option<TranscriptLine> {
+        let idx = self.open.take()?;
+        debug_assert_eq!(
+            idx,
+            self.cells.len() - 1,
+            "open cursor must be the last cell"
+        );
+        self.cells.pop()
+    }
+
+    fn assert_open_last(&self) {
+        debug_assert!(
+            self.open.is_none_or(|idx| idx + 1 == self.cells.len()),
+            "open cursor must be the last cell"
+        );
+    }
+
+    /// Rebuild wrap rows when the width changes. The closed prefix is
+    /// stable; always rewrap from `open_index.unwrap_or(len)`.
     pub(crate) fn refresh_wraps(&self, width: usize) {
+        self.assert_open_last();
         let mut cache = self.cache.borrow_mut();
         if width == 0 {
             cache.invalidate();
@@ -112,18 +155,24 @@ impl TranscriptStore {
             cache.invalidate();
             cache.width = width;
         }
-        if cache.sealed_upto > self.cells.len() {
+        let rewrap_from = self.open.unwrap_or(self.cells.len());
+        if cache.closed_upto > rewrap_from {
+            cache.rows.truncate(rewrap_from);
+            cache.closed_upto = rewrap_from;
+        }
+        if cache.closed_upto > self.cells.len() {
             cache.rows.truncate(self.cells.len());
-            cache.sealed_upto = self.cells.len();
+            cache.closed_upto = self.cells.len();
         }
-        let sealed_upto = cache.sealed_upto;
-        cache.rows.truncate(sealed_upto);
-        for cell in &self.cells[sealed_upto..] {
-            cache.rows.push(text::wrap(&cell.text, width));
-            cache.sealed_upto += 1;
+        let start = cache.closed_upto.min(rewrap_from);
+        cache.rows.truncate(start);
+        cache.closed_upto = start;
+        for cell in &self.cells[start..rewrap_from] {
+            cache.rows.push(wrap_line(cell, width, None));
+            cache.closed_upto += 1;
         }
-        for cell in &self.unsealed {
-            cache.rows.push(text::wrap(&cell.text, width));
+        for cell in &self.cells[rewrap_from..] {
+            cache.rows.push(wrap_line(cell, width, None));
         }
     }
 
@@ -148,8 +197,8 @@ impl TranscriptStore {
     }
 
     #[cfg(test)]
-    fn cached_sealed_upto(&self) -> usize {
-        self.cache.borrow().sealed_upto
+    fn cached_closed_upto(&self) -> usize {
+        self.cache.borrow().closed_upto
     }
 }
 
@@ -404,11 +453,25 @@ fn slice_from_wraps(
     }
 }
 
+pub(crate) fn wrap_line(
+    cell: &TranscriptLine,
+    width: usize,
+    _prev: Option<LineKind>,
+) -> Vec<String> {
+    match cell.kind {
+        LineKind::User => text::wrap_user(&cell.text, width),
+        LineKind::Answer => text::wrap_answer(&cell.text, width, true),
+        LineKind::Tool => text::wrap_hanging(&cell.text, width),
+        LineKind::Reasoning => text::wrap_reasoning(&cell.text, width),
+        _ => text::wrap(&cell.text, width),
+    }
+}
+
 #[cfg(test)]
 fn wrap_all(cells: &[TranscriptLine], width: usize) -> Vec<Vec<String>> {
     cells
         .iter()
-        .map(|cell| text::wrap(&cell.text, width))
+        .map(|cell| wrap_line(cell, width, None))
         .collect()
 }
 
@@ -638,6 +701,30 @@ mod tests {
     }
 
     #[test]
+    fn user_lines_wrap_with_a_hanging_gutter() {
+        let cells = vec![line(LineKind::User, "› abcdefgh")];
+        let scroll = ScrollState::follow();
+        let slice = visible_slice(&cells, 6, 2, &scroll);
+        assert_eq!(texts(&slice), ["› abcd", "  efgh"]);
+    }
+
+    #[test]
+    fn each_answer_cell_gets_its_own_lead_bullet() {
+        let cells = vec![
+            line(LineKind::Answer, "abcdefgh"),
+            line(LineKind::Answer, "ijklmnop"),
+            line(LineKind::Tool, "▸ read"),
+            line(LineKind::Answer, "next"),
+        ];
+        let scroll = ScrollState::follow();
+        let slice = visible_slice(&cells, 6, 8, &scroll);
+        assert_eq!(
+            texts(&slice),
+            ["• abcd", "  efgh", "• ijkl", "  mnop", "▸ read", "• next"]
+        );
+    }
+
+    #[test]
     fn short_transcript_fits_and_stays_following() {
         let cells = vec![meta("one"), meta("two")];
         let mut scroll = ScrollState::follow();
@@ -650,34 +737,59 @@ mod tests {
     }
 
     #[test]
-    fn is_empty_is_false_when_only_unsealed_cells_exist() {
+    fn is_empty_is_false_when_only_an_open_cell_exists() {
         let mut store = TranscriptStore::new();
         assert!(store.is_empty());
-        store.replace_unsealed(vec![meta("partial")]);
+        store.begin(LineKind::Meta, "partial");
         assert!(!store.is_empty());
-        assert!(store.cells().is_empty());
-        assert_eq!(store.unsealed(), [meta("partial")]);
+        assert_eq!(store.cells(), [meta("partial")]);
+        assert_eq!(store.open_index(), Some(0));
+        assert!(store.has_open());
         assert_eq!(store.display_cells(), vec![meta("partial")]);
-        store.append([meta("sealed")]);
-        assert_eq!(store.cells(), [meta("sealed")]);
-        assert_eq!(store.display_cells(), vec![meta("sealed"), meta("partial")]);
+        store.close_open();
+        store.push_closed([meta("sealed")]);
+        assert_eq!(store.cells(), [meta("partial"), meta("sealed")]);
+        assert_eq!(store.display_cells(), vec![meta("partial"), meta("sealed")]);
+        assert!(!store.has_open());
     }
 
     #[test]
-    fn wrap_cache_is_keyed_by_width_and_extends_for_new_sealed_cells() {
+    fn open_cursor_is_always_the_last_cell() {
         let mut store = TranscriptStore::new();
-        store.append((0..3).map(|i| meta(&format!("中文{i}"))));
+        store.begin(LineKind::Answer, "a");
+        assert_eq!(store.open_index(), Some(store.cells().len() - 1));
+        store.write_open("b");
+        assert_eq!(store.cells()[0].text, "ab");
+        store.push_closed([meta("x")]);
+        assert!(!store.has_open());
+        assert_eq!(
+            store.cells().last().map(|cell| cell.text.as_str()),
+            Some("x")
+        );
+        store.begin(LineKind::Answer, "c");
+        assert_eq!(store.open_index(), Some(store.cells().len() - 1));
+        store.close_open();
+        assert!(!store.has_open());
+        store.clear();
+        assert!(store.is_empty());
+        assert!(!store.has_open());
+    }
+
+    #[test]
+    fn wrap_cache_is_keyed_by_width_and_rewraps_from_open() {
+        let mut store = TranscriptStore::new();
+        store.push_closed((0..3).map(|i| meta(&format!("中文{i}"))));
         store.refresh_wraps(4);
         assert_eq!(store.cached_width(), 4);
-        assert_eq!(store.cached_sealed_upto(), 3);
+        assert_eq!(store.cached_closed_upto(), 3);
         let narrow = store.wrap_rows().to_vec();
         assert_eq!(narrow[0], ["中文", "0"]);
 
         store.refresh_wraps(4);
         assert_eq!(
-            store.cached_sealed_upto(),
+            store.cached_closed_upto(),
             3,
-            "same width reuses sealed wraps"
+            "same width reuses closed wraps"
         );
         assert_eq!(&*store.wrap_rows(), narrow.as_slice());
 
@@ -688,22 +800,22 @@ mod tests {
         store.refresh_wraps(4);
         assert_eq!(&*store.wrap_rows(), narrow.as_slice());
 
-        store.append([meta("中文3")]);
+        store.push_closed([meta("中文3")]);
         store.refresh_wraps(4);
-        assert_eq!(store.cached_sealed_upto(), 4);
+        assert_eq!(store.cached_closed_upto(), 4);
         assert_eq!(store.wrap_rows()[3], ["中文", "3"]);
 
-        store.replace_unsealed(vec![meta("中文live")]);
+        store.begin(LineKind::Meta, "中文");
         store.refresh_wraps(4);
-        assert_eq!(store.cached_sealed_upto(), 4);
-        assert_eq!(store.wrap_rows()[4], ["中文", "live"]);
-        store.replace_unsealed(vec![meta("中文x")]);
+        assert_eq!(store.cached_closed_upto(), 4);
+        assert_eq!(store.wrap_rows()[4], ["中文"]);
+        store.write_open("live");
         store.refresh_wraps(4);
         assert_eq!(
-            store.cached_sealed_upto(),
+            store.cached_closed_upto(),
             4,
-            "unsealed never advances sealed cache"
+            "open never advances closed cache"
         );
-        assert_eq!(store.wrap_rows()[4], ["中文", "x"]);
+        assert_eq!(store.wrap_rows()[4], ["中文", "live"]);
     }
 }

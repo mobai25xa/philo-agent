@@ -2,10 +2,19 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+const USER_BAND: Color = Color::Rgb(38, 40, 48);
+const ACCENT: Color = Color::Green;
+
+pub(crate) fn user_band() -> Style {
+    Style::default().bg(USER_BAND)
+}
+
 pub(crate) fn user() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    user_band()
+}
+
+pub(crate) fn user_gutter() -> Style {
+    user_band().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 pub(crate) fn reasoning() -> Style {
@@ -18,8 +27,12 @@ pub(crate) fn answer() -> Style {
     Style::default()
 }
 
+pub(crate) fn answer_gutter() -> Style {
+    Style::default().fg(ACCENT)
+}
+
 pub(crate) fn tool() -> Style {
-    Style::default().fg(Color::Cyan)
+    Style::default().fg(ACCENT)
 }
 
 pub(crate) fn tool_ok() -> Style {
@@ -28,6 +41,14 @@ pub(crate) fn tool_ok() -> Style {
 
 pub(crate) fn tool_err() -> Style {
     Style::default().fg(Color::Red)
+}
+
+pub(crate) fn diff_add() -> Style {
+    Style::default().fg(Color::Green).bg(Color::Rgb(16, 40, 16))
+}
+
+pub(crate) fn diff_del() -> Style {
+    Style::default().fg(Color::Red).bg(Color::Rgb(40, 16, 16))
 }
 
 pub(crate) fn notice() -> Style {
@@ -46,26 +67,10 @@ pub(crate) fn meta() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-pub(crate) fn border() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
-pub(crate) fn border_focus() -> Style {
-    Style::default().fg(Color::Cyan)
-}
-
-pub(crate) fn border_warning() -> Style {
-    Style::default().fg(Color::Yellow)
-}
-
 pub(crate) fn placeholder() -> Style {
     Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::ITALIC)
-}
-
-pub(crate) fn gutter() -> Style {
-    Style::default().fg(Color::Cyan)
 }
 
 pub(crate) fn rule() -> Style {
@@ -73,7 +78,7 @@ pub(crate) fn rule() -> Style {
 }
 
 pub(crate) fn activity_normal() -> Style {
-    Style::default().fg(Color::Cyan)
+    Style::default().fg(ACCENT)
 }
 
 pub(crate) fn activity_reasoning() -> Style {
@@ -81,7 +86,7 @@ pub(crate) fn activity_reasoning() -> Style {
 }
 
 pub(crate) fn activity_tool() -> Style {
-    Style::default().fg(Color::Blue)
+    Style::default().fg(ACCENT)
 }
 
 pub(crate) fn activity_warning() -> Style {

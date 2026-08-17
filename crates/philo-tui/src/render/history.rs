@@ -17,18 +17,23 @@ pub(crate) fn paint_slice(
     markdown: &MarkdownRenderer,
     slice: &VisibleSlice,
     selection: Option<Selection>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     slice
         .rows
         .iter()
         .map(|row| {
-            let line = TranscriptLine {
-                kind: row.kind,
-                text: row.text.clone(),
+            let painted = match row.kind {
+                LineKind::Answer => paint_answer(markdown, &row.text),
+                _ => crate::render::line::styled_line(&TranscriptLine {
+                    kind: row.kind,
+                    text: row.text.clone(),
+                }),
             };
             let painted = match row.kind {
-                LineKind::Answer => markdown.preview(&line),
-                _ => crate::render::line::styled_line(&line),
+                LineKind::User => fill_user_line(painted, width),
+                LineKind::Tool => fill_diff_line(painted, &row.text, width),
+                _ => painted,
             };
             highlight_row(
                 painted,
@@ -39,6 +44,55 @@ pub(crate) fn paint_slice(
             )
         })
         .collect()
+}
+
+fn paint_answer(markdown: &MarkdownRenderer, text: &str) -> Line<'static> {
+    let (gutter, content) = split_answer_gutter(text);
+    let painted = markdown.preview(&TranscriptLine {
+        kind: LineKind::Answer,
+        text: content.to_owned(),
+    });
+    if gutter.is_empty() {
+        return painted;
+    }
+    let mut spans = vec![Span::styled(gutter.to_owned(), theme::answer_gutter())];
+    spans.extend(painted.spans);
+    Line::from(spans)
+}
+
+fn split_answer_gutter(text: &str) -> (&str, &str) {
+    if let Some(rest) = text.strip_prefix("• ") {
+        ("• ", rest)
+    } else if let Some(rest) = text.strip_prefix("  ") {
+        ("  ", rest)
+    } else {
+        ("", text)
+    }
+}
+
+fn fill_user_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let used = line.width();
+    let mut spans = line.spans;
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), theme::user_band()));
+    }
+    Line::from(spans).style(theme::user_band())
+}
+
+fn fill_diff_line(line: Line<'static>, text: &str, width: usize) -> Line<'static> {
+    let style = if text.starts_with('+') {
+        theme::diff_add()
+    } else if text.starts_with('-') {
+        theme::diff_del()
+    } else {
+        return line;
+    };
+    let used = line.width();
+    let mut spans = line.spans;
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), style));
+    }
+    Line::from(spans).style(style)
 }
 
 pub(crate) fn highlight_row(
@@ -98,5 +152,70 @@ fn split_span(span: &Span<'_>, from: usize, to: usize, style: Style, out: &mut V
     }
     if !after.is_empty() {
         out.push(Span::styled(after, span.style));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::cells::{VisibleRow, VisibleSlice};
+    use crate::app::transcript::LineKind;
+    use crate::render::markdown::MarkdownRenderer;
+
+    use super::*;
+
+    fn paint_tool(text: &str, width: usize) -> Line<'static> {
+        let markdown = MarkdownRenderer::new();
+        let slice = VisibleSlice {
+            rows: vec![VisibleRow {
+                cell_index: 0,
+                row_in_cell: 0,
+                kind: LineKind::Tool,
+                text: text.to_owned(),
+            }],
+            total_rows: 1,
+            follow_bottom: true,
+            at_top: true,
+            at_bottom: true,
+        };
+        let mut lines = paint_slice(&markdown, &slice, None, width);
+        assert_eq!(lines.len(), 1);
+        lines.remove(0)
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn tool_diff_rows_wash_full_content_column() {
+        const WIDTH: usize = 20;
+        let add = paint_tool("+bar", WIDTH);
+        assert_eq!(add.width(), WIDTH);
+        assert_eq!(add.style, theme::diff_add());
+        assert!(line_text(&add).starts_with("+ bar"));
+        assert!(!line_text(&add).starts_with("+  bar"));
+
+        let already = paint_tool("+ bar", WIDTH);
+        assert_eq!(already.width(), WIDTH);
+        assert!(line_text(&already).starts_with("+ bar"));
+        assert!(!line_text(&already).starts_with("+  bar"));
+
+        let del = paint_tool("-foo", WIDTH);
+        assert_eq!(del.width(), WIDTH);
+        assert_eq!(del.style, theme::diff_del());
+        assert!(line_text(&del).starts_with("- foo"));
+
+        let header = paint_tool("• Edited  src/lib.rs  (+1 -1)", 40);
+        assert_eq!(header.width(), text::width("• Edited  src/lib.rs  (+1 -1)"));
+        assert_ne!(header.style, theme::diff_add());
+        assert_ne!(header.style, theme::diff_del());
+
+        let context = paint_tool("  foo", WIDTH);
+        assert_eq!(context.width(), text::width("  foo"));
+        assert_ne!(context.style, theme::diff_add());
+        assert_ne!(context.style, theme::diff_del());
     }
 }

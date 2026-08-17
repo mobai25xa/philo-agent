@@ -114,6 +114,68 @@ async fn compatible_chat_sends_cache_identity_and_affinity_headers() {
     assert_eq!(headers["x-session-affinity"], "session-1");
 }
 
+const STUB_RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
+const MINIMAL_RESPONSE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../philo/crates/philo/tests/fixtures/openai_responses/stream/minimal.sse"
+));
+const COMPAT_MINIMAL_RESPONSE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../philo/crates/philo/tests/fixtures/openai_responses/stream/compat-minimal.sse"
+));
+
+#[tokio::test]
+async fn official_responses_sends_prompt_cache_key() {
+    let transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiResponses,
+        "stub-model",
+        STUB_RESPONSES_ENDPOINT,
+    )
+    .compat(ModelCompat::Official)
+    .build_with_transport(transport.clone())
+    .expect("official Responses adapter assembly");
+    let stream = adapter
+        .start(snapshot(vec![user("hello")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+
+    let body = &transport.request_bodies()[0];
+    assert_eq!(body["prompt_cache_key"], "session-1");
+    let headers = &transport.requests()[0].headers;
+    assert!(headers.get("session_id").is_none());
+    assert!(headers.get("x-client-request-id").is_none());
+    assert!(headers.get("x-session-affinity").is_none());
+}
+
+#[tokio::test]
+async fn compatible_responses_sends_cache_identity_and_affinity_headers() {
+    let transport = StubTransport::new([StubResponse::Sse(COMPAT_MINIMAL_RESPONSE.to_vec())]);
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiResponses,
+        "stub-model",
+        STUB_RESPONSES_ENDPOINT,
+    )
+    .compat(ModelCompat::Compatible)
+    .build_with_transport(transport.clone())
+    .expect("compatible Responses adapter assembly");
+    let stream = adapter
+        .start(snapshot(vec![user("hello")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+
+    let body = &transport.request_bodies()[0];
+    assert_eq!(body["prompt_cache_key"], "session-1");
+    let headers = &transport.requests()[0].headers;
+    assert_eq!(headers["session_id"], "session-1");
+    assert_eq!(headers["x-client-request-id"], "session-1");
+    assert_eq!(headers["x-session-affinity"], "session-1");
+}
+
 #[tokio::test]
 async fn request_maps_tool_transcript_messages() {
     let transport =

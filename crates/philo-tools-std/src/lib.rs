@@ -37,6 +37,7 @@
 //! | `io_error` | any other filesystem I/O failure |
 
 mod args;
+mod display;
 mod edit;
 mod grep;
 mod helpers;

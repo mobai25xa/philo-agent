@@ -9,13 +9,13 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolProgressSink,
-    ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
+    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolProgressSink, ToolResult,
 };
 use tokio::io::AsyncReadExt;
 
 use crate::args::{optional_u64, required_string};
+use crate::display::card;
 use crate::error_code;
 use crate::helpers::{field_error, stopped_if_cancelled};
 
@@ -225,14 +225,15 @@ impl ShellTool {
         }
 
         let (display_text, display_truncated) = cap_display(&merged, self.max_display_bytes);
-        let display = ToolDisplay::new(if display_text.is_empty() {
+        let detail = if display_text.is_empty() {
             format!("(no output) exit_code={exit_code}")
         } else {
             display_text
-        })
-        .with_fact("exit_code", exit_code)
-        .with_fact("duration_ms", elapsed_ms.to_string())
-        .with_fact("truncated", (truncated || display_truncated).to_string());
+        };
+        let display = card("Ran", &command_line, "output", detail)
+            .with_fact("exit_code", exit_code)
+            .with_fact("duration_ms", elapsed_ms.to_string())
+            .with_fact("truncated", (truncated || display_truncated).to_string());
         ToolInvokeEnd::Done(
             RichToolResult::new(ToolResult::success(model_text)).with_display(display),
         )
@@ -373,11 +374,16 @@ fn timeout_result(
         ),
     )
     .with_display(
-        ToolDisplay::new(if display_text.is_empty() {
-            format!("timed out after {elapsed_ms}ms")
-        } else {
-            display_text
-        })
+        card(
+            "Ran",
+            command_line,
+            "output",
+            if display_text.is_empty() {
+                format!("timed out after {elapsed_ms}ms")
+            } else {
+                display_text
+            },
+        )
         .with_fact("duration_ms", elapsed_ms.to_string())
         .with_fact("timeout_secs", timeout_secs.to_string())
         .with_fact("truncated", display_truncated.to_string()),

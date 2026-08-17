@@ -175,14 +175,12 @@ impl App {
         }
         self.quit_armed = false;
 
-        let mut lines = crate::app::transcript::user_message_lines(&text);
         let attachments = self.attachments.take();
+        let mut rows: Vec<String> = text.split('\n').map(str::to_owned).collect();
         for attachment in &attachments {
-            lines.push(line(
-                LineKind::User,
-                format!("  [attached {}]", attachment.label()),
-            ));
+            rows.push(format!("[attached {}]", attachment.label()));
         }
+        let mut lines = crate::app::transcript::user_block(rows);
         if self.status.compacting {
             lines.push(line(
                 LineKind::Notice,

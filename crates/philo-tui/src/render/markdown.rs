@@ -169,7 +169,7 @@ fn inline(text: &str) -> Line<'static> {
                 };
                 spans.push(Span::styled(
                     format!("{indent}{marker}"),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::Green),
                 ));
             }
             Event::Start(Tag::BlockQuote(_)) => {

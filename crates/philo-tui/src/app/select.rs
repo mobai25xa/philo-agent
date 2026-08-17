@@ -1,10 +1,10 @@
 //! Transcript selection in wrapped-cell coordinates.
 //!
 //! The range is `(cell, row_in_cell, column)`, the same space as the scroll
-//! pin. `cell` is an index into the display list (sealed + unsealed).
+//! pin. `cell` is an index into the display list.
 //! Native terminal selection is not used: mouse capture owns the screen.
 
-use super::cells::VisibleSlice;
+use super::cells::{VisibleSlice, wrap_line};
 use super::text;
 use super::transcript::TranscriptLine;
 
@@ -135,10 +135,11 @@ pub(crate) fn clamp_pos(pos: SelectPos, cells: &[TranscriptLine], width: usize) 
         };
     }
     let index = pos.cell.min(cells.len() - 1);
+    let prev = (index > 0).then(|| cells[index - 1].kind);
     let wrapped = if width == 0 {
         vec![String::new()]
     } else {
-        text::wrap(&cells[index].text, width)
+        wrap_line(&cells[index], width, prev)
     };
     let row = if wrapped.is_empty() {
         0
@@ -182,8 +183,10 @@ pub(crate) fn extract_text(cells: &[TranscriptLine], width: usize, selection: Se
         return String::new();
     }
     let mut parts = Vec::new();
+    let mut prev = None;
     for (index, cell) in cells.iter().enumerate() {
-        let wrapped = text::wrap(&cell.text, width);
+        let wrapped = wrap_line(cell, width, prev);
+        prev = Some(cell.kind);
         for (row, text) in wrapped.iter().enumerate() {
             if let Some((from, to)) = selection.columns_on_row(index, row, text::width(text)) {
                 parts.push(text::slice_columns(text, from, to));
@@ -249,10 +252,9 @@ mod tests {
     }
 
     #[test]
-    fn live_sorts_after_sealed_cells() {
-        let sealed = meta("ab");
-        let unsealed = meta("live");
-        assert!(0 < 1, "unsealed display index follows sealed cells");
+    fn later_display_cells_sort_after_earlier_cells() {
+        let first = meta("ab");
+        let second = meta("live");
         let selection = Selection {
             anchor: SelectPos {
                 cell: 0,
@@ -266,7 +268,7 @@ mod tests {
             },
             dragging: false,
         };
-        let copied = extract_text(&[sealed, unsealed], 80, selection);
+        let copied = extract_text(&[first, second], 80, selection);
         assert_eq!(copied, "ab\nlive");
     }
 
@@ -290,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn live_without_rows_clamps_onto_the_last_sealed_cell() {
+    fn out_of_range_pointer_clamps_onto_the_last_cell() {
         let cells = vec![meta("xy")];
         let pos = clamp_pos(
             SelectPos {

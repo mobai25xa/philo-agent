@@ -421,9 +421,16 @@ fn chat_compat(compat: ModelCompat, format: Option<ChatReasoningFormat>) -> ext:
 fn responses_compat(compat: ModelCompat, prefers_continuation: bool) -> ext::OpenAiResponsesCompat {
     match (compat, prefers_continuation) {
         (ModelCompat::Official, _) => ext::OpenAiResponsesCompat::default(),
-        (ModelCompat::Compatible, false) => ext::OpenAiResponsesCompat::compatible(),
-        (ModelCompat::Compatible, true) => {
-            ext::OpenAiResponsesCompat::compatible().with_continuation(true)
-        }
+        // SDK `compatible()` stays conservative (no cache identity) so unknown
+        // gateways do not 400. The agent opts in: newapi-class endpoints need
+        // a stable session key plus OpenAI-format affinity headers to pin the
+        // prefix to one cache replica.
+        (ModelCompat::Compatible, false) => ext::OpenAiResponsesCompat::compatible()
+            .with_cache_key(ext::OpenAiResponsesCacheKey::PromptCacheKey)
+            .with_session_affinity(ext::OpenAiResponsesSessionAffinity::OpenAi),
+        (ModelCompat::Compatible, true) => ext::OpenAiResponsesCompat::compatible()
+            .with_continuation(true)
+            .with_cache_key(ext::OpenAiResponsesCacheKey::PromptCacheKey)
+            .with_session_affinity(ext::OpenAiResponsesSessionAffinity::OpenAi),
     }
 }

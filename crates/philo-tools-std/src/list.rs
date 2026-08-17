@@ -4,11 +4,12 @@
 use std::path::PathBuf;
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
+    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::{optional_string, required_string};
+use crate::display::card;
 use crate::error_code;
 use crate::helpers::{field_error, io_error, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
@@ -124,7 +125,7 @@ impl ListTool {
             ));
         }
 
-        let display = ToolDisplay::new(format!("listed {path}: {shown} of {total} entries shown"))
+        let display = card("Listed", path, "none", "")
             .with_fact("entries_total", total.to_string())
             .with_fact("truncated", truncated.to_string());
         RichToolResult::new(ToolResult::success(model_text)).with_display(display)

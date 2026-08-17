@@ -66,6 +66,109 @@ pub(crate) fn tail(text: &str, max_width: usize) -> String {
     format!("{prefix}{}", kept.concat())
 }
 
+/// Soft-wraps an answer, keeping `• ` on the lead row and hanging indent.
+pub(crate) fn wrap_answer(text: &str, max_width: usize, lead: bool) -> Vec<String> {
+    wrap_prefixed(text, max_width, if lead { "• " } else { "  " }, "  ")
+}
+
+/// Soft-wraps a hanging-indented tool line (`• ` / `  ` / `  └ ` / `+ ` / `- `).
+pub(crate) fn wrap_hanging(text: &str, max_width: usize) -> Vec<String> {
+    if let Some(rest) = text.strip_prefix("  └ ") {
+        wrap_prefixed(rest, max_width, "  └ ", "    ")
+    } else if let Some(rest) = text.strip_prefix("    ") {
+        wrap_prefixed(rest, max_width, "    ", "    ")
+    } else if let Some(rest) = text.strip_prefix("  ") {
+        wrap_prefixed(rest, max_width, "  ", "  ")
+    } else if let Some(rest) = text.strip_prefix("• ") {
+        wrap_prefixed(rest, max_width, "• ", "  ")
+    } else if let Some(rest) = text.strip_prefix('+') {
+        wrap_prefixed(
+            rest.strip_prefix(' ').unwrap_or(rest),
+            max_width,
+            "+ ",
+            "+ ",
+        )
+    } else if let Some(rest) = text.strip_prefix('-') {
+        wrap_prefixed(
+            rest.strip_prefix(' ').unwrap_or(rest),
+            max_width,
+            "- ",
+            "- ",
+        )
+    } else {
+        wrap(text, max_width)
+    }
+}
+
+/// Soft-wraps a reasoning cell. The `think` header is ordinary wrap; body
+/// rows hang with a `│ ` gutter (U+2502 + space) and never write that bar
+/// back into the cell store.
+pub(crate) fn wrap_reasoning(text: &str, max_width: usize) -> Vec<String> {
+    if text == "think" || text.starts_with("think · ") {
+        wrap(text, max_width)
+    } else {
+        let rest = text.strip_prefix("  ").unwrap_or(text);
+        wrap_prefixed(rest, max_width, "│ ", "│ ")
+    }
+}
+
+fn wrap_prefixed(
+    text: &str,
+    max_width: usize,
+    first_gutter: &str,
+    rest_gutter: &str,
+) -> Vec<String> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    if text.is_empty() {
+        return vec![first_gutter.to_owned()];
+    }
+    let content_width = max_width.saturating_sub(width(first_gutter)).max(1);
+    wrap(text, content_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let gutter = if index == 0 {
+                first_gutter
+            } else {
+                rest_gutter
+            };
+            format!("{gutter}{row}")
+        })
+        .collect()
+}
+
+/// Soft-wraps a user transcript line, keeping `› ` / hanging indent.
+pub(crate) fn wrap_user(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let (first_gutter, rest_gutter, content) = if let Some(rest) = text.strip_prefix("› ") {
+        ("› ", "  ", rest)
+    } else if let Some(rest) = text.strip_prefix("  ") {
+        ("  ", "  ", rest)
+    } else {
+        return wrap(text, max_width);
+    };
+    let content_width = max_width.saturating_sub(width(first_gutter)).max(1);
+    wrap(content, content_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let gutter = if index == 0 {
+                first_gutter
+            } else {
+                rest_gutter
+            };
+            format!("{gutter}{row}")
+        })
+        .collect()
+}
+
 /// Soft-wraps `text` on terminal cells without splitting graphemes.
 pub(crate) fn wrap(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
@@ -159,5 +262,40 @@ mod tests {
         assert_eq!(slice_columns("中文ab", 0, 4), "中文");
         assert_eq!(slice_columns("中文ab", 2, 6), "文ab");
         assert_eq!(slice_columns("abc", 1, 1), "");
+    }
+
+    #[test]
+    fn wrap_user_keeps_a_hanging_gutter() {
+        assert_eq!(wrap_user("", 8), [""]);
+        assert_eq!(wrap_user("› abcdefgh", 6), ["› abcd", "  efgh"]);
+        assert_eq!(wrap_user("  abcdefgh", 6), ["  abcd", "  efgh"]);
+    }
+
+    #[test]
+    fn wrap_answer_keeps_a_hanging_gutter() {
+        assert_eq!(wrap_answer("abcdefgh", 6, true), ["• abcd", "  efgh"]);
+        assert_eq!(wrap_answer("abcdefgh", 6, false), ["  abcd", "  efgh"]);
+        assert_eq!(wrap_answer("", 6, true), ["• "]);
+    }
+
+    #[test]
+    fn wrap_hanging_keeps_tool_indent() {
+        assert_eq!(wrap_hanging("  abcdefgh", 6), ["  abcd", "  efgh"]);
+        assert_eq!(wrap_hanging("  └ abcdef", 8), ["  └ abcd", "    ef"]);
+        assert_eq!(wrap_hanging("• abcdefgh", 6), ["• abcd", "  efgh"]);
+        assert_eq!(wrap_hanging("+abcdefgh", 5), ["+ abc", "+ def", "+ gh"]);
+        assert_eq!(wrap_hanging("-abcdefgh", 5), ["- abc", "- def", "- gh"]);
+        assert_eq!(wrap_hanging("+ foo", 8), ["+ foo"]);
+        assert_eq!(wrap_hanging("- old", 8), ["- old"]);
+    }
+
+    #[test]
+    fn wrap_reasoning_hangs_body_with_a_bar() {
+        assert_eq!(wrap_reasoning("think", 20), ["think"]);
+        assert_eq!(wrap_reasoning("think · high", 20), ["think · high"]);
+        assert_eq!(
+            wrap_reasoning("  abcdefghijkl", 6),
+            ["│ abcd", "│ efgh", "│ ijkl"]
+        );
     }
 }

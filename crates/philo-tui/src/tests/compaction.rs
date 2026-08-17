@@ -46,6 +46,15 @@ fn appended(effects: &[Effect]) -> Vec<String> {
         .collect()
 }
 
+fn collect_closed_cells(app: &App, seen: &mut usize, output: &mut Vec<String>) {
+    let cells = app.cells.cells();
+    let end = app.cells.open_index().unwrap_or(cells.len());
+    if *seen < end {
+        output.extend(rendered(&cells[*seen..end]));
+    }
+    *seen = end;
+}
+
 fn starts_compaction(effects: &[Effect]) -> bool {
     effects
         .iter()
@@ -154,6 +163,7 @@ fn automatic_events_render_and_update_status_without_breaking_the_flow() {
         ..TokenUsage::default()
     });
     let mut output = Vec::new();
+    let mut seen = 0;
 
     for event in [
         AgentEvent::ContextCompactionStarted,
@@ -161,8 +171,8 @@ fn automatic_events_render_and_update_status_without_breaking_the_flow() {
             covers_up_to: "entry-42".to_owned(),
         },
     ] {
-        let effects = app.on_agent_event(&event);
-        output.extend(appended(&effects));
+        app.on_agent_event(&event);
+        collect_closed_cells(&app, &mut seen, &mut output);
         output.push(format!("status: {}", app.status.line()));
     }
     assert!(app.status.usage.is_none());
@@ -183,10 +193,16 @@ fn automatic_events_render_and_update_status_without_breaking_the_flow() {
             delta: "turn continues".to_owned(),
         },
     ] {
-        let effects = app.on_agent_event(&event);
-        output.extend(appended(&effects));
+        app.on_agent_event(&event);
+        collect_closed_cells(&app, &mut seen, &mut output);
     }
-    output.push(format!("partial: {:?}", app.transcript.partial()));
+    output.push(format!(
+        "open: {:?}",
+        app.cells.open_index().map(|index| {
+            let cell = &app.cells.cells()[index];
+            (cell.kind, cell.text.as_str())
+        })
+    ));
     output.push(format!("status: {}", app.status.line()));
 
     crate::tests::assert_tui_snapshot!("m13_automatic_compaction_events", output.join("\n"));

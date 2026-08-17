@@ -1,37 +1,39 @@
 ---
 source: crates/philo-tui/src/tests/flow.rs
-assertion_line: 166
 expression: "output.join(\"\\n\")"
 ---
 Meta: /sessions
 overlay:
 sessions  1/2
-> s-1                    | You
-  s-image                | count the files
-                         | ▸ read_file  path: src/main.rs
+> s-1                    | › count the files
+  s-image                | ▸ read_file  path: src/main.rs
                          | └ ok · fn main() {}
                          | one file
+                         |
 enter switch  ·  ↑↓ select  ·  esc close
 Meta: session s-image
-User: You
-User:   look at this
+User: 
+User: › look at this
 User:   [image image/png, 4 bytes]
+User: 
 overlay:
 approval required  ·  write workspace file
 path: src/main.rs
 y allow  ·  n / esc deny
 Meta: allowed: write workspace file
 confirmation: Allow
-User: You
-User:   first prompt
-User: You
-User:   queued follow-up
+User: 
+User: › first prompt
+User: 
+User: 
+User: › queued follow-up
+User: 
 Notice: busy: the message is queued behind the active turn
 Notice: queued behind the active turn
 Notice: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Reasoning: think
 Reasoning:   checking
 Answer: answer line
-Tool: ▸ read  src/main.rs  12 B
+Tool: • read  src/main.rs
 Notice: turn cancelled (user)
 Meta: done (cancelled)

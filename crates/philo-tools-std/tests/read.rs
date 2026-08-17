@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_tools::{
-    RichToolResult, ToolCancel, ToolInvocation, ToolInvokeCx, ToolInvokeEnd, ToolPort,
+    RichToolResult, ToolCancel, ToolDisplay, ToolInvocation, ToolInvokeCx, ToolInvokeEnd, ToolPort,
     ToolProgressSink, ToolRegistry, ToolResult,
 };
 use philo_tools_std::{READ_TOOL_NAME, ReadTool, error_code};
@@ -86,6 +86,15 @@ fn content_of(rich: &RichToolResult) -> &str {
     rich.result().content().expect("expected a success result")
 }
 
+fn fact<'a>(display: &'a ToolDisplay, name: &str) -> &'a str {
+    display
+        .facts()
+        .iter()
+        .find(|fact| fact.name() == name)
+        .map(|fact| fact.value())
+        .unwrap_or_else(|| panic!("missing fact {name}"))
+}
+
 #[test]
 fn definition_registers_with_schema_and_effect_class() {
     let root = TempRoot::new();
@@ -111,7 +120,13 @@ fn reads_with_line_number_prefixes() {
         "    1|hello tools\n    2|second line\n"
     );
     let display = result.display().expect("read carries display");
-    assert!(display.detail().contains("2 of 2 lines"));
+    assert!(display.detail().is_empty());
+    assert_eq!(fact(display, "verb"), "Read");
+    assert_eq!(fact(display, "body"), "none");
+    assert_eq!(fact(display, "start_line"), "1");
+    assert_eq!(fact(display, "end_line"), "2");
+    assert_eq!(fact(display, "lines_shown"), "2");
+    assert_eq!(fact(display, "lines_total"), "2");
 }
 
 #[test]

@@ -1,13 +1,14 @@
-//! Pure event-to-line projection for the scrollback transcript.
+//! Event-to-cell reducer for the scrollback transcript.
 //!
-//! Completed lines are append-only once produced. Streaming text accumulates
-//! in partial buffers; [`Transcript::open_cells`] projects the unfinished
-//! tail so the display list can update those cells in place.
+//! [`Transcript::apply`] writes into a [`TranscriptStore`]: in-progress
+//! Answer/Think is a real cell at its insertion point, not a second channel.
+//! Per-op flags live here; `store.clear()` is the App's job on session switch.
 
 use std::collections::HashMap;
 
 use philo_agent_runtime::{AgentEvent, CancelReason, OperationStatus, SettlementDurability};
 
+use super::cells::TranscriptStore;
 use super::text;
 use super::tool_card;
 
@@ -54,28 +55,32 @@ pub(crate) fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     }
 }
 
-/// Echoes a user message as a `You` block. Session replay uses the same
-/// header for live visual grammar; tool replay stays on the older summary.
-pub(crate) fn user_message_lines(text: &str) -> Vec<TranscriptLine> {
-    let mut lines = vec![line(LineKind::User, "You")];
-    for row in text.split('\n') {
-        lines.push(line(LineKind::User, format!("  {row}")));
+/// One user turn: blank, `›` first row, hanging continuations, blank.
+pub(crate) fn user_block(rows: impl IntoIterator<Item = String>) -> Vec<TranscriptLine> {
+    let mut lines = vec![line(LineKind::User, "")];
+    let mut first = true;
+    for row in rows {
+        if first {
+            lines.push(line(LineKind::User, format!("› {row}")));
+            first = false;
+        } else {
+            lines.push(line(LineKind::User, format!("  {row}")));
+        }
     }
+    lines.push(line(LineKind::User, ""));
     lines
 }
 
 /// Streaming projection state for one operation's events.
 #[derive(Debug, Default)]
 pub struct Transcript {
-    partial_answer: String,
-    partial_reasoning: String,
     think_header_written: bool,
     tool_batch_size: usize,
     tool_args: HashMap<usize, String>,
-    verbose: bool,
     /// `[ui].show_reasoning`: when off, reasoning deltas are dropped rather
     /// than rendered dim (the model still receives them).
     show_reasoning: bool,
+    wrote_answer_this_call: bool,
 }
 
 impl Transcript {
@@ -91,143 +96,41 @@ impl Transcript {
     pub fn set_show_reasoning(&mut self, show_reasoning: bool) {
         self.show_reasoning = show_reasoning;
         if !show_reasoning {
-            self.partial_reasoning.clear();
             self.think_header_written = false;
         }
     }
 
-    /// The unfinished streaming line for the live row, if any.
-    #[cfg(test)]
-    pub fn partial(&self) -> Option<(LineKind, &str)> {
-        if !self.partial_answer.is_empty() {
-            return Some((LineKind::Answer, self.partial_answer.as_str()));
-        }
-        if !self.partial_reasoning.is_empty() {
-            return Some((LineKind::Reasoning, self.partial_reasoning.as_str()));
-        }
-        None
-    }
-
-    pub(crate) fn live_answer(&self) -> Option<&str> {
-        if self.partial_answer.is_empty() {
-            None
-        } else {
-            Some(self.partial_answer.as_str())
-        }
-    }
-
-    pub(crate) fn live_reasoning(&self) -> Option<&str> {
-        if self.partial_reasoning.is_empty() {
-            None
-        } else {
-            Some(self.partial_reasoning.as_str())
-        }
-    }
-
-    /// Unfinished streaming buffers as display cells, matching sealed visual
-    /// grammar. Completed lines still come only from [`Self::on_event`].
-    pub fn open_cells(&self) -> Vec<TranscriptLine> {
-        let mut cells = Vec::new();
-        if let Some(partial) = self.live_reasoning() {
-            if !self.think_header_written {
-                cells.push(line(LineKind::Reasoning, "think"));
-            }
-            cells.push(line(LineKind::Reasoning, format!("  {partial}")));
-        }
-        if let Some(partial) = self.live_answer() {
-            cells.push(line(LineKind::Answer, partial.to_owned()));
-        }
-        cells
-    }
-
-    /// Flushes any partial content into completed lines.
-    pub fn flush_partial(&mut self) -> Vec<TranscriptLine> {
-        let mut lines = Vec::new();
-        self.flush_reasoning(&mut lines);
-        if !self.partial_answer.is_empty() {
-            let text = std::mem::take(&mut self.partial_answer);
-            lines.push(line(LineKind::Answer, text));
-        }
-        lines
-    }
-
-    fn drain_think_lines(&mut self, lines: &mut Vec<TranscriptLine>) {
-        while let Some(newline) = self.partial_reasoning.find('\n') {
-            let mut completed: String = self.partial_reasoning.drain(..=newline).collect();
-            completed.pop();
-            if !completed.is_empty() {
-                self.push_think_line(lines, &completed);
-            }
-        }
-    }
-
-    fn push_think_line(&mut self, lines: &mut Vec<TranscriptLine>, row: &str) {
-        if !self.think_header_written {
-            lines.push(line(LineKind::Reasoning, "think"));
-            self.think_header_written = true;
-        }
-        lines.push(line(LineKind::Reasoning, format!("  {row}")));
-    }
-
-    fn flush_reasoning(&mut self, lines: &mut Vec<TranscriptLine>) {
-        self.drain_think_lines(lines);
-        if !self.partial_reasoning.is_empty() {
-            let text = std::mem::take(&mut self.partial_reasoning);
-            self.push_think_line(lines, &text);
-        }
-        self.think_header_written = false;
-    }
-
-    fn clear_ephemeral(&mut self) {
-        self.tool_batch_size = 0;
-        self.tool_args.clear();
-        self.think_header_written = false;
-    }
-
-    /// Projects one event into completed transcript lines.
-    #[allow(clippy::too_many_lines)]
-    pub fn on_event(&mut self, event: &AgentEvent, level: InfoLevel) -> Vec<TranscriptLine> {
-        self.verbose = level == InfoLevel::Verbose;
-        let verbose = self.verbose;
-        let mut lines = Vec::new();
+    /// Projects one event into the ordered store. Resets per-op flags on
+    /// settle; the App clears the store on session switch.
+    pub fn apply(&mut self, store: &mut TranscriptStore, event: &AgentEvent, level: InfoLevel) {
+        let verbose = level == InfoLevel::Verbose;
         match event {
-            AgentEvent::TextDelta { delta } => {
-                self.flush_reasoning(&mut lines);
-                self.partial_answer.push_str(delta);
-                while let Some(newline) = self.partial_answer.find('\n') {
-                    let mut completed: String = self.partial_answer.drain(..=newline).collect();
-                    completed.pop();
-                    lines.push(line(LineKind::Answer, completed));
-                }
-            }
+            AgentEvent::TextDelta { delta } => self.apply_text_delta(store, delta),
             AgentEvent::ReasoningDelta { .. } if !self.show_reasoning => {}
-            AgentEvent::ReasoningDelta { text, .. } => {
-                if !self.partial_answer.is_empty() {
-                    let answer = std::mem::take(&mut self.partial_answer);
-                    lines.push(line(LineKind::Answer, answer));
-                }
-                self.partial_reasoning.push_str(text);
-                self.drain_think_lines(&mut lines);
-            }
+            AgentEvent::ReasoningDelta { text, .. } => self.apply_reasoning_delta(store, text),
             AgentEvent::OperationQueued { .. } => {
-                lines.push(line(LineKind::Notice, "queued behind the active turn"));
+                store.push_closed([line(LineKind::Notice, "queued behind the active turn")]);
             }
             AgentEvent::OperationStarted { operation_id } => {
                 if verbose {
-                    lines.push(line(
+                    store.push_closed([line(
                         LineKind::Meta,
                         format!("operation {operation_id} started"),
-                    ));
+                    )]);
                 }
             }
             AgentEvent::TurnStarted { turn_id } => {
                 if verbose {
-                    lines.push(line(LineKind::Meta, format!("turn {turn_id} started")));
+                    store.push_closed([line(LineKind::Meta, format!("turn {turn_id} started"))]);
                 }
             }
             AgentEvent::ModelCallStarted { model_call_id } => {
+                store.close_open();
+                self.wrote_answer_this_call = false;
+                self.think_header_written = false;
                 if verbose {
-                    lines.push(line(LineKind::Meta, format!("model call {model_call_id}")));
+                    store
+                        .push_closed([line(LineKind::Meta, format!("model call {model_call_id}"))]);
                 }
             }
             AgentEvent::ModelResponseStarted {
@@ -236,26 +139,25 @@ impl Transcript {
                 ..
             } => {
                 if verbose {
-                    lines.push(line(
+                    store.push_closed([line(
                         LineKind::Meta,
                         format!(
                             "model response: model={} id={}",
                             response_model.as_deref().unwrap_or("-"),
                             response_id.as_deref().unwrap_or("-"),
                         ),
-                    ));
+                    )]);
                 }
             }
             AgentEvent::ModelUsageUpdated { .. } => {}
             AgentEvent::ToolBatchRequested { call_count, .. } => {
-                self.flush_reasoning(&mut lines);
+                store.close_open();
                 self.tool_batch_size = *call_count;
                 self.tool_args.clear();
             }
             AgentEvent::ToolExecutionStarted {
                 arguments, index, ..
             } => {
-                self.flush_reasoning(&mut lines);
                 self.tool_args.insert(*index, arguments.clone());
             }
             AgentEvent::ToolExecutionProgress { .. } => {}
@@ -266,52 +168,48 @@ impl Transcript {
                 index,
                 ..
             } => {
-                self.flush_reasoning(&mut lines);
+                store.close_open();
                 let arguments = self.tool_args.remove(index).unwrap_or_default();
-                if verbose {
-                    lines.extend(tool_card::verbose_card(
+                let card = if verbose {
+                    tool_card::verbose_card(
                         tool_name,
                         *index,
                         self.tool_batch_size,
                         &arguments,
                         result,
                         display.as_ref(),
-                    ));
+                    )
                 } else {
-                    lines.extend(tool_card::default_card(
-                        tool_name,
-                        &arguments,
-                        result,
-                        display.as_ref(),
-                    ));
-                }
+                    tool_card::default_card(tool_name, &arguments, result, display.as_ref())
+                };
+                store.push_closed(card);
             }
             AgentEvent::AssistantMessageCompleted { message, .. } => {
-                lines.extend(self.flush_partial());
-                if lines.is_empty() && !message.content().is_empty() {
-                    lines.extend(complete_text_lines(LineKind::Answer, message.content()));
+                store.close_open();
+                if !self.wrote_answer_this_call && !message.content().is_empty() {
+                    store.push_closed([line(LineKind::Answer, message.content())]);
                 }
             }
             AgentEvent::PriorTurnSealed { turn_id } => {
                 if verbose {
-                    lines.push(line(
+                    store.push_closed([line(
                         LineKind::Notice,
                         format!(
                             "previous turn {turn_id} did not end cleanly and was sealed; \
                              its tool calls may have executed without recorded results"
                         ),
-                    ));
+                    )]);
                 } else {
-                    lines.push(line(
+                    store.push_closed([line(
                         LineKind::Notice,
                         "previous turn did not end cleanly and was sealed; its tool \
                          calls may have executed without recorded results",
-                    ));
+                    )]);
                 }
             }
             AgentEvent::ContextCompactionStarted => {
                 if verbose {
-                    lines.push(line(LineKind::Notice, "compacting context..."));
+                    store.push_closed([line(LineKind::Notice, "compacting context...")]);
                 }
             }
             AgentEvent::ContextCompactionCompleted { covers_up_to } => {
@@ -320,62 +218,108 @@ impl Transcript {
                 } else {
                     "context compacted".to_owned()
                 };
-                lines.push(line(LineKind::Meta, text));
+                store.push_closed([line(LineKind::Meta, text)]);
             }
             AgentEvent::ContextCompactionFailed { message } => {
-                lines.push(line(
+                store.push_closed([line(
                     LineKind::Error,
                     format!("compaction failed: {message}; continuing without compaction"),
-                ));
+                )]);
             }
             AgentEvent::CancellationRequested { reason, .. } => {
-                lines.extend(self.flush_partial());
+                store.close_open();
                 if verbose {
-                    lines.push(line(
+                    store.push_closed([line(
                         LineKind::Notice,
                         format!("cancelling ({})...", reason_text(*reason)),
-                    ));
+                    )]);
                 }
             }
             AgentEvent::TurnCancelled { reason, .. } => {
-                lines.extend(self.flush_partial());
-                lines.push(line(
+                store.close_open();
+                store.push_closed([line(
                     LineKind::Notice,
                     format!("turn cancelled ({})", reason_text(*reason)),
-                ));
+                )]);
             }
             AgentEvent::TurnFailed { failure, .. } => {
-                lines.extend(self.flush_partial());
-                lines.push(line(
+                store.close_open();
+                store.push_closed([line(
                     LineKind::Error,
                     format!("turn failed ({:?}): {}", failure.kind(), failure.message()),
-                ));
+                )]);
             }
             AgentEvent::OperationSettled {
                 status, durability, ..
             } => {
-                lines.extend(self.flush_partial());
+                store.close_open();
                 match status {
                     OperationStatus::Succeeded => {}
                     OperationStatus::Failed => {
-                        lines.push(line(LineKind::Meta, "done (failed)"));
+                        store.push_closed([line(LineKind::Meta, "done (failed)")]);
                     }
                     OperationStatus::Cancelled => {
-                        lines.push(line(LineKind::Meta, "done (cancelled)"));
+                        store.push_closed([line(LineKind::Meta, "done (cancelled)")]);
                     }
                 }
                 if *durability == SettlementDurability::Unconfirmed {
-                    lines.push(line(
+                    store.push_closed([line(
                         LineKind::Error,
                         "WARNING: settlement durability UNCONFIRMED - the session may not \
                          have durably recorded this outcome",
-                    ));
+                    )]);
                 }
                 self.clear_ephemeral();
             }
             _ => {}
         }
-        lines
+    }
+
+    fn apply_text_delta(&mut self, store: &mut TranscriptStore, delta: &str) {
+        if store.open_kind() == Some(LineKind::Reasoning) {
+            store.close_open();
+            self.think_header_written = false;
+        }
+        if store.open_kind() != Some(LineKind::Answer) {
+            store.begin(LineKind::Answer, "");
+        }
+        store.write_open(delta);
+        self.wrote_answer_this_call = true;
+    }
+
+    fn apply_reasoning_delta(&mut self, store: &mut TranscriptStore, text: &str) {
+        if store.open_kind() == Some(LineKind::Answer) {
+            store.close_open();
+        }
+        if !self.think_header_written {
+            store.push_closed([line(LineKind::Reasoning, "think")]);
+            self.think_header_written = true;
+        }
+
+        let mut raw = String::new();
+        if store.open_kind() == Some(LineKind::Reasoning) {
+            let existing = store.take_open().expect("open reasoning cell");
+            raw.push_str(existing.text.strip_prefix("  ").unwrap_or(&existing.text));
+        }
+        raw.push_str(text);
+
+        while let Some(newline) = raw.find('\n') {
+            let mut completed: String = raw.drain(..=newline).collect();
+            completed.pop();
+            if !completed.is_empty() {
+                store.push_closed([line(LineKind::Reasoning, format!("  {completed}"))]);
+            }
+        }
+        if !raw.is_empty() {
+            store.begin(LineKind::Reasoning, format!("  {raw}"));
+        }
+    }
+
+    fn clear_ephemeral(&mut self) {
+        self.tool_batch_size = 0;
+        self.tool_args.clear();
+        self.think_header_written = false;
+        self.wrote_answer_this_call = false;
     }
 }
 
@@ -385,12 +329,6 @@ fn reason_text(reason: CancelReason) -> &'static str {
         CancelReason::Timeout => "timeout",
         CancelReason::Abandoned => "abandoned",
     }
-}
-
-fn complete_text_lines(kind: LineKind, text: &str) -> Vec<TranscriptLine> {
-    text.split('\n')
-        .map(|text| line(kind, text.to_owned()))
-        .collect()
 }
 
 /// Single-line preview bounded by terminal cells without splitting graphemes.
@@ -414,13 +352,34 @@ pub(crate) fn compact_args(raw: &str) -> String {
 }
 
 #[cfg(test)]
-mod snapshots {
+mod tests {
     use super::*;
     use philo_agent_runtime::{
         AgentEvent, ModelCallId, OperationId, OperationStatus, SettlementDurability, TokenUsage,
         ToolBatchId, ToolCallId, TurnId,
     };
     use philo_tools::{ToolDisplay, ToolResult};
+
+    fn apply_all(events: &[AgentEvent], level: InfoLevel, show_reasoning: bool) -> TranscriptStore {
+        let mut transcript = Transcript::new(show_reasoning);
+        let mut store = TranscriptStore::new();
+        for event in events {
+            transcript.apply(&mut store, event, level);
+        }
+        store
+    }
+
+    fn format_cells(store: &TranscriptStore) -> String {
+        store
+            .cells()
+            .iter()
+            .map(|line| {
+                let text = line.text.replace('\n', "\\n");
+                format!("{:?}: {text}", line.kind)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn event_sequence() -> Vec<AgentEvent> {
         vec![
@@ -487,20 +446,11 @@ mod snapshots {
     }
 
     fn render(level: InfoLevel) -> String {
-        let mut transcript = Transcript::new(true);
-        let mut lines = Vec::new();
-        for event in event_sequence() {
-            lines.extend(transcript.on_event(&event, level));
-        }
-        lines.extend(transcript.flush_partial());
+        let store = apply_all(&event_sequence(), level, true);
         format!(
-            "lines:\n{}\npartial: {:?}",
-            lines
-                .iter()
-                .map(|line| format!("{:?}: {}", line.kind, line.text))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            transcript.partial()
+            "lines:\n{}\nopen: {:?}",
+            format_cells(&store),
+            store.open_index()
         )
     }
 
@@ -515,25 +465,28 @@ mod snapshots {
     }
 
     #[test]
-    fn open_cells_projects_unfinished_think_with_sealed_grammar() {
+    fn think_stays_line_oriented_with_an_open_remainder() {
         let mut transcript = Transcript::new(true);
-        let lines = transcript.on_event(
+        let mut store = TranscriptStore::new();
+        transcript.apply(
+            &mut store,
             &AgentEvent::ReasoningDelta {
                 model_call_id: ModelCallId::new("call-1"),
                 text: "hello".to_owned(),
             },
             InfoLevel::Default,
         );
-        assert!(lines.is_empty());
         assert_eq!(
-            transcript.open_cells(),
-            vec![
+            store.cells(),
+            [
                 line(LineKind::Reasoning, "think"),
                 line(LineKind::Reasoning, "  hello"),
             ]
         );
+        assert_eq!(store.open_index(), Some(1));
 
-        let lines = transcript.on_event(
+        transcript.apply(
+            &mut store,
             &AgentEvent::ReasoningDelta {
                 model_call_id: ModelCallId::new("call-1"),
                 text: " world\nmore".to_owned(),
@@ -541,39 +494,36 @@ mod snapshots {
             InfoLevel::Default,
         );
         assert_eq!(
-            lines,
-            vec![
+            store.cells(),
+            [
                 line(LineKind::Reasoning, "think"),
                 line(LineKind::Reasoning, "  hello world"),
+                line(LineKind::Reasoning, "  more"),
             ]
         );
-        assert_eq!(
-            transcript.open_cells(),
-            vec![line(LineKind::Reasoning, "  more")]
-        );
+        assert_eq!(store.open_index(), Some(2));
     }
 
     #[test]
     fn reasoning_can_be_switched_off_entirely() {
         let mut transcript = Transcript::new(false);
-        let lines = transcript.on_event(
+        let mut store = TranscriptStore::new();
+        transcript.apply(
+            &mut store,
             &AgentEvent::ReasoningDelta {
                 model_call_id: ModelCallId::new("call-1"),
                 text: "thinking\n".to_owned(),
             },
             InfoLevel::Verbose,
         );
-        assert!(lines.is_empty(), "no reasoning reaches the transcript");
-        assert_eq!(transcript.partial(), None);
-        assert!(
-            transcript.open_cells().is_empty(),
-            "no unsealed think cells when reasoning is hidden"
-        );
+        assert!(store.is_empty(), "no reasoning reaches the transcript");
+        assert!(!store.has_open());
     }
 
     #[test]
     fn default_tool_started_is_transient_and_completion_is_bounded() {
         let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
         let started = AgentEvent::ToolExecutionStarted {
             tool_batch_id: ToolBatchId::new("batch"),
             tool_call_id: ToolCallId::new("tool"),
@@ -581,8 +531,9 @@ mod snapshots {
             tool_name: "读取文件".repeat(40),
             arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
         };
+        transcript.apply(&mut store, &started, InfoLevel::Default);
         assert!(
-            transcript.on_event(&started, InfoLevel::Default).is_empty(),
+            store.is_empty(),
             "started belongs only to Activity in default mode"
         );
 
@@ -594,11 +545,11 @@ mod snapshots {
             result: ToolResult::success("内容".repeat(100)),
             display: None,
         };
-        let lines = transcript.on_event(&completed, InfoLevel::Default);
-        assert_eq!(lines.len(), 1);
-        assert!(text::width(&lines[0].text) <= 120);
+        transcript.apply(&mut store, &completed, InfoLevel::Default);
+        assert_eq!(store.cells().len(), 1);
+        assert!(text::width(&store.cells()[0].text) <= 120);
         assert!(
-            !lines[0].text.contains("内容"),
+            !store.cells()[0].text.contains("内容"),
             "default cards must not dump model-facing content"
         );
     }
@@ -606,22 +557,84 @@ mod snapshots {
     #[test]
     fn tool_progress_never_writes_history() {
         let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
         let progress = AgentEvent::ToolExecutionProgress {
             tool_batch_id: ToolBatchId::new("batch"),
             tool_call_id: ToolCallId::new("tool"),
             index: 0,
             tail: "live output that must stay off scrollback".to_owned(),
         };
+        transcript.apply(&mut store, &progress, InfoLevel::Default);
+        assert!(store.is_empty());
+        transcript.apply(&mut store, &progress, InfoLevel::Verbose);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn preamble_stays_before_tools_and_next_call_starts_a_new_answer() {
+        let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
+        let events = [
+            AgentEvent::TextDelta {
+                delta: "I'll look".to_owned(),
+            },
+            AgentEvent::ToolBatchRequested {
+                tool_batch_id: ToolBatchId::new("batch"),
+                call_count: 1,
+            },
+            AgentEvent::ToolExecutionCompleted {
+                tool_batch_id: ToolBatchId::new("batch"),
+                tool_call_id: ToolCallId::new("tool"),
+                index: 0,
+                tool_name: "read".to_owned(),
+                result: ToolResult::success("ok"),
+                display: None,
+            },
+            AgentEvent::ModelCallStarted {
+                model_call_id: ModelCallId::new("call-2"),
+            },
+            AgentEvent::TextDelta {
+                delta: "done".to_owned(),
+            },
+        ];
+        for event in &events {
+            transcript.apply(&mut store, event, InfoLevel::Default);
+        }
+
+        let answers: Vec<&TranscriptLine> = store
+            .cells()
+            .iter()
+            .filter(|cell| cell.kind == LineKind::Answer)
+            .collect();
+        assert_eq!(answers.len(), 2, "two answer cells, not concatenated");
+        assert_eq!(answers[0].text, "I'll look");
+        assert_eq!(answers[1].text, "done");
+
+        let first_answer = store
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == LineKind::Answer)
+            .expect("first answer");
+        let first_tool = store
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == LineKind::Tool)
+            .expect("tool card");
+        let last_answer = store
+            .cells()
+            .iter()
+            .rposition(|cell| cell.kind == LineKind::Answer)
+            .expect("second answer");
         assert!(
-            transcript
-                .on_event(&progress, InfoLevel::Default)
-                .is_empty()
+            first_answer < first_tool,
+            "tools must not appear before the first answer: {}",
+            format_cells(&store)
         );
         assert!(
-            transcript
-                .on_event(&progress, InfoLevel::Verbose)
-                .is_empty()
+            first_tool < last_answer,
+            "second answer follows the tool card"
         );
+        assert_eq!(store.open_index(), Some(last_answer));
     }
 
     #[test]

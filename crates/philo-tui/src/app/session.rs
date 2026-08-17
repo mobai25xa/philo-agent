@@ -8,7 +8,7 @@ use philo_session::{
     ContextMessage, SessionAssistantBlock, SessionContextView, SessionUserPart, ToolResultOutcome,
 };
 
-use super::transcript::{LineKind, TranscriptLine, compact_args, line, preview};
+use super::transcript::{LineKind, TranscriptLine, compact_args, line, preview, user_block};
 
 /// Replays one session's model-visible context as transcript lines.
 pub(crate) fn history_lines(view: &SessionContextView) -> Vec<TranscriptLine> {
@@ -22,12 +22,16 @@ pub(crate) fn preview_lines(view: &SessionContextView, max_lines: usize) -> Vec<
     if lines.is_empty() {
         return vec!["(empty session)".to_owned()];
     }
-    let mut texts: Vec<String> = lines
+    let visible: Vec<&TranscriptLine> = lines.iter().filter(|line| !line.text.is_empty()).collect();
+    if visible.is_empty() {
+        return vec!["(empty session)".to_owned()];
+    }
+    let mut texts: Vec<String> = visible
         .iter()
         .take(max_lines)
         .map(|line| preview(&line.text, 120))
         .collect();
-    if lines.len() > max_lines
+    if visible.len() > max_lines
         && let Some(last) = texts.last_mut()
     {
         *last = "...".to_owned();
@@ -41,11 +45,7 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
             .split('\n')
             .map(|text| line(LineKind::Notice, format!("[summary] {text}")))
             .collect(),
-        ContextMessage::User { parts } => {
-            let mut lines = vec![line(LineKind::User, "You")];
-            lines.extend(parts.iter().map(user_part_line));
-            lines
-        }
+        ContextMessage::User { parts } => user_block(parts.iter().map(user_part_text)),
         ContextMessage::Assistant { blocks } => assistant_block_lines(blocks, false),
         ContextMessage::AssistantToolCalls { blocks, .. } => assistant_block_lines(blocks, true),
         ContextMessage::ToolResult { outcome, .. } => {
@@ -66,10 +66,9 @@ fn assistant_block_lines(
     let mut lines = Vec::new();
     for block in blocks {
         match block {
-            SessionAssistantBlock::Text { text } => lines.extend(
-                text.split('\n')
-                    .map(|text| line(LineKind::Answer, text.to_owned())),
-            ),
+            SessionAssistantBlock::Text { text } => {
+                lines.push(line(LineKind::Answer, text.clone()));
+            }
             SessionAssistantBlock::ToolCall(call) if include_tool_calls => lines.push(line(
                 LineKind::Tool,
                 format!("▸ {}  {}", call.name(), compact_args(call.arguments())),
@@ -80,13 +79,12 @@ fn assistant_block_lines(
     lines
 }
 
-fn user_part_line(part: &SessionUserPart) -> TranscriptLine {
+fn user_part_text(part: &SessionUserPart) -> String {
     match part {
-        SessionUserPart::Text(text) => line(LineKind::User, format!("  {}", preview(text, 200))),
-        SessionUserPart::Image { media_type, bytes } => line(
-            LineKind::User,
-            format!("  [image {media_type}, {} bytes]", bytes.len()),
-        ),
+        SessionUserPart::Text(text) => preview(text, 200),
+        SessionUserPart::Image { media_type, bytes } => {
+            format!("[image {media_type}, {} bytes]", bytes.len())
+        }
     }
 }
 
@@ -116,8 +114,9 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "User: You",
-                "User:   count the files",
+                "User: ",
+                "User: › count the files",
+                "User: ",
                 "Tool: ▸ read_file  path: src/main.rs",
                 "Tool:   └ ok · fn main() {}",
                 "Answer: one file",
@@ -132,7 +131,7 @@ mod tests {
         let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
             texts,
-            ["You", "  look at this", "  [image image/png, 4 bytes]"]
+            ["", "› look at this", "  [image image/png, 4 bytes]", ""]
         );
     }
 
@@ -159,8 +158,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                line(LineKind::Answer, "let me look"),
-                line(LineKind::Answer, "then call"),
+                line(LineKind::Answer, "let me look\nthen call"),
                 line(LineKind::Tool, "▸ read_file  path: src/main.rs"),
                 line(LineKind::Answer, "after"),
             ]
@@ -186,7 +184,7 @@ mod tests {
         let view = session_view("s-1");
         assert_eq!(
             preview_lines(&view, 2),
-            ["You".to_owned(), "...".to_owned()]
+            ["› count the files".to_owned(), "...".to_owned()]
         );
         let empty = crate::tests::support::empty_session_view("s-empty");
         assert_eq!(preview_lines(&empty, 4), ["(empty session)".to_owned()]);

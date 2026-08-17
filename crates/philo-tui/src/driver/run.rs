@@ -235,7 +235,7 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
         let mut quit = false;
         // Completed host results can request follow-up work (opening the picker
         // requests its first preview), so the queue is drained rather than
-        // iterated. Sealed lines are already in `App.cells`; Append only
+        // iterated. Transcript lines are already in `App.cells`; Append only
         // dirties the next granted frame.
         let mut pending: VecDeque<Effect> = effects.into();
         while let Some(effect) = pending.pop_front() {

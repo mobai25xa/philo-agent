@@ -4,11 +4,12 @@
 use std::path::PathBuf;
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
+    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::required_string;
+use crate::display::{MAX_PLUS_DISPLAY_LINES, card, plus_lines};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
@@ -76,16 +77,19 @@ impl WriteTool {
             None => format!("created {path} ({bytes} bytes)"),
             Some(was) => format!("overwrote {path} ({bytes} bytes, was {was} bytes)"),
         };
-        let display = ToolDisplay::new(format!("wrote {path}:\n{content}"))
-            .with_fact("bytes", bytes.to_string())
-            .with_fact(
-                "operation",
-                if previous_bytes.is_none() {
-                    "created"
-                } else {
-                    "overwrote"
-                },
-            );
+        let created = previous_bytes.is_none();
+        let (detail, added, truncated) = plus_lines(&content, MAX_PLUS_DISPLAY_LINES);
+        let display = card(
+            if created { "Added" } else { "Wrote" },
+            path,
+            "diff",
+            detail,
+        )
+        .with_fact("added", added.to_string())
+        .with_fact("removed", "0")
+        .with_fact("bytes", bytes.to_string())
+        .with_fact("operation", if created { "created" } else { "overwrote" })
+        .with_fact("truncated", truncated.to_string());
         RichToolResult::new(ToolResult::success(confirmation)).with_display(display)
     }
 }

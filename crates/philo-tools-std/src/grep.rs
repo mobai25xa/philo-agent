@@ -4,11 +4,12 @@
 use std::path::{Path, PathBuf};
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
+    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::{optional_string, required_string};
+use crate::display::card;
 use crate::error_code;
 use crate::helpers::{field_error, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
@@ -96,6 +97,7 @@ impl GrepTool {
         };
 
         let mut matches: Vec<String> = Vec::new();
+        let mut locs: Vec<String> = Vec::new();
         let mut files_scanned = 0usize;
         let mut total_matches = 0usize;
         let mut stack = vec![target.clone()];
@@ -145,14 +147,15 @@ impl GrepTool {
             for (index, line) in text.lines().enumerate() {
                 if regex.is_match(line) {
                     total_matches += 1;
-                    matches.push(format!("{relative}:{}:{line}", index + 1));
+                    let line_no = index + 1;
+                    locs.push(format!("{relative}:{line_no}"));
+                    matches.push(format!("{relative}:{line_no}:{line}"));
                 }
             }
         }
 
         let truncated = total_matches > self.max_matches;
         let shown = total_matches.min(self.max_matches);
-        let full_matches = matches.join("\n");
         let mut model_text = matches
             .iter()
             .take(self.max_matches)
@@ -167,14 +170,15 @@ impl GrepTool {
             ));
         }
 
-        let display = ToolDisplay::new(if total_matches == 0 {
-            format!("grep '{pattern}' in {path}: no matches")
+        let detail = if total_matches == 0 {
+            String::new()
         } else {
-            full_matches
-        })
-        .with_fact("files_scanned", files_scanned.to_string())
-        .with_fact("matches_total", total_matches.to_string())
-        .with_fact("truncated", truncated.to_string());
+            locs.join("\n")
+        };
+        let display = card("Searched", format!("'{pattern}' in {path}"), "locs", detail)
+            .with_fact("files_scanned", files_scanned.to_string())
+            .with_fact("matches_total", total_matches.to_string())
+            .with_fact("truncated", truncated.to_string());
         RichToolResult::new(ToolResult::success(model_text)).with_display(display)
     }
 }

@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 288
 expression: "render(&[\"# Title\", \"### Smaller\", \"plain paragraph text\", \"- first item\",\n\"  - nested item\", \"1. ordered item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"---\", \"\",])"
 ---
 # Title
@@ -10,11 +9,11 @@ expression: "render(&[\"# Title\", \"### Smaller\", \"plain paragraph text\", \"
 plain paragraph text
   -> "plain paragraph text"
 - first item
-  -> "- "{cyan} "first item"
+  -> "- "{green} "first item"
   - nested item
-  -> "  - "{cyan} "nested item"
+  -> "  - "{green} "nested item"
 1. ordered item
-  -> "1. "{cyan} "ordered item"
+  -> "1. "{green} "ordered item"
 > quoted remark
   -> "| "{darkgray} "quoted remark"{gray,italic}
 text with **bold**, *italic*, ~~struck~~ and `inline code`

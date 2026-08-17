@@ -1,6 +1,6 @@
 //! One scheduling round's terminal writes: optional hard clear and at most
-//! one draw of the isolated alternate screen. Sealed history lives in
-//! `App.cells`, not here.
+//! one draw of the isolated alternate screen. History lives in `App.cells`,
+//! not here.
 
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -173,7 +173,8 @@ mod tests {
         let mut scheduler = FrameScheduler::new(start);
         let mut output = PendingOutput;
 
-        app.cells.append((0..40).map(|i| line(&format!("row-{i}"))));
+        app.cells
+            .push_closed((0..40).map(|i| line(&format!("row-{i}"))));
         output
             .flush(
                 &mut terminal,
@@ -305,16 +306,14 @@ mod tests {
         operations.inserts += report.inserts;
         operations.draws += report.draws;
 
-        assert_eq!(
-            app.transcript.partial().map(|(_, text)| text),
-            Some(expected.as_str())
-        );
+        let open = app.cells.open_index().expect("stream still open");
+        assert_eq!(app.cells.cells()[open].text, expected);
         assert_eq!(operations.clears, 0);
         assert_eq!(operations.inserts, 0);
         assert!(operations.draws <= 31);
         let screen = screen_text(&terminal);
         assert!(
-            screen.contains(&"x".repeat(80)),
+            screen.contains(&"x".repeat(70)),
             "the history band should show the tail of the stream\n{screen}"
         );
     }

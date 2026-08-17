@@ -78,8 +78,8 @@ impl App {
         self.ingest_appends(vec![Effect::Append(vec![line])])
     }
 
-    /// Starts rendering a different session: fresh transcript, sealed and
-    /// unsealed cells, and usage. Native scrollback is no longer the history store.
+    /// Starts rendering a different session: fresh transcript, cells, and
+    /// usage. Native scrollback is no longer the history store.
     pub(crate) fn begin_session(&mut self, session_id: &str) {
         self.status.session = session_id.to_owned();
         self.status.usage = None;
@@ -90,7 +90,7 @@ impl App {
         self.clear_selection();
     }
 
-    /// Projects one agent event into transcript lines and status updates.
+    /// Projects one agent event into the transcript store and status updates.
     /// Overlays never intercept this path: terminal events must render.
     pub fn on_agent_event(&mut self, event: &AgentEvent) -> Vec<Effect> {
         self.activity.on_event(event);
@@ -113,15 +113,8 @@ impl App {
             }
             _ => {}
         }
-        let lines = self.transcript.on_event(event, self.level);
-        let effects = if lines.is_empty() {
-            vec![]
-        } else {
-            vec![Effect::Append(lines)]
-        };
-        let effects = self.ingest_appends(effects);
-        self.sync_unsealed();
-        effects
+        self.transcript.apply(&mut self.cells, event, self.level);
+        vec![]
     }
 
     pub(super) fn apply_config_notice(

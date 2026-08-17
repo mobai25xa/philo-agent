@@ -73,16 +73,19 @@ pub(crate) fn styled_rows(rows: &[String], empty_placeholder: Option<&str>) -> V
     }
     if let Some(placeholder) = empty_placeholder {
         return vec![Line::from(vec![
-            Span::styled(FIRST_GUTTER.to_owned(), theme::gutter()),
-            Span::styled(placeholder.to_owned(), theme::placeholder()),
+            Span::styled(FIRST_GUTTER.to_owned(), theme::user_gutter()),
+            Span::styled(
+                placeholder.to_owned(),
+                theme::placeholder().patch(theme::user_band()),
+            ),
         ])];
     }
     rows.iter()
         .map(|row| {
             let (gutter, content) = split_gutter(row);
             Line::from(vec![
-                Span::styled(gutter.to_owned(), theme::gutter()),
-                Span::raw(content.to_owned()),
+                Span::styled(gutter.to_owned(), theme::user_gutter()),
+                Span::styled(content.to_owned(), theme::user()),
             ])
         })
         .collect()

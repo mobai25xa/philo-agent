@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/app/transcript.rs
-assertion_line: 502
 expression: "render(InfoLevel::Verbose)"
 ---
 lines:
@@ -10,7 +9,7 @@ Meta: turn turn-1 started
 Meta: model call call-1
 Reasoning: think
 Reasoning:   checking workspace
-Answer: answer line
+Answer: answer line\nfinal
 Tool: ▸ read_file  1/1
 Tool:   args  path: src/main.rs
 Tool:   ok
@@ -18,8 +17,7 @@ Tool:   fn main() {}
 Tool:   detail
 Tool:     read 12 bytes
 Tool:   facts  bytes=12
-Answer: final
 Notice: cancelling (timeout)...
 Notice: turn cancelled (timeout)
 Meta: done (cancelled)
-partial: None
+open: None

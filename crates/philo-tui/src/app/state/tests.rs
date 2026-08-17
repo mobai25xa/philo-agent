@@ -69,11 +69,15 @@ fn submit_echoes_the_message_and_requests_a_prompt() {
             Effect::Append(vec![
                 TranscriptLine {
                     kind: LineKind::User,
-                    text: "You".to_owned(),
+                    text: String::new(),
                 },
                 TranscriptLine {
                     kind: LineKind::User,
-                    text: "  hello".to_owned(),
+                    text: "› hello".to_owned(),
+                },
+                TranscriptLine {
+                    kind: LineKind::User,
+                    text: String::new(),
                 },
             ]),
             Effect::Submit {
@@ -237,10 +241,11 @@ fn a_clipboard_image_joins_the_queue_and_rides_the_next_message() {
     assert_eq!(
         texts(&appended(&effects)),
         [
-            "You",
-            "  what is this?",
+            "",
+            "› what is this?",
             "  [attached shots/a.png]",
             "  [attached clipboard image (image/png, 2.0 KB)]",
+            "",
         ]
     );
     let Effect::Submit { attachments, .. } = &effects[1] else {
@@ -517,8 +522,9 @@ fn overlays_never_swallow_agent_events() {
         status: OperationStatus::Succeeded,
         durability: SettlementDurability::Confirmed,
     });
+    assert!(effects.is_empty(), "agent events write the store directly");
     assert!(
-        appended(&effects).is_empty(),
+        app.cells.is_empty(),
         "successful settlement stays off the transcript"
     );
 }
@@ -697,11 +703,15 @@ fn submit_ingests_append_payloads_into_cells() {
         vec![
             TranscriptLine {
                 kind: LineKind::User,
-                text: "You".to_owned(),
+                text: String::new(),
             },
             TranscriptLine {
                 kind: LineKind::User,
-                text: "  hello".to_owned(),
+                text: "› hello".to_owned(),
+            },
+            TranscriptLine {
+                kind: LineKind::User,
+                text: String::new(),
             },
         ]
     );
@@ -709,7 +719,7 @@ fn submit_ingests_append_payloads_into_cells() {
 }
 
 #[test]
-fn agent_events_ingest_append_lines_into_cells() {
+fn agent_events_apply_into_cells() {
     use philo_agent_runtime::{OperationId, TurnId};
 
     let mut app = app();
@@ -719,15 +729,23 @@ fn agent_events_ingest_append_lines_into_cells() {
     let sealed = app.on_agent_event(&AgentEvent::PriorTurnSealed {
         turn_id: TurnId::new("old-turn"),
     });
-    let expected: Vec<_> = concatenated_appends(&queued)
-        .into_iter()
-        .chain(concatenated_appends(&sealed))
-        .collect();
-    assert!(
-        !expected.is_empty(),
-        "chosen events must emit transcript lines"
+    assert!(queued.is_empty(), "agent events write the store directly");
+    assert!(sealed.is_empty(), "agent events write the store directly");
+    assert_eq!(
+        app.cells.cells(),
+        [
+            TranscriptLine {
+                kind: LineKind::Notice,
+                text: "queued behind the active turn".to_owned(),
+            },
+            TranscriptLine {
+                kind: LineKind::Notice,
+                text: "previous turn did not end cleanly and was sealed; its tool \
+                       calls may have executed without recorded results"
+                    .to_owned(),
+            },
+        ]
     );
-    assert_eq!(app.cells.cells(), expected.as_slice());
 }
 
 #[test]
@@ -738,18 +756,18 @@ fn begin_session_clears_ingested_cells() {
         delta: "partial".to_owned(),
     });
     assert!(!app.cells.is_empty());
-    assert!(!app.cells.unsealed().is_empty());
+    assert!(app.cells.has_open());
     app.begin_session("other");
     assert!(app.cells.is_empty());
     assert!(app.cells.cells().is_empty());
-    assert!(app.cells.unsealed().is_empty());
+    assert!(!app.cells.has_open());
     assert!(app.follow_bottom());
 }
 
 #[test]
 fn page_up_unfollows_after_layout_is_noted() {
     let mut app = app();
-    app.cells.append((0..20).map(|i| TranscriptLine {
+    app.cells.push_closed((0..20).map(|i| TranscriptLine {
         kind: LineKind::Meta,
         text: format!("row-{i}"),
     }));
@@ -775,7 +793,7 @@ fn redraw_returns_hard_redraw_and_does_not_clear_cells() {
 }
 
 fn seed_rows(app: &mut App, count: usize) {
-    app.cells.append((0..count).map(|i| TranscriptLine {
+    app.cells.push_closed((0..count).map(|i| TranscriptLine {
         kind: LineKind::Meta,
         text: format!("row-{i}"),
     }));
@@ -908,15 +926,16 @@ fn begin_session_clears_selection() {
 }
 
 #[test]
-fn text_delta_without_newline_stays_unsealed() {
+fn text_delta_without_close_stays_open() {
     let mut app = app();
     let effects = app.on_agent_event(&AgentEvent::TextDelta {
         delta: "partial answer".to_owned(),
     });
-    assert!(concatenated_appends(&effects).is_empty());
-    assert!(app.cells.cells().is_empty());
+    assert!(effects.is_empty(), "agent events write the store directly");
+    assert_eq!(app.cells.open_index(), Some(0));
+    assert!(app.cells.has_open());
     assert_eq!(
-        app.cells.unsealed(),
+        app.cells.cells(),
         [TranscriptLine {
             kind: LineKind::Answer,
             text: "partial answer".to_owned(),
@@ -929,29 +948,24 @@ fn text_delta_without_newline_stays_unsealed() {
             .iter()
             .map(|row| row.text.as_str())
             .collect::<Vec<_>>(),
-        ["partial answer"]
+        ["• partial answer"]
     );
     assert_eq!(slice.rows[0].cell_index, 0);
 }
 
 #[test]
-fn newline_flushes_a_sealed_line_and_leaves_the_remainder_unsealed() {
+fn newline_stays_inside_one_open_answer_cell() {
     let mut app = app();
     app.on_agent_event(&AgentEvent::TextDelta {
         delta: "hello\nworld".to_owned(),
     });
+    assert_eq!(app.cells.open_index(), Some(0));
+    assert!(app.cells.has_open());
     assert_eq!(
         app.cells.cells(),
         [TranscriptLine {
             kind: LineKind::Answer,
-            text: "hello".to_owned(),
-        }]
-    );
-    assert_eq!(
-        app.cells.unsealed(),
-        [TranscriptLine {
-            kind: LineKind::Answer,
-            text: "world".to_owned(),
+            text: "hello\nworld".to_owned(),
         }]
     );
     let texts: Vec<_> = app
@@ -960,25 +974,25 @@ fn newline_flushes_a_sealed_line_and_leaves_the_remainder_unsealed() {
         .iter()
         .map(|row| row.text.clone())
         .collect();
-    assert_eq!(texts, ["hello", "world"]);
-    assert_eq!(texts.iter().filter(|text| *text == "hello").count(), 1);
-    assert_eq!(texts.iter().filter(|text| *text == "world").count(), 1);
+    assert_eq!(texts, ["• hello", "  world"]);
+    assert_eq!(texts.iter().filter(|text| *text == "• hello").count(), 1);
+    assert_eq!(texts.iter().filter(|text| *text == "  world").count(), 1);
 }
 
 #[test]
-fn show_reasoning_off_produces_no_unsealed_think_cells() {
+fn show_reasoning_off_produces_no_open_think_cells() {
     let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), false);
     app.on_agent_event(&AgentEvent::ReasoningDelta {
         model_call_id: philo_agent_runtime::ModelCallId::new("call-1"),
         text: "secret thoughts".to_owned(),
     });
     assert!(app.cells.cells().is_empty());
-    assert!(app.cells.unsealed().is_empty());
+    assert!(!app.cells.has_open());
     assert!(app.history_slice(80, 3).rows.is_empty());
 }
 
 #[test]
-fn unsealed_rows_do_not_yank_a_pinned_view() {
+fn open_rows_do_not_yank_a_pinned_view() {
     let mut app = app();
     seed_rows(&mut app, 20);
     app.note_history_layout(80, 3);
@@ -1002,16 +1016,12 @@ fn unsealed_rows_do_not_yank_a_pinned_view() {
         .collect();
     assert_eq!(before, after);
     assert!(!app.follow_bottom());
-    assert!(
-        app.cells
-            .unsealed()
-            .iter()
-            .any(|line| line.text == "streaming tail")
-    );
+    let open = app.cells.open_index().expect("stream still open");
+    assert_eq!(app.cells.cells()[open].text, "streaming tail");
 }
 
 #[test]
-fn copy_includes_unsealed_text_via_display_cell_indices() {
+fn copy_includes_open_text_via_display_cell_indices() {
     let mut app = app();
     seed_rows(&mut app, 3);
     app.on_agent_event(&AgentEvent::TextDelta {
@@ -1019,16 +1029,16 @@ fn copy_includes_unsealed_text_via_display_cell_indices() {
     });
     app.note_history_layout(80, 5);
     let slice = app.history_slice(80, 5);
-    let last = slice.rows.last().expect("unsealed visible");
-    assert_eq!(last.text, "live tail");
+    let last = slice.rows.last().expect("open cell visible");
+    assert_eq!(last.text, "• live tail");
     assert_eq!(last.cell_index, 3);
 
     app.on_action(Action::SelectStart { x: 0, y: 3 });
-    app.on_action(Action::SelectDrag { x: 9, y: 3 });
-    app.on_action(Action::SelectEnd { x: 9, y: 3 });
+    app.on_action(Action::SelectDrag { x: 11, y: 3 });
+    app.on_action(Action::SelectEnd { x: 11, y: 3 });
     assert_eq!(
         app.on_action(Action::CtrlC),
-        vec![Effect::WriteClipboard("live tail".to_owned())]
+        vec![Effect::WriteClipboard("• live tail".to_owned())]
     );
 }
 

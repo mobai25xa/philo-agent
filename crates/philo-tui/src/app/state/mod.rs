@@ -57,7 +57,7 @@ pub(crate) struct App {
     automatic_compacting: bool,
     /// Ephemeral operation projection; never enters transcript or Session.
     activity: ActivityState,
-    /// Sealed transcript cells for the TUI-owned viewport.
+    /// Transcript cells for the TUI-owned viewport.
     pub(crate) cells: TranscriptStore,
     scroll: ScrollState,
     layout_width: Cell<usize>,
@@ -99,21 +99,17 @@ impl App {
         self.cells.visible_slice(width, height, &self.scroll)
     }
 
-    /// Copies every `Effect::Append` into the sealed store, then replaces
-    /// the unsealed tail from [`Transcript::open_cells`]. Callers still
-    /// return the original effects so existing collectors keep working.
+    /// Copies every `Effect::Append` into the store as closed cells.
+    /// Callers still return the original effects so existing collectors keep
+    /// working. Agent events write the store through [`Transcript::apply`]
+    /// and must not be ingested again.
     pub(crate) fn ingest_appends(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
         for effect in &effects {
             if let Effect::Append(lines) = effect {
-                self.cells.append(lines.iter().cloned());
+                self.cells.push_closed(lines.clone());
             }
         }
-        self.sync_unsealed();
         effects
-    }
-
-    pub(crate) fn sync_unsealed(&mut self) {
-        self.cells.replace_unsealed(self.transcript.open_cells());
     }
 
     pub(crate) fn page_transcript_up(&mut self, width: usize, height: usize) {

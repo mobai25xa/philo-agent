@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolCancel, ToolHandler, ToolInvokeCx,
+    EffectClass, RichToolResult, ToolArguments, ToolCancel, ToolDisplay, ToolHandler, ToolInvokeCx,
     ToolInvokeEnd, ToolProgressSink, ToolResult,
 };
 use philo_tools_std::{EditTool, GrepTool, ListTool, ShellTool, WriteTool, error_code};
@@ -70,6 +70,15 @@ fn error_code_of(rich: &RichToolResult) -> &str {
 
 fn content_of(rich: &RichToolResult) -> &str {
     rich.result().content().expect("expected success")
+}
+
+fn fact<'a>(display: &'a ToolDisplay, name: &str) -> &'a str {
+    display
+        .facts()
+        .iter()
+        .find(|fact| fact.name() == name)
+        .map(|fact| fact.value())
+        .unwrap_or_else(|| panic!("missing fact {name}"))
 }
 
 // ------------------------------- list ------------------------------------
@@ -164,12 +173,17 @@ fn grep_skips_binaries_reports_no_matches_and_truncates() {
 
     let truncated = call(&tool, r#"{"pattern":"needle"}"#);
     let content = content_of(&truncated);
+    assert!(content.contains("needle"));
     assert!(content.contains("[grep truncated: showing first 2 of 3 matches]"));
     let display = truncated.display().expect("display present");
+    assert_eq!(display.detail(), "text.txt:1\ntext.txt:2\ntext.txt:3");
     assert!(
-        display.detail().matches("needle").count() >= 3,
-        "display carries the full untruncated matches"
+        !display.detail().contains("needle"),
+        "locs omit the matched line text"
     );
+    assert_eq!(fact(display, "matches_total"), "3");
+    assert_eq!(fact(display, "verb"), "Searched");
+    assert_eq!(fact(display, "body"), "locs");
 }
 
 #[test]
@@ -203,9 +217,12 @@ fn write_creates_with_parents_and_reports_overwrites() {
     );
     let display = overwrote.display().expect("display present");
     assert!(
-        display.detail().contains("second!"),
-        "display carries the written text"
+        display.detail().contains("+second!"),
+        "display carries plus-prefixed written lines"
     );
+    assert!(!display.detail().contains("wrote "));
+    assert_eq!(fact(display, "verb"), "Wrote");
+    assert_eq!(fact(display, "body"), "diff");
 }
 
 #[test]
@@ -264,7 +281,15 @@ fn edit_replaces_exactly_one_occurrence() {
         "fn new_name() {}\ncall(old_value);\n"
     );
     let display = result.display().expect("display present");
-    assert!(display.detail().contains("--- old"));
+    assert!(display.detail().contains("-fn old_name()"));
+    assert!(display.detail().contains("+fn new_name()"));
+    assert!(
+        display.detail().contains("call(old_value);"),
+        "hunk includes file context: {}",
+        display.detail()
+    );
+    assert_eq!(fact(display, "verb"), "Edited");
+    assert_eq!(fact(display, "body"), "diff");
 }
 
 #[test]

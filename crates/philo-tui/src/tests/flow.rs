@@ -33,7 +33,7 @@ fn collect(lines: Vec<TranscriptLine>, output: &mut Vec<String>) {
     output.extend(
         lines
             .into_iter()
-            .map(|line| format!("{:?}: {}", line.kind, line.text)),
+            .map(|line| format!("{:?}: {}", line.kind, line.text.trim_end_matches('\n'))),
     );
 }
 
@@ -159,8 +159,10 @@ async fn fake_host_complete_interaction_snapshot() {
             durability: SettlementDurability::Confirmed,
         },
     ] {
+        let before = app.cells.cells().len();
         let effects = app.on_agent_event(&event);
         execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
+        collect(app.cells.cells()[before..].to_vec(), &mut output);
     }
 
     crate::tests::assert_tui_snapshot!("m12_complete_interaction", output.join("\n"));

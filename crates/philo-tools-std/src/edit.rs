@@ -4,11 +4,12 @@
 use std::path::PathBuf;
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
+    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::required_string;
+use crate::display::{card, edit_hunk};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
@@ -113,7 +114,10 @@ impl EditTool {
             text.len(),
             edited.len()
         );
-        let display = ToolDisplay::new(format!("--- old\n{old_string}\n+++ new\n{new_string}"))
+        let (hunk, added, removed) = edit_hunk(&text, &old_string, &new_string);
+        let display = card("Edited", path, "diff", hunk)
+            .with_fact("added", added.to_string())
+            .with_fact("removed", removed.to_string())
             .with_fact("bytes_before", text.len().to_string())
             .with_fact("bytes_after", edited.len().to_string());
         RichToolResult::new(ToolResult::success(confirmation)).with_display(display)

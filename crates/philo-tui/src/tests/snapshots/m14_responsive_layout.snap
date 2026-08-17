@@ -1,46 +1,45 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
-assertion_line: 469
 expression: snapshot
 ---
 40 columns
-| tool  read_file
-path: src/中 文 .rs
+  path: src/中 文 .rs
 
 
 
 
 
-read_file  path: src/中 文 .rs
-┌──────────────────────────────────────┐
-│  s inside the composer               │
-└──────────────────────────────────────┘
+  read_file  path: src/中 文 .rs
+  | tool  read_file
+
+  › 中 文  é 👩‍💻  and a long draft that wr
+    aps inside the composer
 gpt-test  session-中 文
 
 80 columns
-| tool  read_file
-path: src/中 文 .rs
+  path: src/中 文 .rs
 
 
 
 
 
-read_file  path: src/中 文 .rs
-┌──────────────────────────────────────────────────────────────────────────────┐
-│› 中 文  é 👩‍💻  and a long draft that wraps inside the composer                   │
-└──────────────────────────────────────────────────────────────────────────────┘
+  read_file  path: src/中 文 .rs
+  | tool  read_file
+
+  › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
+
 gpt-test  session-中 文
 
 120 columns
-| tool  read_file
-path: src/中 文 .rs
+  path: src/中 文 .rs
 
 
 
 
 
-read_file  path: src/中 文 .rs
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│› 中 文  é 👩‍💻  and a long draft that wraps inside the composer                                                           │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  read_file  path: src/中 文 .rs
+  | tool  read_file
+
+  › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
+
 gpt-test  session-中 文

@@ -4,11 +4,12 @@
 use std::path::PathBuf;
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd,
+    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
+    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd,
 };
 
 use crate::args::required_string;
+use crate::display::card;
 use crate::error_code;
 use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
@@ -146,12 +147,18 @@ impl ReadTool {
             ));
         }
 
-        let display = ToolDisplay::new(format!(
-            "read {path}: {emitted_lines} of {lines_total} lines shown"
-        ))
-        .with_fact("bytes_total", total_bytes.to_string())
-        .with_fact("lines_total", lines_total.to_string())
-        .with_fact("truncated", truncated.to_string());
+        let (start_line, end_line) = if emitted_lines == 0 {
+            (0, 0)
+        } else {
+            (1, emitted_lines)
+        };
+        let display = card("Read", path, "none", "")
+            .with_fact("start_line", start_line.to_string())
+            .with_fact("end_line", end_line.to_string())
+            .with_fact("lines_shown", emitted_lines.to_string())
+            .with_fact("lines_total", lines_total.to_string())
+            .with_fact("bytes_total", total_bytes.to_string())
+            .with_fact("truncated", truncated.to_string());
         RichToolResult::new(philo_tools::ToolResult::success(model_text)).with_display(display)
     }
 }

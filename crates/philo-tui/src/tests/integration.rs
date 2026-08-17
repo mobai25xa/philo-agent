@@ -28,13 +28,49 @@ fn app() -> App {
     )
 }
 
-fn apply_event(app: &mut App, event: AgentEvent, durable: &mut Vec<TranscriptLine>) {
-    for effect in app.on_agent_event(&event) {
-        match effect {
-            Effect::Append(lines) => durable.extend(lines),
-            other => panic!("agent event produced an unexpected effect: {other:?}"),
-        }
-    }
+fn apply_event(app: &mut App, event: AgentEvent) {
+    let effects = app.on_agent_event(&event);
+    assert!(
+        effects.is_empty(),
+        "agent events write the transcript store directly: {effects:?}"
+    );
+}
+
+fn answer_rows(cells: &[TranscriptLine]) -> Vec<String> {
+    cells
+        .iter()
+        .filter(|line| line.kind == LineKind::Answer)
+        .flat_map(|line| {
+            let text = line.text.strip_suffix('\n').unwrap_or(line.text.as_str());
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                text.split('\n').map(str::to_owned).collect::<Vec<_>>()
+            }
+        })
+        .collect()
+}
+
+fn history_dump(cells: &[TranscriptLine]) -> String {
+    cells
+        .iter()
+        .flat_map(|line| {
+            let text = line.text.strip_suffix('\n').unwrap_or(line.text.as_str());
+            let rows: Vec<&str> = if line.kind == LineKind::Answer {
+                if text.is_empty() {
+                    vec![""]
+                } else {
+                    text.split('\n').collect()
+                }
+            } else {
+                vec![line.text.as_str()]
+            };
+            rows.into_iter()
+                .map(|row| format!("{:?}: {}", line.kind, text::truncate(row, 72)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render(app: &App, width: u16, height: u16) -> Vec<String> {
@@ -60,10 +96,16 @@ fn render(app: &App, width: u16, height: u16) -> Vec<String> {
 }
 
 fn composer_row(app: &App, width: u16, height: u16) -> usize {
-    render(app, width, height)
-        .iter()
-        .position(|line| line.contains('┌'))
-        .expect("composer border remains visible")
+    let y = usize::from(frame::composer_y(height));
+    let lines = render(app, width, height);
+    let end = (y + 3).min(lines.len());
+    assert!(
+        lines[y..end]
+            .iter()
+            .any(|line| line.contains('›') || !line.trim().is_empty()),
+        "composer slot is empty at row {y}: {lines:?}"
+    );
+    y
 }
 
 fn indexed_screen(app: &App, width: u16, height: u16) -> String {
@@ -82,21 +124,21 @@ fn assert_responsive_composer(app: &App, expected_rows: &[(u16, usize)]) {
             expected_row,
             "transient state moved the {width}-column composer",
         );
-        let viewport = composer::viewport(&app.input, usize::from(width - 2), 1);
-        assert!(viewport.cursor_x < usize::from(width - 2));
-        assert!(viewport.cursor_y < 1);
+        let viewport = composer::viewport(&app.input, usize::from(width), 3);
+        assert!(viewport.cursor_x < usize::from(width));
+        assert!(viewport.cursor_y < 3);
         assert!(
             viewport
                 .rows
                 .iter()
-                .all(|row| text::width(row) <= usize::from(width - 2)),
-            "soft-wrapped input exceeded its inner composer width",
+                .all(|row| text::width(row) <= usize::from(width)),
+            "soft-wrapped input exceeded its composer width",
         );
     }
     assert!(
         render(app, 40, frame::MIN_SUPPORTED_HEIGHT)
             .iter()
-            .any(|line| line.contains('┌')),
+            .any(|line| line.contains('›') || line.contains("draft") || line.contains("中文")),
         "the composer remains visible at the minimum supported height",
     );
 }
@@ -110,14 +152,12 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         [40, 80, 120].map(|width| (width, composer_row(&app, width, frame::VIEWPORT_HEIGHT)));
 
     app.set_busy(true, 1);
-    let mut durable = Vec::new();
     apply_event(
         &mut app,
         AgentEvent::ReasoningDelta {
             model_call_id: ModelCallId::new("model-call-1"),
             text: "checking constraints\n".to_owned(),
         },
-        &mut durable,
     );
 
     let long_line = format!("{} 中文 e\u{301} 👩‍💻", "0123456789".repeat(96));
@@ -130,7 +170,6 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             AgentEvent::TextDelta {
                 delta: ch.to_string(),
             },
-            &mut durable,
         );
     }
 
@@ -140,9 +179,8 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             tool_batch_id: ToolBatchId::new("batch-1"),
             call_count: 2,
         },
-        &mut durable,
     );
-    let before_started = durable.len();
+    let before_started = app.cells.cells().len();
     apply_event(
         &mut app,
         AgentEvent::ToolExecutionStarted {
@@ -152,9 +190,12 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             tool_name: "read_file".to_owned(),
             arguments: r#"{"path":"src/中文.rs"}"#.to_owned(),
         },
-        &mut durable,
     );
-    assert_eq!(durable.len(), before_started, "Started is Activity-only");
+    assert_eq!(
+        app.cells.cells().len(),
+        before_started,
+        "Started is Activity-only"
+    );
     assert!(
         app.activity_view(40)
             .expect("tool activity")
@@ -176,16 +217,42 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
                 ToolDisplay::new("read completed\nfull display detail").with_fact("bytes", "840"),
             ),
         },
-        &mut durable,
     );
-    let tool_lines = durable
+    let tool_lines = app
+        .cells
+        .cells()
         .iter()
         .filter(|line| line.kind == LineKind::Tool)
         .collect::<Vec<_>>();
-    assert_eq!(tool_lines.len(), 1, "Completed commits one default summary");
+    assert!(
+        tool_lines[0].text.starts_with("• read_file"),
+        "Completed keeps the fact summary: {:?}",
+        tool_lines[0].text
+    );
+    assert_eq!(
+        tool_lines[0].text, "• read_file  src/中文.rs",
+        "old displays without verb/body become a header-only card"
+    );
+    assert_eq!(
+        tool_lines.len(),
+        1,
+        "missing body fact means no body: {tool_lines:?}"
+    );
+    assert!(
+        tool_lines
+            .iter()
+            .all(|line| !line.text.contains("full display detail")),
+        "default cards must not dump display detail when body is missing"
+    );
+    assert!(
+        tool_lines
+            .iter()
+            .all(|line| !line.text.contains("result-result-")),
+        "default cards must not dump the model-facing body"
+    );
     assert!(text::width(&tool_lines[0].text) <= 120);
 
-    apply_event(&mut app, AgentEvent::ContextCompactionStarted, &mut durable);
+    apply_event(&mut app, AgentEvent::ContextCompactionStarted);
     assert!(
         app.activity_view(40)
             .expect("compaction activity")
@@ -197,7 +264,6 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         AgentEvent::ContextCompactionCompleted {
             covers_up_to: "entry-42".to_owned(),
         },
-        &mut durable,
     );
 
     apply_event(
@@ -205,7 +271,6 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         AgentEvent::TextDelta {
             delta: "after tool".to_owned(),
         },
-        &mut durable,
     );
     apply_event(
         &mut app,
@@ -213,14 +278,12 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             operation_id: OperationId::new("op-1"),
             reason: CancelReason::User,
         },
-        &mut durable,
     );
     apply_event(
         &mut app,
         AgentEvent::TextDelta {
             delta: " late-but-preserved".to_owned(),
         },
-        &mut durable,
     );
     assert!(
         app.activity_view(40)
@@ -238,7 +301,6 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             turn_id: TurnId::new("turn-1"),
             reason: CancelReason::User,
         },
-        &mut durable,
     );
     apply_event(
         &mut app,
@@ -247,12 +309,12 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             status: OperationStatus::Cancelled,
             durability: SettlementDurability::Confirmed,
         },
-        &mut durable,
     );
     app.set_busy(false, 0);
     assert!(app.activity_view(40).is_none());
-    assert!(app.transcript.partial().is_none());
+    assert!(!app.cells.has_open());
 
+    let cells = app.cells.cells();
     let mut expected_answer_lines = first_answer
         .strip_suffix('\n')
         .expect("fixture ends in a newline")
@@ -261,19 +323,15 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         .collect::<Vec<_>>();
     expected_answer_lines.extend(["after tool".to_owned(), " late-but-preserved".to_owned()]);
     assert_eq!(
-        durable
-            .iter()
-            .filter(|line| line.kind == LineKind::Answer)
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>(),
+        answer_rows(cells),
         expected_answer_lines,
         "all streamed text remains exact and ordered",
     );
-    let late_text = durable
+    let late_text = cells
         .iter()
-        .position(|line| line.text == " late-but-preserved")
+        .position(|line| line.kind == LineKind::Answer && line.text.contains(" late-but-preserved"))
         .expect("late text was committed");
-    let cancelled = durable
+    let cancelled = cells
         .iter()
         .position(|line| line.text == "turn cancelled (user)")
         .expect("cancellation fact was committed");
@@ -299,11 +357,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     assert_eq!(app.input.text(), draft, "overlays never consume the draft");
     let approval_screen = indexed_screen(&app, 40, frame::VIEWPORT_HEIGHT);
 
-    let history = durable
-        .iter()
-        .map(|line| format!("{:?}: {}", line.kind, text::truncate(&line.text, 72)))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let history = history_dump(app.cells.cells());
     crate::tests::assert_tui_snapshot!(
         "m14_complete_stability_flow",
         format!(

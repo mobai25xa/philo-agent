@@ -3,7 +3,7 @@
 use philo_agent_runtime::{AgentEvent, CancelReason};
 
 use super::text;
-use super::transcript::preview;
+use super::transcript::compact_args;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActivityTone {
@@ -70,7 +70,33 @@ impl ActivityState {
     }
 
     pub(crate) fn wait_for_model(&mut self) {
-        self.set(ActivityKind::Waiting("Waiting for model"));
+        self.set(ActivityKind::Waiting("wait  model"));
+    }
+
+    /// Extra rows for the live band: tool arguments and parallel call names.
+    pub(crate) fn detail_rows(&self, width: usize, height: usize) -> Vec<String> {
+        if height == 0 || width == 0 {
+            return Vec::new();
+        }
+        let Some(ActivityKind::Tool { running, .. }) = &self.current else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for tool in running {
+            let args = compact_args(&tool.arguments);
+            if running.len() == 1 {
+                rows.push(text::truncate(&args, width));
+            } else {
+                rows.push(text::truncate(
+                    &format!("{}  {}  {args}", tool.index + 1, tool.name),
+                    width,
+                ));
+            }
+            if rows.len() >= height {
+                break;
+            }
+        }
+        rows
     }
 
     pub(crate) fn start_manual_compaction(&mut self) {
@@ -93,31 +119,26 @@ impl ActivityState {
         let kind = self.current.as_ref()?;
         let (label, tone) = match kind {
             ActivityKind::Waiting(label) => ((*label).to_owned(), ActivityTone::Normal),
-            ActivityKind::Responding => ("Writing response".to_owned(), ActivityTone::Normal),
-            ActivityKind::Reasoning => ("Reasoning".to_owned(), ActivityTone::Reasoning),
+            ActivityKind::Responding => ("write".to_owned(), ActivityTone::Normal),
+            ActivityKind::Reasoning => ("think".to_owned(), ActivityTone::Reasoning),
             ActivityKind::Tool { running, total } => {
                 let total = (*total).max(running.last().map_or(0, |tool| tool.index + 1));
                 let label = match running.as_slice() {
-                    [tool] => format!(
-                        "Tool {}/{total}: {} {}",
-                        tool.index + 1,
-                        tool.name,
-                        preview(&tool.arguments, max_width.saturating_sub(20))
-                    ),
+                    [tool] => format!("tool {}/{total}  {}", tool.index + 1, tool.name),
                     _ => {
                         let names = running
                             .iter()
                             .map(|tool| tool.name.as_str())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("Tools {}/{total}: {names}", running.len())
+                        format!("tools {}/{total}  {names}", running.len())
                     }
                 };
                 (label, ActivityTone::Tool)
             }
-            ActivityKind::Compacting => ("Compacting context".to_owned(), ActivityTone::Normal),
+            ActivityKind::Compacting => ("compact".to_owned(), ActivityTone::Normal),
             ActivityKind::Cancelling(reason) => (
-                format!("Cancelling ({})", reason_text(*reason)),
+                format!("cancel  {}", reason_text(*reason)),
                 ActivityTone::Warning,
             ),
         };
@@ -131,19 +152,19 @@ impl ActivityState {
     pub(crate) fn on_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::OperationQueued { .. } => {
-                self.set(ActivityKind::Waiting("Queued behind active turn"));
+                self.set(ActivityKind::Waiting("wait  queued"));
             }
             AgentEvent::OperationStarted { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::ModelCallStarted { .. } => self.wait_for_model(),
             AgentEvent::ModelResponseStarted { .. } => {
-                self.set(ActivityKind::Waiting("Receiving model response"));
+                self.set(ActivityKind::Waiting("wait  response"));
             }
             AgentEvent::ReasoningDelta { .. } => self.set(ActivityKind::Reasoning),
             AgentEvent::TextDelta { .. } => self.set(ActivityKind::Responding),
             AgentEvent::ToolBatchRequested { call_count, .. } => {
                 self.tool_batch_size = *call_count;
-                self.set(ActivityKind::Waiting("Preparing tools"));
+                self.set(ActivityKind::Waiting("wait  tools"));
             }
             AgentEvent::ToolExecutionStarted {
                 tool_name,
@@ -180,7 +201,7 @@ impl ActivityState {
                             .cloned()
                             .collect();
                         if running.is_empty() {
-                            Some(ActivityKind::Waiting("Waiting for model"))
+                            Some(ActivityKind::Waiting("wait  model"))
                         } else {
                             Some(ActivityKind::Tool {
                                 running,
@@ -197,7 +218,7 @@ impl ActivityState {
             AgentEvent::ContextCompactionCompleted { .. }
             | AgentEvent::ContextCompactionFailed { .. } => {
                 if matches!(self.current, Some(ActivityKind::Compacting)) {
-                    self.replace(ActivityKind::Waiting("Waiting for model"));
+                    self.replace(ActivityKind::Waiting("wait  model"));
                 }
             }
             AgentEvent::ContextCompactionStarted => self.set(ActivityKind::Compacting),
@@ -206,7 +227,7 @@ impl ActivityState {
                 self.replace(ActivityKind::Cancelling(*reason));
             }
             AgentEvent::AssistantMessageCompleted { .. } => {
-                self.set(ActivityKind::Waiting("Finalizing response"));
+                self.set(ActivityKind::Waiting("wait  settle"));
             }
             AgentEvent::TurnFailed { .. } | AgentEvent::OperationSettled { .. } => self.clear(),
             _ => {}
@@ -261,8 +282,9 @@ mod tests {
             arguments: "{\"path\":\"src/很长的文件.rs\"}".to_owned(),
         });
         let view = state.view(36).expect("activity");
-        assert!(view.text.contains("Tool 1/2: read_file"), "{view:?}");
+        assert!(view.text.contains("tool 1/2  read_file"), "{view:?}");
         assert!(text::width(&view.text) <= 36);
+        assert_eq!(state.detail_rows(40, 2), ["path: src/很长的文件.rs"]);
 
         state.on_event(&AgentEvent::ToolExecutionCompleted {
             tool_batch_id: ToolBatchId::new("batch"),
@@ -272,7 +294,13 @@ mod tests {
             result: ToolResult::success("ok"),
             display: None,
         });
-        assert!(state.view(80).expect("waiting").text.contains("Waiting"));
+        assert!(
+            state
+                .view(80)
+                .expect("waiting")
+                .text
+                .contains("wait  model")
+        );
 
         state.on_event(&AgentEvent::OperationSettled {
             operation_id: OperationId::new("op"),
@@ -304,7 +332,7 @@ mod tests {
             arguments: "{\"pattern\":\"fn\"}".to_owned(),
         });
         let view = state.view(80).expect("parallel activity");
-        assert!(view.text.contains("Tools 2/3: read_file, grep"), "{view:?}");
+        assert!(view.text.contains("tools 2/3  read_file, grep"), "{view:?}");
 
         state.on_event(&AgentEvent::ToolExecutionCompleted {
             tool_batch_id: ToolBatchId::new("batch"),
@@ -315,7 +343,7 @@ mod tests {
             display: None,
         });
         let remaining = state.view(80).expect("one still running");
-        assert!(remaining.text.contains("Tool 2/3: grep"), "{remaining:?}");
+        assert!(remaining.text.contains("tool 2/3  grep"), "{remaining:?}");
     }
 
     #[test]
@@ -336,12 +364,6 @@ mod tests {
             result: ToolResult::success("late"),
             display: None,
         });
-        assert!(
-            state
-                .view(80)
-                .expect("activity")
-                .text
-                .contains("Cancelling")
-        );
+        assert!(state.view(80).expect("activity").text.contains("cancel"));
     }
 }

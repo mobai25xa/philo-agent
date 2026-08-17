@@ -154,11 +154,11 @@ impl SessionPicker {
             .collect();
         OverlayFrame {
             title: text::truncate(
-                &format!("sessions ({}/{})", self.selected + 1, self.sessions.len()),
+                &format!("sessions  {}/{}", self.selected + 1, self.sessions.len()),
                 width,
             ),
             body,
-            footer: text::truncate("Enter switch | Up/Down select | Esc close", width),
+            footer: text::truncate("enter switch  ·  ↑↓ select  ·  esc close", width),
         }
     }
 
@@ -205,9 +205,12 @@ impl ConfirmPrompt {
             .map(|line| text::truncate(line, width))
             .collect();
         OverlayFrame {
-            title: text::truncate(&format!("approval required: {}", self.request.title), width),
+            title: text::truncate(
+                &format!("approval required  ·  {}", self.request.title),
+                width,
+            ),
             body,
-            footer: text::truncate("y allow | n / Esc deny", width),
+            footer: text::truncate("y allow  ·  n / esc deny", width),
         }
     }
 }

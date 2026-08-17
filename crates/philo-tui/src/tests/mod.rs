@@ -9,7 +9,7 @@ pub(crate) mod support;
 macro_rules! assert_tui_snapshot {
     ($name:literal, $value:expr) => {
         insta::with_settings!({
-            snapshot_path => "../tests/snapshots",
+            snapshot_path => concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/snapshots"),
             prepend_module_to_snapshot => false,
         }, {
             insta::assert_snapshot!($name, $value);

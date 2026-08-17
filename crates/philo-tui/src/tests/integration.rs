@@ -159,7 +159,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         app.activity_view(40)
             .expect("tool activity")
             .text
-            .contains("Tool 1/2: read_file")
+            .contains("tool 1/2  read_file")
     );
     assert_responsive_composer(&app, &expected_rows);
     let tool_screen = indexed_screen(&app, 40, frame::VIEWPORT_HEIGHT);
@@ -190,7 +190,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         app.activity_view(40)
             .expect("compaction activity")
             .text
-            .contains("Compacting context")
+            .contains("compact")
     );
     apply_event(
         &mut app,
@@ -226,7 +226,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         app.activity_view(40)
             .expect("cancellation activity")
             .text
-            .contains("Cancelling (user)"),
+            .contains("cancel  user"),
         "a late delta cannot replace the higher-priority cancellation",
     );
     assert_responsive_composer(&app, &expected_rows);

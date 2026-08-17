@@ -1,10 +1,12 @@
 //! Session-history projection: durable context messages become transcript
 //! lines. Pure and read-only — the TUI never writes a session, and images
 //! render as placeholder text (no inline terminal graphics).
+//!
+//! This is session replay, not the composer's input-history recall.
 
 use philo_session::{ContextMessage, SessionContextView, SessionUserPart, ToolResultOutcome};
 
-use super::transcript::{LineKind, TranscriptLine, preview};
+use super::transcript::{LineKind, TranscriptLine, compact_args, preview};
 
 fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     TranscriptLine {
@@ -54,14 +56,14 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
             .map(|call| {
                 line(
                     LineKind::Tool,
-                    format!("tool {}({})", call.name(), preview(call.arguments(), 60)),
+                    format!("▸ {}  {}", call.name(), compact_args(call.arguments())),
                 )
             })
             .collect(),
         ContextMessage::ToolResult { outcome, .. } => {
             vec![line(
                 LineKind::Tool,
-                format!("  -> {}", outcome_text(outcome)),
+                format!("  └ {}", outcome_text(outcome)),
             )]
         }
     }
@@ -79,9 +81,9 @@ fn user_part_line(part: &SessionUserPart) -> TranscriptLine {
 
 fn outcome_text(outcome: &ToolResultOutcome) -> String {
     match outcome {
-        ToolResultOutcome::Success { content } => format!("ok: {}", preview(content, 80)),
+        ToolResultOutcome::Success { content } => format!("ok · {}", preview(content, 80)),
         ToolResultOutcome::Error { code, message } => {
-            format!("error {code}: {}", preview(message, 80))
+            format!("error {code} · {}", preview(message, 80))
         }
         ToolResultOutcome::Cancelled => "cancelled (never executed)".to_owned(),
         ToolResultOutcome::Interrupted => "interrupted (execution state unknown)".to_owned(),
@@ -104,8 +106,8 @@ mod tests {
             rendered,
             [
                 "User: > count the files",
-                "Tool: tool read_file({\"path\":\"src/main.rs\"})",
-                "Tool:   -> ok: fn main() {}",
+                "Tool: ▸ read_file  path: src/main.rs",
+                "Tool:   └ ok · fn main() {}",
                 "Answer: one file",
             ]
         );

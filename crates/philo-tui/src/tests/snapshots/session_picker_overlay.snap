@@ -1,13 +1,11 @@
 ---
 source: crates/philo-tui/src/app/overlay.rs
-description: session picker overlay frame
-assertion_line: 250
 expression: picker.frame(5).to_text()
 ---
-sessions (1/3)
+sessions  1/3
 > s-1                    | > count the files
   s-2                    | one file
   s-3                    |
                          |
                          |
-Enter switch | Up/Down select | Esc close
+enter switch  ·  ↑↓ select  ·  esc close

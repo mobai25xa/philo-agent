@@ -195,7 +195,7 @@ mod tests {
         let screen = screen_text(&terminal);
         assert!(screen.contains("third completed"));
         assert!(screen.contains("fourth completed"));
-        assert!(screen.contains("model model-a | session s-1 | idle"));
+        assert!(screen.contains("model model-a · session s-1 · idle"));
     }
 
     #[test]
@@ -333,6 +333,11 @@ mod tests {
         assert_eq!(operations.clears, 0);
         assert_eq!(operations.inserts, 0);
         assert!(operations.draws <= 31);
-        assert!(screen_text(&terminal).contains(&format!("...{}", "x".repeat(77))));
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("answer"), "{screen}");
+        assert!(
+            screen.contains(&"x".repeat(80)),
+            "the live band should show the tail of the stream\n{screen}"
+        );
     }
 }

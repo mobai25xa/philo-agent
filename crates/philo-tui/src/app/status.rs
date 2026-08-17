@@ -120,7 +120,7 @@ impl StatusData {
             .into_iter()
             .map(|(_, value)| value)
             .collect::<Vec<_>>()
-            .join(" | ");
+            .join(" · ");
         if line.is_empty() {
             text::truncate(
                 if self.compacting {
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn status_line_shows_model_session_and_state() {
         let mut status = StatusData::new("gpt-test", "s-1", InfoLevel::Default);
-        assert_eq!(status.line(), "model gpt-test | session s-1 | idle");
+        assert_eq!(status.line(), "model gpt-test · session s-1 · idle");
 
         status.busy = true;
         status.queued = 2;
@@ -162,8 +162,8 @@ mod tests {
         status.level = InfoLevel::Verbose;
         assert_eq!(
             status.line(),
-            "model gpt-test | session s-1 | busy | queued 2 | \
-             tokens in 1200 out 340 | ctx 1200/128000 | verbose"
+            "model gpt-test · session s-1 · busy · queued 2 · \
+             tokens in 1200 out 340 · ctx 1200/128000 · verbose"
         );
     }
 
@@ -173,7 +173,7 @@ mod tests {
         status.busy = true;
         status.queued = 3;
         let line = status.line_for_width(40);
-        assert_eq!(line, "session session-123 | busy | queued 3");
+        assert_eq!(line, "session session-123 · busy · queued 3");
         assert!(text::width(&line) <= 40);
     }
 

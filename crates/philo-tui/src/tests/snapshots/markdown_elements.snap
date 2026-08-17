@@ -1,13 +1,11 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-description: markdown element matrix, one committed answer line each
-assertion_line: 282
 expression: "render(&[\"# Title\", \"### Smaller\", \"plain paragraph text\", \"- first item\",\n\"  - nested item\", \"1. ordered item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"---\", \"\",])"
 ---
 # Title
-  -> "Title"{magenta,bold,underlined}
+  -> "▍ "{magenta,bold,underlined} "Title"{magenta,bold,underlined}
 ### Smaller
-  -> "Smaller"{magenta,bold}
+  -> "▍ "{magenta,bold} "Smaller"{magenta,bold}
 plain paragraph text
   -> "plain paragraph text"
 - first item

@@ -1,23 +1,22 @@
 ---
 source: crates/philo-tui/src/app/transcript.rs
-description: verbose transcript information tier
-assertion_line: 449
 expression: "render(InfoLevel::Verbose)"
 ---
 lines:
 Meta: operation op-1 started
-Notice: notice: previous turn old-turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
+Notice: previous turn old-turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Meta: turn turn-1 started
 Meta: model call call-1
-Reasoning: [reasoning] checking workspace
+Reasoning: think │ checking workspace
 Answer: answer line
-Tool: tool batch batch-1: 1 call(s)
-Tool: tool 1/1 read_file arguments: {"path":"src/main.rs"}
-Tool: tool read_file result:
+Tool: ▸ batch batch-1  1 call(s)
+Tool: ▸ read_file  1/1
+Tool:   args  path: src/main.rs
+Tool: ▸ read_file  ok
 Tool:   fn main() {}
-Tool: detail:
-Tool:   read 12 bytes
-Tool: facts: bytes=12
+Tool:   detail
+Tool:     read 12 bytes
+Tool:   facts  bytes=12
 Answer: final
 Notice: cancelling (timeout)...
 Notice: turn cancelled (timeout)

@@ -215,10 +215,14 @@ pub fn help_lines() -> Vec<String> {
     lines.push("keys:".to_owned());
     lines.extend(
         [
-            "Enter submit (queued while busy) | Ctrl+J newline (Shift+Enter where supported)",
-            "Esc cancel the running turn | Ctrl+C clear input, cancel, or press twice to exit",
-            "Ctrl+D exit on an empty prompt | Ctrl+O detail tier | Ctrl+L redraw",
-            "Tab complete a command | Up/Down input history | scrolling stays native",
+            "Enter     submit (queues while busy)",
+            "Ctrl+J    newline (Shift+Enter where supported)",
+            "Esc       cancel the running turn",
+            "Ctrl+C    clear input, cancel, or press twice to exit",
+            "Ctrl+D    exit on an empty prompt",
+            "Ctrl+O    detail tier   ·   Ctrl+L redraw",
+            "Tab       complete a command   ·   Up/Down input history",
+            "scroll    stays in the terminal native scrollback",
         ]
         .into_iter()
         .map(|hint| format!("  {hint}")),

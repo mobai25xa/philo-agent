@@ -56,7 +56,6 @@ impl Attachments {
         self.items.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -70,7 +69,7 @@ impl Attachments {
         if self.items.is_empty() {
             return None;
         }
-        Some(format!("attachments: {}", self.labels().join(", ")))
+        Some(format!("attach  {}", self.labels().join("  ·  ")))
     }
 }
 
@@ -113,7 +112,7 @@ mod tests {
         );
         assert_eq!(
             attachments.summary(),
-            Some("attachments: shots/a.png, clipboard image (image/png, 2.0 KB)".to_owned())
+            Some("attach  shots/a.png  ·  clipboard image (image/png, 2.0 KB)".to_owned())
         );
     }
 

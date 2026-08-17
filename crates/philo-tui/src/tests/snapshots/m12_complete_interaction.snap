@@ -1,32 +1,32 @@
 ---
-source: crates/philo-tui/src/tests/m12_flow.rs
+source: crates/philo-tui/src/tests/flow.rs
 expression: "output.join(\"\\n\")"
 ---
 Meta: /sessions
 overlay:
-sessions (1/2)
+sessions  1/2
 > s-1                    | > count the files
-  s-image                | tool read_file({"path":"src/main.rs"})
-                         | -> ok: fn main() {}
+  s-image                | ▸ read_file  path: src/main.rs
+                         | └ ok · fn main() {}
                          | one file
                          |
-Enter switch | Up/Down select | Esc close
+enter switch  ·  ↑↓ select  ·  esc close
 Meta: session s-image
 User: > look at this
 User: > [image image/png, 4 bytes]
 overlay:
-approval required: write workspace file
+approval required  ·  write workspace file
 path: src/main.rs
-y allow | n / Esc deny
+y allow  ·  n / esc deny
 Meta: allowed: write workspace file
 confirmation: Allow
 User: > first prompt
 User: > queued follow-up
 Notice: busy: the message is queued behind the active turn
-Notice: queued: waiting for the active turn
-Notice: notice: a previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
-Reasoning: [reasoning] checking
+Notice: queued behind the active turn
+Notice: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
+Reasoning: think │ checking
 Answer: answer line
-Tool:   read -> ok: fn main() {}
+Tool: ▸ read  ok · fn main() {}
 Notice: turn cancelled (user)
 Meta: done (cancelled)

@@ -1,10 +1,8 @@
 ---
 source: crates/philo-tui/src/app/overlay.rs
-description: confirmation overlay frame
-assertion_line: 262
 expression: prompt.frame(5).to_text()
 ---
-approval required: run_command
+approval required  ·  run_command
 cargo test -p philo-tui
 working directory: /repo
-y allow | n / Esc deny
+y allow  ·  n / esc deny

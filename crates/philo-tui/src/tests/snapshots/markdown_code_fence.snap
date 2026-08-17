@@ -1,13 +1,11 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-description: fenced code blocks - syntect highlighting and unknown-language fallback
-assertion_line: 302
 expression: "render(&[\"```rust\", \"fn main() {}\", \"```\", \"between blocks\",\n\"```not-a-language\", \"* not a list *\", \"```\", \"after\",])"
 ---
 ```rust
   -> "```rust"{darkgray}
 fn main() {}
-  -> "fn"{rgb(180, 142, 173)} " "{rgb(192, 197, 206)} "main"{rgb(143, 161, 179)} "("{rgb(192, 197, 206)} ")"{rgb(192, 197, 206)} " "{rgb(192, 197, 206)} "{"{rgb(192, 197, 206)} "}"{rgb(192, 197, 206)}
+  -> "│ "{darkgray} "fn"{rgb(180, 142, 173)} " "{rgb(192, 197, 206)} "main"{rgb(143, 161, 179)} "("{rgb(192, 197, 206)} ")"{rgb(192, 197, 206)} " "{rgb(192, 197, 206)} "{"{rgb(192, 197, 206)} "}"{rgb(192, 197, 206)}
 ```
   -> "```"{darkgray}
 between blocks
@@ -15,7 +13,7 @@ between blocks
 ```not-a-language
   -> "```not-a-language"{darkgray}
 * not a list *
-  -> "* not a list *"{lightgreen}
+  -> "│ "{darkgray} "* not a list *"{lightgreen}
 ```
   -> "```"{darkgray}
 after

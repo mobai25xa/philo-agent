@@ -191,6 +191,59 @@ impl InputEditor {
     }
 }
 
+/// Recalled submissions for Up/Down when the cursor is already on the
+/// first or last draft line. Distinct from session replay (`session`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InputHistory {
+    entries: Vec<String>,
+    /// Index into `entries` while browsing; `None` when editing fresh text.
+    cursor: Option<usize>,
+    /// The fresh text stashed while browsing history.
+    stash: Option<String>,
+}
+
+impl InputHistory {
+    pub(crate) fn push(&mut self, text: String) {
+        self.entries.push(text);
+        self.cursor = None;
+        self.stash = None;
+    }
+
+    pub(crate) fn reset_browse(&mut self) {
+        self.cursor = None;
+    }
+
+    /// Moves to an older submission. Always yields text when the list is
+    /// non-empty, including when already on the oldest entry.
+    pub(crate) fn prev(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let next_index = match self.cursor {
+            None => {
+                self.stash = Some(current.to_owned());
+                self.entries.len() - 1
+            }
+            Some(0) => 0,
+            Some(index) => index - 1,
+        };
+        self.cursor = Some(next_index);
+        Some(self.entries[next_index].clone())
+    }
+
+    /// Moves toward newer submissions, or restores the stashed draft.
+    pub(crate) fn next(&mut self) -> Option<String> {
+        let index = self.cursor?;
+        if index + 1 < self.entries.len() {
+            self.cursor = Some(index + 1);
+            Some(self.entries[index + 1].clone())
+        } else {
+            self.cursor = None;
+            Some(self.stash.take().unwrap_or_default())
+        }
+    }
+}
+
 fn previous_boundary(line: &str, byte: usize) -> usize {
     line[..byte]
         .grapheme_indices(true)

@@ -49,13 +49,15 @@ impl MarkdownRenderer {
                 self.fence = None;
                 return delimiter(text);
             }
-            let spans = match fence.highlighter.line(text) {
-                Some(regions) => regions
-                    .into_iter()
-                    .map(|(style, fragment)| Span::styled(fragment, style))
-                    .collect(),
-                None => vec![Span::styled(text.to_owned(), code_style())],
-            };
+            let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+            match fence.highlighter.line(text) {
+                Some(regions) => spans.extend(
+                    regions
+                        .into_iter()
+                        .map(|(style, fragment)| Span::styled(fragment, style)),
+                ),
+                None => spans.push(Span::styled(text.to_owned(), code_style())),
+            }
             return Line::from(spans);
         }
         match opens(text) {
@@ -140,7 +142,10 @@ fn inline(text: &str) -> Line<'static> {
 
     for event in Parser::new_ext(text, options) {
         match event {
-            Event::Start(Tag::Heading { level, .. }) => styles.push(heading_style(level)),
+            Event::Start(Tag::Heading { level, .. }) => {
+                spans.push(Span::styled("▍ ", heading_style(level)));
+                styles.push(heading_style(level));
+            }
             Event::End(TagEnd::Heading(_)) => pop(&mut styles),
             Event::Start(Tag::List(start)) => ordered = start,
             Event::Start(Tag::Item) => {
@@ -324,7 +329,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "# not a heading"
+            "│ # not a heading"
         );
         assert!(
             !inside.spans[0].style.add_modifier.contains(Modifier::BOLD),

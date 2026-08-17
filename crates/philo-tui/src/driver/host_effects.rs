@@ -10,8 +10,8 @@ use philo_session::{SessionContextView, SessionId};
 use crate::api::host::{ConfigEntry, HostError};
 use crate::app::command;
 use crate::app::effect::{Effect, HostRequest};
-use crate::app::history;
 use crate::app::overlay::Preview;
+use crate::app::session;
 use crate::app::state::App;
 use crate::app::transcript::{LineKind, TranscriptLine};
 
@@ -85,7 +85,7 @@ pub(crate) fn apply(app: &mut App, result: HostResult) -> Vec<Effect> {
         }
         HostResult::Preview { id, result } => {
             let preview = match result {
-                Ok(view) => Preview::Ready(history::preview_lines(&view, PREVIEW_ROWS)),
+                Ok(view) => Preview::Ready(session::preview_lines(&view, PREVIEW_ROWS)),
                 Err(error) => Preview::Failed(error.message().to_owned()),
             };
             app.set_preview(&id, preview);
@@ -97,7 +97,7 @@ pub(crate) fn apply(app: &mut App, result: HostResult) -> Vec<Effect> {
         } => {
             app.begin_session(id.as_str());
             let mut lines = vec![line(LineKind::Meta, format!("session {}", id.as_str()))];
-            let history = history::history_lines(&view);
+            let history = session::history_lines(&view);
             if history.is_empty() {
                 lines.push(line(LineKind::Meta, "(no history yet)"));
             } else {

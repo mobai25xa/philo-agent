@@ -65,6 +65,43 @@ pub(crate) fn tail(text: &str, max_width: usize) -> String {
     format!("{prefix}{}", kept.concat())
 }
 
+/// Soft-wraps `text` on terminal cells without splitting graphemes.
+pub(crate) fn wrap(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for logical in text.split('\n') {
+        if logical.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for grapheme in logical.graphemes(true) {
+            let grapheme_width = width(grapheme);
+            if current_width > 0 && current_width + grapheme_width > max_width {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push_str(grapheme);
+            current_width += grapheme_width;
+        }
+        rows.push(current);
+    }
+    rows
+}
+
+/// Last `height` visual rows of `text` after wrapping to `max_width`.
+pub(crate) fn tail_rows(text: &str, max_width: usize, height: usize) -> Vec<String> {
+    if height == 0 || max_width == 0 {
+        return Vec::new();
+    }
+    let rows = wrap(text, max_width);
+    let skip = rows.len().saturating_sub(height);
+    rows.into_iter().skip(skip).collect()
+}
+
 pub(crate) fn pad(text: &str, target_width: usize) -> String {
     let mut result = truncate(text, target_width);
     result.extend(std::iter::repeat_n(
@@ -89,5 +126,11 @@ mod tests {
     fn padding_uses_cells_instead_of_scalar_count() {
         assert_eq!(pad("中", 4), "中  ");
         assert_eq!(width(&pad("中", 4)), 4);
+    }
+
+    #[test]
+    fn wrap_and_tail_rows_keep_cjk_cells() {
+        assert_eq!(wrap("中文ab", 4), ["中文", "ab"]);
+        assert_eq!(tail_rows("one\ntwo\nthree", 8, 2), ["two", "three"]);
     }
 }

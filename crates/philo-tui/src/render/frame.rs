@@ -1,17 +1,18 @@
 //! Pure projection of app state into a stable inline bottom panel.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::activity::ActivityTone;
 use crate::app::state::App;
 use crate::app::text;
-use crate::app::transcript::TranscriptLine;
+use crate::app::transcript::{LineKind, TranscriptLine};
 
 use super::composer;
 use super::markdown::MarkdownRenderer;
+use super::theme;
 
 pub(crate) const VIEWPORT_HEIGHT: u16 = 12;
 /// M14's reviewed responsive matrix starts here. Smaller terminals degrade
@@ -37,10 +38,24 @@ pub(crate) fn draw(
 ) {
     let areas = panel_areas(frame.area());
     draw_activity(frame, app, areas.activity);
-    draw_live_tail(frame, app, markdown, areas.live);
-    draw_popover(frame, app, areas.popover);
+    draw_band(frame, app, markdown, union(areas.live, areas.popover));
     draw_composer(frame, app, areas.composer);
     draw_status(frame, app, areas.status);
+}
+
+fn union(top: Rect, bottom: Rect) -> Rect {
+    if top.height == 0 {
+        return bottom;
+    }
+    if bottom.height == 0 {
+        return top;
+    }
+    Rect::new(
+        top.x,
+        top.y,
+        top.width,
+        top.height.saturating_add(bottom.height),
+    )
 }
 
 fn panel_areas(area: Rect) -> PanelAreas {
@@ -77,54 +92,21 @@ fn draw_activity(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         return;
     };
     let style = match activity.tone {
-        ActivityTone::Normal => Style::default().fg(Color::Cyan),
-        ActivityTone::Reasoning => Style::default().fg(Color::Magenta),
-        ActivityTone::Tool => Style::default().fg(Color::Blue),
-        ActivityTone::Warning => Style::default().fg(Color::Yellow),
+        ActivityTone::Normal => theme::activity_normal(),
+        ActivityTone::Reasoning => theme::activity_reasoning(),
+        ActivityTone::Tool => theme::activity_tool(),
+        ActivityTone::Warning => theme::activity_warning(),
     };
     frame.render_widget(Paragraph::new(Line::styled(activity.text, style)), area);
 }
 
-fn draw_live_tail(
-    frame: &mut ratatui::Frame<'_>,
-    app: &App,
-    markdown: &MarkdownRenderer,
-    area: Rect,
-) {
-    if area.is_empty() {
-        return;
-    }
-    let Some((kind, partial)) = app.transcript.partial() else {
-        return;
-    };
-    let preview = TranscriptLine {
-        kind,
-        text: text::tail(partial, usize::from(area.width)),
-    };
-    frame.render_widget(Paragraph::new(markdown.preview(&preview)), area);
-}
-
-fn draw_popover(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRenderer, area: Rect) {
     if area.is_empty() {
         return;
     }
     let width = usize::from(area.width);
     if let Some(overlay) = app.overlay_frame_for(area.height.saturating_sub(2).into(), width) {
-        let mut lines = vec![Line::styled(
-            overlay.title,
-            Style::default().add_modifier(Modifier::BOLD),
-        )];
-        if area.height > 2 {
-            lines.extend(overlay.body.into_iter().map(Line::from));
-        }
-        if area.height > 1 {
-            lines.push(Line::styled(
-                overlay.footer,
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        lines.truncate(usize::from(area.height));
-        frame.render_widget(Paragraph::new(lines), area);
+        draw_overlay(frame, area, overlay);
         return;
     }
 
@@ -132,22 +114,151 @@ fn draw_popover(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         .completion_line()
         .or_else(|| app.attachments().summary())
         .map(|line| text::truncate(&line, width));
-    if let Some(hint) = hint {
-        frame.render_widget(
-            Paragraph::new(Line::styled(hint, Style::default().fg(Color::DarkGray))),
-            area,
-        );
+    let hint_height = u16::from(hint.is_some());
+    let live_height = area.height.saturating_sub(hint_height);
+    let live_area = Rect::new(area.x, area.y, area.width, live_height);
+    let hint_area = Rect::new(area.x, live_area.bottom(), area.width, hint_height);
+
+    if !live_area.is_empty() {
+        if let Some((kind, partial)) = app.transcript.partial() {
+            draw_live_stream(frame, markdown, live_area, kind, partial);
+        } else {
+            let details = app.activity_detail_rows(width, usize::from(live_height));
+            if details.is_empty() {
+                draw_idle_chrome(frame, app, live_area);
+            } else {
+                let lines = details
+                    .into_iter()
+                    .map(|row| Line::styled(row, theme::meta()))
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(lines), live_area);
+            }
+        }
     }
+    if let Some(hint) = hint {
+        frame.render_widget(Paragraph::new(Line::styled(hint, theme::meta())), hint_area);
+    }
+}
+
+fn draw_live_stream(
+    frame: &mut ratatui::Frame<'_>,
+    markdown: &MarkdownRenderer,
+    area: Rect,
+    kind: LineKind,
+    partial: &str,
+) {
+    let width = usize::from(area.width);
+    let height = usize::from(area.height);
+    if height == 1 {
+        let preview = TranscriptLine {
+            kind,
+            text: text::tail(partial, width),
+        };
+        frame.render_widget(Paragraph::new(live_row(markdown, kind, preview)), area);
+        return;
+    }
+    let header = match kind {
+        LineKind::Reasoning => ("think", theme::reasoning()),
+        LineKind::Answer => ("answer", theme::activity_normal()),
+        other => (other_label(other), theme::meta()),
+    };
+    let mut lines = vec![Line::styled(
+        header.0.to_owned(),
+        header.1.add_modifier(Modifier::BOLD),
+    )];
+    for row in text::tail_rows(partial, width, height.saturating_sub(1)) {
+        lines.push(live_row(markdown, kind, TranscriptLine { kind, text: row }));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn live_row(markdown: &MarkdownRenderer, kind: LineKind, preview: TranscriptLine) -> Line<'static> {
+    match kind {
+        LineKind::Answer => markdown.preview(&preview),
+        LineKind::Reasoning => Line::styled(preview.text, theme::reasoning()),
+        _ => markdown.preview(&preview),
+    }
+}
+
+fn other_label(kind: LineKind) -> &'static str {
+    match kind {
+        LineKind::User => "you",
+        LineKind::Tool => "tool",
+        LineKind::Notice => "note",
+        LineKind::Error => "error",
+        LineKind::Meta => "meta",
+        LineKind::Answer => "answer",
+        LineKind::Reasoning => "think",
+    }
+}
+
+fn draw_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    overlay: crate::app::overlay::OverlayFrame,
+) {
+    let title_style = if overlay.title.starts_with("approval") {
+        theme::activity_warning().add_modifier(Modifier::BOLD)
+    } else {
+        theme::activity_normal().add_modifier(Modifier::BOLD)
+    };
+    let mut lines = vec![Line::styled(overlay.title, title_style)];
+    if area.height > 2 {
+        lines.extend(overlay.body.into_iter().map(Line::from));
+    }
+    if area.height > 1 {
+        lines.push(Line::styled(overlay.footer, theme::meta()));
+    }
+    lines.truncate(usize::from(area.height));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_idle_chrome(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    if app.status.busy || app.activity_view(1).is_some() {
+        return;
+    }
+    let width = usize::from(area.width);
+    let mut lines = Vec::new();
+    if area.height >= 1 {
+        lines.push(Line::styled("─".repeat(width), theme::rule()));
+    }
+    if area.height >= 2 {
+        lines.push(Line::from(vec![Span::styled(
+            text::truncate(&app.status.model, width),
+            theme::activity_normal(),
+        )]));
+    }
+    if area.height >= 3 {
+        lines.push(Line::styled(
+            text::truncate(&format!("session  {}", app.status.session), width),
+            theme::meta(),
+        ));
+    }
+    if area.height >= 4 {
+        lines.push(Line::styled(
+            text::truncate("enter send  ·  ctrl+j newline  ·  /help", width),
+            theme::meta(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     if area.is_empty() {
         return;
     }
+    let border = if app.has_overlay() {
+        theme::border_warning()
+    } else if app.input_focused() {
+        theme::border_focus()
+    } else {
+        theme::border()
+    };
+    let title = composer_title(app, usize::from(area.width));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Message ");
+        .border_style(border)
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -159,8 +270,9 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         usize::from(inner.width),
         usize::from(inner.height),
     );
+    let placeholder = app.input.is_empty().then_some("type a message");
     frame.render_widget(
-        Paragraph::new(view.rows.into_iter().map(Line::from).collect::<Vec<_>>()),
+        Paragraph::new(composer::styled_rows(&view.rows, placeholder)),
         inner,
     );
     if app.input_focused() {
@@ -174,15 +286,49 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     }
 }
 
+fn composer_title(app: &App, width: usize) -> String {
+    let hint = if app.has_overlay() {
+        "draft kept"
+    } else if app.status.busy {
+        "enter queues"
+    } else if !app.attachments().is_empty() {
+        "enter send  ·  image attached"
+    } else {
+        "enter send"
+    };
+    let title = format!(" Message · {hint} ");
+    if text::width(&title) + 2 <= width {
+        title
+    } else {
+        " Message ".to_owned()
+    }
+}
+
 fn draw_status(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     if area.is_empty() {
         return;
     }
-    let status = app.status.line_for_width(usize::from(area.width));
-    frame.render_widget(
-        Paragraph::new(Line::styled(status, Style::default().fg(Color::DarkGray))),
-        area,
-    );
+    let raw = app.status.line_for_width(usize::from(area.width));
+    let spans = raw
+        .split(" · ")
+        .enumerate()
+        .flat_map(|(index, field)| {
+            let style = if field == "idle" {
+                theme::status_idle()
+            } else if field.starts_with("busy") || field.starts_with("compacting") {
+                theme::status_busy()
+            } else {
+                theme::meta()
+            };
+            let mut parts = Vec::new();
+            if index > 0 {
+                parts.push(Span::styled(" · ", theme::rule()));
+            }
+            parts.push(Span::styled(field.to_owned(), style));
+            parts
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]

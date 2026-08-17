@@ -106,7 +106,7 @@ impl Transcript {
     fn flush_reasoning(&mut self, lines: &mut Vec<TranscriptLine>) {
         if !self.partial_reasoning.is_empty() {
             let text = std::mem::take(&mut self.partial_reasoning);
-            lines.push(line(LineKind::Reasoning, format!("[reasoning] {text}")));
+            lines.push(line(LineKind::Reasoning, format!("think │ {text}")));
         }
     }
 
@@ -136,18 +136,12 @@ impl Transcript {
                     let mut completed: String = self.partial_reasoning.drain(..=newline).collect();
                     completed.pop();
                     if !completed.is_empty() {
-                        lines.push(line(
-                            LineKind::Reasoning,
-                            format!("[reasoning] {completed}"),
-                        ));
+                        lines.push(line(LineKind::Reasoning, format!("think │ {completed}")));
                     }
                 }
             }
             AgentEvent::OperationQueued { .. } => {
-                lines.push(line(
-                    LineKind::Notice,
-                    "queued: waiting for the active turn",
-                ));
+                lines.push(line(LineKind::Notice, "queued behind the active turn"));
             }
             AgentEvent::OperationStarted { operation_id } => {
                 if verbose {
@@ -194,7 +188,7 @@ impl Transcript {
                 if verbose {
                     lines.push(line(
                         LineKind::Tool,
-                        format!("tool batch {tool_batch_id}: {call_count} call(s)"),
+                        format!("▸ batch {tool_batch_id}  {call_count} call(s)"),
                     ));
                 }
             }
@@ -208,11 +202,11 @@ impl Transcript {
                 if verbose {
                     lines.push(line(
                         LineKind::Tool,
-                        format!(
-                            "tool {}/{} {tool_name} arguments: {arguments}",
-                            index + 1,
-                            self.tool_batch_size,
-                        ),
+                        format!("▸ {tool_name}  {}/{}", index + 1, self.tool_batch_size),
+                    ));
+                    lines.push(line(
+                        LineKind::Tool,
+                        format!("  args  {}", compact_args(arguments)),
                     ));
                 }
             }
@@ -224,22 +218,24 @@ impl Transcript {
             } => {
                 self.flush_reasoning(&mut lines);
                 if verbose {
-                    let full = match result {
-                        philo_agent_runtime::ToolResult::Success { content } => content.clone(),
+                    let (label, full) = match result {
+                        philo_agent_runtime::ToolResult::Success { content } => {
+                            ("ok", content.clone())
+                        }
                         philo_agent_runtime::ToolResult::Error { code, message } => {
-                            format!("[{code}] {message}")
+                            ("error", format!("[{code}] {message}"))
                         }
                     };
-                    lines.push(line(LineKind::Tool, format!("tool {tool_name} result:")));
+                    lines.push(line(LineKind::Tool, format!("▸ {tool_name}  {label}")));
                     lines.extend(
                         full.lines()
                             .map(|result_line| line(LineKind::Tool, format!("  {result_line}"))),
                     );
                     if let Some(display) = display {
                         if !display.detail().is_empty() {
-                            lines.push(line(LineKind::Tool, "detail:"));
+                            lines.push(line(LineKind::Tool, "  detail"));
                             lines.extend(display.detail().lines().map(|detail_line| {
-                                line(LineKind::Tool, format!("  {detail_line}"))
+                                line(LineKind::Tool, format!("    {detail_line}"))
                             }));
                         }
                         if !display.facts().is_empty() {
@@ -248,23 +244,23 @@ impl Transcript {
                                 .iter()
                                 .map(|fact| format!("{}={}", fact.name(), fact.value()))
                                 .collect::<Vec<_>>()
-                                .join(" ");
-                            lines.push(line(LineKind::Tool, format!("facts: {facts}")));
+                                .join("  ");
+                            lines.push(line(LineKind::Tool, format!("  facts  {facts}")));
                         }
                     }
                 } else {
                     let summary = match result {
                         philo_agent_runtime::ToolResult::Success { content } => {
-                            format!("ok: {}", preview(content, 80))
+                            format!("ok · {}", preview(content, 80))
                         }
                         philo_agent_runtime::ToolResult::Error { code, message } => {
-                            format!("error {code}: {}", preview(message, 80))
+                            format!("error {code} · {}", preview(message, 80))
                         }
                     };
                     lines.push(line(
                         LineKind::Tool,
                         text::truncate(
-                            &format!("  {tool_name} -> {summary}"),
+                            &format!("▸ {tool_name}  {summary}"),
                             DEFAULT_TOOL_SUMMARY_WIDTH,
                         ),
                     ));
@@ -281,14 +277,14 @@ impl Transcript {
                     lines.push(line(
                         LineKind::Notice,
                         format!(
-                            "notice: previous turn {turn_id} did not end cleanly and was \
-                             sealed; its tool calls may have executed without recorded results"
+                            "previous turn {turn_id} did not end cleanly and was sealed; \
+                             its tool calls may have executed without recorded results"
                         ),
                     ));
                 } else {
                     lines.push(line(
                         LineKind::Notice,
-                        "notice: a previous turn did not end cleanly and was sealed; its tool \
+                        "previous turn did not end cleanly and was sealed; its tool \
                          calls may have executed without recorded results",
                     ));
                 }
@@ -309,10 +305,7 @@ impl Transcript {
             AgentEvent::ContextCompactionFailed { message } => {
                 lines.push(line(
                     LineKind::Error,
-                    format!(
-                        "warning: context compaction failed: {message}; continuing without \
-                         compaction"
-                    ),
+                    format!("compaction failed: {message}; continuing without compaction"),
                 ));
             }
             AgentEvent::CancellationRequested { reason, .. } => {
@@ -335,11 +328,7 @@ impl Transcript {
                 lines.extend(self.flush_partial());
                 lines.push(line(
                     LineKind::Error,
-                    format!(
-                        "error: turn failed ({:?}): {}",
-                        failure.kind(),
-                        failure.message(),
-                    ),
+                    format!("turn failed ({:?}): {}", failure.kind(), failure.message()),
                 ));
             }
             AgentEvent::OperationSettled {
@@ -387,6 +376,19 @@ pub(crate) fn preview(text: &str, max_width: usize) -> String {
     let flat = text.replace(['\n', '\r'], " ");
     let flat = flat.trim();
     text::truncate(flat, max_width)
+}
+
+/// Flattens a JSON-looking argument object into `key: value` pairs.
+pub(crate) fn compact_args(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('{')
+        .and_then(|text| text.strip_suffix('}'))
+    else {
+        return preview(trimmed, 80);
+    };
+    let compact = inner.replace('"', "").replace(',', "  ").replace(':', ": ");
+    preview(&compact, 80)
 }
 
 #[cfg(test)]

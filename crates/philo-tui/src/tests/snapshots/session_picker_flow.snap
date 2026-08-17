@@ -1,30 +1,28 @@
 ---
 source: crates/philo-tui/src/driver/host_effects.rs
-description: lazy session preview and history switch flow
-assertion_line: 341
 expression: "format!(\"FIRST\\n{first}\\n\\nSECOND\\n{second}\\n\\nSWITCHED\\n{}\",\nhistory.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join(\"\\n\"))"
 ---
 FIRST
-sessions (1/2)
+sessions  1/2
 > s-1                    | > count the files
-  s-2                    | tool read_file({"path":"src/main.rs"})
-                         | -> ok: fn main() {}
+  s-2                    | ▸ read_file  path: src/main.rs
+                         | └ ok · fn main() {}
                          | one file
                          |
-Enter switch | Up/Down select | Esc close
+enter switch  ·  ↑↓ select  ·  esc close
 
 SECOND
-sessions (2/2)
+sessions  2/2
   s-1                    | > count the files
-> s-2                    | tool read_file({"path":"src/main.rs"})
-                         | -> ok: fn main() {}
+> s-2                    | ▸ read_file  path: src/main.rs
+                         | └ ok · fn main() {}
                          | one file
                          |
-Enter switch | Up/Down select | Esc close
+enter switch  ·  ↑↓ select  ·  esc close
 
 SWITCHED
 session s-2
 > count the files
-tool read_file({"path":"src/main.rs"})
-  -> ok: fn main() {}
+▸ read_file  path: src/main.rs
+  └ ok · fn main() {}
 one file

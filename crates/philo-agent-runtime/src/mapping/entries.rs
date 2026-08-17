@@ -74,7 +74,16 @@ pub(crate) fn success_entries(
     Ok(vec![
         session::SessionEntryKind::AssistantMessage {
             turn_id: session::TurnId::new(turn_id.as_str()),
-            content: output.text().to_owned(),
+            blocks: output
+                .blocks()
+                .iter()
+                .filter_map(|block| match block {
+                    kernel::AssistantBlock::Text { text } => {
+                        Some(session::SessionAssistantBlock::Text { text: text.clone() })
+                    }
+                    kernel::AssistantBlock::ToolCall(_) => None,
+                })
+                .collect(),
         },
         session::SessionEntryKind::TurnTerminated {
             turn_id: session::TurnId::new(turn_id.as_str()),
@@ -117,25 +126,31 @@ pub(crate) fn failure_entries(
     ])
 }
 
-/// The durable record of one accepted tool-call batch.
+/// The durable record of one accepted tool-call batch, including any
+/// interleaved text blocks from the same model call.
 pub(crate) fn batch_entry(
     turn_id: &TurnId,
     model_call_id: &kernel::ModelCallId,
     batch_id: &kernel::ToolBatchId,
-    calls: &[kernel::KernelToolCall],
+    blocks: &[kernel::AssistantBlock],
 ) -> session::SessionEntryKind {
     session::SessionEntryKind::AssistantToolCallBatch {
         turn_id: session::TurnId::new(turn_id.as_str()),
         model_call_id: model_call_id.as_str().to_owned(),
         tool_batch_id: session::ToolBatchId::new(batch_id.as_str()),
-        calls: calls
+        blocks: blocks
             .iter()
-            .map(|call| {
-                session::SessionToolCall::new(
-                    session::ToolCallId::new(call.id().as_str()),
-                    call.name(),
-                    call.arguments(),
-                )
+            .map(|block| match block {
+                kernel::AssistantBlock::Text { text } => {
+                    session::SessionAssistantBlock::Text { text: text.clone() }
+                }
+                kernel::AssistantBlock::ToolCall(call) => {
+                    session::SessionAssistantBlock::ToolCall(session::SessionToolCall::new(
+                        session::ToolCallId::new(call.id().as_str()),
+                        call.name(),
+                        call.arguments(),
+                    ))
+                }
             })
             .collect(),
     }

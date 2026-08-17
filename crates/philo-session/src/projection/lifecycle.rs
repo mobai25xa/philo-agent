@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::entry::{
-    CancelReason, OperationId, OperationOutcome, SessionEntryKind, SessionUserPart, ToolBatchId,
-    ToolCallId, TurnFailure, TurnId, TurnOutcome,
+    CancelReason, OperationId, OperationOutcome, SessionAssistantBlock, SessionEntryKind,
+    SessionUserPart, ToolBatchId, ToolCallId, TurnFailure, TurnId, TurnOutcome,
 };
 use crate::error::{SessionError, SessionValidationError, validation};
 use crate::tool_entry::ToolResultOutcome;
@@ -156,16 +156,27 @@ impl LifecycleProjection {
             SessionEntryKind::AssistantToolCallBatch {
                 turn_id,
                 tool_batch_id,
-                calls,
+                blocks,
                 ..
             } => {
                 let turn = self.active_turn_mut(turn_id)?;
+                let calls = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        SessionAssistantBlock::ToolCall(call) => Some(call),
+                        SessionAssistantBlock::Text { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
                 let unique = calls
                     .iter()
                     .map(|call| call.id())
                     .collect::<HashSet<_>>()
                     .len()
                     == calls.len();
+                let texts_nonempty = blocks.iter().all(|block| match block {
+                    SessionAssistantBlock::Text { text } => !text.is_empty(),
+                    SessionAssistantBlock::ToolCall(_) => true,
+                });
                 let batch_id_unused = turn
                     .tool_batches
                     .iter()
@@ -177,6 +188,7 @@ impl LifecycleProjection {
                     || !batch_id_unused
                     || calls.is_empty()
                     || !unique
+                    || !texts_nonempty
                 {
                     return validation(SessionValidationError::InvalidToolBatch {
                         turn_id: turn_id.clone(),
@@ -211,7 +223,16 @@ impl LifecycleProjection {
                 }
                 batch.results.push(result.call_id().clone());
             }
-            SessionEntryKind::AssistantMessage { turn_id, .. } => {
+            SessionEntryKind::AssistantMessage { turn_id, blocks } => {
+                let blocks_valid = blocks.iter().all(|block| match block {
+                    SessionAssistantBlock::Text { text } => !text.is_empty(),
+                    SessionAssistantBlock::ToolCall(_) => false,
+                });
+                if !blocks_valid {
+                    return validation(SessionValidationError::InvalidTurnReference {
+                        turn_id: turn_id.clone(),
+                    });
+                }
                 let turn = self.active_turn_mut(turn_id)?;
                 let tools_complete = turn.tool_rounds_complete();
                 if !turn.has_user_message || turn.failure.is_some() || !tools_complete {

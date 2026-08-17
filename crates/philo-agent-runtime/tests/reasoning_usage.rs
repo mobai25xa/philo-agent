@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelEvent, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, TokenUsage, UserMessage,
+    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelEvent,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, TokenUsage, UserMessage,
 };
 use philo_session::{MemorySessionStore, SessionStore};
 use support::fake_model::{FakeModel, ModelScript};
@@ -112,7 +112,11 @@ fn reasoning_deltas_are_forwarded_before_text_and_never_persisted() {
     assert_eq!(view.messages().len(), 2, "user and assistant only");
     assert!(matches!(
         &view.messages()[1],
-        philo_session::ContextMessage::Assistant { content } if content == "answer"
+        philo_session::ContextMessage::Assistant { blocks }
+            if matches!(
+                blocks.as_slice(),
+                [philo_session::SessionAssistantBlock::Text { text }] if text == "answer"
+            )
     ));
 }
 
@@ -126,7 +130,11 @@ fn usage_updates_are_forwarded_with_the_last_one_winning() {
         Ok(ModelEvent::UsageUpdated {
             usage: usage(10, 7),
         }),
-        Ok(ModelEvent::Completed),
+        Ok(ModelEvent::Completed {
+            blocks: vec![ModelAssistantBlock::Text {
+                text: "ok".to_owned(),
+            }],
+        }),
     ])]));
     let sessions = Arc::new(MemorySessionStore::new());
     let handle = block_on(
@@ -178,7 +186,11 @@ fn streams_without_new_events_keep_the_baseline_behavior() {
 fn reasoning_after_completed_is_an_invalid_stream() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::TextDelta("ok".to_owned())),
-        Ok(ModelEvent::Completed),
+        Ok(ModelEvent::Completed {
+            blocks: vec![ModelAssistantBlock::Text {
+                text: "ok".to_owned(),
+            }],
+        }),
         Ok(ModelEvent::ReasoningDelta {
             text: "late".to_owned(),
         }),
@@ -199,7 +211,11 @@ fn reasoning_after_completed_is_an_invalid_stream() {
 fn usage_after_completed_is_an_invalid_stream() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::TextDelta("ok".to_owned())),
-        Ok(ModelEvent::Completed),
+        Ok(ModelEvent::Completed {
+            blocks: vec![ModelAssistantBlock::Text {
+                text: "ok".to_owned(),
+            }],
+        }),
         Ok(ModelEvent::UsageUpdated { usage: usage(1, 1) }),
     ])]));
     let handle = block_on(

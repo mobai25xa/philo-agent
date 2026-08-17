@@ -129,7 +129,7 @@ fn session_dir(root: &TempRoot, encoded: &str) -> PathBuf {
 
 /// M8-001 + M8-002 + M8-008(v=1): an image-bearing turn completes a tool loop
 /// on the JSONL backend; the artifact is durable and content-addressed, the
-/// log lines stay small references under envelope v1.
+/// log lines stay small references under envelope v2.
 #[test]
 fn image_turn_completes_a_tool_loop_on_jsonl() {
     let root = TempRoot::new();
@@ -168,7 +168,7 @@ fn image_turn_completes_a_tool_loop_on_jsonl() {
     }
 
     // The artifact is durable under its content hash; the log carries only
-    // references and keeps envelope v1 (M8-002, M8-008).
+    // references and keeps envelope v2 (M8-002, M8-008).
     let dir = session_dir(&root, "s-m8-001");
     assert_eq!(
         std::fs::read(dir.join("artifacts").join(IMAGE_SHA256)).expect("artifact"),
@@ -176,7 +176,7 @@ fn image_turn_completes_a_tool_loop_on_jsonl() {
     );
     let log = std::fs::read_to_string(dir.join("log.jsonl")).expect("log");
     for line in log.lines() {
-        assert!(line.starts_with(r#"{"v":1,"#), "envelope v stays 1");
+        assert!(line.starts_with(r#"{"v":2,"#), "envelope v stays 2");
     }
     assert!(
         log.contains(&format!(r#""artifact":"{IMAGE_SHA256}""#)),

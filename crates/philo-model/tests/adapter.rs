@@ -9,16 +9,16 @@ use std::time::Duration;
 
 use http::header::{AUTHORIZATION, USER_AGENT};
 use philo_agent_runtime::{
-    ModelEvent, ModelMessage, ModelPort, ModelToolCall, ModelToolResultOutcome, ToolCallId,
-    UserPart,
+    ModelAssistantBlock, ModelEvent, ModelMessage, ModelPort, ModelToolCall,
+    ModelToolResultOutcome, ToolCallId, UserPart,
 };
 use philo_model::{
     DEFAULT_USER_AGENT, ModelCompat, ModelProtocol, ModelRequestHeaders, PhiloModelAdapter,
     TimeoutPolicy,
 };
 use support::{
-    StubResponse, StubTransport, adapter_over, collect, collect_ok, read_tool_definition, snapshot,
-    sse, text_sse,
+    StubResponse, StubTransport, adapter_over, assistant_text, assistant_tool_calls, collect,
+    collect_ok, completed_text, read_tool_definition, snapshot, sse, text_sse,
 };
 
 fn user(content: &str) -> ModelMessage {
@@ -45,9 +45,7 @@ async fn request_maps_system_history_tools_and_generation() {
             vec![
                 system("be helpful"),
                 user("hello"),
-                ModelMessage::Assistant {
-                    content: "earlier answer".to_owned(),
-                },
+                assistant_text("earlier answer"),
                 user("again"),
             ],
             vec![read_tool_definition()],
@@ -125,20 +123,18 @@ async fn request_maps_tool_transcript_messages() {
         .start(snapshot(
             vec![
                 user("read two files"),
-                ModelMessage::AssistantToolCalls {
-                    calls: vec![
-                        ModelToolCall {
-                            tool_call_id: ToolCallId::new("call-a"),
-                            name: "read".to_owned(),
-                            arguments: r#"{"path":"a.txt"}"#.to_owned(),
-                        },
-                        ModelToolCall {
-                            tool_call_id: ToolCallId::new("call-b"),
-                            name: "read".to_owned(),
-                            arguments: r#"{"path":"b.txt"}"#.to_owned(),
-                        },
-                    ],
-                },
+                assistant_tool_calls([
+                    ModelToolCall {
+                        tool_call_id: ToolCallId::new("call-a"),
+                        name: "read".to_owned(),
+                        arguments: r#"{"path":"a.txt"}"#.to_owned(),
+                    },
+                    ModelToolCall {
+                        tool_call_id: ToolCallId::new("call-b"),
+                        name: "read".to_owned(),
+                        arguments: r#"{"path":"b.txt"}"#.to_owned(),
+                    },
+                ]),
                 ModelMessage::ToolResult {
                     tool_call_id: ToolCallId::new("call-a"),
                     outcome: ModelToolResultOutcome::Success {
@@ -198,13 +194,11 @@ async fn empty_tool_success_text_maps_to_placeholder() {
         .start(snapshot(
             vec![
                 user("read the empty file"),
-                ModelMessage::AssistantToolCalls {
-                    calls: vec![ModelToolCall {
-                        tool_call_id: ToolCallId::new("call-1"),
-                        name: "read".to_owned(),
-                        arguments: "{}".to_owned(),
-                    }],
-                },
+                assistant_tool_calls([ModelToolCall {
+                    tool_call_id: ToolCallId::new("call-1"),
+                    name: "read".to_owned(),
+                    arguments: "{}".to_owned(),
+                }]),
                 ModelMessage::ToolResult {
                     tool_call_id: ToolCallId::new("call-1"),
                     outcome: ModelToolResultOutcome::Success {
@@ -248,13 +242,11 @@ async fn invalid_raw_arguments_replay_degraded_to_empty_object() {
         .start(snapshot(
             vec![
                 user("go"),
-                ModelMessage::AssistantToolCalls {
-                    calls: vec![ModelToolCall {
-                        tool_call_id: ToolCallId::new("call-1"),
-                        name: "read".to_owned(),
-                        arguments: "this is not json".to_owned(),
-                    }],
-                },
+                assistant_tool_calls([ModelToolCall {
+                    tool_call_id: ToolCallId::new("call-1"),
+                    name: "read".to_owned(),
+                    arguments: "this is not json".to_owned(),
+                }]),
                 ModelMessage::ToolResult {
                     tool_call_id: ToolCallId::new("call-1"),
                     outcome: ModelToolResultOutcome::Error {
@@ -320,7 +312,7 @@ async fn text_stream_normalizes_started_deltas_and_unique_completed() {
             },
             ModelEvent::TextDelta("Hel".to_owned()),
             ModelEvent::TextDelta("lo".to_owned()),
-            ModelEvent::Completed,
+            completed_text("Hello"),
         ]
     );
 }
@@ -385,8 +377,104 @@ async fn tool_call_stream_aggregates_interleaved_blocks_in_source_order() {
                 name: None,
                 arguments: "}".to_owned(),
             },
-            ModelEvent::Completed,
+            ModelEvent::Completed {
+                blocks: vec![
+                    ModelAssistantBlock::ToolCall(ModelToolCall {
+                        tool_call_id: ToolCallId::new("call-a"),
+                        name: "read".to_owned(),
+                        arguments: r#"{"path":"a.txt"}"#.to_owned(),
+                    }),
+                    ModelAssistantBlock::ToolCall(ModelToolCall {
+                        tool_call_id: ToolCallId::new("call-b"),
+                        name: "read".to_owned(),
+                        arguments: r#"{"path":"b.txt"}"#.to_owned(),
+                    }),
+                ],
+            },
         ]
+    );
+}
+
+#[tokio::test]
+async fn mixed_text_and_tool_completes_as_ordered_blocks_and_replays_as_one_assistant() {
+    let head = r#"{"id":"resp-mix","object":"chat.completion.chunk","model":"stub-gpt","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#;
+    let text =
+        r#"{"choices":[{"index":0,"delta":{"content":"Let me look"},"finish_reason":null}]}"#;
+    let start = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#;
+    let args = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":null}]}"#;
+    let finish = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+    let transport = StubTransport::new([
+        StubResponse::Sse(sse(&[head, text, start, args, finish, "[DONE]"])),
+        StubResponse::Sse(text_sse("resp-2", "stub-gpt", &["done"])),
+    ]);
+    let adapter = adapter_over(transport.clone());
+    let events = collect_ok(
+        adapter
+            .start(snapshot(
+                vec![user("look this up")],
+                vec![read_tool_definition()],
+            ))
+            .await
+            .expect("mixed call starts"),
+    )
+    .await;
+    let Some(ModelEvent::Completed { blocks }) = events.last() else {
+        panic!("expected Completed with blocks, got {:?}", events.last());
+    };
+    assert_eq!(
+        blocks,
+        &vec![
+            ModelAssistantBlock::Text {
+                text: "Let me look".to_owned(),
+            },
+            ModelAssistantBlock::ToolCall(ModelToolCall {
+                tool_call_id: ToolCallId::new("call-1"),
+                name: "read".to_owned(),
+                arguments: r#"{"path":"a.txt"}"#.to_owned(),
+            }),
+        ]
+    );
+
+    collect_ok(
+        adapter
+            .start(snapshot(
+                vec![
+                    user("look this up"),
+                    ModelMessage::Assistant {
+                        blocks: blocks.clone(),
+                    },
+                    ModelMessage::ToolResult {
+                        tool_call_id: ToolCallId::new("call-1"),
+                        outcome: ModelToolResultOutcome::Success {
+                            content: "alpha".to_owned(),
+                        },
+                    },
+                ],
+                vec![read_tool_definition()],
+            ))
+            .await
+            .expect("replay call starts"),
+    )
+    .await;
+
+    let body = &transport.request_bodies()[1];
+    let assistants: Vec<&serde_json::Value> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "text and tool stay one assistant message: {assistants:?}"
+    );
+    assert_eq!(assistants[0]["content"][0]["text"], "Let me look");
+    assert_eq!(assistants[0]["tool_calls"][0]["id"], "call-1");
+    assert_eq!(assistants[0]["tool_calls"][0]["function"]["name"], "read");
+    assert_eq!(
+        assistants[0]["tool_calls"][0]["function"]["arguments"],
+        r#"{"path":"a.txt"}"#
     );
 }
 
@@ -424,7 +512,7 @@ async fn usage_updates_are_forwarded_in_the_normalized_stream() {
                     ..philo_agent_runtime::TokenUsage::default()
                 },
             },
-            ModelEvent::Completed,
+            completed_text("ok"),
         ],
         "usage maps onto the runtime TokenUsage; block boundaries stay dropped"
     );
@@ -455,7 +543,7 @@ async fn mid_stream_decode_error_terminates_without_completed() {
     assert!(
         !events
             .iter()
-            .any(|event| event == &Ok(ModelEvent::Completed)),
+            .any(|event| matches!(event, Ok(ModelEvent::Completed { .. }))),
         "no Completed after a mid-stream error"
     );
 }

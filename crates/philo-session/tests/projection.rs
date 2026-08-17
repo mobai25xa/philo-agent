@@ -5,10 +5,10 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
 use philo_session::{
-    EntryId, MemorySessionStore, OperationId, OperationOutcome, SessionEntry, SessionEntryKind,
-    SessionError, SessionId, SessionProjection, SessionRevision, SessionStore, SessionToolCall,
-    SessionToolResult, SessionTransaction, SessionUserPart, SessionValidationError, ToolBatchId,
-    ToolCallId, TurnId, TurnOutcome,
+    EntryId, MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock,
+    SessionEntry, SessionEntryKind, SessionError, SessionId, SessionProjection, SessionRevision,
+    SessionStore, SessionToolCall, SessionToolResult, SessionTransaction, SessionUserPart,
+    SessionValidationError, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -55,11 +55,11 @@ fn batch_transaction(revision: SessionRevision) -> SessionTransaction {
             turn_id: TurnId::new("turn-1"),
             model_call_id: "model-call-1".to_owned(),
             tool_batch_id: ToolBatchId::new("batch-1"),
-            calls: vec![SessionToolCall::new(
+            blocks: vec![SessionAssistantBlock::ToolCall(SessionToolCall::new(
                 ToolCallId::new("call-1"),
                 "read",
                 r#"{"path":"a.txt"}"#,
-            )],
+            ))],
         }],
     )
 }
@@ -83,7 +83,9 @@ fn settle_transaction(revision: SessionRevision) -> SessionTransaction {
         vec![
             SessionEntryKind::AssistantMessage {
                 turn_id: TurnId::new("turn-1"),
-                content: "done".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "done".into(),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id: TurnId::new("turn-1"),

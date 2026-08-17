@@ -1,4 +1,4 @@
-//! JSONL-001: golden schema v1 format, recovery, locking, and backend parity.
+//! JSONL-001: golden schema v2 format, recovery, locking, and backend parity.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_session::{
-    MemorySessionStore, OperationId, OperationOutcome, SessionEntryKind, SessionError, SessionId,
-    SessionRevision, SessionStore, SessionToolCall, SessionToolResult, SessionTransaction,
-    SessionUserPart, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
+    MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock, SessionEntryKind,
+    SessionError, SessionId, SessionRevision, SessionStore, SessionToolCall, SessionToolResult,
+    SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
 
@@ -78,11 +78,16 @@ fn batch_transaction(revision: u64) -> SessionTransaction {
             turn_id: TurnId::new("turn-1"),
             model_call_id: "model-call-1".to_owned(),
             tool_batch_id: ToolBatchId::new("batch-1"),
-            calls: vec![SessionToolCall::new(
-                ToolCallId::new("call-1"),
-                "read",
-                r#"{"path":"a.txt"}"#,
-            )],
+            blocks: vec![
+                SessionAssistantBlock::Text {
+                    text: "I'll read that.".to_owned(),
+                },
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-1"),
+                    "read",
+                    r#"{"path":"a.txt"}"#,
+                )),
+            ],
         }],
     )
 }
@@ -110,7 +115,9 @@ fn settle_transaction(revision: u64) -> SessionTransaction {
         vec![
             SessionEntryKind::AssistantMessage {
                 turn_id: TurnId::new("turn-1"),
-                content: "done".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "done".to_owned(),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id: TurnId::new("turn-1"),
@@ -142,7 +149,7 @@ fn log_path(root: &TempRoot) -> PathBuf {
 // --- Golden format (M5-007 schema pinning) ----------------------------------
 
 #[test]
-fn golden_schema_v1_format_and_directory_encoding() {
+fn golden_schema_v2_format_and_directory_encoding() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     commit_full_turn(&store);
@@ -157,19 +164,19 @@ fn golden_schema_v1_format_and_directory_encoding() {
     assert_eq!(lines.len(), 4);
     assert_eq!(
         lines[0],
-        r#"{"v":1,"revision":1,"entries":[{"id":"golden:entry:1","kind":{"type":"operation_started","operation_id":"op-1"}},{"id":"golden:entry:2","parent":"golden:entry:1","kind":{"type":"turn_started","operation_id":"op-1","turn_id":"turn-1"}},{"id":"golden:entry:3","parent":"golden:entry:2","kind":{"type":"user_message","turn_id":"turn-1","parts":[{"type":"text","text":"read a.txt"}]}}]}"#
+        r#"{"v":2,"revision":1,"entries":[{"id":"golden:entry:1","kind":{"type":"operation_started","operation_id":"op-1"}},{"id":"golden:entry:2","parent":"golden:entry:1","kind":{"type":"turn_started","operation_id":"op-1","turn_id":"turn-1"}},{"id":"golden:entry:3","parent":"golden:entry:2","kind":{"type":"user_message","turn_id":"turn-1","parts":[{"type":"text","text":"read a.txt"}]}}]}"#
     );
     assert_eq!(
         lines[1],
-        r#"{"v":1,"revision":2,"entries":[{"id":"golden:entry:4","parent":"golden:entry:3","kind":{"type":"assistant_tool_call_batch","turn_id":"turn-1","model_call_id":"model-call-1","tool_batch_id":"batch-1","calls":[{"id":"call-1","name":"read","arguments":"{\"path\":\"a.txt\"}"}]}}]}"#
+        r#"{"v":2,"revision":2,"entries":[{"id":"golden:entry:4","parent":"golden:entry:3","kind":{"type":"assistant_tool_call_batch","turn_id":"turn-1","model_call_id":"model-call-1","tool_batch_id":"batch-1","blocks":[{"type":"text","text":"I'll read that."},{"type":"tool_call","id":"call-1","name":"read","arguments":"{\"path\":\"a.txt\"}"}]}}]}"#
     );
     assert_eq!(
         lines[2],
-        r#"{"v":1,"revision":3,"entries":[{"id":"golden:entry:5","parent":"golden:entry:4","kind":{"type":"tool_result","turn_id":"turn-1","tool_batch_id":"batch-1","result":{"call_id":"call-1","status":"error","code":"not_found","message":"file not found"}}}]}"#
+        r#"{"v":2,"revision":3,"entries":[{"id":"golden:entry:5","parent":"golden:entry:4","kind":{"type":"tool_result","turn_id":"turn-1","tool_batch_id":"batch-1","result":{"call_id":"call-1","status":"error","code":"not_found","message":"file not found"}}}]}"#
     );
     assert_eq!(
         lines[3],
-        r#"{"v":1,"revision":4,"entries":[{"id":"golden:entry:6","parent":"golden:entry:5","kind":{"type":"assistant_message","turn_id":"turn-1","content":"done"}},{"id":"golden:entry:7","parent":"golden:entry:6","kind":{"type":"turn_terminated","turn_id":"turn-1","outcome":"succeeded"}},{"id":"golden:entry:8","parent":"golden:entry:7","kind":{"type":"operation_settled","operation_id":"op-1","outcome":"succeeded"}}]}"#
+        r#"{"v":2,"revision":4,"entries":[{"id":"golden:entry:6","parent":"golden:entry:5","kind":{"type":"assistant_message","turn_id":"turn-1","blocks":[{"type":"text","text":"done"}]}},{"id":"golden:entry:7","parent":"golden:entry:6","kind":{"type":"turn_terminated","turn_id":"turn-1","outcome":"succeeded"}},{"id":"golden:entry:8","parent":"golden:entry:7","kind":{"type":"operation_settled","operation_id":"op-1","outcome":"succeeded"}}]}"#
     );
 }
 
@@ -250,7 +257,7 @@ fn torn_tail_is_truncated_reported_and_appendable() {
     // Simulate a crash mid-append: a partial line without a terminator.
     let intact_len = std::fs::metadata(log_path(&root)).expect("meta").len();
     let mut bytes = std::fs::read(log_path(&root)).expect("read");
-    bytes.extend_from_slice(br#"{"v":1,"revision":3,"entr"#);
+    bytes.extend_from_slice(br#"{"v":2,"revision":3,"entr"#);
     std::fs::write(log_path(&root), &bytes).expect("write torn tail");
 
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
@@ -281,7 +288,7 @@ fn torn_json_with_terminator_at_eof_is_crash_residue() {
         block_on(store.commit(start_transaction(0))).expect("commit");
     }
     let mut bytes = std::fs::read(log_path(&root)).expect("read");
-    bytes.extend_from_slice(b"{\"v\":1,\"revision\":2\n");
+    bytes.extend_from_slice(b"{\"v\":2,\"revision\":2\n");
     std::fs::write(log_path(&root), &bytes).expect("write");
 
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
@@ -345,20 +352,22 @@ fn revision_discontinuity_is_corruption() {
 #[test]
 fn unsupported_schema_version_refuses_to_open() {
     let root = TempRoot::new();
-    {
-        let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0))).expect("commit");
-    }
-    let log = std::fs::read_to_string(log_path(&root)).expect("read");
-    std::fs::write(log_path(&root), log.replace("{\"v\":1,", "{\"v\":2,")).expect("write");
+    let dir = root.path.join("s-golden");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("log.jsonl"),
+        concat!(
+            r#"{"v":1,"revision":1,"entries":[{"id":"golden:entry:1","kind":{"type":"operation_started","operation_id":"op-1"}}]}"#,
+            "\n",
+        ),
+    )
+    .expect("write v1 file");
 
-    let reopened = JsonlSessionStore::open(&root.path).expect("open store");
-    let error = reopened
-        .recover_session(&session_id())
-        .expect_err("refused");
+    let store = JsonlSessionStore::open(&root.path).expect("open store");
+    let error = store.recover_session(&session_id()).expect_err("refused");
     assert!(matches!(
         error,
-        JsonlOpenError::UnsupportedSchema { found: 2 }
+        JsonlOpenError::UnsupportedSchema { found: 1 }
     ));
 }
 

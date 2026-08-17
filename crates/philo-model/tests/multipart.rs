@@ -6,7 +6,9 @@ mod support;
 use philo_agent_runtime::{
     ModelMessage, ModelPort, ModelToolCall, ModelToolResultOutcome, ToolCallId, UserPart,
 };
-use support::{StubResponse, StubTransport, adapter_over, collect_ok, snapshot, text_sse};
+use support::{
+    StubResponse, StubTransport, adapter_over, assistant_tool_calls, collect_ok, snapshot, text_sse,
+};
 
 /// Image bytes `abc`; base64 `YWJj`.
 const IMAGE_BYTES: &[u8] = b"abc";
@@ -96,13 +98,11 @@ async fn multipart_history_replays_in_later_round_requests() {
         .start(snapshot(
             vec![
                 mixed_user(),
-                ModelMessage::AssistantToolCalls {
-                    calls: vec![ModelToolCall {
-                        tool_call_id: ToolCallId::new("call-1"),
-                        name: "read".to_owned(),
-                        arguments: r#"{"path":"a.txt"}"#.to_owned(),
-                    }],
-                },
+                assistant_tool_calls([ModelToolCall {
+                    tool_call_id: ToolCallId::new("call-1"),
+                    name: "read".to_owned(),
+                    arguments: r#"{"path":"a.txt"}"#.to_owned(),
+                }]),
                 ModelMessage::ToolResult {
                     tool_call_id: ToolCallId::new("call-1"),
                     outcome: ModelToolResultOutcome::Success {

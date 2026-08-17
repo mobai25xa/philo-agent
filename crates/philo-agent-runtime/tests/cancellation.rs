@@ -586,7 +586,11 @@ fn cancel_after_final_decision_is_a_no_op() {
             .unwrap()
             .messages()
             .last(),
-        Some(ContextMessage::Assistant { content }) if content == "fin"
+        Some(ContextMessage::Assistant { blocks })
+            if matches!(
+                blocks.as_slice(),
+                [philo_session::SessionAssistantBlock::Text { text }] if text == "fin"
+            )
     ));
 }
 

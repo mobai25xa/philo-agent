@@ -4,7 +4,9 @@
 mod support;
 
 use philo_agent_runtime::{ModelMessage, ModelPort, UserPart};
-use support::{StubResponse, StubTransport, adapter_over, collect_ok, snapshot, text_sse};
+use support::{
+    StubResponse, StubTransport, adapter_over, assistant_text, collect_ok, snapshot, text_sse,
+};
 
 fn system(content: &str) -> ModelMessage {
     ModelMessage::System {
@@ -35,9 +37,7 @@ async fn compacted_history_places_summary_after_system_and_preserves_tail_order(
                 system("main system prompt"),
                 summary("The user chose the compact layout."),
                 user("What did I choose?"),
-                ModelMessage::Assistant {
-                    content: "The compact layout.".to_owned(),
-                },
+                assistant_text("The compact layout."),
                 user("Continue."),
             ],
             Vec::new(),

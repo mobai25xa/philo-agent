@@ -12,8 +12,8 @@ use philo_agent_runtime::{
 };
 use philo_model::{ChatReasoningFormat, ModelCompat, ModelProtocol, PhiloModelAdapter};
 use support::{
-    StubResponse, StubTransport, adapter_over, collect_ok, read_tool_definition,
-    reasoning_snapshot, snapshot, sse, text_sse,
+    StubResponse, StubTransport, adapter_over, assistant_tool_calls, collect_ok,
+    read_tool_definition, reasoning_snapshot, snapshot, sse, text_sse,
 };
 
 fn user(content: &str) -> ModelMessage {
@@ -49,13 +49,11 @@ fn reasoning_tool_call_body() -> Vec<u8> {
 fn second_call_messages() -> Vec<ModelMessage> {
     vec![
         user("go"),
-        ModelMessage::AssistantToolCalls {
-            calls: vec![ModelToolCall {
-                tool_call_id: ToolCallId::new("call-1"),
-                name: "read".to_owned(),
-                arguments: r#"{"path":"a.txt"}"#.to_owned(),
-            }],
-        },
+        assistant_tool_calls([ModelToolCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"a.txt"}"#.to_owned(),
+        }]),
         ModelMessage::ToolResult {
             tool_call_id: ToolCallId::new("call-1"),
             outcome: ModelToolResultOutcome::Success {
@@ -106,7 +104,7 @@ async fn reasoning_stream_normalizes_to_transient_reasoning_events() {
         last_reasoning < tool_delta,
         "reasoning precedes the tool call"
     );
-    assert!(matches!(events.last(), Some(ModelEvent::Completed)));
+    assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
 }
 
 // --- M7-002: same-turn replay and cross-turn isolation --------------------------

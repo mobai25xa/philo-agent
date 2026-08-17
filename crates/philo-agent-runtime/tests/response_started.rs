@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelError, ModelEvent,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelError,
+    ModelEvent, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition,
+    UserMessage,
 };
 use philo_session::MemorySessionStore;
 use support::fake_model::{FakeModel, ModelScript};
@@ -225,7 +226,11 @@ fn duplicate_response_started_fails_the_operation() {
             response_id: Some("resp-2".to_owned()),
         }),
         Ok(ModelEvent::TextDelta("hi".to_owned())),
-        Ok(ModelEvent::Completed),
+        Ok(ModelEvent::Completed {
+            blocks: vec![ModelAssistantBlock::Text {
+                text: "hi".to_owned(),
+            }],
+        }),
     ])]));
     let handle = block_on(
         direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
@@ -242,7 +247,11 @@ fn duplicate_response_started_fails_the_operation() {
 fn response_started_after_completed_fails_the_operation() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::TextDelta("hi".to_owned())),
-        Ok(ModelEvent::Completed),
+        Ok(ModelEvent::Completed {
+            blocks: vec![ModelAssistantBlock::Text {
+                text: "hi".to_owned(),
+            }],
+        }),
         Ok(ModelEvent::ResponseStarted {
             response_model: None,
             response_id: None,

@@ -4,7 +4,9 @@
 //!
 //! This is session replay, not the composer's input-history recall.
 
-use philo_session::{ContextMessage, SessionContextView, SessionUserPart, ToolResultOutcome};
+use philo_session::{
+    ContextMessage, SessionAssistantBlock, SessionContextView, SessionUserPart, ToolResultOutcome,
+};
 
 use super::transcript::{LineKind, TranscriptLine, compact_args, line, preview};
 
@@ -44,19 +46,8 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
             lines.extend(parts.iter().map(user_part_line));
             lines
         }
-        ContextMessage::Assistant { content } => content
-            .split('\n')
-            .map(|text| line(LineKind::Answer, text.to_owned()))
-            .collect(),
-        ContextMessage::AssistantToolCalls { calls, .. } => calls
-            .iter()
-            .map(|call| {
-                line(
-                    LineKind::Tool,
-                    format!("▸ {}  {}", call.name(), compact_args(call.arguments())),
-                )
-            })
-            .collect(),
+        ContextMessage::Assistant { blocks } => assistant_block_lines(blocks, false),
+        ContextMessage::AssistantToolCalls { blocks, .. } => assistant_block_lines(blocks, true),
         ContextMessage::ToolResult { outcome, .. } => {
             // Replay keeps the older `ok · {content}` summary: ToolDisplay
             // is not durable, so live cards cannot be reconstructed.
@@ -66,6 +57,27 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
             )]
         }
     }
+}
+
+fn assistant_block_lines(
+    blocks: &[SessionAssistantBlock],
+    include_tool_calls: bool,
+) -> Vec<TranscriptLine> {
+    let mut lines = Vec::new();
+    for block in blocks {
+        match block {
+            SessionAssistantBlock::Text { text } => lines.extend(
+                text.split('\n')
+                    .map(|text| line(LineKind::Answer, text.to_owned())),
+            ),
+            SessionAssistantBlock::ToolCall(call) if include_tool_calls => lines.push(line(
+                LineKind::Tool,
+                format!("▸ {}  {}", call.name(), compact_args(call.arguments())),
+            )),
+            SessionAssistantBlock::ToolCall(_) => {}
+        }
+    }
+    lines
 }
 
 fn user_part_line(part: &SessionUserPart) -> TranscriptLine {
@@ -121,6 +133,37 @@ mod tests {
         assert_eq!(
             texts,
             ["You", "  look at this", "  [image image/png, 4 bytes]"]
+        );
+    }
+
+    #[test]
+    fn tool_batch_renders_text_and_calls_in_block_order() {
+        use philo_session::{SessionToolCall, ToolBatchId, ToolCallId};
+
+        let lines = message_lines(&ContextMessage::AssistantToolCalls {
+            tool_batch_id: ToolBatchId::new("batch"),
+            blocks: vec![
+                SessionAssistantBlock::Text {
+                    text: "let me look\nthen call".to_owned(),
+                },
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("c"),
+                    "read_file",
+                    r#"{"path":"src/main.rs"}"#,
+                )),
+                SessionAssistantBlock::Text {
+                    text: "after".to_owned(),
+                },
+            ],
+        });
+        assert_eq!(
+            lines,
+            [
+                line(LineKind::Answer, "let me look"),
+                line(LineKind::Answer, "then call"),
+                line(LineKind::Tool, "▸ read_file  path: src/main.rs"),
+                line(LineKind::Answer, "after"),
+            ]
         );
     }
 

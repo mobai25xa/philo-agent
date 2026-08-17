@@ -1,10 +1,10 @@
 //! Model-visible context projection of the active linear path.
 
 use crate::entry::{
-    EntryId, OperationId, SessionId, SessionRevision, SessionUserPart, ToolBatchId, ToolCallId,
-    TurnId,
+    EntryId, OperationId, SessionAssistantBlock, SessionId, SessionRevision, SessionUserPart,
+    ToolBatchId, ToolCallId, TurnId,
 };
-use crate::tool_entry::{SessionToolCall, ToolResultOutcome};
+use crate::tool_entry::ToolResultOutcome;
 
 /// A model-visible message projected from the active linear path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,12 +13,14 @@ pub enum ContextMessage {
     Summary { text: String },
     /// A user message carrying the turn's full multi-part payload.
     User { parts: Vec<SessionUserPart> },
-    /// A final assistant message.
-    Assistant { content: String },
-    /// Assistant tool calls in source order.
+    /// A final assistant message. Blocks are text-only; an empty list is
+    /// empty final text.
+    Assistant { blocks: Vec<SessionAssistantBlock> },
+    /// An assistant tool-call batch in source order, including any
+    /// interleaved text blocks.
     AssistantToolCalls {
         tool_batch_id: ToolBatchId,
-        calls: Vec<SessionToolCall>,
+        blocks: Vec<SessionAssistantBlock>,
     },
     /// A tool result visible to a model.
     ToolResult {

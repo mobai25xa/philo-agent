@@ -1,5 +1,7 @@
 use philo::api::stable as sdk;
-use philo_agent_runtime::{ModelError, ModelMessage, ModelToolResultOutcome, UserPart};
+use philo_agent_runtime::{
+    ModelAssistantBlock, ModelError, ModelMessage, ModelToolCall, ModelToolResultOutcome, UserPart,
+};
 
 use crate::replay::{CapturedContent, CapturedItem, ReplayHistory};
 
@@ -44,17 +46,10 @@ pub(super) fn map_messages(
             ModelMessage::User { parts } => request.messages.push(sdk::Message::User {
                 content: map_user_parts(parts)?,
             }),
-            ModelMessage::Assistant { content } => {
-                request.messages.push(map_assistant_text(
-                    content,
-                    replayed.items_for(message_index),
-                )?);
-            }
-            ModelMessage::AssistantToolCalls { calls } => {
-                request.messages.push(map_assistant_tool_calls(
-                    calls,
-                    replayed.items_for(message_index),
-                )?);
+            ModelMessage::Assistant { blocks } => {
+                request
+                    .messages
+                    .push(map_assistant(blocks, replayed.items_for(message_index))?);
             }
             ModelMessage::ToolResult {
                 tool_call_id,
@@ -91,30 +86,27 @@ pub(super) fn map_messages(
     Ok(())
 }
 
-fn map_assistant_tool_calls(
-    calls: &[philo_agent_runtime::ModelToolCall],
+fn map_assistant(
+    blocks: &[ModelAssistantBlock],
     replay_items: &[CapturedItem],
 ) -> Result<sdk::Message, ModelError> {
     if !replay_items.is_empty() {
-        return map_replayed_assistant(replay_items, None, calls);
+        return map_replayed_assistant(replay_items, blocks);
     }
-    let mut items = Vec::with_capacity(calls.len());
-    for call in calls {
-        let id = sdk::ToolCallId::new(call.tool_call_id.as_str())
-            .map_err(|_| history_error("tool call id"))?;
-        let name =
-            sdk::ToolName::new(call.name.as_str()).map_err(|_| history_error("tool call name"))?;
-        let tool_call = match sdk::ToolCall::from_raw(id.clone(), name.clone(), &call.arguments) {
-            Ok(tool_call) => tool_call,
-            // Replay degradation: invalid arguments replay as `{}`. Durable
-            // facts are untouched; the paired error result keeps the detail.
-            Err(_) => sdk::ToolCall::from_raw(id, name, "{}").expect("`{}` is a valid JSON object"),
+    let mut items = Vec::with_capacity(blocks.len());
+    for (position, block) in blocks.iter().enumerate() {
+        let content = match block {
+            ModelAssistantBlock::Text { text } => {
+                sdk::AssistantContent::Text { text: text.clone() }
+            }
+            ModelAssistantBlock::ToolCall(call) => {
+                sdk::AssistantContent::ToolCall(sdk_tool_call(call)?)
+            }
         };
-        let position = items.len();
         items.push(sdk::ResponseItem::new(
             sdk::BlockId::new(position as u64),
-            u32::try_from(position).map_err(|_| history_error("tool call index"))?,
-            sdk::AssistantContent::ToolCall(tool_call),
+            u32::try_from(position).map_err(|_| history_error("assistant item index"))?,
+            content,
             sdk::ReplayRequirement::None,
             None,
         ));
@@ -122,31 +114,14 @@ fn map_assistant_tool_calls(
     Ok(sdk::Message::Assistant { content: items })
 }
 
-fn map_assistant_text(
-    content: &str,
-    replay_items: &[CapturedItem],
-) -> Result<sdk::Message, ModelError> {
-    if !replay_items.is_empty() {
-        return map_replayed_assistant(replay_items, Some(content), &[]);
-    }
-    Ok(sdk::Message::Assistant {
-        content: vec![sdk::ResponseItem::new(
-            sdk::BlockId::new(0),
-            0,
-            sdk::AssistantContent::Text {
-                text: content.to_owned(),
-            },
-            sdk::ReplayRequirement::None,
-            None,
-        )],
-    })
-}
-
 fn map_replayed_assistant(
     replay_items: &[CapturedItem],
-    text: Option<&str>,
-    calls: &[philo_agent_runtime::ModelToolCall],
+    blocks: &[ModelAssistantBlock],
 ) -> Result<sdk::Message, ModelError> {
+    let mut next_text = blocks.iter().filter_map(|block| match block {
+        ModelAssistantBlock::Text { text } => Some(text.as_str()),
+        ModelAssistantBlock::ToolCall(_) => None,
+    });
     let mut items = Vec::with_capacity(replay_items.len());
     for item in replay_items {
         let content = match &item.content {
@@ -154,24 +129,27 @@ fn map_replayed_assistant(
                 kind: *kind,
                 text: text.clone(),
             },
-            CapturedContent::Text { .. } => sdk::AssistantContent::Text {
-                text: text
-                    .ok_or_else(|| history_error("replayed text item binding"))?
-                    .to_owned(),
-            },
-            CapturedContent::ToolCall { call_id } => {
-                let call = calls
+            CapturedContent::Text { .. } => {
+                let text = next_text
+                    .next()
+                    .ok_or_else(|| history_error("replayed text item binding"))?;
+                sdk::AssistantContent::Text {
+                    text: text.to_owned(),
+                }
+            }
+            CapturedContent::ToolCall { call_id, .. } => {
+                let call = blocks
                     .iter()
-                    .find(|call| call.tool_call_id.as_str() == call_id)
+                    .find_map(|block| match block {
+                        ModelAssistantBlock::ToolCall(call)
+                            if call.tool_call_id.as_str() == call_id =>
+                        {
+                            Some(call)
+                        }
+                        _ => None,
+                    })
                     .ok_or_else(|| history_error("replayed tool call binding"))?;
-                let id = sdk::ToolCallId::new(call.tool_call_id.as_str())
-                    .map_err(|_| history_error("tool call id"))?;
-                let name = sdk::ToolName::new(call.name.as_str())
-                    .map_err(|_| history_error("tool call name"))?;
-                let tool_call = sdk::ToolCall::from_raw(id.clone(), name.clone(), &call.arguments)
-                    .or_else(|_| sdk::ToolCall::from_raw(id, name, "{}"))
-                    .map_err(|_| history_error("tool call arguments"))?;
-                sdk::AssistantContent::ToolCall(tool_call)
+                sdk::AssistantContent::ToolCall(sdk_tool_call(call)?)
             }
         };
         items.push(sdk::ResponseItem::new(
@@ -183,6 +161,19 @@ fn map_replayed_assistant(
         ));
     }
     Ok(sdk::Message::Assistant { content: items })
+}
+
+fn sdk_tool_call(call: &ModelToolCall) -> Result<sdk::ToolCall, ModelError> {
+    let id = sdk::ToolCallId::new(call.tool_call_id.as_str())
+        .map_err(|_| history_error("tool call id"))?;
+    let name =
+        sdk::ToolName::new(call.name.as_str()).map_err(|_| history_error("tool call name"))?;
+    match sdk::ToolCall::from_raw(id.clone(), name.clone(), &call.arguments) {
+        Ok(tool_call) => Ok(tool_call),
+        // Replay degradation: invalid arguments replay as `{}`. Durable
+        // facts are untouched; the paired error result keeps the detail.
+        Err(_) => Ok(sdk::ToolCall::from_raw(id, name, "{}").expect("`{}` is a valid JSON object")),
+    }
 }
 
 fn map_tool_result(

@@ -10,8 +10,9 @@ use philo_session::SessionEntryKind::{
 };
 use philo_session::{
     ContextMessage, MemorySessionStore, NewSessionEntry, OperationId, OperationOutcome,
-    SessionError, SessionId, SessionRevision, SessionStore, SessionTransaction, SessionUserPart,
-    SessionValidationError, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    SessionAssistantBlock, SessionError, SessionId, SessionRevision, SessionStore,
+    SessionTransaction, SessionUserPart, SessionValidationError, TurnFailure, TurnFailureKind,
+    TurnId, TurnOutcome,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -69,7 +70,9 @@ fn success_transaction(
         vec![
             AssistantMessage {
                 turn_id: turn_id.clone(),
-                content: content.to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: content.to_owned(),
+                }],
             },
             TurnTerminated {
                 turn_id: turn_id.clone(),
@@ -306,13 +309,17 @@ fn two_completed_turns_project_ordered_messages() {
                 parts: SessionUserPart::text_parts("one"),
             },
             ContextMessage::Assistant {
-                content: "first".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "first".to_owned(),
+                }],
             },
             ContextMessage::User {
                 parts: SessionUserPart::text_parts("two"),
             },
             ContextMessage::Assistant {
-                content: "second".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "second".to_owned(),
+                }],
             },
         ]
     );

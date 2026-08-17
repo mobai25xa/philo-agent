@@ -12,7 +12,9 @@ use philo_model::{
     PhiloModelAdapter,
 };
 use serde_json::Value;
-use support::{StubResponse, StubTransport, collect, collect_ok, reasoning_snapshot};
+use support::{
+    StubResponse, StubTransport, assistant_text, collect, collect_ok, reasoning_snapshot,
+};
 
 const STUB_RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
 const OFFICIAL_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -142,13 +144,7 @@ async fn completed_response_continues_across_adapter_instances_with_only_new_inp
         second
             .start(snapshot(
                 "turn-2",
-                vec![
-                    user("first"),
-                    ModelMessage::Assistant {
-                        content: "hello".to_owned(),
-                    },
-                    user("second"),
-                ],
+                vec![user("first"), assistant_text("hello"), user("second")],
             ))
             .await
             .expect("continued call starts"),
@@ -191,13 +187,7 @@ async fn target_switch_starts_a_new_full_chain_without_reusing_the_old_id() {
         switched
             .start(snapshot(
                 "turn-2",
-                vec![
-                    user("first"),
-                    ModelMessage::Assistant {
-                        content: "hello".to_owned(),
-                    },
-                    user("second"),
-                ],
+                vec![user("first"), assistant_text("hello"), user("second")],
             ))
             .await
             .expect("switched target starts"),
@@ -233,13 +223,7 @@ async fn unavailable_chain_falls_back_once_and_does_not_reactivate_the_old_id() 
     )
     .await;
 
-    let second_history = vec![
-        user("first"),
-        ModelMessage::Assistant {
-            content: "hello".to_owned(),
-        },
-        user("second"),
-    ];
+    let second_history = vec![user("first"), assistant_text("hello"), user("second")];
     collect_ok(
         model
             .start(snapshot("turn-2", second_history.clone()))
@@ -249,9 +233,7 @@ async fn unavailable_chain_falls_back_once_and_does_not_reactivate_the_old_id() 
     .await;
 
     let mut third_history = second_history;
-    third_history.push(ModelMessage::Assistant {
-        content: "hello".to_owned(),
-    });
+    third_history.push(assistant_text("hello"));
     third_history.push(user("third"));
     let restarted = official_adapter(
         transport.clone(),
@@ -321,9 +303,7 @@ async fn changed_prefix_and_incomplete_response_never_activate_a_stale_id() {
                 "turn-2",
                 vec![
                     user("different branch"),
-                    ModelMessage::Assistant {
-                        content: "hello".to_owned(),
-                    },
+                    assistant_text("hello"),
                     user("next"),
                 ],
             ))
@@ -360,19 +340,13 @@ async fn changed_prefix_and_incomplete_response_never_activate_a_stale_id() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Ok(ModelEvent::Completed)))
+            .any(|event| matches!(event, Ok(ModelEvent::Completed { .. })))
     );
     collect_ok(
         incomplete
             .start(snapshot(
                 "after-incomplete",
-                vec![
-                    user("partial"),
-                    ModelMessage::Assistant {
-                        content: "hello".to_owned(),
-                    },
-                    user("retry"),
-                ],
+                vec![user("partial"), assistant_text("hello"), user("retry")],
             ))
             .await
             .expect("next call starts"),
@@ -418,13 +392,7 @@ async fn compatible_continuation_uses_reconstruct_fixture_not_official_lifecycle
         second
             .start(snapshot(
                 "turn-2",
-                vec![
-                    user("first"),
-                    ModelMessage::Assistant {
-                        content: "hello".to_owned(),
-                    },
-                    user("second"),
-                ],
+                vec![user("first"), assistant_text("hello"), user("second")],
             ))
             .await
             .expect("continued call starts"),

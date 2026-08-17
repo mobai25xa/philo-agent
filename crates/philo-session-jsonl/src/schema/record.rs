@@ -1,7 +1,8 @@
-//! Serde-only schema v1 record definitions.
+//! Serde-only schema v2 record definitions.
 //!
 //! Field names and shapes are part of the persistent compatibility promise
-//! and are pinned by golden tests.
+//! and are pinned by golden tests. v2 accepts only `parts` / `blocks` and
+//! requires a `reason` on cancelled outcomes.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,35 +32,21 @@ pub(crate) enum KindRecord {
         operation_id: String,
         turn_id: String,
     },
-    /// New files always write `parts`; `content` is the pre-M8 legacy shape.
-    UserMessage {
-        turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parts: Option<Vec<UserPartRecord>>,
-    },
-    AssistantToolCallBatch {
-        turn_id: String,
-        model_call_id: String,
-        tool_batch_id: String,
-        calls: Vec<ToolCallRecord>,
-    },
+    /// v2 writes and accepts only `parts`. A leftover `content` field is
+    /// unknown and fails decode.
+    UserMessage(UserMessageRecord),
+    AssistantToolCallBatch(AssistantToolCallBatchRecord),
     ToolResult {
         turn_id: String,
         tool_batch_id: String,
         result: ToolResultRecord,
     },
-    AssistantMessage {
-        turn_id: String,
-        content: String,
-    },
+    AssistantMessage(AssistantMessageRecord),
     TurnFailure {
         turn_id: String,
         failure: FailureRecord,
     },
-    /// Cancelled outcomes written since M11 carry a reason; absent means the
-    /// legacy user-cancellation source.
+    /// Cancelled outcomes must carry a reason; absence is corrupt.
     TurnTerminated {
         turn_id: String,
         outcome: OutcomeRecord,
@@ -79,6 +66,29 @@ pub(crate) enum KindRecord {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UserMessageRecord {
+    pub turn_id: String,
+    pub parts: Vec<UserPartRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssistantToolCallBatchRecord {
+    pub turn_id: String,
+    pub model_call_id: String,
+    pub tool_batch_id: String,
+    pub blocks: Vec<AssistantBlockRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssistantMessageRecord {
+    pub turn_id: String,
+    pub blocks: Vec<AssistantBlockRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum UserPartRecord {
     Text {
@@ -92,10 +102,16 @@ pub(crate) enum UserPartRecord {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ToolCallRecord {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum AssistantBlockRecord {
+    Text {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

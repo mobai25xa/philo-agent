@@ -9,12 +9,13 @@ use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
     AgentEvent, AgentFailureKind, AgentRuntime, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig,
-    ModelMessage, OperationHandle, OperationOutcome, OperationPhase, OperationStatus,
-    RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability, UserMessage, UserPart,
+    ModelAssistantBlock, ModelMessage, OperationHandle, OperationOutcome, OperationPhase,
+    OperationStatus, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
+    UserMessage, UserPart,
 };
 use philo_session::{
-    ContextMessage, MemorySessionStore, SessionCommit, SessionContextView, SessionError,
-    SessionFuture, SessionStore, SessionTransaction, SessionUserPart,
+    ContextMessage, MemorySessionStore, SessionAssistantBlock, SessionCommit, SessionContextView,
+    SessionError, SessionFuture, SessionStore, SessionTransaction, SessionUserPart,
 };
 use support::fake_model::FakeModel;
 
@@ -121,7 +122,9 @@ fn direct_answer_success() {
                 parts: SessionUserPart::text_parts("hi"),
             },
             ContextMessage::Assistant {
-                content: "hello".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "hello".to_owned(),
+                }],
             },
         ]
     );
@@ -309,7 +312,9 @@ fn single_turn_success() {
                 parts: SessionUserPart::text_parts("hi"),
             },
             ContextMessage::Assistant {
-                content: "hello".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "hello".to_owned(),
+                }],
             },
         ]
     );
@@ -396,7 +401,9 @@ fn second_turn_contains_first_turn_context() {
                 parts: vec![UserPart::Text("one".to_owned())],
             },
             ModelMessage::Assistant {
-                content: "first".to_owned(),
+                blocks: vec![ModelAssistantBlock::Text {
+                    text: "first".to_owned(),
+                }],
             },
             ModelMessage::User {
                 parts: vec![UserPart::Text("two".to_owned())],
@@ -413,13 +420,17 @@ fn second_turn_contains_first_turn_context() {
                 parts: SessionUserPart::text_parts("one"),
             },
             ContextMessage::Assistant {
-                content: "first".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "first".to_owned(),
+                }],
             },
             ContextMessage::User {
                 parts: SessionUserPart::text_parts("two"),
             },
             ContextMessage::Assistant {
-                content: "second".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "second".to_owned(),
+                }],
             },
         ]
     );

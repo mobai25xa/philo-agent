@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use philo_agent_runtime::{
-    ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream, ModelPort, RuntimeFuture,
-    TokenUsage,
+    ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream, ModelPort,
+    ModelToolCall, RuntimeFuture, TokenUsage, ToolCallId,
 };
 
 use super::gate::Gate;
@@ -33,7 +33,7 @@ impl ModelScript {
             .iter()
             .map(|delta| Ok(ModelEvent::TextDelta((*delta).to_owned())))
             .collect::<Vec<_>>();
-        events.push(Ok(ModelEvent::Completed));
+        events.push(Ok(completed_text(&deltas.concat())));
         Self::Events(events)
     }
 
@@ -63,7 +63,13 @@ impl ModelScript {
                 })
             })
             .collect::<Vec<_>>();
-        events.push(Ok(ModelEvent::Completed));
+        events.push(Ok(ModelEvent::Completed {
+            blocks: vec![ModelAssistantBlock::ToolCall(ModelToolCall {
+                tool_call_id: ToolCallId::new(id.unwrap_or_default()),
+                name: name.unwrap_or_default().to_owned(),
+                arguments: argument_fragments.concat(),
+            })],
+        }));
         Self::Events(events)
     }
 
@@ -78,8 +84,47 @@ impl ModelScript {
                     arguments: (*arguments).to_owned(),
                 })
             })
-            .chain([Ok(ModelEvent::Completed)])
+            .chain([Ok(ModelEvent::Completed {
+                blocks: calls
+                    .iter()
+                    .map(|(_, id, name, arguments)| {
+                        ModelAssistantBlock::ToolCall(ModelToolCall {
+                            tool_call_id: ToolCallId::new(*id),
+                            name: (*name).to_owned(),
+                            arguments: (*arguments).to_owned(),
+                        })
+                    })
+                    .collect(),
+            })])
             .collect();
+        Self::Events(events)
+    }
+
+    /// Mixed text-then-tools output: deltas for the UI, one `Completed`
+    /// whose blocks are `[Text, ToolCall, ...]`.
+    pub fn text_and_tools(text: &str, calls: &[(usize, &str, &str, &str)]) -> Self {
+        let mut events = Vec::new();
+        let mut blocks = Vec::new();
+        if !text.is_empty() {
+            events.push(Ok(ModelEvent::TextDelta(text.to_owned())));
+            blocks.push(ModelAssistantBlock::Text {
+                text: text.to_owned(),
+            });
+        }
+        for (index, id, name, arguments) in calls {
+            events.push(Ok(ModelEvent::ToolCallDelta {
+                index: *index,
+                id: Some((*id).to_owned()),
+                name: Some((*name).to_owned()),
+                arguments: (*arguments).to_owned(),
+            }));
+            blocks.push(ModelAssistantBlock::ToolCall(ModelToolCall {
+                tool_call_id: ToolCallId::new(*id),
+                name: (*name).to_owned(),
+                arguments: (*arguments).to_owned(),
+            }));
+        }
+        events.push(Ok(ModelEvent::Completed { blocks }));
         Self::Events(events)
     }
 
@@ -97,7 +142,11 @@ impl ModelScript {
                 .collect::<Vec<_>>()
         };
         let mut tail_events = deltas(tail);
-        tail_events.push(Ok(ModelEvent::Completed));
+        tail_events.push(Ok(completed_text(&format!(
+            "{}{}",
+            head.concat(),
+            tail.concat()
+        ))));
         Self::SuspendedEvents {
             head: deltas(head),
             gate: gate.clone(),
@@ -124,7 +173,7 @@ impl ModelScript {
             Self::Events(mut events) => {
                 let insert_at = events
                     .iter()
-                    .rposition(|event| matches!(event, Ok(ModelEvent::Completed)))
+                    .rposition(|event| matches!(event, Ok(ModelEvent::Completed { .. })))
                     .map_or(events.len(), |position| position);
                 events.insert(insert_at, Ok(ModelEvent::UsageUpdated { usage }));
                 Self::Events(events)
@@ -181,16 +230,7 @@ impl ModelScript {
     }
 
     pub fn mixed_output() -> Self {
-        Self::Events(vec![
-            Ok(ModelEvent::TextDelta("text".to_owned())),
-            Ok(ModelEvent::ToolCallDelta {
-                index: 0,
-                id: Some("call-1".to_owned()),
-                name: Some("tool".to_owned()),
-                arguments: "{}".to_owned(),
-            }),
-            Ok(ModelEvent::Completed),
-        ])
+        Self::text_and_tools("text", &[(0, "call-1", "tool", "{}")])
     }
 
     pub fn missing_tool_identity() -> Self {
@@ -201,7 +241,13 @@ impl ModelScript {
                 name: Some("tool".to_owned()),
                 arguments: "{}".to_owned(),
             }),
-            Ok(ModelEvent::Completed),
+            Ok(ModelEvent::Completed {
+                blocks: vec![ModelAssistantBlock::ToolCall(ModelToolCall {
+                    tool_call_id: ToolCallId::new(""),
+                    name: "tool".to_owned(),
+                    arguments: "{}".to_owned(),
+                })],
+            }),
         ])
     }
 
@@ -212,8 +258,8 @@ impl ModelScript {
     pub fn completed_twice() -> Self {
         Self::Events(vec![
             Ok(ModelEvent::TextDelta("text".to_owned())),
-            Ok(ModelEvent::Completed),
-            Ok(ModelEvent::Completed),
+            Ok(completed_text("text")),
+            Ok(completed_text("text")),
         ])
     }
 
@@ -224,6 +270,17 @@ impl ModelScript {
     pub fn second_tool_call() -> Self {
         Self::tool_call(0, Some("call-2"), Some("tool"), &["{}"])
     }
+}
+
+fn completed_text(text: &str) -> ModelEvent {
+    let blocks = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![ModelAssistantBlock::Text {
+            text: text.to_owned(),
+        }]
+    };
+    ModelEvent::Completed { blocks }
 }
 
 /// Deterministic, script-driven ModelPort used by Runtime integration tests.

@@ -10,8 +10,9 @@ mod view;
 
 pub use entry::{
     CancelReason, EntryId, NewEntryParent, NewSessionEntry, OperationId, OperationOutcome,
-    SessionCommit, SessionEntry, SessionEntryKind, SessionId, SessionRevision, SessionTransaction,
-    SessionUserPart, ToolBatchId, ToolCallId, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    SessionAssistantBlock, SessionCommit, SessionEntry, SessionEntryKind, SessionId,
+    SessionRevision, SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, TurnFailure,
+    TurnFailureKind, TurnId, TurnOutcome,
 };
 pub use error::{SessionError, SessionValidationError};
 pub use memory::MemorySessionStore;

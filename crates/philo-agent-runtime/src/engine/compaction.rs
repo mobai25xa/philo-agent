@@ -7,8 +7,8 @@ use crate::mapping::failure::session_failure;
 use crate::mapping::messages::context_messages;
 use crate::operation::OperationPublisher;
 use crate::{
-    AgentEvent, CompactionError, CompactionReport, ModelCallId, ModelCallSnapshot, ModelEvent,
-    ModelMessage, OperationId, SessionId, TurnId, UserPart,
+    AgentEvent, CompactionError, CompactionReport, ModelAssistantBlock, ModelCallId,
+    ModelCallSnapshot, ModelEvent, ModelMessage, OperationId, SessionId, TurnId, UserPart,
 };
 use philo_session as session;
 
@@ -222,8 +222,7 @@ async fn generate_summary(
             message: error.message().to_owned(),
         })
     })?;
-    let mut summary = String::new();
-    let mut completed = false;
+    let mut completed_blocks = None;
     let mut response_started = false;
     loop {
         let step = match operation {
@@ -240,16 +239,18 @@ async fn generate_summary(
                     message: error.message().to_owned(),
                 }));
             }
-            StreamStep::Event(Some(Ok(event))) if completed => {
+            StreamStep::Event(Some(Ok(event))) if completed_blocks.is_some() => {
                 return Err(invalid_summary(match event {
-                    ModelEvent::Completed => "summary stream emitted Completed more than once",
+                    ModelEvent::Completed { .. } => {
+                        "summary stream emitted Completed more than once"
+                    }
                     _ => "summary stream emitted output after Completed",
                 }));
             }
-            StreamStep::Event(Some(Ok(ModelEvent::Completed))) => completed = true,
-            StreamStep::Event(Some(Ok(ModelEvent::TextDelta(delta)))) => {
-                summary.push_str(&delta);
+            StreamStep::Event(Some(Ok(ModelEvent::Completed { blocks }))) => {
+                completed_blocks = Some(blocks);
             }
+            StreamStep::Event(Some(Ok(ModelEvent::TextDelta(_)))) => {}
             StreamStep::Event(Some(Ok(ModelEvent::ResponseStarted { .. }))) => {
                 if response_started {
                     return Err(invalid_summary(
@@ -258,20 +259,32 @@ async fn generate_summary(
                 }
                 response_started = true;
             }
-            StreamStep::Event(Some(Ok(ModelEvent::ToolCallDelta { .. }))) => {
-                return Err(invalid_summary(
-                    "summary model returned tool calls instead of FinalText",
-                ));
-            }
+            StreamStep::Event(Some(Ok(ModelEvent::ToolCallDelta { .. }))) => {}
             StreamStep::Event(Some(Ok(
                 ModelEvent::ReasoningDelta { .. } | ModelEvent::UsageUpdated { .. },
             ))) => {}
-            StreamStep::Event(None) if completed => break,
+            StreamStep::Event(None) if completed_blocks.is_some() => break,
             StreamStep::Event(None) => {
                 return Err(invalid_summary("summary stream ended before Completed"));
             }
         }
     }
+    let blocks = completed_blocks.expect("Completed was observed before the stream ended");
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ModelAssistantBlock::ToolCall(_)))
+    {
+        return Err(invalid_summary(
+            "summary model returned tool calls instead of FinalText",
+        ));
+    }
+    let summary: String = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ModelAssistantBlock::Text { text } => Some(text.as_str()),
+            ModelAssistantBlock::ToolCall(_) => None,
+        })
+        .collect();
     if summary.is_empty() {
         return Err(invalid_summary("summary model returned empty FinalText"));
     }
@@ -298,8 +311,7 @@ fn context_bytes(context: &session::SessionContextView) -> u64 {
 
 fn message_bytes(message: &session::ContextMessage) -> u64 {
     match message {
-        session::ContextMessage::Summary { text }
-        | session::ContextMessage::Assistant { content: text } => byte_len(text),
+        session::ContextMessage::Summary { text } => byte_len(text),
         session::ContextMessage::User { parts } => parts.iter().fold(0, |total, part| {
             total.saturating_add(match part {
                 session::SessionUserPart::Text(text) => byte_len(text),
@@ -308,17 +320,17 @@ fn message_bytes(message: &session::ContextMessage) -> u64 {
                 }
             })
         }),
-        session::ContextMessage::AssistantToolCalls {
-            tool_batch_id,
-            calls,
-        } => calls
-            .iter()
-            .fold(byte_len(tool_batch_id.as_str()), |total, call| {
-                total
-                    .saturating_add(byte_len(call.id().as_str()))
-                    .saturating_add(byte_len(call.name()))
-                    .saturating_add(byte_len(call.arguments()))
-            }),
+        session::ContextMessage::Assistant { blocks }
+        | session::ContextMessage::AssistantToolCalls { blocks, .. } => {
+            blocks.iter().fold(0, |total, block| {
+                total.saturating_add(match block {
+                    session::SessionAssistantBlock::Text { text } => byte_len(text),
+                    session::SessionAssistantBlock::ToolCall(call) => byte_len(call.id().as_str())
+                        .saturating_add(byte_len(call.name()))
+                        .saturating_add(byte_len(call.arguments())),
+                })
+            })
+        }
         session::ContextMessage::ToolResult {
             tool_call_id,
             outcome,

@@ -15,7 +15,7 @@ mod tool_progress;
 
 use crate::mapping::entries::{batch_entry, start_entries, success_entries};
 use crate::mapping::failure::session_failure;
-use crate::mapping::messages::context_messages;
+use crate::mapping::messages::{context_messages, kernel_blocks_from_model};
 use crate::mapping::parts::kernel_user_parts;
 use crate::mapping::tool::kernel_result;
 use crate::operation::{OperationPublisher, OperationShared, QueueClaim, Scheduler};
@@ -233,20 +233,30 @@ async fn drive(
                     tools_allowed,
                 )
                 .await;
-                let Some((next_cx, text, calls)) = step else {
+                let Some((next_cx, blocks)) = step else {
                     return;
                 };
                 cx = next_cx;
-                let output = if calls.is_empty() {
-                    kernel::AssistantOutput::final_text(&text)
-                } else {
-                    kernel::AssistantOutput::tool_calls(calls)
-                };
+                let output =
+                    match kernel::AssistantOutput::from_blocks(kernel_blocks_from_model(blocks)) {
+                        Ok(output) => output,
+                        Err(_) => {
+                            cx.fail(
+                                effect_id,
+                                AgentFailure::invalid_model_output(
+                                    "model produced an empty text block",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                let text = output.text();
                 let completed = match kernel::transition(
                     &cx.state,
                     kernel::KernelInput::ModelCallCompleted {
                         effect_id: effect_id.clone(),
-                        output,
+                        output: output.clone(),
                     },
                 ) {
                     Ok(value) => value,
@@ -259,12 +269,7 @@ async fn drive(
                         return;
                     }
                 };
-                if !completed.observations.iter().any(|observation| {
-                    matches!(
-                        observation,
-                        kernel::KernelObservation::AssistantToolCallsAccepted { .. }
-                    )
-                }) {
+                if !output.contains_tool_call() {
                     // The kernel made its final decision: cancellation can
                     // no longer take effect on this operation.
                     settle_success(cx, effect_id, &completed.observations, text).await;
@@ -290,7 +295,12 @@ async fn drive(
                 cx.operation.set_phase(OperationPhase::RunningToolBatch(
                     RunningToolBatchPhase::Preparing,
                 ));
-                let entry = batch_entry(cx.operation.turn_id(), &model_call_id, &batch_id, &calls);
+                let entry = batch_entry(
+                    cx.operation.turn_id(),
+                    &model_call_id,
+                    &batch_id,
+                    output.blocks(),
+                );
                 let committed = cx
                     .ctx
                     .sessions

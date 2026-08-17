@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use philo::api::stable as sdk;
 use philo_agent_runtime::{
-    ModelCallSnapshot, ModelError, ModelMessage, ModelToolResultOutcome, UserPart,
+    ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelMessage, ModelToolCall,
+    ModelToolResultOutcome, ToolCallId, UserPart,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -448,7 +449,30 @@ pub(crate) enum CapturedContent {
     },
     ToolCall {
         call_id: String,
+        name: String,
+        arguments: String,
     },
+}
+
+pub(crate) fn assistant_blocks_from_captured(items: &[CapturedItem]) -> Vec<ModelAssistantBlock> {
+    items
+        .iter()
+        .filter_map(|item| match &item.content {
+            CapturedContent::Text { text } if !text.is_empty() => {
+                Some(ModelAssistantBlock::Text { text: text.clone() })
+            }
+            CapturedContent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => Some(ModelAssistantBlock::ToolCall(ModelToolCall {
+                tool_call_id: ToolCallId::new(call_id.clone()),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) struct ReplayHistory {
@@ -841,30 +865,46 @@ impl StoredGeneration {
     }
 
     fn matches(&self, message: &ModelMessage) -> bool {
-        match message {
-            ModelMessage::Assistant { content } => self.items.iter().any(|item| {
-                matches!(
-                    &item.content,
-                    StoredContent::Text { digest } if digest == &text_digest(content)
-                )
-            }),
-            ModelMessage::AssistantToolCalls { calls } => {
-                let stored = self
-                    .items
-                    .iter()
-                    .filter_map(|item| match &item.content {
-                        StoredContent::ToolCall { call_id } => Some(call_id.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                stored.len() == calls.len()
-                    && stored
-                        .iter()
-                        .zip(calls)
-                        .all(|(stored, call)| *stored == call.tool_call_id.as_str())
-            }
-            _ => false,
-        }
+        let ModelMessage::Assistant { blocks } = message else {
+            return false;
+        };
+        let stored_texts = self
+            .items
+            .iter()
+            .filter_map(|item| match &item.content {
+                StoredContent::Text { digest } => Some(digest.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let block_texts = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ModelAssistantBlock::Text { text } => Some(text_digest(text)),
+                ModelAssistantBlock::ToolCall(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let texts_match = stored_texts.len() == block_texts.len()
+            && stored_texts
+                .iter()
+                .zip(&block_texts)
+                .all(|(stored, digest)| *stored == digest.as_str());
+
+        let stored_calls = self
+            .items
+            .iter()
+            .filter_map(|item| match &item.content {
+                StoredContent::ToolCall { call_id } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let block_calls = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ModelAssistantBlock::ToolCall(call) => Some(call.tool_call_id.as_str()),
+                ModelAssistantBlock::Text { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        texts_match && stored_calls == block_calls
     }
 
     fn restore(
@@ -932,7 +972,7 @@ impl StoredItem {
                 reasoning_kind: StoredReasoningKind::from_sdk(kind)?,
                 text,
             },
-            CapturedContent::ToolCall { call_id } => StoredContent::ToolCall { call_id },
+            CapturedContent::ToolCall { call_id, .. } => StoredContent::ToolCall { call_id },
         };
         Ok(Self {
             index: item.index,
@@ -959,6 +999,8 @@ impl StoredItem {
             },
             StoredContent::ToolCall { call_id } => CapturedContent::ToolCall {
                 call_id: call_id.clone(),
+                name: String::new(),
+                arguments: String::new(),
             },
         };
         Ok(CapturedItem {
@@ -1051,56 +1093,39 @@ fn continuation_prefix_digest_from_response(
     for message in messages {
         hash_message(&mut hasher, message);
     }
-    let tool_calls = items
-        .iter()
-        .filter_map(|item| match &item.content {
-            CapturedContent::ToolCall { call_id } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !tool_calls.is_empty() {
-        hash_tag(&mut hasher, 5);
-        for call_id in tool_calls {
-            hash_str(&mut hasher, call_id);
-        }
-        return Some(encode_digest(hasher.finalize()));
-    }
-
-    let text = items
-        .iter()
-        .filter_map(|item| match &item.content {
-            CapturedContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    if text.is_empty() {
-        return None;
-    }
-    hash_tag(&mut hasher, 4);
-    hash_str(&mut hasher, &text);
+    hash_assistant_blocks(&mut hasher, &assistant_blocks_from_captured(items));
     Some(encode_digest(hasher.finalize()))
 }
 
 fn continuation_prefix_digest_from_history(messages: &[ModelMessage]) -> Option<String> {
     let (terminal, prefix) = messages.split_last()?;
+    let ModelMessage::Assistant { blocks } = terminal else {
+        return None;
+    };
     let mut hasher = Sha256::new();
     for message in prefix {
         hash_message(&mut hasher, message);
     }
-    match terminal {
-        ModelMessage::Assistant { content } => {
-            hash_tag(&mut hasher, 4);
-            hash_str(&mut hasher, content);
-        }
-        ModelMessage::AssistantToolCalls { calls } => {
-            hash_tag(&mut hasher, 5);
-            for call in calls {
-                hash_str(&mut hasher, call.tool_call_id.as_str());
+    hash_assistant_blocks(&mut hasher, blocks);
+    Some(encode_digest(hasher.finalize()))
+}
+
+fn hash_assistant_blocks(hasher: &mut Sha256, blocks: &[ModelAssistantBlock]) {
+    hash_tag(hasher, 4);
+    for block in blocks {
+        match block {
+            ModelAssistantBlock::Text { text } => {
+                hash_tag(hasher, 1);
+                hash_str(hasher, text);
+            }
+            ModelAssistantBlock::ToolCall(call) => {
+                hash_tag(hasher, 2);
+                hash_str(hasher, call.tool_call_id.as_str());
+                hash_str(hasher, &call.name);
+                hash_str(hasher, &call.arguments);
             }
         }
-        _ => return None,
     }
-    Some(encode_digest(hasher.finalize()))
 }
 
 fn hash_message(hasher: &mut Sha256, message: &ModelMessage) {
@@ -1129,18 +1154,7 @@ fn hash_message(hasher: &mut Sha256, message: &ModelMessage) {
                 }
             }
         }
-        ModelMessage::Assistant { content } => {
-            hash_tag(hasher, 4);
-            hash_str(hasher, content);
-        }
-        ModelMessage::AssistantToolCalls { calls } => {
-            hash_tag(hasher, 5);
-            for call in calls {
-                hash_str(hasher, call.tool_call_id.as_str());
-                hash_str(hasher, &call.name);
-                hash_str(hasher, &call.arguments);
-            }
-        }
+        ModelMessage::Assistant { blocks } => hash_assistant_blocks(hasher, blocks),
         ModelMessage::ToolResult {
             tool_call_id,
             outcome,

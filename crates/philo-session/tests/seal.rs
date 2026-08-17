@@ -2,10 +2,10 @@
 //! transaction validation, and the `open_turns` query surface.
 
 use philo_session::{
-    CancelReason, MemorySessionStore, OperationId, OperationOutcome, SessionEntryKind,
-    SessionError, SessionId, SessionProjection, SessionRevision, SessionStore, SessionToolCall,
-    SessionToolResult, SessionTransaction, SessionUserPart, SessionValidationError, ToolBatchId,
-    ToolCallId, TurnId, TurnOutcome,
+    CancelReason, MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock,
+    SessionEntryKind, SessionError, SessionId, SessionProjection, SessionRevision, SessionStore,
+    SessionToolCall, SessionToolResult, SessionTransaction, SessionUserPart,
+    SessionValidationError, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
 };
 
 use std::future::Future;
@@ -62,9 +62,17 @@ fn batch_transaction(revision: u64) -> SessionTransaction {
             turn_id: turn_id(),
             model_call_id: "model-call-1".to_owned(),
             tool_batch_id: ToolBatchId::new("batch-1"),
-            calls: vec![
-                SessionToolCall::new(ToolCallId::new("call-1"), "write", "{}"),
-                SessionToolCall::new(ToolCallId::new("call-2"), "shell", "{}"),
+            blocks: vec![
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-1"),
+                    "write",
+                    "{}",
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-2"),
+                    "shell",
+                    "{}",
+                )),
             ],
         }],
     )
@@ -78,10 +86,22 @@ fn three_call_batch_transaction(revision: u64) -> SessionTransaction {
             turn_id: turn_id(),
             model_call_id: "model-call-1".to_owned(),
             tool_batch_id: ToolBatchId::new("batch-1"),
-            calls: vec![
-                SessionToolCall::new(ToolCallId::new("call-1"), "write", "{}"),
-                SessionToolCall::new(ToolCallId::new("call-2"), "shell", "{}"),
-                SessionToolCall::new(ToolCallId::new("call-3"), "read", "{}"),
+            blocks: vec![
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-1"),
+                    "write",
+                    "{}",
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-2"),
+                    "shell",
+                    "{}",
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-3"),
+                    "read",
+                    "{}",
+                )),
             ],
         }],
     )
@@ -517,7 +537,9 @@ fn open_turns_is_empty_for_cleanly_terminated_sessions() {
                 vec![
                     SessionEntryKind::AssistantMessage {
                         turn_id: turn_id(),
-                        content: "done".to_owned(),
+                        blocks: vec![SessionAssistantBlock::Text {
+                            text: "done".into(),
+                        }],
                     },
                     SessionEntryKind::TurnTerminated {
                         turn_id: turn_id(),

@@ -1,5 +1,4 @@
-//! JSONL-002: compatible on-disk extension for the `Cancelled` variants.
-//! Schema `v` stays 1 (ADR-0001 compatible-evolution path).
+//! JSONL-002: cancelled outcomes on schema v2, with required `reason`.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,11 +8,11 @@ use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     CancelReason, ContextMessage, MemorySessionStore, OperationId, OperationOutcome,
-    SessionEntryKind, SessionRevision, SessionStore, SessionToolCall, SessionToolResult,
-    SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, ToolResultOutcome, TurnId,
-    TurnOutcome,
+    SessionAssistantBlock, SessionEntryKind, SessionRevision, SessionStore, SessionToolCall,
+    SessionToolResult, SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId,
+    ToolResultOutcome, TurnId, TurnOutcome,
 };
-use philo_session_jsonl::JsonlSessionStore;
+use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
@@ -84,9 +83,17 @@ fn batch_transaction(revision: u64) -> SessionTransaction {
             turn_id: TurnId::new("turn-1"),
             model_call_id: "model-call-1".to_owned(),
             tool_batch_id: ToolBatchId::new("batch-1"),
-            calls: vec![
-                SessionToolCall::new(ToolCallId::new("call-1"), "read", r#"{"path":"a.txt"}"#),
-                SessionToolCall::new(ToolCallId::new("call-2"), "read", r#"{"path":"b.txt"}"#),
+            blocks: vec![
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-1"),
+                    "read",
+                    r#"{"path":"a.txt"}"#,
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-2"),
+                    "read",
+                    r#"{"path":"b.txt"}"#,
+                )),
             ],
         }],
     )
@@ -137,7 +144,7 @@ fn commit_cancelled_turn(store: &dyn SessionStore) {
 // --- Golden format for cancellation lines ------------------------------------
 
 #[test]
-fn golden_cancellation_transaction_keeps_schema_v1() {
+fn golden_cancellation_transaction_uses_schema_v2() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     commit_cancelled_turn(&store);
@@ -147,21 +154,20 @@ fn golden_cancellation_transaction_keeps_schema_v1() {
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(lines.len(), 3);
     assert!(
-        lines.iter().all(|line| line.starts_with(r#"{"v":1,"#)),
-        "cancellation is a compatible evolution: envelope v stays 1"
+        lines.iter().all(|line| line.starts_with(r#"{"v":2,"#)),
+        "cancellation writes schema v2"
     );
     assert_eq!(
         lines[2],
-        r#"{"v":1,"revision":3,"entries":[{"id":"golden:entry:5","parent":"golden:entry:4","kind":{"type":"tool_result","turn_id":"turn-1","tool_batch_id":"batch-1","result":{"call_id":"call-1","status":"success","content":"ok"}}},{"id":"golden:entry:6","parent":"golden:entry:5","kind":{"type":"tool_result","turn_id":"turn-1","tool_batch_id":"batch-1","result":{"call_id":"call-2","status":"cancelled"}}},{"id":"golden:entry:7","parent":"golden:entry:6","kind":{"type":"turn_terminated","turn_id":"turn-1","outcome":"cancelled","reason":"user"}},{"id":"golden:entry:8","parent":"golden:entry:7","kind":{"type":"operation_settled","operation_id":"op-1","outcome":"cancelled","reason":"user"}}]}"#
+        r#"{"v":2,"revision":3,"entries":[{"id":"golden:entry:5","parent":"golden:entry:4","kind":{"type":"tool_result","turn_id":"turn-1","tool_batch_id":"batch-1","result":{"call_id":"call-1","status":"success","content":"ok"}}},{"id":"golden:entry:6","parent":"golden:entry:5","kind":{"type":"tool_result","turn_id":"turn-1","tool_batch_id":"batch-1","result":{"call_id":"call-2","status":"cancelled"}}},{"id":"golden:entry:7","parent":"golden:entry:6","kind":{"type":"turn_terminated","turn_id":"turn-1","outcome":"cancelled","reason":"user"}},{"id":"golden:entry:8","parent":"golden:entry:7","kind":{"type":"operation_settled","operation_id":"op-1","outcome":"cancelled","reason":"user"}}]}"#
     );
 }
 
-// --- Old files stay readable ---------------------------------------------------
+// --- v1 files are refused ------------------------------------------------------
 
 #[test]
-fn legacy_file_without_cancelled_still_opens_and_replays() {
+fn schema_v1_file_is_unsupported() {
     let root = TempRoot::new();
-    // A file written by the M5 implementation, byte for byte.
     let dir = root.path.join("s-golden");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(
@@ -173,15 +179,14 @@ fn legacy_file_without_cancelled_still_opens_and_replays() {
             "\n",
         ),
     )
-    .expect("write pre-M6 file");
+    .expect("write v1 file");
 
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    let report = store.recover_session(&session_id()).expect("recover");
-    assert_eq!(report.transactions(), 2);
-    assert!(!report.tail_was_truncated());
-    let view = block_on(store.context_view(&session_id())).expect("view");
-    assert_eq!(view.revision(), SessionRevision::new(2));
-    assert_eq!(view.messages().len(), 2);
+    let error = store.recover_session(&session_id()).expect_err("refused");
+    assert!(matches!(
+        error,
+        JsonlOpenError::UnsupportedSchema { found: 1 }
+    ));
 }
 
 // --- Roundtrip: write, reopen, project ----------------------------------------

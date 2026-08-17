@@ -21,7 +21,9 @@ use philo_session::SessionStore;
 use philo_session_jsonl::JsonlSessionStore;
 use philo_tools_std::ReadTool;
 use serde_json::{Value, json};
-use support::{StubResponse, StubTransport, collect, collect_ok, reasoning_snapshot, sse};
+use support::{
+    StubResponse, StubTransport, assistant_tool_calls, collect, collect_ok, reasoning_snapshot, sse,
+};
 
 const RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
 const MINIMAL_RESPONSE: &[u8] = include_bytes!(concat!(
@@ -67,10 +69,7 @@ fn tool_history(calls: &[(&str, &str, &str)]) -> Vec<ModelMessage> {
             arguments: (*arguments).to_owned(),
         })
         .collect::<Vec<_>>();
-    let mut messages = vec![
-        user("use the tools"),
-        ModelMessage::AssistantToolCalls { calls: model_calls },
-    ];
+    let mut messages = vec![user("use the tools"), assistant_tool_calls(model_calls)];
     messages.extend(
         calls
             .iter()
@@ -247,7 +246,7 @@ async fn response_items_restore_in_order_through_a_fresh_adapter() {
             .expect("first call starts"),
     )
     .await;
-    assert!(matches!(events.last(), Some(ModelEvent::Completed)));
+    assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
     drop(first);
 
     let second_store =
@@ -414,7 +413,7 @@ async fn incomplete_response_and_disabled_maintenance_call_commit_nothing() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Ok(ModelEvent::Completed)))
+            .any(|event| matches!(event, Ok(ModelEvent::Completed { .. })))
     );
     assert!(store.load("session-1").expect("load store").is_empty());
 
@@ -502,7 +501,7 @@ async fn required_commit_failure_is_emitted_instead_of_completed() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, Ok(ModelEvent::Completed)))
+            .any(|event| matches!(event, Ok(ModelEvent::Completed { .. })))
     );
     let error = events
         .last()
@@ -533,7 +532,7 @@ async fn optional_commit_failure_degrades_and_still_completes() {
             .expect("call starts"),
     )
     .await;
-    assert!(matches!(events.last(), Some(ModelEvent::Completed)));
+    assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
 }
 
 #[test]

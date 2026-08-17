@@ -144,58 +144,92 @@ impl KernelToolResult {
     }
 }
 
+/// One ordered content block from a completed model call.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum AssistantOutputKind {
-    FinalText,
-    ToolCalls(Vec<KernelToolCall>),
-    Unsupported,
+pub enum AssistantBlock {
+    Text { text: String },
+    ToolCall(KernelToolCall),
+}
+
+/// Why constructing an [`AssistantOutput`] from blocks was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidAssistantOutput {
+    EmptyTextBlock,
 }
 
 /// Complete semantic assistant output supplied after a model stream completes.
+///
+/// Blocks are the only representation: text and tool calls may coexist and
+/// interleave. Convenience constructors are sugar over [`Self::from_blocks`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssistantOutput {
-    text: String,
-    kind: AssistantOutputKind,
+    blocks: Vec<AssistantBlock>,
+    unsupported: bool,
 }
 impl AssistantOutput {
-    pub fn final_text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            kind: AssistantOutputKind::FinalText,
+    pub fn from_blocks(blocks: Vec<AssistantBlock>) -> Result<Self, InvalidAssistantOutput> {
+        if blocks
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::Text { text } if text.is_empty()))
+        {
+            return Err(InvalidAssistantOutput::EmptyTextBlock);
         }
+        Ok(Self {
+            blocks,
+            unsupported: false,
+        })
+    }
+    /// Empty string yields empty blocks; non-empty text is a single `Text` block.
+    pub fn final_text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let blocks = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![AssistantBlock::Text { text }]
+        };
+        Self::from_blocks(blocks).expect("final_text never inserts an empty Text block")
     }
     pub fn tool_calls(calls: Vec<KernelToolCall>) -> Self {
-        Self {
-            text: String::new(),
-            kind: AssistantOutputKind::ToolCalls(calls),
-        }
-    }
-    pub fn mixed(text: impl Into<String>, calls: Vec<KernelToolCall>) -> Self {
-        Self {
-            text: text.into(),
-            kind: AssistantOutputKind::ToolCalls(calls),
-        }
+        Self::from_blocks(calls.into_iter().map(AssistantBlock::ToolCall).collect())
+            .expect("tool-call blocks have no empty text")
     }
     pub fn with_unsupported_tool_call(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            kind: AssistantOutputKind::Unsupported,
-        }
+        let mut output = Self::final_text(text);
+        output.unsupported = true;
+        output
     }
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn blocks(&self) -> &[AssistantBlock] {
+        &self.blocks
     }
-    pub fn tool_call_batch(&self) -> Option<&[KernelToolCall]> {
-        match &self.kind {
-            AssistantOutputKind::ToolCalls(calls) => Some(calls),
-            _ => None,
-        }
+    /// Concatenate every `Text` block in source order.
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantBlock::Text { text } => Some(text.as_str()),
+                AssistantBlock::ToolCall(_) => None,
+            })
+            .collect()
+    }
+    /// Extracted `ToolCall` blocks in source order, or `None` when none exist.
+    pub fn tool_call_batch(&self) -> Option<Vec<KernelToolCall>> {
+        let calls: Vec<KernelToolCall> = self
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantBlock::ToolCall(call) => Some(call.clone()),
+                AssistantBlock::Text { .. } => None,
+            })
+            .collect();
+        if calls.is_empty() { None } else { Some(calls) }
     }
     pub fn contains_tool_call(&self) -> bool {
-        !matches!(self.kind, AssistantOutputKind::FinalText)
+        self.blocks
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::ToolCall(_)))
     }
     pub(crate) fn is_unsupported(&self) -> bool {
-        matches!(self.kind, AssistantOutputKind::Unsupported)
+        self.unsupported
     }
 }
 
@@ -205,7 +239,7 @@ pub enum TurnMessage {
     Assistant(AssistantOutput),
     AssistantToolCalls {
         tool_batch_id: ToolBatchId,
-        calls: Vec<KernelToolCall>,
+        blocks: Vec<AssistantBlock>,
     },
     ToolResult(KernelToolResult),
 }
@@ -300,6 +334,7 @@ pub enum KernelObservation {
     AssistantToolCallsAccepted {
         model_call_id: ModelCallId,
         tool_batch_id: ToolBatchId,
+        blocks: Vec<AssistantBlock>,
         calls: Vec<KernelToolCall>,
     },
     ToolBatchRequested {

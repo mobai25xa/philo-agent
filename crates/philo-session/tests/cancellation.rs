@@ -7,10 +7,10 @@ use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     CancelReason, ContextMessage, MemorySessionStore, OperationId, OperationOutcome,
-    SessionEntryKind, SessionError, SessionId, SessionProjection, SessionRevision, SessionStore,
-    SessionToolCall, SessionToolResult, SessionTransaction, SessionUserPart,
-    SessionValidationError, ToolBatchId, ToolCallId, ToolResultOutcome, TurnFailure,
-    TurnFailureKind, TurnId, TurnOutcome,
+    SessionAssistantBlock, SessionEntryKind, SessionError, SessionId, SessionProjection,
+    SessionRevision, SessionStore, SessionToolCall, SessionToolResult, SessionTransaction,
+    SessionUserPart, SessionValidationError, ToolBatchId, ToolCallId, ToolResultOutcome,
+    TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -63,9 +63,17 @@ fn batch_transaction(revision: u64) -> SessionTransaction {
             turn_id: turn_id(),
             model_call_id: "model-call-1".to_owned(),
             tool_batch_id: ToolBatchId::new("batch-1"),
-            calls: vec![
-                SessionToolCall::new(ToolCallId::new("call-1"), "read", "{}"),
-                SessionToolCall::new(ToolCallId::new("call-2"), "read", "{}"),
+            blocks: vec![
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-1"),
+                    "read",
+                    "{}",
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new("call-2"),
+                    "read",
+                    "{}",
+                )),
             ],
         }],
     )
@@ -225,7 +233,7 @@ fn session_continues_after_a_cancelled_turn_and_projects_cancelled_results() {
     ));
     assert!(matches!(
         &messages[1],
-        ContextMessage::AssistantToolCalls { calls, .. } if calls.len() == 2
+        ContextMessage::AssistantToolCalls { blocks, .. } if blocks.len() == 2
     ));
     assert!(matches!(
         &messages[2],
@@ -360,7 +368,9 @@ fn a_turn_with_an_assistant_message_cannot_cancel() {
                 SessionRevision::new(1),
                 vec![SessionEntryKind::AssistantMessage {
                     turn_id: turn_id(),
-                    content: "done".to_owned(),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: "done".into(),
+                    }],
                 }],
             ),
         ],
@@ -458,7 +468,9 @@ fn cancelled_operation_outcome_requires_a_cancelled_turn() {
             vec![
                 SessionEntryKind::AssistantMessage {
                     turn_id: turn_id(),
-                    content: "done".to_owned(),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: "done".into(),
+                    }],
                 },
                 SessionEntryKind::TurnTerminated {
                     turn_id: turn_id(),

@@ -1,5 +1,5 @@
-//! JSONL-006: Compaction entry schema v1 serialization, legacy compatibility,
-//! and restart replay parity with the in-memory backend.
+//! JSONL-006: Compaction entry schema v2 serialization and restart replay
+//! parity with the in-memory backend.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_session::{
-    ContextMessage, EntryId, MemorySessionStore, OperationId, OperationOutcome, SessionEntryKind,
-    SessionId, SessionRevision, SessionStore, SessionTransaction, SessionUserPart, TurnId,
-    TurnOutcome,
+    ContextMessage, EntryId, MemorySessionStore, OperationId, OperationOutcome,
+    SessionAssistantBlock, SessionEntryKind, SessionId, SessionRevision, SessionStore,
+    SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
 };
-use philo_session_jsonl::JsonlSessionStore;
+use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
@@ -75,7 +75,9 @@ fn successful_turn(revision: SessionRevision, number: usize) -> SessionTransacti
             },
             SessionEntryKind::AssistantMessage {
                 turn_id: turn_id.clone(),
-                content: format!("assistant-{number}"),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: format!("assistant-{number}"),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id,
@@ -105,7 +107,7 @@ fn compaction(
 }
 
 #[test]
-fn golden_compaction_serializes_as_schema_v1_with_opaque_boundary() {
+fn golden_compaction_serializes_as_schema_v2_with_opaque_boundary() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     let first =
@@ -129,12 +131,12 @@ fn golden_compaction_serializes_as_schema_v1_with_opaque_boundary() {
     assert_eq!(lines.len(), 2);
     assert_eq!(
         lines[1],
-        r#"{"v":1,"revision":2,"entries":[{"id":"m13-jsonl:entry:7","parent":"m13-jsonl:entry:6","kind":{"type":"compaction","summary":"summary \"quoted\"\nnext","covers_up_to":"m13-jsonl:entry:6"}}]}"#
+        r#"{"v":2,"revision":2,"entries":[{"id":"m13-jsonl:entry:7","parent":"m13-jsonl:entry:6","kind":{"type":"compaction","summary":"summary \"quoted\"\nnext","covers_up_to":"m13-jsonl:entry:6"}}]}"#
     );
 }
 
 #[test]
-fn pre_compaction_schema_v1_log_still_opens_and_replays() {
+fn schema_v1_pre_compaction_log_is_unsupported() {
     let root = TempRoot::new();
     let dir = root.path.join("s-m13-jsonl");
     std::fs::create_dir_all(&dir).expect("create session dir");
@@ -145,22 +147,14 @@ fn pre_compaction_schema_v1_log_still_opens_and_replays() {
             "\n",
         ),
     )
-    .expect("write legacy log");
+    .expect("write v1 log");
 
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    let view = block_on(store.context_view(&session_id())).expect("replay legacy log");
-    assert_eq!(view.revision(), SessionRevision::new(1));
-    assert_eq!(
-        view.messages(),
-        [
-            ContextMessage::User {
-                parts: SessionUserPart::text_parts("legacy user"),
-            },
-            ContextMessage::Assistant {
-                content: "legacy assistant".to_owned(),
-            },
-        ]
-    );
+    let error = store.recover_session(&session_id()).expect_err("refused");
+    assert!(matches!(
+        error,
+        JsonlOpenError::UnsupportedSchema { found: 1 }
+    ));
 }
 
 #[test]
@@ -225,7 +219,9 @@ fn compactions_roundtrip_across_restart_with_latest_boundary() {
                 parts: SessionUserPart::text_parts("user-3"),
             },
             ContextMessage::Assistant {
-                content: "assistant-3".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "assistant-3".to_owned(),
+                }],
             },
         ],
         "only the latest compaction boundary controls the replayed projection"

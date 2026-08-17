@@ -25,8 +25,8 @@ pub use ids::{
 };
 pub use message::{AssistantMessage, InvalidUserMessage, UserMessage, UserPart};
 pub use model::{
-    ModelError, ModelEvent, ModelEventStream, ModelMessage, ModelPort, ModelToolCall,
-    ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
+    ModelAssistantBlock, ModelError, ModelEvent, ModelEventStream, ModelMessage, ModelPort,
+    ModelToolCall, ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
 };
 pub use operation::OperationHandle;
 pub use outcome::{

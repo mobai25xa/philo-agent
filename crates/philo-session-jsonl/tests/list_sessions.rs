@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_session::{
-    OperationId, SessionEntryKind, SessionId, SessionRevision, SessionStore, SessionTransaction,
-    SessionUserPart, TurnId,
+    OperationId, SessionAssistantBlock, SessionEntryKind, SessionId, SessionRevision, SessionStore,
+    SessionTransaction, SessionUserPart, TurnId,
 };
 use philo_session_jsonl::JsonlSessionStore;
 
@@ -140,7 +140,9 @@ fn enumeration_coexists_with_an_active_writer_and_writes_nothing() {
         SessionRevision::new(1),
         vec![SessionEntryKind::AssistantMessage {
             turn_id: TurnId::new("turn-1"),
-            content: "hello".to_owned(),
+            blocks: vec![SessionAssistantBlock::Text {
+                text: "hello".to_owned(),
+            }],
         }],
     )))
     .expect("writer unaffected");
@@ -157,7 +159,7 @@ fn listing_does_not_trigger_recovery() {
     // Simulate crash residue: a torn tail that recovery would truncate.
     let log = root.path.join("s-torn").join("log.jsonl");
     let mut bytes = std::fs::read(&log).expect("read log");
-    bytes.extend_from_slice(br#"{"v":1,"revision":2,"entr"#);
+    bytes.extend_from_slice(br#"{"v":2,"revision":2,"entr"#);
     std::fs::write(&log, &bytes).expect("write torn tail");
 
     let store = JsonlSessionStore::open(&root.path).expect("re-open");

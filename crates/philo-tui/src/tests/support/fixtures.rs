@@ -2,8 +2,9 @@
 
 use philo_agent_runtime::{EffectClass, ToolDefinition};
 use philo_session::{
-    SessionContextView, SessionEntryKind, SessionProjection, SessionRevision, SessionToolCall,
-    SessionToolResult, SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, TurnId,
+    SessionAssistantBlock, SessionContextView, SessionEntryKind, SessionProjection,
+    SessionRevision, SessionToolCall, SessionToolResult, SessionTransaction, SessionUserPart,
+    ToolBatchId, ToolCallId, TurnId,
 };
 
 pub(crate) fn tool(name: &str, class: EffectClass) -> ToolDefinition {
@@ -47,11 +48,11 @@ pub(crate) fn session_view(id: &str) -> SessionContextView {
             turn_id: turn_id.clone(),
             model_call_id: format!("{id}-model-call"),
             tool_batch_id: tool_batch_id.clone(),
-            calls: vec![SessionToolCall::new(
+            blocks: vec![SessionAssistantBlock::ToolCall(SessionToolCall::new(
                 call_id.clone(),
                 "read_file",
                 r#"{"path":"src/main.rs"}"#,
-            )],
+            ))],
         }],
         vec![SessionEntryKind::ToolResult {
             turn_id: turn_id.clone(),
@@ -61,7 +62,9 @@ pub(crate) fn session_view(id: &str) -> SessionContextView {
         vec![
             SessionEntryKind::AssistantMessage {
                 turn_id: turn_id.clone(),
-                content: "one file".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "one file".to_owned(),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id,

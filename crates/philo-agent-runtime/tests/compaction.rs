@@ -121,7 +121,9 @@ fn seed_turn(store: &dyn SessionStore, index: usize, user: &str, assistant: &str
             },
             SessionEntryKind::AssistantMessage {
                 turn_id: turn_id.clone(),
-                content: assistant.to_owned(),
+                blocks: vec![philo_session::SessionAssistantBlock::Text {
+                    text: assistant.to_owned(),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id,

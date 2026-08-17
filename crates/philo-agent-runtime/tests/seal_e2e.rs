@@ -18,8 +18,8 @@ use philo_agent_runtime::{
     SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{
-    SessionEntryKind, SessionRevision, SessionStore, SessionToolCall, SessionTransaction,
-    SessionUserPart,
+    SessionAssistantBlock, SessionEntryKind, SessionRevision, SessionStore, SessionToolCall,
+    SessionTransaction, SessionUserPart,
 };
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
@@ -146,17 +146,17 @@ fn persist_crash_remnant(store: &JsonlSessionStore) {
             turn_id: philo_session::TurnId::new("stale-turn"),
             model_call_id: "stale-model-call".to_owned(),
             tool_batch_id: philo_session::ToolBatchId::new("stale-batch"),
-            calls: vec![
-                SessionToolCall::new(
+            blocks: vec![
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
                     philo_session::ToolCallId::new("stale-call-1"),
                     "write",
                     r#"{"path":"a.txt"}"#,
-                ),
-                SessionToolCall::new(
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
                     philo_session::ToolCallId::new("stale-call-2"),
                     "shell",
                     r#"{"command":"cargo test"}"#,
-                ),
+                )),
             ],
         }],
     )))
@@ -372,20 +372,19 @@ fn timeout_cancellation_lands_on_disk_with_its_reason() {
 #[test]
 fn legacy_cancelled_session_continues_after_upgrade() {
     let root = TempRoot::new();
-    // A cancellation written by the M6-M10 implementation, byte for byte
-    // (no reason field anywhere).
+    // A previously cancelled session on schema v2 (jsonl no longer opens v1).
     let dir = root.path.join("s-s");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(
         dir.join("log.jsonl"),
         concat!(
-            r#"{"v":1,"revision":1,"entries":[{"id":"s:entry:1","kind":{"type":"operation_started","operation_id":"op-legacy"}},{"id":"s:entry:2","parent":"s:entry:1","kind":{"type":"turn_started","operation_id":"op-legacy","turn_id":"turn-legacy"}},{"id":"s:entry:3","parent":"s:entry:2","kind":{"type":"user_message","turn_id":"turn-legacy","content":"old prompt"}}]}"#,
+            r#"{"v":2,"revision":1,"entries":[{"id":"s:entry:1","kind":{"type":"operation_started","operation_id":"op-legacy"}},{"id":"s:entry:2","parent":"s:entry:1","kind":{"type":"turn_started","operation_id":"op-legacy","turn_id":"turn-legacy"}},{"id":"s:entry:3","parent":"s:entry:2","kind":{"type":"user_message","turn_id":"turn-legacy","parts":[{"type":"text","text":"old prompt"}]}}]}"#,
             "\n",
-            r#"{"v":1,"revision":2,"entries":[{"id":"s:entry:4","parent":"s:entry:3","kind":{"type":"turn_terminated","turn_id":"turn-legacy","outcome":"cancelled"}},{"id":"s:entry:5","parent":"s:entry:4","kind":{"type":"operation_settled","operation_id":"op-legacy","outcome":"cancelled"}}]}"#,
+            r#"{"v":2,"revision":2,"entries":[{"id":"s:entry:4","parent":"s:entry:3","kind":{"type":"turn_terminated","turn_id":"turn-legacy","outcome":"cancelled","reason":"user"}},{"id":"s:entry:5","parent":"s:entry:4","kind":{"type":"operation_settled","operation_id":"op-legacy","outcome":"cancelled","reason":"user"}}]}"#,
             "\n",
         ),
     )
-    .expect("write legacy session");
+    .expect("write cancelled session");
 
     let store = Arc::new(JsonlSessionStore::open(&root.path).expect("open"));
     let model = Arc::new(FakeModel::succeeds(&["hello again"]));

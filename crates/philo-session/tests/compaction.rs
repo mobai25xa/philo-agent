@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use philo_session::{
-    ContextMessage, EntryId, MemorySessionStore, OperationId, OperationOutcome, SessionEntry,
-    SessionEntryKind, SessionError, SessionId, SessionProjection, SessionRevision, SessionStore,
-    SessionTransaction, SessionUserPart, SessionValidationError, TurnId, TurnOutcome,
+    ContextMessage, EntryId, MemorySessionStore, OperationId, OperationOutcome,
+    SessionAssistantBlock, SessionEntry, SessionEntryKind, SessionError, SessionId,
+    SessionProjection, SessionRevision, SessionStore, SessionTransaction, SessionUserPart,
+    SessionValidationError, TurnId, TurnOutcome,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -55,7 +56,9 @@ fn successful_turn(revision: SessionRevision, number: usize) -> SessionTransacti
             },
             SessionEntryKind::AssistantMessage {
                 turn_id: turn_id.clone(),
-                content: format!("assistant-{number}"),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: format!("assistant-{number}"),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id,
@@ -146,7 +149,9 @@ fn expected_tail(from: usize, through: usize) -> Vec<ContextMessage> {
                     parts: SessionUserPart::text_parts(format!("user-{number}")),
                 },
                 ContextMessage::Assistant {
-                    content: format!("assistant-{number}"),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: format!("assistant-{number}"),
+                    }],
                 },
             ]
         })

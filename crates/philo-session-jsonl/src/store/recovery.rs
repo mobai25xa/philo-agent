@@ -70,12 +70,35 @@ pub(super) fn recover_locked(dir: &Path) -> Result<SessionState, JsonlOpenError>
         let line = &bytes[offset..offset + relative_end];
         offset += relative_end + 1;
         let is_last_line = offset >= bytes.len();
-        let record = match serde_json::from_slice::<TransactionRecord>(line) {
-            Ok(record) => record,
+        // Peek `v` before the v2 record shape so a v1 line is
+        // `UnsupportedSchema`, not a parse `Corrupt` from old fields.
+        let value = match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(value) => value,
             Err(error) if is_last_line && error.is_eof() => {
                 truncate_at = Some(line_start as u64);
                 break;
             }
+            Err(error) => {
+                return Err(JsonlOpenError::Corrupt {
+                    line: line_number,
+                    reason: format!("envelope parse failed: {error}"),
+                });
+            }
+        };
+        let found = match value.get("v").and_then(|version| version.as_u64()) {
+            Some(version) => version,
+            None => {
+                return Err(JsonlOpenError::Corrupt {
+                    line: line_number,
+                    reason: "envelope parse failed: missing numeric schema version".to_owned(),
+                });
+            }
+        };
+        if found != SCHEMA_VERSION {
+            return Err(JsonlOpenError::UnsupportedSchema { found });
+        }
+        let record = match serde_json::from_value::<TransactionRecord>(value) {
+            Ok(record) => record,
             Err(error) => {
                 return Err(JsonlOpenError::Corrupt {
                     line: line_number,

@@ -27,8 +27,9 @@ pub(super) async fn next_or_cancel(
     .await
 }
 
-/// Accumulates streamed deltas into the call's assembled output: final text
-/// or a validated list of complete tool calls, never both.
+/// Accumulates streamed deltas for live UI and diagnostics. The
+/// authoritative assistant output is `ModelEvent::Completed.blocks`, not
+/// this assembler.
 #[derive(Default)]
 pub(super) struct OutputAssembler {
     text: String,
@@ -58,12 +59,8 @@ impl OutputAssembler {
         }
         parts.arguments.push_str(&delta.arguments);
     }
+    #[allow(dead_code)]
     pub fn finish(self) -> Result<(String, Vec<kernel::KernelToolCall>), AgentFailure> {
-        if !self.calls.is_empty() && !self.text.is_empty() {
-            return Err(AgentFailure::invalid_model_output(
-                "model mixed text and tool calls",
-            ));
-        }
         let mut ids = HashSet::new();
         let mut calls = Vec::new();
         for index in self.order {

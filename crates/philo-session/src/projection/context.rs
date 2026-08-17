@@ -53,20 +53,20 @@ impl ContextProjection {
                     parts: parts.clone(),
                 });
             }
-            SessionEntryKind::AssistantMessage { content, .. } => {
+            SessionEntryKind::AssistantMessage { blocks, .. } => {
                 self.source_messages.push(ContextMessage::Assistant {
-                    content: content.clone(),
+                    blocks: blocks.clone(),
                 });
             }
             SessionEntryKind::AssistantToolCallBatch {
                 tool_batch_id,
-                calls,
+                blocks,
                 ..
             } => {
                 self.source_messages
                     .push(ContextMessage::AssistantToolCalls {
                         tool_batch_id: tool_batch_id.clone(),
-                        calls: calls.clone(),
+                        blocks: blocks.clone(),
                     });
             }
             SessionEntryKind::ToolResult { result, .. } => {

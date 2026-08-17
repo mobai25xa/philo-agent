@@ -16,7 +16,7 @@ use philo_agent_runtime::{
     SettlementDurability, ToolRegistry, UserMessage,
 };
 use philo_model::{ChatReasoningFormat, ModelCompat, ModelProtocol, PhiloModelAdapter};
-use philo_session::{ContextMessage, MemorySessionStore, SessionStore};
+use philo_session::{ContextMessage, MemorySessionStore, SessionAssistantBlock, SessionStore};
 use philo_tools_std::ReadTool;
 use support::{StubResponse, StubTransport, sse, text_sse};
 
@@ -243,7 +243,10 @@ async fn reasoning_flows_replay_and_stay_out_of_the_session() {
         .collect();
     assert_eq!(kinds, vec!["user", "calls", "result", "assistant"]);
     assert!(view.messages().iter().all(|message| match message {
-        ContextMessage::Assistant { content } => !content.contains("planning"),
+        ContextMessage::Assistant { blocks } => blocks.iter().all(|block| match block {
+            SessionAssistantBlock::Text { text } => !text.contains("planning"),
+            SessionAssistantBlock::ToolCall(_) => true,
+        }),
         _ => true,
     }));
 

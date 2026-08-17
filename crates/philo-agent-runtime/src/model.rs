@@ -31,6 +31,14 @@ pub enum ModelToolResultOutcome {
     Interrupted,
 }
 
+/// One ordered block of a completed model call. Text and tool calls may
+/// coexist and interleave; empty Text is invalid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelAssistantBlock {
+    Text { text: String },
+    ToolCall(ModelToolCall),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelMessage {
     System {
@@ -46,11 +54,9 @@ pub enum ModelMessage {
     User {
         parts: Vec<UserPart>,
     },
+    /// One assistant turn: a tool round or a final message, never split.
     Assistant {
-        content: String,
-    },
-    AssistantToolCalls {
-        calls: Vec<ModelToolCall>,
+        blocks: Vec<ModelAssistantBlock>,
     },
     ToolResult {
         tool_call_id: ToolCallId,
@@ -126,7 +132,12 @@ pub enum ModelEvent {
     UsageUpdated {
         usage: TokenUsage,
     },
-    Completed,
+    /// Authoritative assistant output for this logical call, in SDK item
+    /// order. Text and tool calls may coexist; deltas are not the source
+    /// of truth.
+    Completed {
+        blocks: Vec<ModelAssistantBlock>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

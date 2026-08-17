@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelMessage, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability, ToolDefinition,
-    UserMessage,
+    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock,
+    ModelMessage, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
+    SettlementDurability, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::failing_session::{FailingSessionStore, FailurePlan};
@@ -593,7 +593,13 @@ fn next_prompt_replays_all_rounds_in_source_order() {
             ModelMessage::System { .. } => "system",
             ModelMessage::Summary { .. } => "summary",
             ModelMessage::User { .. } => "user",
-            ModelMessage::AssistantToolCalls { .. } => "calls",
+            ModelMessage::Assistant { blocks }
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ModelAssistantBlock::ToolCall(_))) =>
+            {
+                "calls"
+            }
             ModelMessage::ToolResult { .. } => "result",
             ModelMessage::Assistant { .. } => "assistant",
         })

@@ -1,7 +1,10 @@
 //! Projections of durable context and in-turn messages into model messages.
 
 use super::parts::{runtime_parts_from_kernel, runtime_parts_from_session};
-use crate::{ModelMessage, ModelToolCall, ModelToolResultOutcome, ToolCallId, TurnSnapshot};
+use crate::{
+    ModelAssistantBlock, ModelMessage, ModelToolCall, ModelToolResultOutcome, ToolCallId,
+    TurnSnapshot,
+};
 use philo_agent_kernel as kernel;
 use philo_session as session;
 
@@ -57,25 +60,15 @@ pub(crate) fn context_messages(context: &session::SessionContextView) -> Vec<Mod
                     session::ContextMessage::User { parts } => output.push(ModelMessage::User {
                         parts: runtime_parts_from_session(parts),
                     }),
-                    session::ContextMessage::Assistant { content } => {
+                    session::ContextMessage::Assistant { blocks } => {
                         output.push(ModelMessage::Assistant {
-                            content: content.clone(),
+                            blocks: model_blocks_from_session(blocks),
                         });
                     }
-                    session::ContextMessage::AssistantToolCalls { calls, .. } => {
-                        pending = calls
-                            .iter()
-                            .map(|call| ToolCallId::new(call.id().as_str()))
-                            .collect();
-                        output.push(ModelMessage::AssistantToolCalls {
-                            calls: calls
-                                .iter()
-                                .map(|call| ModelToolCall {
-                                    tool_call_id: ToolCallId::new(call.id().as_str()),
-                                    name: call.name().to_owned(),
-                                    arguments: call.arguments().to_owned(),
-                                })
-                                .collect(),
+                    session::ContextMessage::AssistantToolCalls { blocks, .. } => {
+                        pending = tool_call_ids_from_session(blocks);
+                        output.push(ModelMessage::Assistant {
+                            blocks: model_blocks_from_session(blocks),
                         });
                     }
                     session::ContextMessage::ToolResult { .. } => unreachable!("matched above"),
@@ -104,20 +97,11 @@ fn turn_messages(messages: Vec<kernel::TurnMessage>) -> Vec<ModelMessage> {
                 parts: runtime_parts_from_kernel(user.parts()),
             },
             kernel::TurnMessage::Assistant(output) => ModelMessage::Assistant {
-                content: output.text().to_owned(),
+                blocks: model_blocks_from_kernel(output.blocks()),
             },
-            kernel::TurnMessage::AssistantToolCalls { calls, .. } => {
-                ModelMessage::AssistantToolCalls {
-                    calls: calls
-                        .into_iter()
-                        .map(|call| ModelToolCall {
-                            tool_call_id: ToolCallId::new(call.id().as_str()),
-                            name: call.name().to_owned(),
-                            arguments: call.arguments().to_owned(),
-                        })
-                        .collect(),
-                }
-            }
+            kernel::TurnMessage::AssistantToolCalls { blocks, .. } => ModelMessage::Assistant {
+                blocks: model_blocks_from_kernel(&blocks),
+            },
             kernel::TurnMessage::ToolResult(result) => ModelMessage::ToolResult {
                 tool_call_id: ToolCallId::new(result.call_id().as_str()),
                 outcome: match result.outcome() {
@@ -150,4 +134,72 @@ pub(crate) fn build_messages(
     output.extend(turn.context_messages.clone());
     output.extend(turn_messages(messages));
     output
+}
+
+pub(crate) fn kernel_blocks_from_model(
+    blocks: Vec<ModelAssistantBlock>,
+) -> Vec<kernel::AssistantBlock> {
+    blocks
+        .into_iter()
+        .map(|block| match block {
+            ModelAssistantBlock::Text { text } => kernel::AssistantBlock::Text { text },
+            ModelAssistantBlock::ToolCall(call) => {
+                kernel::AssistantBlock::ToolCall(kernel::KernelToolCall::new(
+                    kernel::ToolCallId::new(call.tool_call_id.as_str()),
+                    call.name,
+                    call.arguments,
+                ))
+            }
+        })
+        .collect()
+}
+
+fn model_blocks_from_session(
+    blocks: &[session::SessionAssistantBlock],
+) -> Vec<ModelAssistantBlock> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            session::SessionAssistantBlock::Text { text } => {
+                ModelAssistantBlock::Text { text: text.clone() }
+            }
+            session::SessionAssistantBlock::ToolCall(call) => {
+                ModelAssistantBlock::ToolCall(ModelToolCall {
+                    tool_call_id: ToolCallId::new(call.id().as_str()),
+                    name: call.name().to_owned(),
+                    arguments: call.arguments().to_owned(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn model_blocks_from_kernel(blocks: &[kernel::AssistantBlock]) -> Vec<ModelAssistantBlock> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            kernel::AssistantBlock::Text { text } => {
+                ModelAssistantBlock::Text { text: text.clone() }
+            }
+            kernel::AssistantBlock::ToolCall(call) => {
+                ModelAssistantBlock::ToolCall(ModelToolCall {
+                    tool_call_id: ToolCallId::new(call.id().as_str()),
+                    name: call.name().to_owned(),
+                    arguments: call.arguments().to_owned(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn tool_call_ids_from_session(blocks: &[session::SessionAssistantBlock]) -> Vec<ToolCallId> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            session::SessionAssistantBlock::ToolCall(call) => {
+                Some(ToolCallId::new(call.id().as_str()))
+            }
+            session::SessionAssistantBlock::Text { .. } => None,
+        })
+        .collect()
 }

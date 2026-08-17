@@ -7,8 +7,8 @@ use philo_agent_runtime::{
     UserPart,
 };
 use support::{
-    BodyDropFlag, StubResponse, StubTransport, adapter_over, collect_ok, read_tool_definition,
-    snapshot, text_sse,
+    BodyDropFlag, StubResponse, StubTransport, adapter_over, assistant_tool_calls, collect_ok,
+    read_tool_definition, snapshot, text_sse,
 };
 
 const CANCELLED_TEXT: &str =
@@ -24,20 +24,18 @@ fn user(content: &str) -> ModelMessage {
 fn cancelled_turn_history() -> Vec<ModelMessage> {
     vec![
         user("read two files"),
-        ModelMessage::AssistantToolCalls {
-            calls: vec![
-                ModelToolCall {
-                    tool_call_id: ToolCallId::new("call-1"),
-                    name: "read".to_owned(),
-                    arguments: r#"{"path":"a.txt"}"#.to_owned(),
-                },
-                ModelToolCall {
-                    tool_call_id: ToolCallId::new("call-2"),
-                    name: "read".to_owned(),
-                    arguments: r#"{"path":"b.txt"}"#.to_owned(),
-                },
-            ],
-        },
+        assistant_tool_calls([
+            ModelToolCall {
+                tool_call_id: ToolCallId::new("call-1"),
+                name: "read".to_owned(),
+                arguments: r#"{"path":"a.txt"}"#.to_owned(),
+            },
+            ModelToolCall {
+                tool_call_id: ToolCallId::new("call-2"),
+                name: "read".to_owned(),
+                arguments: r#"{"path":"b.txt"}"#.to_owned(),
+            },
+        ]),
         ModelMessage::ToolResult {
             tool_call_id: ToolCallId::new("call-1"),
             outcome: ModelToolResultOutcome::Success {
@@ -67,7 +65,11 @@ async fn cancelled_history_replays_canonical_text_without_native_error_status() 
         .await
         .expect("replay with a cancelled mark passes validation");
     let events = collect_ok(stream).await;
-    assert!(events.contains(&ModelEvent::Completed));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::Completed { .. }))
+    );
 
     let body = &transport.request_bodies()[0];
     let real = &body["messages"][2];

@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelMessage, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability, ToolDefinition, ToolPort,
-    ToolRegistry, UserMessage,
+    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelEvent,
+    ModelMessage, ModelToolCall, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
+    SettlementDurability, ToolCallId, ToolDefinition, ToolPort, ToolRegistry, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::failing_session::{FailingSessionStore, FailurePlan};
@@ -485,17 +485,28 @@ fn second_turn_reads_prior_tool_exchange() {
         Ok(OperationOutcome::Succeeded { .. })
     ));
     let messages = &model.calls()[2].messages;
-    assert!(
-        messages
-            .iter()
-            .any(|message| matches!(message, ModelMessage::AssistantToolCalls { .. }))
-    );
+    assert!(messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::Assistant { blocks }
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ModelAssistantBlock::ToolCall(_)))
+        )
+    }));
     assert!(
         messages
             .iter()
             .any(|message| matches!(message, ModelMessage::ToolResult { .. }))
     );
-    assert!(messages.iter().any(|message| matches!(message, ModelMessage::Assistant { content } if content == "first answer")));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        ModelMessage::Assistant { blocks }
+            if matches!(
+                blocks.as_slice(),
+                [ModelAssistantBlock::Text { text }] if text == "first answer"
+            )
+    )));
 }
 
 #[test]
@@ -552,6 +563,62 @@ fn direct_answer_regression() {
     );
     assert_eq!(model.call_count(), 1);
     assert_eq!(tools.invocation_count(), 0);
+}
+
+#[test]
+fn mixed_text_and_tool_call_continues_the_tool_loop() {
+    let model = Arc::new(FakeModel::new([
+        ModelScript::Events(vec![
+            Ok(ModelEvent::TextDelta("calling echo".to_owned())),
+            Ok(ModelEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".to_owned()),
+                name: Some("echo".to_owned()),
+                arguments: "{}".to_owned(),
+            }),
+            Ok(ModelEvent::Completed {
+                blocks: vec![
+                    ModelAssistantBlock::Text {
+                        text: "calling echo".to_owned(),
+                    },
+                    ModelAssistantBlock::ToolCall(ModelToolCall {
+                        tool_call_id: ToolCallId::new("call-1"),
+                        name: "echo".to_owned(),
+                        arguments: "{}".to_owned(),
+                    }),
+                ],
+            }),
+        ]),
+        ModelScript::text(&["done"]),
+    ]));
+    let tools = Arc::new(FakeTool::one(
+        definition("echo"),
+        FakeToolResult::success("ok"),
+    ));
+    let sessions = Arc::new(MemorySessionStore::new());
+    let (handle, model, tools) = success_handle(model, sessions.clone(), tools);
+    assert!(matches!(
+        block_on(handle.wait()),
+        OperationOutcome::Succeeded { assistant } if assistant.content() == "done"
+    ));
+    assert_eq!(model.call_count(), 2);
+    assert_eq!(tools.invocation_count(), 1);
+    let events = collect_events(handle);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::TextDelta { delta } if delta == "calling echo")
+        )
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolBatchRequested { .. }))
+    );
+    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    assert!(matches!(
+        view.messages()[1],
+        ContextMessage::AssistantToolCalls { .. }
+    ));
 }
 
 fn assert_tool_error_continues(

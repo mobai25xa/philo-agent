@@ -2,7 +2,7 @@
 //!
 //! Layout: one directory per session (`{root}/{session_dir}/`) holding an
 //! append-only `log.jsonl` transaction log and an advisory `lock` file. One
-//! line is one committed `SessionTransaction` (schema v1 envelope); `commit`
+//! line is one committed `SessionTransaction` (schema v2 envelope); `commit`
 //! returns only after the line is fsynced, so `Confirmed` means on disk.
 //!
 //! Recovery replays complete transaction lines through the shared

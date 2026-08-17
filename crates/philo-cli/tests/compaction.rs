@@ -12,8 +12,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use philo_session::{
-    OperationId, OperationOutcome, SessionEntryKind, SessionId, SessionRevision, SessionStore,
-    SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
+    OperationId, OperationOutcome, SessionAssistantBlock, SessionEntryKind, SessionId,
+    SessionRevision, SessionStore, SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
 };
 
 struct TempRoot(PathBuf);
@@ -145,7 +145,9 @@ fn seed_completed_turns(root: &Path, session: &str, count: usize) {
                 },
                 SessionEntryKind::AssistantMessage {
                     turn_id: turn_id.clone(),
-                    content: format!("seed answer {index}"),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: format!("seed answer {index}"),
+                    }],
                 },
                 SessionEntryKind::TurnTerminated {
                     turn_id,

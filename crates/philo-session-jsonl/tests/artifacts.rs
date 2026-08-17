@@ -1,5 +1,5 @@
-//! JSONL-003: content-addressed artifact storage, UserMessage record
-//! evolution with legacy compatibility, and recovery semantics (ADR-0002).
+//! JSONL-003: content-addressed artifact storage, UserMessage `parts` on
+//! schema v2, and recovery semantics (ADR-0002).
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_session::{
-    ContextMessage, MemorySessionStore, OperationId, OperationOutcome, SessionEntryKind, SessionId,
-    SessionRevision, SessionStore, SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
+    ContextMessage, MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock,
+    SessionEntryKind, SessionId, SessionRevision, SessionStore, SessionTransaction,
+    SessionUserPart, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
 
@@ -108,7 +109,9 @@ fn settle_transaction(revision: u64, operation: &str, turn: &str) -> SessionTran
         vec![
             SessionEntryKind::AssistantMessage {
                 turn_id: TurnId::new(turn),
-                content: "a cat".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "a cat".to_owned(),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id: TurnId::new(turn),
@@ -139,7 +142,7 @@ fn golden_image_transaction_stores_reference_and_fsynced_artifact() {
         IMAGE_BYTES
     );
 
-    // The log line carries only the reference; envelope v stays 1.
+    // The log line carries only the reference; envelope is schema v2.
     let log = std::fs::read_to_string(log_path(&root)).expect("read log");
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(lines.len(), 1);
@@ -147,7 +150,7 @@ fn golden_image_transaction_stores_reference_and_fsynced_artifact() {
         lines[0],
         format!(
             concat!(
-                r#"{{"v":1,"revision":1,"entries":["#,
+                r#"{{"v":2,"revision":1,"entries":["#,
                 r#"{{"id":"golden:entry:1","kind":{{"type":"operation_started","operation_id":"op-1"}}}},"#,
                 r#"{{"id":"golden:entry:2","parent":"golden:entry:1","kind":{{"type":"turn_started","operation_id":"op-1","turn_id":"turn-1"}}}},"#,
                 r#"{{"id":"golden:entry:3","parent":"golden:entry:2","kind":{{"type":"user_message","turn_id":"turn-1","parts":["#,
@@ -313,14 +316,13 @@ fn wrong_length_artifact_refuses_to_open() {
     assert!(reason.contains("length"), "names the mismatch: {reason}");
 }
 
-// --- Legacy compatibility (M8-005) ----------------------------------------------
+// --- v2 user_message shape (no legacy content) ---------------------------------
 
 #[test]
-fn legacy_content_records_read_as_a_single_text_part() {
+fn schema_v1_legacy_content_file_is_unsupported() {
     let root = TempRoot::new();
     let dir = session_dir(&root);
     std::fs::create_dir_all(&dir).expect("mkdir");
-    // A pre-M8 file, byte for byte: user_message carries a plain content field.
     std::fs::write(
         dir.join("log.jsonl"),
         concat!(
@@ -328,31 +330,14 @@ fn legacy_content_records_read_as_a_single_text_part() {
             "\n",
         ),
     )
-    .expect("write legacy file");
+    .expect("write v1 file");
 
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    let report = store.recover_session(&session_id()).expect("legacy opens");
-    assert_eq!(report.transactions(), 1);
-    assert!(report.orphan_artifacts().is_empty());
-
-    let view = block_on(store.context_view(&session_id())).expect("view");
-    assert_eq!(
-        view.messages(),
-        &[ContextMessage::User {
-            parts: SessionUserPart::text_parts("hi")
-        }]
-    );
-
-    // Appended transactions write the new parts shape while the legacy line
-    // stays untouched: both shapes coexist in one file under v1.
-    block_on(store.commit(settle_transaction(1, "op-1", "turn-1"))).expect("append");
-    let log = std::fs::read_to_string(log_path(&root)).expect("read log");
-    assert!(
-        log.lines()
-            .next()
-            .expect("line 1")
-            .contains(r#""content":"hi""#)
-    );
+    let error = store.recover_session(&session_id()).expect_err("refused");
+    assert!(matches!(
+        error,
+        JsonlOpenError::UnsupportedSchema { found: 1 }
+    ));
 }
 
 #[test]
@@ -363,11 +348,30 @@ fn user_message_with_both_content_and_parts_is_corrupt() {
     std::fs::write(
         dir.join("log.jsonl"),
         concat!(
-            r#"{"v":1,"revision":1,"entries":[{"id":"golden:entry:1","kind":{"type":"operation_started","operation_id":"op-1"}},{"id":"golden:entry:2","parent":"golden:entry:1","kind":{"type":"turn_started","operation_id":"op-1","turn_id":"turn-1"}},{"id":"golden:entry:3","parent":"golden:entry:2","kind":{"type":"user_message","turn_id":"turn-1","content":"hi","parts":[{"type":"text","text":"hi"}]}}]}"#,
+            r#"{"v":2,"revision":1,"entries":[{"id":"golden:entry:1","kind":{"type":"operation_started","operation_id":"op-1"}},{"id":"golden:entry:2","parent":"golden:entry:1","kind":{"type":"turn_started","operation_id":"op-1","turn_id":"turn-1"}},{"id":"golden:entry:3","parent":"golden:entry:2","kind":{"type":"user_message","turn_id":"turn-1","content":"hi","parts":[{"type":"text","text":"hi"}]}}]}"#,
             "\n",
         ),
     )
     .expect("write ambiguous file");
+
+    let store = JsonlSessionStore::open(&root.path).expect("open");
+    let error = store.recover_session(&session_id()).expect_err("refused");
+    assert!(matches!(error, JsonlOpenError::Corrupt { line: 1, .. }));
+}
+
+#[test]
+fn user_message_without_parts_is_corrupt() {
+    let root = TempRoot::new();
+    let dir = session_dir(&root);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("log.jsonl"),
+        concat!(
+            r#"{"v":2,"revision":1,"entries":[{"id":"golden:entry:1","kind":{"type":"operation_started","operation_id":"op-1"}},{"id":"golden:entry:2","parent":"golden:entry:1","kind":{"type":"turn_started","operation_id":"op-1","turn_id":"turn-1"}},{"id":"golden:entry:3","parent":"golden:entry:2","kind":{"type":"user_message","turn_id":"turn-1"}}]}"#,
+            "\n",
+        ),
+    )
+    .expect("write file missing parts");
 
     let store = JsonlSessionStore::open(&root.path).expect("open");
     let error = store.recover_session(&session_id()).expect_err("refused");

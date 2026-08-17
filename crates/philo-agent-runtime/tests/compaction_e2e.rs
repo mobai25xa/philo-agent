@@ -12,12 +12,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentRuntime, CompactionConfig, GenerationConfig, ModelMessage, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, UserMessage, UserPart,
+    AgentEvent, AgentRuntime, CompactionConfig, GenerationConfig, ModelAssistantBlock,
+    ModelMessage, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, UserMessage,
+    UserPart,
 };
 use philo_session::{
-    ContextMessage, OperationId, OperationOutcome as StoredOperationOutcome, SessionEntryKind,
-    SessionStore, SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
+    ContextMessage, OperationId, OperationOutcome as StoredOperationOutcome, SessionAssistantBlock,
+    SessionEntryKind, SessionStore, SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
@@ -91,7 +92,9 @@ fn seed_turn(store: &dyn SessionStore, index: usize) -> String {
             },
             SessionEntryKind::AssistantMessage {
                 turn_id: turn_id.clone(),
-                content: format!("seed answer {index}"),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: format!("seed answer {index}"),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id,
@@ -182,7 +185,9 @@ fn automatic_compaction_is_append_only_and_reopens_to_the_exact_model_projection
                 parts: text_part("seed question 3"),
             },
             ModelMessage::Assistant {
-                content: "seed answer 3".to_owned(),
+                blocks: vec![ModelAssistantBlock::Text {
+                    text: "seed answer 3".to_owned(),
+                }],
             },
             ModelMessage::User {
                 parts: text_part("continue"),
@@ -224,13 +229,17 @@ fn automatic_compaction_is_append_only_and_reopens_to_the_exact_model_projection
                 parts: SessionUserPart::text_parts("seed question 3"),
             },
             ContextMessage::Assistant {
-                content: "seed answer 3".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "seed answer 3".to_owned(),
+                }],
             },
             ContextMessage::User {
                 parts: SessionUserPart::text_parts("continue"),
             },
             ContextMessage::Assistant {
-                content: "continued answer".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "continued answer".to_owned(),
+                }],
             },
         ],
         "restart projection must equal the model-visible durable context"

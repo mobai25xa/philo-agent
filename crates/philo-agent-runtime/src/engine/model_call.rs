@@ -5,13 +5,13 @@ use super::settlement::TurnCx;
 use super::stream::{OutputAssembler, StreamStep, next_or_cancel};
 use crate::mapping::messages::build_messages;
 use crate::{
-    AgentEvent, AgentFailure, AgentFailureKind, ModelCallPhase, ModelCallSnapshot, ModelEvent,
-    OperationPhase, ToolCallDelta, TurnSnapshot,
+    AgentEvent, AgentFailure, AgentFailureKind, ModelAssistantBlock, ModelCallPhase,
+    ModelCallSnapshot, ModelEvent, OperationPhase, ToolCallDelta, TurnSnapshot,
 };
 use philo_agent_kernel as kernel;
 
-/// Runs one logical model call and returns the context with the assembled
-/// output (final text or tool calls); `None` when a failure or cancellation
+/// Runs one logical model call and returns the context with the
+/// authoritative `Completed.blocks`; `None` when a failure or cancellation
 /// already settled the operation.
 pub(super) async fn run<'a>(
     cx: TurnCx<'a>,
@@ -21,7 +21,7 @@ pub(super) async fn run<'a>(
     model_call_index: u32,
     messages: Vec<kernel::TurnMessage>,
     tools_allowed: bool,
-) -> Option<(TurnCx<'a>, String, Vec<kernel::KernelToolCall>)> {
+) -> Option<(TurnCx<'a>, Vec<ModelAssistantBlock>)> {
     // Injection point: between barriers, before the next model call starts.
     // The latest batch is already fully committed, so the cancellation
     // transaction is terminal-only.
@@ -71,6 +71,7 @@ pub(super) async fn run<'a>(
     ));
     let mut assembler = OutputAssembler::default();
     let mut completed_seen = false;
+    let mut completed_blocks = None;
     let mut response_started_seen = false;
     loop {
         let step = next_or_cancel(stream.as_mut(), cx.operation.shared()).await;
@@ -85,7 +86,7 @@ pub(super) async fn run<'a>(
                 return None;
             }
             StreamStep::Event(Some(Ok(event))) => match (completed_seen, event) {
-                (true, ModelEvent::Completed) => {
+                (true, ModelEvent::Completed { .. }) => {
                     cx.fail(
                         effect_id.clone(),
                         AgentFailure::invalid_model_output(
@@ -105,7 +106,10 @@ pub(super) async fn run<'a>(
                     .await;
                     return None;
                 }
-                (false, ModelEvent::Completed) => completed_seen = true,
+                (false, ModelEvent::Completed { blocks }) => {
+                    completed_seen = true;
+                    completed_blocks = Some(blocks);
+                }
                 (
                     false,
                     ModelEvent::ResponseStarted {
@@ -189,11 +193,8 @@ pub(super) async fn run<'a>(
             }
         }
     }
-    match assembler.finish() {
-        Ok((text, calls)) => Some((cx, text, calls)),
-        Err(failure) => {
-            cx.fail(effect_id.clone(), failure).await;
-            None
-        }
-    }
+    Some((
+        cx,
+        completed_blocks.expect("Completed was observed before the stream ended"),
+    ))
 }

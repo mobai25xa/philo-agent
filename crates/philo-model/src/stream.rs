@@ -8,7 +8,9 @@ use philo_agent_runtime::{
 };
 
 use crate::error::model_error;
-use crate::replay::{CapturedContent, CapturedItem, ReplayCoordinator};
+use crate::replay::{
+    CapturedContent, CapturedItem, ReplayCoordinator, assistant_blocks_from_captured,
+};
 
 /// Normalizes the SDK event stream into the runtime `ModelEvent` vocabulary.
 ///
@@ -21,8 +23,8 @@ use crate::replay::{CapturedContent, CapturedItem, ReplayCoordinator};
 /// replay sidecar. Usage updates map onto the runtime `TokenUsage`.
 /// Structured-output events and block start/finish boundaries are dropped.
 /// `ResponseFinished` snapshots and atomically commits the collected items
-/// before yielding the unique `Completed`; a mid-stream SDK error terminates
-/// without a sidecar commit or later `Completed`.
+/// before yielding the unique `Completed { blocks }`; a mid-stream SDK error
+/// terminates without a sidecar commit or later `Completed`.
 pub(crate) struct NormalizedStream {
     call: sdk::ModelCall,
     client: sdk::PhiloClient,
@@ -43,6 +45,8 @@ struct ToolEntry {
     index: usize,
     response_index: u32,
     call_id: String,
+    name: String,
+    arguments: String,
     replay_requirement: sdk::ReplayRequirement,
     announced: bool,
 }
@@ -97,6 +101,10 @@ impl NormalizedStream {
                 "philo model stream violated protocol: tool delta before ToolCallStarted",
             ));
         };
+        if let Some(delta) = name.as_deref() {
+            entry.name.push_str(delta);
+        }
+        entry.arguments.push_str(&arguments);
         let id = if entry.announced {
             None
         } else {
@@ -109,6 +117,36 @@ impl NormalizedStream {
             name,
             arguments,
         })
+    }
+
+    fn flush_remaining_items(&mut self) {
+        for (_, entry) in self.text.drain() {
+            if entry.text.is_empty() {
+                continue;
+            }
+            self.captured.push(CapturedItem {
+                index: entry.index,
+                content: CapturedContent::Text { text: entry.text },
+                replay_requirement: entry.replay_requirement,
+                replay_token: None,
+            });
+        }
+        for (_, entry) in self.tools.drain() {
+            self.captured.push(tool_captured(entry, None));
+        }
+    }
+}
+
+fn tool_captured(entry: ToolEntry, replay_token: Option<sdk::ReplayToken>) -> CapturedItem {
+    CapturedItem {
+        index: entry.response_index,
+        content: CapturedContent::ToolCall {
+            call_id: entry.call_id,
+            name: entry.name,
+            arguments: entry.arguments,
+        },
+        replay_requirement: entry.replay_requirement,
+        replay_token,
     }
 }
 
@@ -181,12 +219,14 @@ impl ModelEventStream for NormalizedStream {
                         replay_token,
                     } => {
                         if let Some(entry) = self.text.remove(&block_id) {
-                            self.captured.push(CapturedItem {
-                                index: entry.index,
-                                content: CapturedContent::Text { text: entry.text },
-                                replay_requirement: entry.replay_requirement,
-                                replay_token,
-                            });
+                            if !entry.text.is_empty() {
+                                self.captured.push(CapturedItem {
+                                    index: entry.index,
+                                    content: CapturedContent::Text { text: entry.text },
+                                    replay_requirement: entry.replay_requirement,
+                                    replay_token,
+                                });
+                            }
                         }
                     }
                     sdk::ModelEvent::ReasoningStarted {
@@ -261,6 +301,8 @@ impl ModelEventStream for NormalizedStream {
                                 index,
                                 response_index,
                                 call_id: call_id.as_str().to_owned(),
+                                name: String::new(),
+                                arguments: String::new(),
                                 replay_requirement,
                                 announced: false,
                             },
@@ -293,14 +335,7 @@ impl ModelEventStream for NormalizedStream {
                                 name: None,
                                 arguments: String::new(),
                             });
-                            self.captured.push(CapturedItem {
-                                index: entry.response_index,
-                                content: CapturedContent::ToolCall {
-                                    call_id: entry.call_id,
-                                },
-                                replay_requirement: entry.replay_requirement,
-                                replay_token,
-                            });
+                            self.captured.push(tool_captured(entry, replay_token));
                             if let Some(fallback) = fallback {
                                 return Some(Ok(fallback));
                             }
@@ -308,6 +343,9 @@ impl ModelEventStream for NormalizedStream {
                     }
                     sdk::ModelEvent::ResponseFinished { .. } => {
                         self.done = true;
+                        self.flush_remaining_items();
+                        self.captured.sort_by_key(|item| item.index);
+                        let blocks = assistant_blocks_from_captured(&self.captured);
                         if let Err(error) = self.replay.commit(
                             &self.client,
                             &self.target,
@@ -317,7 +355,7 @@ impl ModelEventStream for NormalizedStream {
                         ) {
                             return Some(Err(error));
                         }
-                        return Some(Ok(ModelEvent::Completed));
+                        return Some(Ok(ModelEvent::Completed { blocks }));
                     }
                     // Text/StructuredOutput block boundaries and structured
                     // output deltas have no runtime vocabulary and are

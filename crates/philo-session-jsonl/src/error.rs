@@ -33,7 +33,7 @@ impl fmt::Display for JsonlOpenError {
             Self::UnsupportedSchema { found } => {
                 write!(
                     f,
-                    "jsonl schema version {found} is unsupported (expected 1)"
+                    "jsonl schema version {found} is unsupported (expected 2)"
                 )
             }
         }

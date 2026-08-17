@@ -9,7 +9,8 @@ use philo_agent_runtime::{
     UserPart,
 };
 use support::{
-    StubResponse, StubTransport, adapter_over, collect_ok, read_tool_definition, snapshot, text_sse,
+    StubResponse, StubTransport, adapter_over, assistant_tool_calls, collect_ok,
+    read_tool_definition, snapshot, text_sse,
 };
 
 const INTERRUPTED_TEXT: &str = "interrupted: the process was interrupted while this call was \
@@ -25,20 +26,18 @@ fn user(content: &str) -> ModelMessage {
 fn sealed_turn_history() -> Vec<ModelMessage> {
     vec![
         user("edit two files"),
-        ModelMessage::AssistantToolCalls {
-            calls: vec![
-                ModelToolCall {
-                    tool_call_id: ToolCallId::new("call-1"),
-                    name: "write".to_owned(),
-                    arguments: r#"{"path":"a.txt"}"#.to_owned(),
-                },
-                ModelToolCall {
-                    tool_call_id: ToolCallId::new("call-2"),
-                    name: "shell".to_owned(),
-                    arguments: r#"{"command":"ls"}"#.to_owned(),
-                },
-            ],
-        },
+        assistant_tool_calls([
+            ModelToolCall {
+                tool_call_id: ToolCallId::new("call-1"),
+                name: "write".to_owned(),
+                arguments: r#"{"path":"a.txt"}"#.to_owned(),
+            },
+            ModelToolCall {
+                tool_call_id: ToolCallId::new("call-2"),
+                name: "shell".to_owned(),
+                arguments: r#"{"command":"ls"}"#.to_owned(),
+            },
+        ]),
         ModelMessage::ToolResult {
             tool_call_id: ToolCallId::new("call-1"),
             outcome: ModelToolResultOutcome::Interrupted,
@@ -64,7 +63,11 @@ async fn interrupted_history_replays_canonical_text_without_native_error_status(
         .await
         .expect("replay with interrupted marks passes validation");
     let events = collect_ok(stream).await;
-    assert!(events.contains(&ModelEvent::Completed));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::Completed { .. }))
+    );
 
     // OpenAI Chat has no native error status: the canonical interrupted
     // text travels as plain result content (M4 adaptation precedent).
@@ -86,13 +89,11 @@ async fn histories_without_interrupted_keep_the_previous_request_shape() {
     let adapter = adapter_over(transport.clone());
     let history = vec![
         user("read a file"),
-        ModelMessage::AssistantToolCalls {
-            calls: vec![ModelToolCall {
-                tool_call_id: ToolCallId::new("call-1"),
-                name: "read".to_owned(),
-                arguments: r#"{"path":"a.txt"}"#.to_owned(),
-            }],
-        },
+        assistant_tool_calls([ModelToolCall {
+            tool_call_id: ToolCallId::new("call-1"),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"a.txt"}"#.to_owned(),
+        }]),
         ModelMessage::ToolResult {
             tool_call_id: ToolCallId::new("call-1"),
             outcome: ModelToolResultOutcome::Success {

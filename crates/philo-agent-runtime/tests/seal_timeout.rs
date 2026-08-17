@@ -17,8 +17,8 @@ use philo_agent_runtime::{
     UserMessage,
 };
 use philo_session::{
-    ContextMessage, MemorySessionStore, SessionEntryKind, SessionRevision, SessionStore,
-    SessionToolCall, SessionTransaction, SessionUserPart, ToolResultOutcome,
+    ContextMessage, MemorySessionStore, SessionAssistantBlock, SessionEntryKind, SessionRevision,
+    SessionStore, SessionToolCall, SessionTransaction, SessionUserPart, ToolResultOutcome,
 };
 use support::failing_session::{FailingSessionStore, FailurePlan};
 use support::fake_model::{FakeModel, ModelScript};
@@ -127,17 +127,17 @@ fn commit_remnant_batch(store: &dyn SessionStore, revision: u64, suffix: &str) {
             turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
             model_call_id: "stale-model-call".to_owned(),
             tool_batch_id: philo_session::ToolBatchId::new(format!("stale-batch-{suffix}")),
-            calls: vec![
-                SessionToolCall::new(
+            blocks: vec![
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
                     philo_session::ToolCallId::new(format!("stale-call-{suffix}-1")),
                     "write",
                     r#"{"path":"a.txt"}"#,
-                ),
-                SessionToolCall::new(
+                )),
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
                     philo_session::ToolCallId::new(format!("stale-call-{suffix}-2")),
                     "shell",
                     r#"{"command":"ls"}"#,
-                ),
+                )),
             ],
         }],
     )))

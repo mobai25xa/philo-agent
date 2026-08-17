@@ -16,8 +16,8 @@ use philo_agent_runtime::{
 };
 use philo_session::{
     ContextMessage, MemorySessionStore, OperationOutcome as SessionOperationOutcome,
-    SessionEntryKind, SessionStore, SessionToolCall, SessionToolResult, SessionTransaction,
-    ToolResultOutcome, TurnOutcome,
+    SessionAssistantBlock, SessionEntryKind, SessionStore, SessionToolCall, SessionToolResult,
+    SessionTransaction, ToolResultOutcome, TurnOutcome,
 };
 use philo_tools_std::ReadTool;
 use support::{StubResponse, StubTransport, adapter_over, sse, text_sse};
@@ -212,9 +212,16 @@ async fn multi_round_tool_loop_with_real_adapter_and_registry() {
         ContextMessage::User { parts }
             if parts == &philo_session::SessionUserPart::text_parts("read hello.txt")
     ));
-    let ContextMessage::AssistantToolCalls { calls, .. } = &messages[1] else {
+    let ContextMessage::AssistantToolCalls { blocks, .. } = &messages[1] else {
         panic!("expected persisted tool calls, got {:?}", messages[1]);
     };
+    let calls: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            SessionAssistantBlock::ToolCall(call) => Some(call),
+            SessionAssistantBlock::Text { .. } => None,
+        })
+        .collect();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name(), "read");
     assert_eq!(calls[0].arguments(), r#"{"path":"hello.txt"}"#);
@@ -231,7 +238,11 @@ async fn multi_round_tool_loop_with_real_adapter_and_registry() {
     );
     assert!(matches!(
         &messages[3],
-        ContextMessage::Assistant { content } if content == "The file says: philo"
+        ContextMessage::Assistant { blocks }
+            if blocks
+                == &vec![SessionAssistantBlock::Text {
+                    text: "The file says: philo".to_owned(),
+                }]
     ));
 
     // The second model call replayed the tool transcript through the adapter.
@@ -333,11 +344,11 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
                 turn_id: turn.clone(),
                 model_call_id: "seed-call".to_owned(),
                 tool_batch_id: philo_session::ToolBatchId::new("seed-batch"),
-                calls: vec![SessionToolCall::new(
+                blocks: vec![SessionAssistantBlock::ToolCall(SessionToolCall::new(
                     philo_session::ToolCallId::new("call-x"),
                     "read",
                     "this is not a json object",
-                )],
+                ))],
             }],
         ))
         .await
@@ -365,7 +376,9 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
             vec![
                 SessionEntryKind::AssistantMessage {
                     turn_id: turn.clone(),
-                    content: "sorry, that failed".to_owned(),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: "sorry, that failed".to_owned(),
+                    }],
                 },
                 SessionEntryKind::TurnTerminated {
                     turn_id: turn.clone(),

@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentRuntime, GenerationConfig, ModelMessage, ModelToolResultOutcome, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelMessage, ModelToolResultOutcome,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
@@ -281,7 +281,12 @@ fn mid_batch_cancel_survives_restart_and_replays() {
     let messages = &calls[0].messages;
     assert!(matches!(
         &messages[4],
-        ModelMessage::AssistantToolCalls { calls } if calls.len() == 2
+        ModelMessage::Assistant { blocks }
+            if blocks
+                .iter()
+                .filter(|block| matches!(block, ModelAssistantBlock::ToolCall(_)))
+                .count()
+                == 2
     ));
     assert_eq!(
         messages[5],

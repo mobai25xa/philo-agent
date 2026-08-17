@@ -173,7 +173,7 @@ fn complete_model(
             reason: KernelInputRejectionReason::UnsupportedAssistantOutput,
         });
     }
-    if let Some(calls) = output.tool_call_batch() {
+    if output.contains_tool_call() {
         let tools_allowed = used_rounds < max_tool_rounds;
         if !tools_allowed {
             return Err(KernelInputRejection {
@@ -181,7 +181,10 @@ fn complete_model(
                 reason: KernelInputRejectionReason::UnsupportedAssistantOutput,
             });
         }
-        if !output.text().is_empty() || !valid_calls(calls) {
+        let calls = output
+            .tool_call_batch()
+            .expect("contains_tool_call implies extracted calls");
+        if !valid_calls(&calls) {
             return Err(KernelInputRejection {
                 phase: current,
                 reason: KernelInputRejectionReason::InvalidToolCalls,
@@ -189,11 +192,11 @@ fn complete_model(
         }
         let round = used_rounds + 1;
         let (batch_id, tool_effect) = tool_batch_ids(turn_id, round);
-        let calls = calls.to_vec();
+        let blocks = output.blocks().to_vec();
         let mut next_transcript = transcript.to_vec();
         next_transcript.push(TurnMessage::AssistantToolCalls {
             tool_batch_id: batch_id.clone(),
-            calls: calls.clone(),
+            blocks: blocks.clone(),
         });
         let next_state = KernelState {
             inner: State::ExpectingToolBatchCompletion {
@@ -213,6 +216,7 @@ fn complete_model(
                 KernelObservation::AssistantToolCallsAccepted {
                     model_call_id: model_id.clone(),
                     tool_batch_id: batch_id.clone(),
+                    blocks,
                     calls: calls.clone(),
                 },
                 KernelObservation::ToolBatchRequested {

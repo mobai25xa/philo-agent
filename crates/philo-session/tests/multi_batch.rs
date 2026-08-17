@@ -44,9 +44,15 @@ fn batch_entry(turn: &TurnId, batch: &str, call_ids: &[&str]) -> SessionEntryKin
         turn_id: turn.clone(),
         model_call_id: format!("model-for-{batch}"),
         tool_batch_id: ToolBatchId::new(batch),
-        calls: call_ids
+        blocks: call_ids
             .iter()
-            .map(|id| SessionToolCall::new(ToolCallId::new(*id), "tool", "{}"))
+            .map(|id| {
+                SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                    ToolCallId::new(*id),
+                    "tool",
+                    "{}",
+                ))
+            })
             .collect(),
     }
 }
@@ -104,7 +110,9 @@ fn two_rounds_project_interleaved_in_source_order() {
         vec![
             SessionEntryKind::AssistantMessage {
                 turn_id: turn.clone(),
-                content: "done".to_owned(),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "done".into(),
+                }],
             },
             SessionEntryKind::TurnTerminated {
                 turn_id: turn.clone(),
@@ -220,7 +228,9 @@ fn assistant_message_before_latest_results_is_rejected() {
         4,
         vec![SessionEntryKind::AssistantMessage {
             turn_id: turn.clone(),
-            content: "too early".to_owned(),
+            blocks: vec![SessionAssistantBlock::Text {
+                text: "too early".into(),
+            }],
         }],
     )
     .expect_err("batch b2 is incomplete");

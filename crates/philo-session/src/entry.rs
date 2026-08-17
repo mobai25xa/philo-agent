@@ -153,6 +153,17 @@ impl SessionUserPart {
     }
 }
 
+/// One ordered block of assistant output. Tool batches and final messages
+/// share this type: a batch must contain at least one [`Self::ToolCall`],
+/// while a final message may contain only [`Self::Text`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionAssistantBlock {
+    /// Non-empty assistant text, in source order among neighboring blocks.
+    Text { text: String },
+    /// A model-requested tool call.
+    ToolCall(SessionToolCall),
+}
+
 /// The durable payload of a session entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEntryKind {
@@ -173,7 +184,7 @@ pub enum SessionEntryKind {
         turn_id: TurnId,
         model_call_id: String,
         tool_batch_id: ToolBatchId,
-        calls: Vec<SessionToolCall>,
+        blocks: Vec<SessionAssistantBlock>,
     },
     /// Records an ordered tool result.
     ToolResult {
@@ -182,7 +193,10 @@ pub enum SessionEntryKind {
         result: SessionToolResult,
     },
     /// Records the final assistant message of a successful turn.
-    AssistantMessage { turn_id: TurnId, content: String },
+    AssistantMessage {
+        turn_id: TurnId,
+        blocks: Vec<SessionAssistantBlock>,
+    },
     /// Records a normalized failure for an active turn.
     TurnFailure {
         turn_id: TurnId,

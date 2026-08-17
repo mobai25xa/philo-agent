@@ -15,8 +15,8 @@ use http::{HeaderMap, HeaderValue, StatusCode, Version};
 use philo::api::extension::{HttpRequest, HttpResponse, HttpResponseHead, Transport};
 use philo::api::stable::{DeliveryState, TransportStage};
 use philo_agent_runtime::{
-    GenerationConfig, ModelCallId, ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream,
-    ModelMessage, OperationId, ToolDefinition, TurnId,
+    GenerationConfig, ModelAssistantBlock, ModelCallId, ModelCallSnapshot, ModelError, ModelEvent,
+    ModelEventStream, ModelMessage, ModelToolCall, OperationId, ToolDefinition, TurnId,
 };
 use philo_model::{ModelCompat, ModelProtocol, PhiloModelAdapter};
 
@@ -262,6 +262,27 @@ pub fn reasoning_snapshot(
             tool_choice: philo_agent_runtime::ToolChoice::Auto,
         },
         max_parallel_tool_calls: 1,
+    }
+}
+
+pub fn assistant_text(text: impl Into<String>) -> ModelMessage {
+    ModelMessage::Assistant {
+        blocks: vec![ModelAssistantBlock::Text { text: text.into() }],
+    }
+}
+
+pub fn assistant_tool_calls(calls: impl IntoIterator<Item = ModelToolCall>) -> ModelMessage {
+    ModelMessage::Assistant {
+        blocks: calls
+            .into_iter()
+            .map(ModelAssistantBlock::ToolCall)
+            .collect(),
+    }
+}
+
+pub fn completed_text(text: impl Into<String>) -> ModelEvent {
+    ModelEvent::Completed {
+        blocks: vec![ModelAssistantBlock::Text { text: text.into() }],
     }
 }
 

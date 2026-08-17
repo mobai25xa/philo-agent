@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentFailureKind, AgentRuntime, GenerationConfig, ModelMessage, ModelToolResultOutcome,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
-    ToolDefinition, UserMessage, UserPart,
+    AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelMessage,
+    ModelToolResultOutcome, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
+    SettlementDurability, ToolDefinition, UserMessage, UserPart,
 };
 use philo_session::{ContextMessage, SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
@@ -262,10 +262,13 @@ fn restart_continues_with_the_full_replayed_history() {
             parts: vec![UserPart::Text("first prompt".to_owned())]
         }
     );
-    let ModelMessage::AssistantToolCalls { calls: round_one } = &messages[2] else {
+    let ModelMessage::Assistant { blocks: round_one } = &messages[2] else {
         panic!("expected first tool round, got {:?}", messages[2]);
     };
-    assert_eq!(round_one[0].tool_call_id.as_str(), "call-1");
+    let ModelAssistantBlock::ToolCall(round_one_call) = &round_one[0] else {
+        panic!("expected first tool call block, got {:?}", round_one[0]);
+    };
+    assert_eq!(round_one_call.tool_call_id.as_str(), "call-1");
     assert_eq!(
         messages[3],
         ModelMessage::ToolResult {
@@ -275,10 +278,13 @@ fn restart_continues_with_the_full_replayed_history() {
             },
         }
     );
-    let ModelMessage::AssistantToolCalls { calls: round_two } = &messages[4] else {
+    let ModelMessage::Assistant { blocks: round_two } = &messages[4] else {
         panic!("expected second tool round, got {:?}", messages[4]);
     };
-    assert_eq!(round_two[0].tool_call_id.as_str(), "call-2");
+    let ModelAssistantBlock::ToolCall(round_two_call) = &round_two[0] else {
+        panic!("expected second tool call block, got {:?}", round_two[0]);
+    };
+    assert_eq!(round_two_call.tool_call_id.as_str(), "call-2");
     assert_eq!(
         messages[5],
         ModelMessage::ToolResult {
@@ -292,7 +298,9 @@ fn restart_continues_with_the_full_replayed_history() {
     assert_eq!(
         messages[6],
         ModelMessage::Assistant {
-            content: "turn one done".to_owned()
+            blocks: vec![ModelAssistantBlock::Text {
+                text: "turn one done".to_owned(),
+            }]
         }
     );
     assert_eq!(

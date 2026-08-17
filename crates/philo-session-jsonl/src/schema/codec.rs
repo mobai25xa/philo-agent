@@ -1,16 +1,17 @@
-//! Explicit conversion between schema v1 records and session domain facts.
+//! Explicit conversion between schema v2 records and session domain facts.
 
 use philo_session::{
-    CancelReason, EntryId, OperationId, OperationOutcome, SessionEntry, SessionEntryKind,
-    SessionToolCall, SessionToolResult, SessionUserPart, ToolBatchId, ToolCallId,
+    CancelReason, EntryId, OperationId, OperationOutcome, SessionAssistantBlock, SessionEntry,
+    SessionEntryKind, SessionToolCall, SessionToolResult, SessionUserPart, ToolBatchId, ToolCallId,
     ToolResultOutcome, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 
 use crate::artifact::sha256_hex;
 
 use super::record::{
-    EntryRecord, FailureKindRecord, FailureRecord, KindRecord, OutcomeRecord, ReasonRecord,
-    ToolCallRecord, ToolOutcomeRecord, ToolResultRecord, UserPartRecord,
+    AssistantBlockRecord, AssistantMessageRecord, AssistantToolCallBatchRecord, EntryRecord,
+    FailureKindRecord, FailureRecord, KindRecord, OutcomeRecord, ReasonRecord, ToolOutcomeRecord,
+    ToolResultRecord, UserMessageRecord, UserPartRecord,
 };
 
 /// An artifact newly referenced by the transaction being encoded.
@@ -30,13 +31,38 @@ fn encode_reason(reason: CancelReason) -> ReasonRecord {
     }
 }
 
-/// Legacy cancelled lines carry no reason because user cancellation was the
-/// only cancel source before reasons were recorded.
-fn decode_reason(reason: Option<ReasonRecord>) -> CancelReason {
+fn decode_reason(reason: Option<ReasonRecord>) -> Result<CancelReason, String> {
     match reason {
-        Some(ReasonRecord::User) | None => CancelReason::User,
-        Some(ReasonRecord::Timeout) => CancelReason::Timeout,
-        Some(ReasonRecord::Abandoned) => CancelReason::Abandoned,
+        Some(ReasonRecord::User) => Ok(CancelReason::User),
+        Some(ReasonRecord::Timeout) => Ok(CancelReason::Timeout),
+        Some(ReasonRecord::Abandoned) => Ok(CancelReason::Abandoned),
+        None => Err("cancelled outcome is missing required reason".to_owned()),
+    }
+}
+
+fn encode_block(block: &SessionAssistantBlock) -> AssistantBlockRecord {
+    match block {
+        SessionAssistantBlock::Text { text } => AssistantBlockRecord::Text { text: text.clone() },
+        SessionAssistantBlock::ToolCall(call) => AssistantBlockRecord::ToolCall {
+            id: call.id().as_str().to_owned(),
+            name: call.name().to_owned(),
+            arguments: call.arguments().to_owned(),
+        },
+    }
+}
+
+fn decode_block(block: AssistantBlockRecord) -> SessionAssistantBlock {
+    match block {
+        AssistantBlockRecord::Text { text } => SessionAssistantBlock::Text { text },
+        AssistantBlockRecord::ToolCall {
+            id,
+            name,
+            arguments,
+        } => SessionAssistantBlock::ToolCall(SessionToolCall::new(
+            ToolCallId::new(id),
+            name,
+            arguments,
+        )),
     }
 }
 
@@ -76,11 +102,10 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
             operation_id: operation_id.as_str().to_owned(),
             turn_id: turn_id.as_str().to_owned(),
         },
-        SessionEntryKind::UserMessage { turn_id, parts } => KindRecord::UserMessage {
-            turn_id: turn_id.as_str().to_owned(),
-            content: None,
-            parts: Some(
-                parts
+        SessionEntryKind::UserMessage { turn_id, parts } => {
+            KindRecord::UserMessage(UserMessageRecord {
+                turn_id: turn_id.as_str().to_owned(),
+                parts: parts
                     .iter()
                     .map(|part| match part {
                         SessionUserPart::Text(text) => UserPartRecord::Text { text: text.clone() },
@@ -100,26 +125,19 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
                         }
                     })
                     .collect(),
-            ),
-        },
+            })
+        }
         SessionEntryKind::AssistantToolCallBatch {
             turn_id,
             model_call_id,
             tool_batch_id,
-            calls,
-        } => KindRecord::AssistantToolCallBatch {
+            blocks,
+        } => KindRecord::AssistantToolCallBatch(AssistantToolCallBatchRecord {
             turn_id: turn_id.as_str().to_owned(),
             model_call_id: model_call_id.clone(),
             tool_batch_id: tool_batch_id.as_str().to_owned(),
-            calls: calls
-                .iter()
-                .map(|call| ToolCallRecord {
-                    id: call.id().as_str().to_owned(),
-                    name: call.name().to_owned(),
-                    arguments: call.arguments().to_owned(),
-                })
-                .collect(),
-        },
+            blocks: blocks.iter().map(encode_block).collect(),
+        }),
         SessionEntryKind::ToolResult {
             turn_id,
             tool_batch_id,
@@ -142,10 +160,12 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
                 },
             },
         },
-        SessionEntryKind::AssistantMessage { turn_id, content } => KindRecord::AssistantMessage {
-            turn_id: turn_id.as_str().to_owned(),
-            content: content.clone(),
-        },
+        SessionEntryKind::AssistantMessage { turn_id, blocks } => {
+            KindRecord::AssistantMessage(AssistantMessageRecord {
+                turn_id: turn_id.as_str().to_owned(),
+                blocks: blocks.iter().map(encode_block).collect(),
+            })
+        }
         SessionEntryKind::TurnFailure { turn_id, failure } => KindRecord::TurnFailure {
             turn_id: turn_id.as_str().to_owned(),
             failure: FailureRecord {
@@ -215,13 +235,10 @@ fn decode_kind(
             operation_id: OperationId::new(operation_id),
             turn_id: TurnId::new(turn_id),
         },
-        KindRecord::UserMessage {
-            turn_id,
-            content,
-            parts,
-        } => {
-            let parts = match (parts, content) {
-                (Some(parts), None) => parts
+        KindRecord::UserMessage(UserMessageRecord { turn_id, parts }) => {
+            SessionEntryKind::UserMessage {
+                turn_id: TurnId::new(turn_id),
+                parts: parts
                     .into_iter()
                     .map(|part| match part {
                         UserPartRecord::Text { text } => Ok(SessionUserPart::Text(text)),
@@ -235,33 +252,18 @@ fn decode_kind(
                         }),
                     })
                     .collect::<Result<Vec<_>, String>>()?,
-                (None, Some(content)) => SessionUserPart::text_parts(content),
-                _ => {
-                    return Err(
-                        "user_message record must have exactly one of parts or content".to_owned(),
-                    );
-                }
-            };
-            SessionEntryKind::UserMessage {
-                turn_id: TurnId::new(turn_id),
-                parts,
             }
         }
-        KindRecord::AssistantToolCallBatch {
+        KindRecord::AssistantToolCallBatch(AssistantToolCallBatchRecord {
             turn_id,
             model_call_id,
             tool_batch_id,
-            calls,
-        } => SessionEntryKind::AssistantToolCallBatch {
+            blocks,
+        }) => SessionEntryKind::AssistantToolCallBatch {
             turn_id: TurnId::new(turn_id),
             model_call_id,
             tool_batch_id: ToolBatchId::new(tool_batch_id),
-            calls: calls
-                .into_iter()
-                .map(|call| {
-                    SessionToolCall::new(ToolCallId::new(call.id), call.name, call.arguments)
-                })
-                .collect(),
+            blocks: blocks.into_iter().map(decode_block).collect(),
         },
         KindRecord::ToolResult {
             turn_id,
@@ -285,10 +287,12 @@ fn decode_kind(
                 }
             },
         },
-        KindRecord::AssistantMessage { turn_id, content } => SessionEntryKind::AssistantMessage {
-            turn_id: TurnId::new(turn_id),
-            content,
-        },
+        KindRecord::AssistantMessage(AssistantMessageRecord { turn_id, blocks }) => {
+            SessionEntryKind::AssistantMessage {
+                turn_id: TurnId::new(turn_id),
+                blocks: blocks.into_iter().map(decode_block).collect(),
+            }
+        }
         KindRecord::TurnFailure { turn_id, failure } => SessionEntryKind::TurnFailure {
             turn_id: TurnId::new(turn_id),
             failure: TurnFailure::new(
@@ -312,7 +316,7 @@ fn decode_kind(
                 OutcomeRecord::Succeeded => TurnOutcome::Succeeded,
                 OutcomeRecord::Failed => TurnOutcome::Failed,
                 OutcomeRecord::Cancelled => TurnOutcome::Cancelled {
-                    reason: decode_reason(reason),
+                    reason: decode_reason(reason)?,
                 },
             },
         },
@@ -326,7 +330,7 @@ fn decode_kind(
                 OutcomeRecord::Succeeded => OperationOutcome::Succeeded,
                 OutcomeRecord::Failed => OperationOutcome::Failed,
                 OutcomeRecord::Cancelled => OperationOutcome::Cancelled {
-                    reason: decode_reason(reason),
+                    reason: decode_reason(reason)?,
                 },
             },
         },

@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 use philo_tools::{
     EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerFuture, ToolResult,
+    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::required_string;
 use crate::error_code;
-use crate::helpers::{field_error, io_error, not_found, path_error};
+use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
 
 /// Stable registry name of the edit tool.
@@ -123,5 +123,18 @@ impl EditTool {
 impl ToolHandler for EditTool {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
         Box::pin(async move { self.edit(&arguments) })
+    }
+
+    fn call_with_cx<'a>(
+        &'a self,
+        arguments: ToolArguments,
+        cx: ToolInvokeCx,
+    ) -> ToolHandlerEndFuture<'a> {
+        Box::pin(async move {
+            if let Some(stopped) = stopped_if_cancelled(&cx) {
+                return stopped;
+            }
+            ToolInvokeEnd::Done(self.edit(&arguments))
+        })
     }
 }

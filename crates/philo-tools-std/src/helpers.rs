@@ -1,11 +1,20 @@
 //! Shared error-construction helpers: every failure in this crate is a
 //! business error on the model channel, never a `ToolPortError`.
 
-use philo_tools::RichToolResult;
+use philo_tools::{RichToolResult, ToolInvokeCx, ToolInvokeEnd};
 
 use crate::args::FieldError;
 use crate::error_code;
 use crate::path::PathError;
+
+/// Returns [`ToolInvokeEnd::Stopped`] when the invoke token is already requested.
+pub(crate) fn stopped_if_cancelled(cx: &ToolInvokeCx) -> Option<ToolInvokeEnd> {
+    if cx.cancel().is_requested() {
+        Some(ToolInvokeEnd::Stopped)
+    } else {
+        None
+    }
+}
 
 pub(crate) fn field_error(key: &str, error: &FieldError) -> RichToolResult {
     let message = match error {

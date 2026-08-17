@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::invocation::ToolArguments;
 use crate::port::{Handler, ToolFuture};
 use crate::{
-    RichToolResult, ToolDefinition, ToolHandler, ToolInvocation, ToolPort, ToolProgressSink,
+    RichToolResult, ToolDefinition, ToolHandler, ToolInvocation, ToolInvokeCx, ToolInvokeEnd,
+    ToolPort,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,32 +78,36 @@ impl ToolPort for ToolRegistry {
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions()
     }
-    fn invoke<'a>(
-        &'a self,
-        invocation: ToolInvocation,
-        progress: ToolProgressSink,
-    ) -> ToolFuture<'a> {
+    fn invoke<'a>(&'a self, invocation: ToolInvocation, cx: ToolInvokeCx) -> ToolFuture<'a> {
         Box::pin(async move {
-            // Registry-synthesized errors carry no display detail and
-            // never touch the progress sink.
+            // Registry-synthesized errors carry no display detail, never
+            // touch the progress sink, and ignore the cancel token.
             let Some((definition, handler)) = self
                 .entries
                 .iter()
                 .find(|(d, _)| d.name() == invocation.name())
             else {
-                return Ok(RichToolResult::error(
+                return Ok(ToolInvokeEnd::Done(RichToolResult::error(
                     "unknown_tool",
                     format!("unknown tool: {}", invocation.name()),
-                ));
+                )));
             };
             let args = match ToolArguments::parse(invocation.raw_arguments()) {
                 Ok(args) => args,
-                Err(message) => return Ok(RichToolResult::error("invalid_arguments", message)),
+                Err(message) => {
+                    return Ok(ToolInvokeEnd::Done(RichToolResult::error(
+                        "invalid_arguments",
+                        message,
+                    )));
+                }
             };
             if let Err(message) = definition.validate_arguments(args.as_str()) {
-                return Ok(RichToolResult::error("invalid_arguments", message));
+                return Ok(ToolInvokeEnd::Done(RichToolResult::error(
+                    "invalid_arguments",
+                    message,
+                )));
             }
-            Ok(handler.call_with_progress(args, progress).await)
+            Ok(handler.call_with_cx(args, cx).await)
         })
     }
 }

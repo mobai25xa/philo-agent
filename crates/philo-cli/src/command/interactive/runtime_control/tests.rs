@@ -8,6 +8,7 @@ use philo_model::{
     MemoryModelReplayStore, ModelCompat, ModelContinuationPolicy, ModelProtocol,
     ModelRequestHeaders,
 };
+use philo_tui::TuiScreen;
 
 use crate::config::{ResolveFlags, Settings, Verbosity};
 
@@ -73,6 +74,7 @@ fn settings(dir: &Path, model: &str) -> Settings {
         shell_timeout_secs: None,
         verbosity: Verbosity::Default,
         show_reasoning: true,
+        screen: TuiScreen::Alternate,
         entries: vec![],
     }
 }
@@ -93,6 +95,7 @@ fn control(dir: &Path) -> RuntimeControl {
             max_tool_rounds: 1,
             max_parallel_tool_calls: 1,
             operation_timeout: None,
+            tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: CompactionConfig {
                 context_budget: Some(64_000),
                 auto_threshold: 0.7,
@@ -198,6 +201,40 @@ fn ui_only_reload_does_not_rebuild_the_runtime() {
     assert!(!runtime_pending);
     assert!(!display.show_reasoning);
     assert_eq!(before, Arc::as_ptr(&control.runtime()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn screen_only_reload_updates_config_entries_without_rebuilding() {
+    let dir = temp_dir("screen-only");
+    let control = control(&dir);
+    let before = Arc::as_ptr(&control.runtime());
+    let mut next = settings(&dir, "model-a");
+    next.screen = TuiScreen::Inline;
+    next.entries = vec![crate::config::EffectiveSetting {
+        key: "screen".to_owned(),
+        value: "inline".to_owned(),
+        source: "project".to_owned(),
+    }];
+
+    let result = control.apply_settings(next).expect("screen apply");
+    let ApplyResult::Applied {
+        runtime_pending, ..
+    } = result
+    else {
+        panic!("screen-only apply must succeed immediately");
+    };
+    assert!(!runtime_pending);
+    assert_eq!(before, Arc::as_ptr(&control.runtime()));
+    assert!(
+        control
+            .config_entries()
+            .iter()
+            .any(|entry| entry.key == "screen"
+                && entry.value == "inline"
+                && entry.source == "project"),
+        "hot reload must show the configured token without switching the session screen"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

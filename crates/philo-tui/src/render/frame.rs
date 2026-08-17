@@ -1,4 +1,4 @@
-//! Pure projection of app state into a stable inline bottom panel.
+//! Pure projection of app state into the isolated terminal screen.
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -6,14 +6,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::activity::ActivityTone;
+use crate::app::select::BandLayout;
 use crate::app::state::App;
 use crate::app::text;
-use crate::app::transcript::{LineKind, TranscriptLine};
 
 use super::composer;
+use super::history;
 use super::markdown::MarkdownRenderer;
 use super::theme;
 
+#[cfg(test)]
 pub(crate) const VIEWPORT_HEIGHT: u16 = 12;
 /// M14's reviewed responsive matrix starts here. Smaller terminals degrade
 /// without panicking, but are not part of the supported layout guarantee.
@@ -58,6 +60,19 @@ fn union(top: Rect, bottom: Rect) -> Rect {
     )
 }
 
+/// Fullscreen slot contract (M14 chrome + history band):
+///
+/// ```text
+/// fullscreen
+///   transcript+band  = height - activity - composer - status
+///   activity         = 0|1   (height >= 6)   unchanged
+///   composer         = 3     immediately above status
+///   status           = 0|1
+/// ```
+///
+/// `panel_areas` already assigns the leftover to `live`. Composer stays
+/// immediately above status. History, the live stream, and the tool row
+/// share that leftover band; they never move the composer.
 fn panel_areas(area: Rect) -> PanelAreas {
     let height = area.height;
     let status_height = u16::from(height >= 2);
@@ -104,12 +119,14 @@ fn draw_activity(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRenderer, area: Rect) {
+    let width = usize::from(area.width);
     if area.is_empty() {
+        app.note_history_layout(width, 0);
         return;
     }
-    let width = usize::from(area.width);
     if let Some(overlay) = app.overlay_frame_for(area.height.saturating_sub(2).into(), width) {
         draw_overlay(frame, area, overlay);
+        app.note_history_layout(width, 0);
         return;
     }
 
@@ -124,61 +141,80 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRende
         })
         .map(|line| text::truncate(&line, width));
     let hint_height = u16::from(hint.is_some());
-    let live_height = area.height.saturating_sub(hint_height);
-    let live_area = Rect::new(area.x, area.y, area.width, live_height);
-    let hint_area = Rect::new(area.x, live_area.bottom(), area.width, hint_height);
+    let remaining = area.height.saturating_sub(hint_height);
+    let remaining_area = Rect::new(area.x, area.y, area.width, remaining);
+    let hint_area = Rect::new(area.x, remaining_area.bottom(), area.width, hint_height);
 
-    if !live_area.is_empty() {
-        draw_timeline(frame, app, markdown, live_area);
+    if !remaining_area.is_empty() {
+        draw_remaining_band(frame, app, markdown, remaining_area);
+    } else {
+        app.note_history_layout(width, 0);
     }
     if let Some(hint) = hint {
         frame.render_widget(Paragraph::new(Line::styled(hint, theme::meta())), hint_area);
     }
 }
 
-fn draw_timeline(
+/// Split the leftover band (above composer, below activity, above hint):
+///
+/// 1. If a tool timeline row exists: 1 row at the bottom; the rest is
+///    history, or idle chrome when the display list is empty.
+/// 2. Else if display cells are empty: idle chrome / activity details.
+/// 3. Else: history gets all remaining. Do not draw the idle rule over
+///    history. In-progress answer/think are unsealed cells in that list.
+fn draw_remaining_band(
     frame: &mut ratatui::Frame<'_>,
     app: &App,
     markdown: &MarkdownRenderer,
     area: Rect,
 ) {
     let width = usize::from(area.width);
-    let height = usize::from(area.height);
-    let think = app.transcript.live_reasoning();
-    let answer = app.transcript.live_answer();
+    let remaining = area.height;
     let tool = app.activity_timeline_row(width);
-    let tool_height = u16::from(tool.is_some() && height > 1);
-    let stream_height = area.height.saturating_sub(tool_height);
-    let stream_area = Rect::new(area.x, area.y, area.width, stream_height);
-    let tool_area = Rect::new(area.x, stream_area.bottom(), area.width, tool_height);
+    let cells_empty = app.cells.is_empty();
 
-    if let Some(answer) = answer {
-        draw_live_stream(frame, markdown, stream_area, LineKind::Answer, answer);
-    } else if let Some(think) = think {
-        draw_live_stream(frame, markdown, stream_area, LineKind::Reasoning, think);
-    } else if stream_height > 0 {
-        let details = app.activity_detail_rows(width, usize::from(stream_height));
+    let tool_h = u16::from(tool.is_some() && remaining > 0);
+    let leftover = remaining.saturating_sub(tool_h);
+    let (history_h, chrome_h) = if cells_empty {
+        (0, leftover)
+    } else {
+        (leftover, 0)
+    };
+
+    let history_area = Rect::new(area.x, area.y, area.width, history_h);
+    let chrome_area = Rect::new(area.x, history_area.bottom(), area.width, chrome_h);
+    let tool_area = Rect::new(area.x, chrome_area.bottom(), area.width, tool_h);
+
+    app.note_transcript_layout(BandLayout::from_parts(
+        history_area.x,
+        history_area.y,
+        history_area.width,
+        history_area.height,
+    ));
+
+    let selection = app.clamped_selection();
+
+    if !history_area.is_empty() {
+        let slice = app.history_slice(width, usize::from(history_h));
+        frame.render_widget(
+            Paragraph::new(history::paint_slice(markdown, &slice, selection)),
+            history_area,
+        );
+    }
+    if !chrome_area.is_empty() {
+        let details = app.activity_detail_rows(width, usize::from(chrome_h));
         if details.is_empty() {
-            draw_idle_chrome(frame, app, stream_area);
+            draw_idle_chrome(frame, app, chrome_area);
         } else {
             let lines = details
                 .into_iter()
                 .map(|row| Line::styled(row, theme::meta()))
                 .collect::<Vec<_>>();
-            frame.render_widget(Paragraph::new(lines), stream_area);
+            frame.render_widget(Paragraph::new(lines), chrome_area);
         }
     }
-
     if let Some(tool) = tool {
-        if tool_area.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    text::truncate(&tool, width),
-                    theme::activity_tool(),
-                )),
-                area,
-            );
-        } else {
+        if !tool_area.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     text::truncate(&tool, width),
@@ -187,61 +223,6 @@ fn draw_timeline(
                 tool_area,
             );
         }
-    }
-}
-
-fn draw_live_stream(
-    frame: &mut ratatui::Frame<'_>,
-    markdown: &MarkdownRenderer,
-    area: Rect,
-    kind: LineKind,
-    partial: &str,
-) {
-    if area.is_empty() {
-        return;
-    }
-    let width = usize::from(area.width);
-    let height = usize::from(area.height);
-    if height == 1 {
-        let preview = TranscriptLine {
-            kind,
-            text: text::tail(partial, width),
-        };
-        frame.render_widget(Paragraph::new(live_row(markdown, kind, preview)), area);
-        return;
-    }
-    let header = match kind {
-        LineKind::Reasoning => ("think", theme::reasoning()),
-        LineKind::Answer => ("answer", theme::activity_normal()),
-        other => (other_label(other), theme::meta()),
-    };
-    let mut lines = vec![Line::styled(
-        header.0.to_owned(),
-        header.1.add_modifier(Modifier::BOLD),
-    )];
-    for row in text::tail_rows(partial, width, height.saturating_sub(1)) {
-        lines.push(live_row(markdown, kind, TranscriptLine { kind, text: row }));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn other_label(kind: LineKind) -> &'static str {
-    match kind {
-        LineKind::User => "you",
-        LineKind::Tool => "tool",
-        LineKind::Notice => "note",
-        LineKind::Error => "error",
-        LineKind::Meta => "meta",
-        LineKind::Answer => "answer",
-        LineKind::Reasoning => "think",
-    }
-}
-
-fn live_row(markdown: &MarkdownRenderer, kind: LineKind, preview: TranscriptLine) -> Line<'static> {
-    match kind {
-        LineKind::Answer => markdown.preview(&preview),
-        LineKind::Reasoning => Line::styled(preview.text, theme::reasoning()),
-        _ => markdown.preview(&preview),
     }
 }
 
@@ -358,7 +339,7 @@ mod tests {
 
     use crate::app::action::Action;
     use crate::app::status::StatusData;
-    use crate::app::transcript::InfoLevel;
+    use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 
     use super::*;
 
@@ -487,5 +468,103 @@ mod tests {
         assert!(rendered.contains("Approval required"));
         assert!(rendered.contains('┌'));
         assert!(rendered.contains("draft"));
+    }
+
+    #[test]
+    fn history_viewport_follows_then_pages_at_24_rows() {
+        let mut app = app();
+        app.cells.append((0..30).map(|i| TranscriptLine {
+            kind: LineKind::Meta,
+            text: format!("row-{i}"),
+        }));
+
+        let follow = render(&app, 80, 24);
+        assert!(
+            follow.lines().any(|line| line == "row-29"),
+            "follow shows the tail: {follow}"
+        );
+        assert!(
+            !follow.lines().any(|line| line == "row-0"),
+            "follow hides the head: {follow}"
+        );
+        crate::tests::assert_tui_snapshot!("m17_history_viewport_24", follow);
+
+        app.on_action(Action::PageTranscriptUp);
+        let paged = render(&app, 80, 24);
+        assert!(
+            paged.lines().any(|line| line == "row-0"),
+            "page-up reveals older rows: {paged}"
+        );
+        assert!(
+            !paged.lines().any(|line| line == "row-29"),
+            "page-up leaves the tail: {paged}"
+        );
+
+        let areas = panel_areas(Rect::new(0, 0, 80, 24));
+        assert_eq!(areas.composer.height, 3);
+        assert_eq!(areas.composer.bottom(), areas.status.y);
+
+        app.on_agent_event(&AgentEvent::TextDelta {
+            delta: "partial answer".to_owned(),
+        });
+        let pinned = render(&app, 80, 24);
+        assert!(
+            pinned.lines().any(|line| line == "row-0"),
+            "unsealed output must not yank a paged-up view: {pinned}"
+        );
+        assert!(
+            !pinned.lines().any(|line| line == "partial answer"),
+            "pinned view stays on older rows: {pinned}"
+        );
+        assert_eq!(app.cells.cells().len(), 30, "partial stays unsealed");
+        assert_eq!(
+            app.cells.unsealed(),
+            [TranscriptLine {
+                kind: LineKind::Answer,
+                text: "partial answer".to_owned(),
+            }]
+        );
+
+        app.on_action(Action::PageTranscriptDown);
+        let followed = render(&app, 80, 24);
+        assert!(
+            followed.lines().any(|line| line == "partial answer"),
+            "follow-bottom shows the unsealed tail: {followed}"
+        );
+        assert!(
+            !followed.lines().any(|line| line == "answer"),
+            "no live-band answer header: {followed}"
+        );
+    }
+
+    #[test]
+    fn transcript_selection_highlights_history_rows() {
+        let mut app = app();
+        app.cells.append((0..30).map(|i| TranscriptLine {
+            kind: LineKind::Meta,
+            text: format!("row-{i}"),
+        }));
+        let _ = render(&app, 80, 24);
+        let areas = panel_areas(Rect::new(0, 0, 80, 24));
+        let y = areas.live.y;
+        app.on_action(Action::SelectStart { x: 0, y });
+        app.on_action(Action::SelectDrag { x: 5, y });
+        app.on_action(Action::SelectEnd { x: 5, y });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let markdown = MarkdownRenderer::new();
+        terminal
+            .draw(|frame| draw(frame, &app, &markdown, false))
+            .expect("draw");
+        let reversed = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+        assert!(reversed, "selected columns must paint a reversed highlight");
+        assert!(app.has_selection());
+        assert!(!app.follow_bottom());
     }
 }

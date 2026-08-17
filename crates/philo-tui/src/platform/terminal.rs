@@ -1,22 +1,33 @@
-//! Crossterm terminal ownership: raw mode, bracketed paste, optional keyboard
-//! enhancement, and the restore obligation (normal exit, error exit, and
-//! panic all restore the terminal state).
+//! Crossterm terminal ownership: raw mode, optional alternate screen, mouse
+//! capture for wheel scroll, bracketed paste, and the restore obligation
+//! (normal exit, error exit, and panic all restore the terminal state).
+//!
+//! Alternate mode owns the isolated alternate buffer. Inline mode draws an
+//! inline viewport on the main buffer and never enters the alternate screen.
+//! Native main-buffer scrollback dump on exit is not implemented here.
 
 use std::io::{Stdout, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+
+use crate::api::types::TuiScreen;
 
 /// Set while a session owns the terminal so the panic hook knows to
 /// restore before the default hook prints.
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ENHANCED_KEYS: AtomicBool = AtomicBool::new(false);
+static ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
 
 /// Restores the terminal to its normal state; idempotent and safe to call
 /// from the panic hook.
@@ -28,18 +39,27 @@ pub fn restore_terminal() {
     if ENHANCED_KEYS.swap(false, Ordering::SeqCst) {
         let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
     }
+    if MOUSE_CAPTURE.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(out, DisableMouseCapture);
+    }
+    if ALTERNATE_SCREEN.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(out, LeaveAlternateScreen);
+    }
     let _ = crossterm::execute!(out, DisableBracketedPaste);
     let _ = disable_raw_mode();
     println!();
 }
 
-/// One terminal session: raw mode plus an inline viewport. Dropping the
-/// guard restores the terminal.
+/// One terminal session: raw mode plus either an isolated alternate screen
+/// or an inline viewport on the main buffer.
+/// Dropping the guard restores the terminal.
 pub struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
     /// Whether `Shift+Enter` is deliverable (Windows native or kitty
     /// enhancement); the hint line adapts.
     pub shift_enter: bool,
+    /// Screen mode chosen at enter; the session never switches.
+    pub screen: TuiScreen,
 }
 
 struct SetupGuard;
@@ -54,13 +74,19 @@ impl Drop for SetupGuard {
 
 impl TerminalSession {
     /// Takes terminal ownership and installs the panic-restore hook.
-    pub fn enter(viewport_height: u16) -> std::io::Result<Self> {
+    pub fn enter(screen: TuiScreen) -> std::io::Result<Self> {
         enable_raw_mode()?;
         TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
         install_panic_hook();
         let setup_guard = SetupGuard;
 
         let mut out = stdout();
+        if matches!(screen, TuiScreen::Alternate) {
+            crossterm::execute!(out, EnterAlternateScreen)?;
+            ALTERNATE_SCREEN.store(true, Ordering::SeqCst);
+        }
+        crossterm::execute!(out, EnableMouseCapture)?;
+        MOUSE_CAPTURE.store(true, Ordering::SeqCst);
         crossterm::execute!(out, EnableBracketedPaste)?;
 
         // Capability probe: kitty-protocol terminals disambiguate
@@ -77,16 +103,23 @@ impl TerminalSession {
         }
 
         let backend = CrosstermBackend::new(stdout());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(viewport_height),
-            },
-        )?;
+        let terminal = match screen {
+            TuiScreen::Alternate => Terminal::new(backend)?,
+            TuiScreen::Inline => {
+                let (_, height) = crossterm::terminal::size()?;
+                Terminal::with_options(
+                    backend,
+                    TerminalOptions {
+                        viewport: Viewport::Inline(height),
+                    },
+                )?
+            }
+        };
         std::mem::forget(setup_guard);
         Ok(Self {
             terminal,
             shift_enter,
+            screen,
         })
     }
 }

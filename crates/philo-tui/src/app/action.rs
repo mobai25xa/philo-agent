@@ -23,6 +23,27 @@ pub(crate) enum Action {
     ToggleLevel,
     /// `Ctrl+L`: force a full redraw.
     Redraw,
+    /// `PageUp`: scroll the sealed transcript toward older rows.
+    PageTranscriptUp,
+    /// `PageDown`: scroll the sealed transcript toward newer rows.
+    PageTranscriptDown,
+    /// Wheel or equivalent: negative moves toward older rows.
+    ScrollTranscript(isize),
+    /// Left-button down inside the transcript/live band.
+    SelectStart {
+        x: u16,
+        y: u16,
+    },
+    /// Pointer moved while a transcript selection is being dragged.
+    SelectDrag {
+        x: u16,
+        y: u16,
+    },
+    /// Left-button up; a collapsed range is discarded.
+    SelectEnd {
+        x: u16,
+        y: u16,
+    },
     /// `Tab`: slash-command completion.
     Complete,
     /// `Ctrl+V` reached the app: the terminal did not turn it into a

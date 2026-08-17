@@ -42,6 +42,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
     let tui_verbose = settings.verbosity == Verbosity::Verbose;
     let tui_show_reasoning = settings.show_reasoning;
     let tui_context_window = settings.context_window;
+    let tui_screen = settings.screen;
     let assembly = RunAssembly::prepare(&cli, settings)?;
     let host = Arc::new(CliHost::new(assembly, flags.clone()));
     let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -68,6 +69,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
         verbose: tui_verbose,
         show_reasoning: tui_show_reasoning,
         context_window: tui_context_window,
+        screen: tui_screen,
         config_notices: Some(notice_rx),
     };
 

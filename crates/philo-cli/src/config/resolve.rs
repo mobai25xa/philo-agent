@@ -9,6 +9,7 @@ use philo_model::{
     ChatReasoningFormat, DEFAULT_USER_AGENT, ModelCompat, ModelContinuationPolicy, ModelProtocol,
     ModelRequestHeaders,
 };
+use philo_tui::TuiScreen;
 
 use super::file::{FileConfig, Sourced};
 use crate::args::Cli;
@@ -60,6 +61,9 @@ pub struct Settings {
     pub shell_timeout_secs: Option<u64>,
     pub verbosity: Verbosity,
     pub show_reasoning: bool,
+    /// Mapped screen for `TuiConfig`. `/config` shows the configured token
+    /// from `entries`, not this mapped value.
+    pub screen: TuiScreen,
     pub entries: Vec<EffectiveSetting>,
 }
 
@@ -431,6 +435,19 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         }
     };
 
+    let zellij_set = std::env::var_os("ZELLIJ").is_some();
+    let screen = match from_file(file.screen.as_ref()) {
+        Some(picked) => {
+            record("screen", picked.value.clone(), picked.source);
+            map_ui_screen(&picked.value, zellij_set)
+                .map_err(|error| error.at(&origin(picked.source, None, None, "[ui].screen")))?
+        }
+        None => {
+            record("screen", "auto".to_owned(), "default");
+            map_ui_screen("auto", zellij_set)?
+        }
+    };
+
     entries.extend(header_entries);
 
     Ok(Settings {
@@ -460,6 +477,7 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         shell_timeout_secs,
         verbosity,
         show_reasoning,
+        screen,
         entries,
     })
 }
@@ -638,6 +656,23 @@ pub(super) fn parse_verbosity(value: &str) -> Result<Verbosity, UsageError> {
         "quiet" => Ok(Verbosity::Quiet),
         other => Err(UsageError::new(format!(
             "invalid [ui].verbosity '{other}': expected default | verbose | quiet"
+        ))),
+    }
+}
+
+/// Maps the configured `[ui].screen` token to a TUI screen mode.
+/// `auto` becomes Inline only when `ZELLIJ` is set; TUI never reads that env.
+pub(super) fn map_ui_screen(value: &str, zellij_set: bool) -> Result<TuiScreen, UsageError> {
+    match value {
+        "alternate" => Ok(TuiScreen::Alternate),
+        "inline" => Ok(TuiScreen::Inline),
+        "auto" => Ok(if zellij_set {
+            TuiScreen::Inline
+        } else {
+            TuiScreen::Alternate
+        }),
+        other => Err(UsageError::new(format!(
+            "invalid [ui].screen '{other}': expected auto | alternate | inline"
         ))),
     }
 }

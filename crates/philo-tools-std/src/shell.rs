@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use philo_tools::{
     EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerFuture, ToolProgressSink, ToolResult,
+    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolProgressSink,
+    ToolResult,
 };
 use tokio::io::AsyncReadExt;
 
 use crate::args::{optional_u64, required_string};
 use crate::error_code;
-use crate::helpers::field_error;
+use crate::helpers::{field_error, stopped_if_cancelled};
 
 /// Stable registry name of the shell tool.
 pub const SHELL_TOOL_NAME: &str = "shell";
@@ -116,26 +117,29 @@ impl ShellTool {
         .expect("shell tool definition is valid")
     }
 
-    async fn run(&self, arguments: &ToolArguments, progress: ToolProgressSink) -> RichToolResult {
+    async fn run(&self, arguments: &ToolArguments, cx: ToolInvokeCx) -> ToolInvokeEnd {
+        if let Some(stopped) = stopped_if_cancelled(&cx) {
+            return stopped;
+        }
         let command_line = match required_string(arguments.as_str(), "command") {
             Ok(command) => command,
-            Err(error) => return field_error("command", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("command", &error)),
         };
         let timeout_secs = match optional_u64(arguments.as_str(), "timeout_secs") {
             Ok(Some(seconds)) => {
                 if seconds == 0 || seconds > self.max_timeout_secs {
-                    return RichToolResult::error(
+                    return ToolInvokeEnd::Done(RichToolResult::error(
                         error_code::INVALID_ARGUMENTS,
                         format!(
                             "timeout_secs must be between 1 and {}",
                             self.max_timeout_secs
                         ),
-                    );
+                    ));
                 }
                 seconds
             }
             Ok(None) => self.default_timeout_secs,
-            Err(error) => return field_error("timeout_secs", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("timeout_secs", &error)),
         };
 
         let mut command = platform_command(&command_line);
@@ -156,14 +160,18 @@ impl ShellTool {
             }
         }
 
+        if let Some(stopped) = stopped_if_cancelled(&cx) {
+            return stopped;
+        }
+
         let started = Instant::now();
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return RichToolResult::error(
+                return ToolInvokeEnd::Done(RichToolResult::error(
                     error_code::SPAWN_FAILED,
                     format!("failed to start the platform shell: {}", error.kind()),
-                );
+                ));
             }
         };
 
@@ -173,27 +181,30 @@ impl ShellTool {
             &mut child,
             &mut stdout,
             &mut stderr,
-            &progress,
+            &cx,
             started + Duration::from_secs(timeout_secs),
         )
         .await;
+        if captured.cancelled {
+            return ToolInvokeEnd::Stopped;
+        }
         let elapsed_ms = started.elapsed().as_millis();
         if captured.timed_out {
-            return timeout_result(
+            return ToolInvokeEnd::Done(timeout_result(
                 &command_line,
                 timeout_secs,
                 elapsed_ms,
                 &captured,
                 self.max_display_bytes,
-            );
+            ));
         }
         let status = match captured.status {
             Ok(status) => status,
             Err(error) => {
-                return RichToolResult::error(
+                return ToolInvokeEnd::Done(RichToolResult::error(
                     error_code::IO_ERROR,
                     format!("command execution failed: {}", error.kind()),
-                );
+                ));
             }
         };
         let stdout = captured.stdout;
@@ -222,7 +233,9 @@ impl ShellTool {
         .with_fact("exit_code", exit_code)
         .with_fact("duration_ms", elapsed_ms.to_string())
         .with_fact("truncated", (truncated || display_truncated).to_string());
-        RichToolResult::new(ToolResult::success(model_text)).with_display(display)
+        ToolInvokeEnd::Done(
+            RichToolResult::new(ToolResult::success(model_text)).with_display(display),
+        )
     }
 }
 
@@ -243,15 +256,17 @@ struct Captured {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     timed_out: bool,
+    cancelled: bool,
 }
 
 async fn capture_output(
     child: &mut tokio::process::Child,
     stdout: &mut Option<tokio::process::ChildStdout>,
     stderr: &mut Option<tokio::process::ChildStderr>,
-    progress: &ToolProgressSink,
+    cx: &ToolInvokeCx,
     deadline: Instant,
 ) -> Captured {
+    let progress = cx.progress();
     let mut stdout_all = Vec::new();
     let mut stderr_all = Vec::new();
     let mut stdout_pending = Vec::new();
@@ -262,6 +277,7 @@ async fn capture_output(
     let mut stderr_done = stderr.is_none();
     let mut status = None;
     let mut timed_out = false;
+    let mut cancelled = false;
 
     while status.is_none() || !stdout_done || !stderr_done {
         let until_deadline = deadline.saturating_duration_since(Instant::now());
@@ -299,9 +315,13 @@ async fn capture_output(
                     }
                 }
             }
-            _ = tokio::time::sleep(until_deadline), if !timed_out && status.is_none() => {
+            _ = tokio::time::sleep(until_deadline), if !timed_out && !cancelled && status.is_none() => {
                 let _ = child.start_kill();
                 timed_out = true;
+            }
+            _ = cx.cancel().cancelled(), if !cancelled && !timed_out && status.is_none() => {
+                let _ = child.start_kill();
+                cancelled = true;
             }
         }
     }
@@ -311,6 +331,7 @@ async fn capture_output(
         stdout: stdout_all,
         stderr: stderr_all,
         timed_out,
+        cancelled,
     }
 }
 
@@ -432,14 +453,20 @@ fn truncate_output(text: &str, max_bytes: usize, max_lines: usize) -> (String, b
 
 impl ToolHandler for ShellTool {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
-        self.call_with_progress(arguments, ToolProgressSink::noop())
+        let future = self.call_with_cx(arguments, ToolInvokeCx::ignore());
+        Box::pin(async move {
+            future
+                .await
+                .into_done()
+                .expect("ToolInvokeCx::ignore() never requests cancel")
+        })
     }
 
-    fn call_with_progress<'a>(
+    fn call_with_cx<'a>(
         &'a self,
         arguments: ToolArguments,
-        progress: ToolProgressSink,
-    ) -> ToolHandlerFuture<'a> {
-        Box::pin(async move { self.run(&arguments, progress).await })
+        cx: ToolInvokeCx,
+    ) -> ToolHandlerEndFuture<'a> {
+        Box::pin(async move { self.run(&arguments, cx).await })
     }
 }

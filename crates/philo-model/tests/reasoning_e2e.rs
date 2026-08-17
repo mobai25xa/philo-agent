@@ -84,6 +84,7 @@ fn runtime_over(
             max_tool_rounds: 2,
             max_parallel_tool_calls: 1,
             operation_timeout: None,
+            tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
         },
         Arc::new(registry),

@@ -1,8 +1,8 @@
 //! Pure event-to-line projection for the scrollback transcript.
 //!
-//! History lines are append-only once produced (inline discipline: written
-//! lines are never rewritten). Streaming text accumulates in partial buffers
-//! exposed separately for the live timeline of the bottom panel.
+//! Completed lines are append-only once produced. Streaming text accumulates
+//! in partial buffers; [`Transcript::open_cells`] projects the unfinished
+//! tail so the display list can update those cells in place.
 
 use std::collections::HashMap;
 
@@ -122,6 +122,22 @@ impl Transcript {
         } else {
             Some(self.partial_reasoning.as_str())
         }
+    }
+
+    /// Unfinished streaming buffers as display cells, matching sealed visual
+    /// grammar. Completed lines still come only from [`Self::on_event`].
+    pub fn open_cells(&self) -> Vec<TranscriptLine> {
+        let mut cells = Vec::new();
+        if let Some(partial) = self.live_reasoning() {
+            if !self.think_header_written {
+                cells.push(line(LineKind::Reasoning, "think"));
+            }
+            cells.push(line(LineKind::Reasoning, format!("  {partial}")));
+        }
+        if let Some(partial) = self.live_answer() {
+            cells.push(line(LineKind::Answer, partial.to_owned()));
+        }
+        cells
     }
 
     /// Flushes any partial content into completed lines.
@@ -499,6 +515,45 @@ mod snapshots {
     }
 
     #[test]
+    fn open_cells_projects_unfinished_think_with_sealed_grammar() {
+        let mut transcript = Transcript::new(true);
+        let lines = transcript.on_event(
+            &AgentEvent::ReasoningDelta {
+                model_call_id: ModelCallId::new("call-1"),
+                text: "hello".to_owned(),
+            },
+            InfoLevel::Default,
+        );
+        assert!(lines.is_empty());
+        assert_eq!(
+            transcript.open_cells(),
+            vec![
+                line(LineKind::Reasoning, "think"),
+                line(LineKind::Reasoning, "  hello"),
+            ]
+        );
+
+        let lines = transcript.on_event(
+            &AgentEvent::ReasoningDelta {
+                model_call_id: ModelCallId::new("call-1"),
+                text: " world\nmore".to_owned(),
+            },
+            InfoLevel::Default,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                line(LineKind::Reasoning, "think"),
+                line(LineKind::Reasoning, "  hello world"),
+            ]
+        );
+        assert_eq!(
+            transcript.open_cells(),
+            vec![line(LineKind::Reasoning, "  more")]
+        );
+    }
+
+    #[test]
     fn reasoning_can_be_switched_off_entirely() {
         let mut transcript = Transcript::new(false);
         let lines = transcript.on_event(
@@ -510,6 +565,10 @@ mod snapshots {
         );
         assert!(lines.is_empty(), "no reasoning reaches the transcript");
         assert_eq!(transcript.partial(), None);
+        assert!(
+            transcript.open_cells().is_empty(),
+            "no unsealed think cells when reasoning is hidden"
+        );
     }
 
     #[test]

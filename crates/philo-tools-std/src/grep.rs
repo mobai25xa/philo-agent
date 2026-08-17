@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use philo_tools::{
     EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerFuture, ToolResult,
+    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::{optional_string, required_string};
 use crate::error_code;
-use crate::helpers::{field_error, path_error};
+use crate::helpers::{field_error, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
 
 /// Stable registry name of the grep tool.
@@ -192,5 +192,18 @@ fn display_path(base: &Path, file: &Path, requested: &str) -> String {
 impl ToolHandler for GrepTool {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
         Box::pin(async move { self.grep(&arguments) })
+    }
+
+    fn call_with_cx<'a>(
+        &'a self,
+        arguments: ToolArguments,
+        cx: ToolInvokeCx,
+    ) -> ToolHandlerEndFuture<'a> {
+        Box::pin(async move {
+            if let Some(stopped) = stopped_if_cancelled(&cx) {
+                return stopped;
+            }
+            ToolInvokeEnd::Done(self.grep(&arguments))
+        })
     }
 }

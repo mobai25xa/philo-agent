@@ -189,6 +189,17 @@ impl InputEditor {
         self.byte = self.lines[self.row].len();
         self.preferred_cell = None;
     }
+
+    /// Cursor is at the start of the current editing line (grapheme-safe:
+    /// Home lands on a byte boundary).
+    pub(crate) fn at_line_start(&self) -> bool {
+        self.byte == 0
+    }
+
+    /// Cursor is at the end of the current editing line.
+    pub(crate) fn at_line_end(&self) -> bool {
+        self.byte == self.lines[self.row].len()
+    }
 }
 
 /// Recalled submissions for Up/Down when the cursor is already on the

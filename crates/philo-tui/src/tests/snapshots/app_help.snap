@@ -19,8 +19,9 @@ keys:
   Enter     submit (queues while busy)
   Ctrl+J    newline (Shift+Enter where supported)
   Esc       cancel the running turn
-  Ctrl+C    clear input, cancel, or press twice to exit
+  Ctrl+C    copy selection, or clear / cancel / twice to exit
   Ctrl+D    exit on an empty prompt
   Ctrl+O    detail tier   ·   Ctrl+L redraw
   Tab       complete a command   ·   Up/Down input history
-  scroll    stays in the terminal native scrollback
+  scroll    wheel or PageUp/Dn
+  Home/End  line start/end, or transcript top/bottom

@@ -91,17 +91,21 @@ fn registry_synthesized_errors_have_no_display() {
 
     let unknown = block_on(registry.invoke(
         ToolInvocation::new("c", "nope", "{}"),
-        ToolProgressSink::noop(),
+        ToolInvokeCx::ignore(),
     ))
-    .unwrap();
+    .unwrap()
+    .into_done()
+    .expect("unknown tool completes");
     assert_eq!(unknown.result().as_error().unwrap().code(), "unknown_tool");
     assert!(unknown.display().is_none());
 
     let bad_json = block_on(registry.invoke(
         ToolInvocation::new("c", "strict", "not json"),
-        ToolProgressSink::noop(),
+        ToolInvokeCx::ignore(),
     ))
-    .unwrap();
+    .unwrap()
+    .into_done()
+    .expect("bad json completes");
     assert_eq!(
         bad_json.result().as_error().unwrap().code(),
         "invalid_arguments"
@@ -110,9 +114,11 @@ fn registry_synthesized_errors_have_no_display() {
 
     let missing = block_on(registry.invoke(
         ToolInvocation::new("c", "strict", "{}"),
-        ToolProgressSink::noop(),
+        ToolInvokeCx::ignore(),
     ))
-    .unwrap();
+    .unwrap()
+    .into_done()
+    .expect("missing field completes");
     assert_eq!(
         missing.result().as_error().unwrap().code(),
         "invalid_arguments"
@@ -134,9 +140,11 @@ fn handler_display_passes_through_untouched() {
         .build();
     let rich = block_on(registry.invoke(
         ToolInvocation::new("c", "probe", "{}"),
-        ToolProgressSink::noop(),
+        ToolInvokeCx::ignore(),
     ))
-    .unwrap();
+    .unwrap()
+    .into_done()
+    .expect("probe completes");
     assert_eq!(rich.result().content(), Some("truncated model view"));
     assert_eq!(rich.display().unwrap().detail(), "the full detail");
 }
@@ -151,19 +159,20 @@ fn progress_sink_does_not_change_the_final_result() {
     }
     impl ToolHandler for StreamingEcho {
         fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
-            self.call_with_progress(arguments, ToolProgressSink::noop())
+            let future = self.call_with_cx(arguments, ToolInvokeCx::ignore());
+            Box::pin(async move { future.await.into_done().expect("echo completes") })
         }
-        fn call_with_progress<'a>(
+        fn call_with_cx<'a>(
             &'a self,
             _arguments: ToolArguments,
-            progress: ToolProgressSink,
-        ) -> ToolHandlerFuture<'a> {
+            cx: ToolInvokeCx,
+        ) -> ToolHandlerEndFuture<'a> {
             let seen = Arc::clone(&self.seen);
             Box::pin(async move {
-                progress.push_text("chunk-a");
-                progress.push_text("chunk-b");
+                cx.progress().push_text("chunk-a");
+                cx.progress().push_text("chunk-b");
                 seen.lock().expect("seen").push("ran".to_owned());
-                RichToolResult::success("final")
+                ToolInvokeEnd::Done(RichToolResult::success("final"))
             })
         }
     }
@@ -182,7 +191,13 @@ fn progress_sink_does_not_change_the_final_result() {
         )
         .unwrap()
         .build();
-    let rich = block_on(registry.invoke(ToolInvocation::new("c", "echo", "{}"), sink)).unwrap();
+    let rich = block_on(registry.invoke(
+        ToolInvocation::new("c", "echo", "{}"),
+        ToolInvokeCx::progress_only(sink),
+    ))
+    .unwrap()
+    .into_done()
+    .expect("echo completes");
     assert_eq!(rich.result().content(), Some("final"));
     assert_eq!(pushed.lock().expect("pushed").as_str(), "chunk-achunk-b");
     assert_eq!(seen.lock().expect("seen").as_slice(), ["ran"]);

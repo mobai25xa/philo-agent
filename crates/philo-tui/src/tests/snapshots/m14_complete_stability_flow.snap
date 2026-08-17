@@ -20,12 +20,12 @@ Meta: done (cancelled)
 
 TOOL
 00: | tool  read_file
-01: path: src/中 文 .rs
-02: 
-03: 
-04: 
-05: 
-06: 
+01: 0123456789012345678901234567890123456789
+02: 0123456789012345678901234567890123456789
+03: 中 文  é 👩‍💻
+04: ```rust
+05: fn main() { println!("稳 定 "); }
+06: ```
 07: read_file  path: src/中 文 .rs
 08: ┌──────────────────────────────────────┐
 09: │  long composer draft                 │
@@ -34,13 +34,13 @@ TOOL
 
 CANCELLING
 00: | cancel  user
-01: answer
-02: late-but-preserved
-03: 
-04: 
-05: 
-06: 
-07: 
+01: ```rust
+02: fn main() { println!("稳 定 "); }
+03: ```
+04: ▸ read_file  src/中 文 .rs  840 B
+05: context compacted
+06: after tool
+07: late-but-preserved
 08: ┌──────────────────────────────────────┐
 09: │  long composer draft                 │
 10: └──────────────────────────────────────┘

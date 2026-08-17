@@ -11,7 +11,7 @@ use philo_agent_runtime::{AgentEvent, OperationHandle, SessionId};
 use tokio::time::Instant;
 
 use crate::api::host::TuiHost;
-use crate::api::types::{TuiConfig, TuiExit};
+use crate::api::types::{TuiConfig, TuiExit, TuiScreen};
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::state::App;
 use crate::app::status::StatusData;
@@ -27,19 +27,18 @@ use super::scheduler::FrameScheduler;
 use super::tasks::{PendingTasks, SubmissionResult, TaskCompletion};
 use super::{host_effects, media, tasks};
 
-/// Fixed inline viewport: activity + live tail + popover + composer + status.
-const VIEWPORT_HEIGHT: u16 = crate::render::frame::VIEWPORT_HEIGHT;
 /// ConfirmationChannel currently has no wake stream. While an operation is
 /// active, poll its front without producing a frame unless the overlay changed.
 const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Runs the interactive session until the user quits.
 ///
-/// Terminal ownership: raw mode and the inline viewport are held for the
-/// whole call and restored on every exit path (the guard also covers
-/// panics). Errors after the loop starts surface as `io::Error`.
+/// Terminal ownership: raw mode and the configured screen (alternate buffer
+/// or inline viewport) are held for the whole call and restored on every
+/// exit path (the guard also covers panics). The session never switches
+/// screen mode. Errors after the loop starts surface as `io::Error`.
 pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<TuiExit> {
-    let mut session = TerminalSession::enter(VIEWPORT_HEIGHT)?;
+    let mut session = TerminalSession::enter(config.screen)?;
     let shift_enter = session.shift_enter;
 
     let mut status = StatusData::new(
@@ -131,13 +130,22 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                         }
                         host_effects::apply(&mut app, result)
                     }
-                    TaskCompletion::Clipboard(result) => finish_clipboard(&mut app, result),
+                    TaskCompletion::Clipboard(result) => {
+                        let effects = finish_clipboard(&mut app, result);
+                        app.ingest_appends(effects)
+                    }
+                    TaskCompletion::ClipboardWrite(result) => match result {
+                        Ok(()) => Vec::new(),
+                        Err(error) => app.ingest_appends(vec![Effect::Append(tasks::task_error(
+                            format!("copy failed: {error}"),
+                        ))]),
+                    },
                     TaskCompletion::Submission(SubmissionResult::Accepted(handle)) => {
                         handles.push_back(handle);
                         Vec::new()
                     }
                     TaskCompletion::Submission(SubmissionResult::Rejected(error)) => {
-                        vec![Effect::Append(tasks::task_error(error))]
+                        app.ingest_appends(vec![Effect::Append(tasks::task_error(error))])
                     }
                     TaskCompletion::Submission(SubmissionResult::MediaRefused {
                         text,
@@ -146,12 +154,12 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                         draft_generation,
                     }) => {
                         let restored = app.restore_draft_if_current(draft_generation, &text, kept);
-                        vec![Effect::Append(media::refusal_lines_for_restore(
+                        app.ingest_appends(vec![Effect::Append(media::refusal_lines_for_restore(
                             &errors, restored,
-                        ))]
+                        ))])
                     }
                     TaskCompletion::Failed(error) => {
-                        vec![Effect::Append(tasks::task_error(error))]
+                        app.ingest_appends(vec![Effect::Append(tasks::task_error(error))])
                     }
                     TaskCompletion::Superseded => Vec::new(),
                 };
@@ -181,10 +189,24 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                     scheduler.invalidate_immediate(event_time);
                     app.on_paste(&text)
                 }
+                TermEvent::Mouse(mouse) => {
+                    let action = keymap::interpret_mouse(&mouse, app.is_selecting());
+                    if matches!(action, crate::app::action::Action::None) {
+                        Vec::new()
+                    } else {
+                        scheduler.invalidate_immediate(event_time);
+                        app.on_action(action)
+                    }
+                }
                 TermEvent::Resize(..) => {
-                    // Ratatui autoresizes on the next draw. A resize is an
-                    // immediate invalidation, not an unconditional clear.
-                    scheduler.invalidate_immediate(event_time);
+                    // Alternate may wipe the alt buffer. Inline must not
+                    // request a hard clear: `terminal.clear()` would wipe
+                    // the main buffer and leave stacked ghost frames.
+                    if session.screen == TuiScreen::Alternate {
+                        scheduler.request_hard_redraw(event_time);
+                    } else {
+                        scheduler.invalidate_immediate(event_time);
+                    }
                     Vec::new()
                 }
                 _ => Vec::new(),
@@ -213,13 +235,12 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
         let mut quit = false;
         // Completed host results can request follow-up work (opening the picker
         // requests its first preview), so the queue is drained rather than
-        // iterated. Transcript lines stay queued until the next granted frame
-        // and are then inserted in one scrollback batch.
+        // iterated. Sealed lines are already in `App.cells`; Append only
+        // dirties the next granted frame.
         let mut pending: VecDeque<Effect> = effects.into();
         while let Some(effect) = pending.pop_front() {
             match effect {
-                Effect::Append(lines) => {
-                    output.append(&mut markdown, lines);
+                Effect::Append(_) => {
                     scheduler.invalidate_background(event_time);
                 }
                 Effect::Submit { text, attachments } => {
@@ -235,6 +256,9 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                 }
                 Effect::ReadClipboard => {
                     tasks.start_clipboard();
+                }
+                Effect::WriteClipboard(text) => {
+                    tasks.start_clipboard_write(text);
                 }
                 Effect::CancelActive => {
                     if let Some(handle) = handles.front() {

@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_tools::{
-    RichToolResult, ToolInvocation, ToolPort, ToolProgressSink, ToolRegistry, ToolResult,
+    RichToolResult, ToolCancel, ToolInvocation, ToolInvokeCx, ToolInvokeEnd, ToolPort,
+    ToolProgressSink, ToolRegistry, ToolResult,
 };
 use philo_tools_std::{READ_TOOL_NAME, ReadTool, error_code};
 
@@ -63,11 +64,15 @@ fn registry(tool: ReadTool) -> ToolRegistry {
 }
 
 fn invoke(registry: &ToolRegistry, arguments: &str) -> RichToolResult {
-    block_on(registry.invoke(
+    match block_on(registry.invoke(
         ToolInvocation::new("call-1", READ_TOOL_NAME, arguments),
-        ToolProgressSink::noop(),
+        ToolInvokeCx::ignore(),
     ))
     .expect("read tool never raises infrastructure errors")
+    {
+        ToolInvokeEnd::Done(result) => result,
+        ToolInvokeEnd::Stopped => panic!("expected Done without a requested cancel"),
+    }
 }
 
 fn error_code_of(rich: &RichToolResult) -> &str {
@@ -276,4 +281,19 @@ fn non_string_path_is_an_invalid_arguments_error() {
     let registry = registry(ReadTool::new(&root.path));
     let result = invoke(&registry, r#"{"path":42}"#);
     assert_eq!(error_code_of(&result), error_code::INVALID_ARGUMENTS);
+}
+
+#[test]
+fn already_requested_cancel_returns_stopped() {
+    let root = TempRoot::new();
+    root.file("hello.txt", b"hello tools");
+    let registry = registry(ReadTool::new(&root.path));
+    let cancel = ToolCancel::new();
+    cancel.request();
+    let end = block_on(registry.invoke(
+        ToolInvocation::new("call-1", READ_TOOL_NAME, r#"{"path":"hello.txt"}"#),
+        ToolInvokeCx::new(ToolProgressSink::noop(), cancel),
+    ))
+    .expect("read tool never raises infrastructure errors");
+    assert_eq!(end, ToolInvokeEnd::Stopped);
 }

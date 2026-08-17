@@ -14,6 +14,7 @@ impl App {
         }
         self.exit_armed = false;
         self.completion = None;
+        self.clear_selection();
         self.history.reset_browse();
         self.bump_draft_generation();
         self.input.insert_str(text);
@@ -83,6 +84,7 @@ impl App {
     }
 
     pub(super) fn insert_char(&mut self, ch: char) -> Vec<Effect> {
+        self.clear_selection();
         self.bump_draft_generation();
         self.history.reset_browse();
         self.input.insert_char(ch);
@@ -91,6 +93,7 @@ impl App {
     }
 
     pub(super) fn insert_newline(&mut self) -> Vec<Effect> {
+        self.clear_selection();
         self.bump_draft_generation();
         self.history.reset_browse();
         self.input.insert_newline();
@@ -99,6 +102,7 @@ impl App {
     }
 
     pub(super) fn backspace(&mut self) -> Vec<Effect> {
+        self.clear_selection();
         self.bump_draft_generation();
         self.input.backspace();
         self.disarm_quit_unless_typing_quit();
@@ -106,6 +110,7 @@ impl App {
     }
 
     pub(super) fn delete(&mut self) -> Vec<Effect> {
+        self.clear_selection();
         self.bump_draft_generation();
         self.input.delete();
         self.disarm_quit_unless_typing_quit();
@@ -123,12 +128,20 @@ impl App {
     }
 
     pub(super) fn home(&mut self) -> Vec<Effect> {
-        self.input.home();
+        if self.input.at_line_start() {
+            self.jump_transcript_top();
+        } else {
+            self.input.home();
+        }
         vec![]
     }
 
     pub(super) fn end(&mut self) -> Vec<Effect> {
-        self.input.end();
+        if self.input.at_line_end() {
+            self.jump_transcript_bottom();
+        } else {
+            self.input.end();
+        }
         vec![]
     }
 
@@ -147,6 +160,7 @@ impl App {
     }
 
     pub(super) fn submit(&mut self) -> Vec<Effect> {
+        self.clear_selection();
         if self.input.is_empty() {
             return vec![];
         }

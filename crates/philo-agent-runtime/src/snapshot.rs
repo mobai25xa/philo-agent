@@ -20,8 +20,9 @@ pub struct TurnSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelCallSnapshot {
-    /// Session owning this call. Model adapters use it only to scope
-    /// provider replay sidecars; it is not sent to the provider.
+    /// Session owning this call. Model adapters use it to scope provider
+    /// replay sidecars and, for openai-chat, as the stable cache-routing
+    /// identity (`prompt_cache_key` / session-affinity headers).
     pub session_id: SessionId,
     /// Opaque active-path leaf before this call. It prevents replay state
     /// from one context branch being treated as state for another branch.

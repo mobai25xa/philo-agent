@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolHandler, ToolProgressSink, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolCancel, ToolHandler, ToolInvokeCx,
+    ToolInvokeEnd, ToolProgressSink, ToolResult,
 };
 use philo_tools_std::{EditTool, GrepTool, ListTool, ShellTool, WriteTool, error_code};
 
@@ -226,6 +227,25 @@ fn write_rejects_escapes_and_directories() {
     );
 }
 
+#[test]
+fn write_already_requested_cancel_does_not_create_the_file() {
+    let root = TempRoot::new();
+    let tool = WriteTool::new(&root.path);
+    let cancel = ToolCancel::new();
+    cancel.request();
+    let arguments =
+        ToolArguments::parse(r#"{"path":"stopped.txt","content":"nope"}"#).expect("valid JSON");
+    let end = block_on(tool.call_with_cx(
+        arguments,
+        ToolInvokeCx::new(ToolProgressSink::noop(), cancel),
+    ));
+    assert_eq!(end, ToolInvokeEnd::Stopped);
+    assert!(
+        !root.path.join("stopped.txt").exists(),
+        "cancelled write must not create the target"
+    );
+}
+
 // ------------------------------- edit ------------------------------------
 
 #[test]
@@ -430,6 +450,57 @@ fn shell_scrubs_credential_environment_variables() {
     );
 }
 
+fn shell_call_cx(tool: &ShellTool, arguments: &str, cx: ToolInvokeCx) -> ToolInvokeEnd {
+    let arguments = ToolArguments::parse(arguments).expect("valid JSON");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(tool.call_with_cx(arguments, cx))
+}
+
+#[test]
+fn shell_already_requested_cancel_returns_stopped_not_timeout() {
+    let root = TempRoot::new();
+    let tool = ShellTool::new(&root.path);
+    let cancel = ToolCancel::new();
+    cancel.request();
+    let command = if cfg!(windows) {
+        r#"{"command":"Start-Sleep -Seconds 30","timeout_secs":5}"#
+    } else {
+        r#"{"command":"sleep 30","timeout_secs":5}"#
+    };
+    let end = shell_call_cx(
+        &tool,
+        command,
+        ToolInvokeCx::new(ToolProgressSink::noop(), cancel),
+    );
+    assert_eq!(end, ToolInvokeEnd::Stopped);
+}
+
+#[test]
+fn shell_cancel_after_spawn_returns_stopped_not_timeout() {
+    let root = TempRoot::new();
+    let tool = ShellTool::new(&root.path).with_max_timeout_secs(600);
+    let cancel = ToolCancel::new();
+    let cancel_later = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        cancel_later.request();
+    });
+    let command = if cfg!(windows) {
+        r#"{"command":"Start-Sleep -Seconds 30","timeout_secs":20}"#
+    } else {
+        r#"{"command":"sleep 30","timeout_secs":20}"#
+    };
+    let end = shell_call_cx(
+        &tool,
+        command,
+        ToolInvokeCx::new(ToolProgressSink::noop(), cancel),
+    );
+    assert_eq!(end, ToolInvokeEnd::Stopped);
+}
+
 #[test]
 fn shell_truncates_long_output_with_a_marker() {
     let root = TempRoot::new();
@@ -471,7 +542,10 @@ fn shell_streams_progress_and_caps_display() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let result = runtime.block_on(tool.call_with_progress(arguments, sink));
+    let end = runtime.block_on(tool.call_with_cx(arguments, ToolInvokeCx::progress_only(sink)));
+    let result = end
+        .into_done()
+        .expect("progress-only context never requests cancel");
     let live = pushed.lock().expect("pushed").clone();
     assert!(
         live.contains("abcd"),

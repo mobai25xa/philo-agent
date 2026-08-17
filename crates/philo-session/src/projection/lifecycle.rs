@@ -391,7 +391,7 @@ impl LifecycleProjection {
         // depends on how (and whether) it cancels the turn.
         //
         //   no cancellation        only real results (plain C_k)
-        //   User / Timeout         real source-order prefix + Cancelled suffix
+        //   User / Timeout         (real | Interrupted)* Cancelled*
         //   Abandoned (seal)       every completion mark is Interrupted
         let cancel_reason = kinds.clone().find_map(|kind| match kind {
             SessionEntryKind::TurnTerminated {
@@ -413,14 +413,11 @@ impl LifecycleProjection {
             Some(CancelReason::Abandoned) => result_entries
                 .iter()
                 .all(|(_, _, result)| matches!(result.outcome(), ToolResultOutcome::Interrupted)),
-            Some(_) => {
-                !has_interrupted
-                    && first_cancelled.is_none_or(|first| {
-                        result_entries[first..].iter().all(|(_, _, result)| {
-                            matches!(result.outcome(), ToolResultOutcome::Cancelled)
-                        })
-                    })
-            }
+            Some(_) => first_cancelled.is_none_or(|first| {
+                result_entries[first..]
+                    .iter()
+                    .all(|(_, _, result)| matches!(result.outcome(), ToolResultOutcome::Cancelled))
+            }),
             None => !has_interrupted && first_cancelled.is_none(),
         };
         if !valid_marks {

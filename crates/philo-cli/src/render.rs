@@ -389,6 +389,9 @@ fn usage_line(usage: &TokenUsage) -> String {
         part(usage.input_tokens),
         part(usage.output_tokens)
     );
+    if usage.cache_read_tokens.is_some() {
+        line.push_str(&format!(", cache {}", part(usage.cache_read_tokens)));
+    }
     if usage.reasoning_tokens.is_some() {
         line.push_str(&format!(", reasoning {}", part(usage.reasoning_tokens)));
     }
@@ -874,5 +877,16 @@ mod tests {
         assert!(stderr.contains("warning: context compaction failed"));
         assert!(stderr.contains("summary model unavailable"));
         assert!(stderr.contains("continuing without compaction"));
+    }
+
+    #[test]
+    fn usage_line_includes_cache_read_when_present() {
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            cache_read_tokens: Some(8),
+            ..TokenUsage::default()
+        };
+        assert_eq!(usage_line(&usage), "tokens: input 10, output 20, cache 8");
     }
 }

@@ -38,6 +38,10 @@ pub(crate) fn error() -> Style {
     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
 }
 
+pub(crate) fn selection() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
 pub(crate) fn meta() -> Style {
     Style::default().fg(Color::DarkGray)
 }

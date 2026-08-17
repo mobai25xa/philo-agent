@@ -75,16 +75,19 @@ impl App {
                 format!("error: context compaction failed: {}", error.message()),
             ),
         };
-        vec![Effect::Append(vec![line])]
+        self.ingest_appends(vec![Effect::Append(vec![line])])
     }
 
-    /// Starts rendering a different session: fresh transcript and usage,
-    /// same terminal scrollback (history is append-only).
+    /// Starts rendering a different session: fresh transcript, sealed and
+    /// unsealed cells, and usage. Native scrollback is no longer the history store.
     pub(crate) fn begin_session(&mut self, session_id: &str) {
         self.status.session = session_id.to_owned();
         self.status.usage = None;
         self.transcript = crate::app::transcript::Transcript::new(self.show_reasoning);
         self.activity.clear();
+        self.cells.clear();
+        self.scroll = crate::app::cells::ScrollState::follow();
+        self.clear_selection();
     }
 
     /// Projects one agent event into transcript lines and status updates.
@@ -111,11 +114,14 @@ impl App {
             _ => {}
         }
         let lines = self.transcript.on_event(event, self.level);
-        if lines.is_empty() {
+        let effects = if lines.is_empty() {
             vec![]
         } else {
             vec![Effect::Append(lines)]
-        }
+        };
+        let effects = self.ingest_appends(effects);
+        self.sync_unsealed();
+        effects
     }
 
     pub(super) fn apply_config_notice(
@@ -188,6 +194,7 @@ impl App {
     }
 
     pub(super) fn escape(&mut self) -> Vec<Effect> {
+        self.clear_selection();
         if self.manual_compacting {
             self.cancel_manual_compaction()
         } else if self.status.busy {
@@ -198,6 +205,10 @@ impl App {
     }
 
     pub(super) fn ctrl_c(&mut self) -> Vec<Effect> {
+        if let Some(effect) = self.copy_selection() {
+            self.exit_armed = false;
+            return vec![effect];
+        }
         if !self.input.is_empty() {
             self.bump_draft_generation();
             self.input.clear();

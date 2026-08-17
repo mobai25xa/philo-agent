@@ -83,7 +83,7 @@ async fn request_without_summary_matches_the_pre_summary_wire_golden_byte_for_by
     collect_ok(stream).await;
 
     let request = &transport.requests()[0];
-    const PRE_SUMMARY_WIRE_GOLDEN: &[u8] = br#"{"model":"stub-model","messages":[{"role":"developer","content":"be helpful"},{"role":"user","content":[{"type":"text","text":"hello"}]}],"max_completion_tokens":256,"stream":true,"n":1,"stream_options":{"include_usage":true},"temperature":0.25}"#;
+    const PRE_SUMMARY_WIRE_GOLDEN: &[u8] = br#"{"model":"stub-model","messages":[{"role":"developer","content":"be helpful"},{"role":"user","content":[{"type":"text","text":"hello"}]}],"max_completion_tokens":256,"stream":true,"n":1,"stream_options":{"include_usage":true},"temperature":0.25,"prompt_cache_key":"session-1"}"#;
     let body: &[u8] = request.body.as_ref();
     assert_eq!(body, PRE_SUMMARY_WIRE_GOLDEN);
 }

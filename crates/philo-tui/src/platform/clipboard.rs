@@ -87,6 +87,12 @@ fn describe(error: arboard::Error) -> String {
     }
 }
 
+/// Writes UTF-8 text to the system clipboard. Failures are never fatal.
+pub(crate) fn write_text(text: String) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(describe)?;
+    clipboard.set_text(text).map_err(describe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

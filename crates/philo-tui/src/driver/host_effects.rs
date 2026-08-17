@@ -64,7 +64,7 @@ impl HostResult {
 
 /// Applies one completed host result through the pure App state machine.
 pub(crate) fn apply(app: &mut App, result: HostResult) -> Vec<Effect> {
-    match result {
+    let effects = match result {
         HostResult::NewSession(id) => {
             app.begin_session(&id);
             append(vec![line(LineKind::Meta, format!("new session: {id}"))])
@@ -151,7 +151,8 @@ pub(crate) fn apply(app: &mut App, result: HostResult) -> Vec<Effect> {
         )]),
         HostResult::ShowConfig(entries) => append(config_lines(entries)),
         HostResult::ShowStatus(tools) => append(status_lines(app, tools)),
-    }
+    };
+    app.ingest_appends(effects)
 }
 
 fn append(lines: Vec<TranscriptLine>) -> Vec<Effect> {

@@ -34,6 +34,8 @@ pub(crate) enum Effect {
     },
     /// `Ctrl+V` outside bracketed paste: read the system clipboard.
     ReadClipboard,
+    /// Copy the TUI selection to the system clipboard.
+    WriteClipboard(String),
     CancelActive,
     /// Start a cancellable manual compaction in the driver's select loop.
     StartCompaction,

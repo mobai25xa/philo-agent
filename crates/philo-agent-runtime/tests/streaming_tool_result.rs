@@ -34,6 +34,7 @@ fn config(max_parallel: u32) -> RuntimeConfig {
         max_tool_rounds: 1,
         max_parallel_tool_calls: max_parallel,
         operation_timeout: None,
+        tool_cancel_grace: std::time::Duration::from_millis(300),
         compaction: Default::default(),
     }
 }

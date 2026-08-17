@@ -563,7 +563,7 @@ impl RuntimeControl {
 }
 
 fn merge_display_entries(current: &mut Vec<EffectiveSetting>, incoming: &[EffectiveSetting]) {
-    for key in ["verbosity", "show_reasoning", "context_window"] {
+    for key in ["verbosity", "show_reasoning", "context_window", "screen"] {
         if let Some(entry) = incoming.iter().find(|entry| entry.key == key) {
             if let Some(slot) = current.iter_mut().find(|entry| entry.key == key) {
                 *slot = entry.clone();

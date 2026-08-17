@@ -31,18 +31,18 @@
 //! struct Approval<P: ToolPort> { inner: P }
 //! impl<P: ToolPort> ToolPort for Approval<P> {
 //!     fn definitions(&self) -> Vec<ToolDefinition> { self.inner.definitions() }
-//!     fn invoke<'a>(&'a self, invocation: ToolInvocation, progress: ToolProgressSink) -> ToolFuture<'a> {
+//!     fn invoke<'a>(&'a self, invocation: ToolInvocation, cx: ToolInvokeCx) -> ToolFuture<'a> {
 //!         let class = self.inner.definitions().iter()
 //!             .find(|d| d.name() == invocation.name())
 //!             .map(|d| d.effect_class());
 //!         Box::pin(async move {
 //!             if let Some(EffectClass::System) = class {
 //!                 if !user_approves(&invocation) {
-//!                     return Ok(RichToolResult::error(
-//!                         "denied", "the user declined this command"));
+//!                     return Ok(ToolInvokeEnd::Done(RichToolResult::error(
+//!                         "denied", "the user declined this command")));
 //!                 }
 //!             }
-//!             self.inner.invoke(invocation, progress).await
+//!             self.inner.invoke(invocation, cx).await
 //!         })
 //!     }
 //! }
@@ -163,6 +163,7 @@ impl CodingProfile {
             // The operation timeout is deployment configuration, not
             // scenario knowledge: the profile keeps it disabled.
             operation_timeout: None,
+            tool_cancel_grace: philo_agent_runtime::DEFAULT_TOOL_CANCEL_GRACE,
             compaction: Default::default(),
         }
     }

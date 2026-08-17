@@ -19,6 +19,14 @@ pub enum ConfigReloadNotice {
     Pending,
 }
 
+/// Alternate screen versus an inline viewport on the main buffer.
+/// Chosen by the composition root; a session never switches modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuiScreen {
+    Alternate,
+    Inline,
+}
+
 /// Deployment inputs for one interactive session (from the composition
 /// root's configuration chain).
 #[derive(Debug)]
@@ -31,6 +39,8 @@ pub struct TuiConfig {
     pub show_reasoning: bool,
     /// Context-budget hint for the status bar.
     pub context_window: Option<u64>,
+    /// Screen mode for this session. Hot reload must not change it.
+    pub screen: TuiScreen,
     /// Optional notices from the composition-root watcher.
     pub config_notices: Option<tokio::sync::mpsc::UnboundedReceiver<ConfigReloadNotice>>,
 }

@@ -91,10 +91,33 @@ pub struct RuntimeConfig {
     /// Operation-level automatic cancellation (M11). Timing starts when the
     /// operation is dequeued and actually starts driving (`Queued` waiting
     /// is excluded). On expiry the runtime requests cancellation exactly
-    /// like `cancel()` — effect points stay the M6 injection points, an
-    /// executing tool call runs to completion — with reason `Timeout`.
+    /// like `cancel()` — effect points stay the M6 injection points — with
+    /// reason `Timeout`. In-flight tools are signalled immediately and
+    /// waited only up to [`RuntimeConfig::tool_cancel_grace`].
     /// `None` (the default) disables the timeout entirely.
     pub operation_timeout: Option<std::time::Duration>,
+    /// Shared grace for in-flight tool invokes after cancel is signalled.
+    /// Not a CLI/TOML key. `ZERO` drops still-pending futures on the next
+    /// poll; a same-poll `Ready` still wins.
+    pub tool_cancel_grace: std::time::Duration,
     /// Pre-turn and manual context-compaction policy (M13).
     pub compaction: CompactionConfig,
+}
+
+/// Default shared in-flight cancel grace.
+pub const DEFAULT_TOOL_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: String::new(),
+            model_target: String::new(),
+            generation: GenerationConfig::default(),
+            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+            max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+            operation_timeout: None,
+            tool_cancel_grace: DEFAULT_TOOL_CANCEL_GRACE,
+            compaction: CompactionConfig::default(),
+        }
+    }
 }

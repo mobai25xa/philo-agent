@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
+use std::future;
 use std::sync::Mutex;
 
 use philo_agent_runtime::{
-    RichToolResult, ToolDefinition, ToolDisplay, ToolFuture, ToolInvocation, ToolPort,
-    ToolPortError, ToolProgressSink,
+    RichToolResult, ToolDefinition, ToolDisplay, ToolFuture, ToolInvocation, ToolInvokeCx,
+    ToolInvokeEnd, ToolPort, ToolPortError,
 };
 
 use super::gate::Gate;
@@ -31,6 +32,15 @@ pub enum FakeToolResult {
     StreamingSuccess {
         chunks: Vec<String>,
         content: String,
+    },
+    /// Returns [`ToolInvokeEnd::Stopped`] once cancel is requested.
+    StopsOnCancel,
+    /// Never becomes ready; Runtime must drop after grace.
+    IgnoresCancel,
+    /// Blocks until the gate opens, then returns a port error.
+    GatedInfrastructureError {
+        gate: Gate,
+        message: String,
     },
 }
 
@@ -71,6 +81,21 @@ impl FakeToolResult {
         Self::StreamingSuccess {
             chunks: chunks.into_iter().map(Into::into).collect(),
             content: content.into(),
+        }
+    }
+
+    pub fn stops_on_cancel() -> Self {
+        Self::StopsOnCancel
+    }
+
+    pub fn ignores_cancel() -> Self {
+        Self::IgnoresCancel
+    }
+
+    pub fn gated_infrastructure_error(gate: &Gate, message: impl Into<String>) -> Self {
+        Self::GatedInfrastructureError {
+            gate: gate.clone(),
+            message: message.into(),
         }
     }
 }
@@ -122,11 +147,7 @@ impl ToolPort for FakeTool {
         self.definitions_snapshot()
     }
 
-    fn invoke<'a>(
-        &'a self,
-        invocation: ToolInvocation,
-        progress: ToolProgressSink,
-    ) -> ToolFuture<'a> {
+    fn invoke<'a>(&'a self, invocation: ToolInvocation, cx: ToolInvokeCx) -> ToolFuture<'a> {
         Box::pin(async move {
             self.invocations
                 .lock()
@@ -139,23 +160,37 @@ impl ToolPort for FakeTool {
                 .pop_front()
                 .expect("fake tool invoked more times than scripted");
             match result {
-                FakeToolResult::Success(content) => Ok(RichToolResult::success(content)),
-                FakeToolResult::SuccessWithDisplay { content, display } => {
-                    Ok(RichToolResult::success(content).with_display(display))
+                FakeToolResult::Success(content) => {
+                    Ok(ToolInvokeEnd::Done(RichToolResult::success(content)))
                 }
+                FakeToolResult::SuccessWithDisplay { content, display } => Ok(ToolInvokeEnd::Done(
+                    RichToolResult::success(content).with_display(display),
+                )),
                 FakeToolResult::BusinessError { code, message } => {
-                    Ok(RichToolResult::error(code, message))
+                    Ok(ToolInvokeEnd::Done(RichToolResult::error(code, message)))
                 }
                 FakeToolResult::InfrastructureError(message) => Err(ToolPortError::new(message)),
                 FakeToolResult::GatedSuccess { gate, content } => {
                     gate.wait().await;
-                    Ok(RichToolResult::success(content))
+                    Ok(ToolInvokeEnd::Done(RichToolResult::success(content)))
                 }
                 FakeToolResult::StreamingSuccess { chunks, content } => {
                     for chunk in chunks {
-                        progress.push_text(&chunk);
+                        cx.progress().push_text(&chunk);
                     }
-                    Ok(RichToolResult::success(content))
+                    Ok(ToolInvokeEnd::Done(RichToolResult::success(content)))
+                }
+                FakeToolResult::StopsOnCancel => {
+                    cx.cancel().cancelled().await;
+                    Ok(ToolInvokeEnd::Stopped)
+                }
+                FakeToolResult::IgnoresCancel => {
+                    future::pending::<()>().await;
+                    Ok(ToolInvokeEnd::Stopped)
+                }
+                FakeToolResult::GatedInfrastructureError { gate, message } => {
+                    gate.wait().await;
+                    Err(ToolPortError::new(message))
                 }
             }
         })

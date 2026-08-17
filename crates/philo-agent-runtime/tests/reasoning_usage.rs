@@ -38,6 +38,7 @@ fn runtime(model: Arc<FakeModel>, sessions: Arc<dyn SessionStore>) -> AgentRunti
             max_tool_rounds: 0,
             max_parallel_tool_calls: 1,
             operation_timeout: None,
+            tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
         },
     )

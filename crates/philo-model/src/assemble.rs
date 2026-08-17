@@ -391,7 +391,15 @@ const fn effective_chat_reasoning_format(
 fn chat_compat(compat: ModelCompat, format: Option<ChatReasoningFormat>) -> ext::OpenAiChatCompat {
     let preset = match compat {
         ModelCompat::Official => ext::OpenAiChatCompat::default(),
-        ModelCompat::Compatible => ext::OpenAiChatCompat::compatible(),
+        // SDK `compatible()` stays conservative (no cache identity) so unknown
+        // gateways do not 400. The agent opts in: newapi-class endpoints need
+        // a stable session key plus OpenAI-format affinity headers to pin the
+        // prefix to one cache replica. `include_usage` is required to observe
+        // `cached_tokens` on OpenAI-shaped streams.
+        ModelCompat::Compatible => ext::OpenAiChatCompat::compatible()
+            .with_cache_key(ext::OpenAiChatCacheKey::PromptCacheKey)
+            .with_session_affinity(ext::OpenAiChatSessionAffinity::OpenAi)
+            .with_sends_stream_usage(true),
     };
     match format {
         None => preset,

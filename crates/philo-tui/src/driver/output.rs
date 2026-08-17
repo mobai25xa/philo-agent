@@ -1,17 +1,15 @@
-//! One scheduling round's terminal writes: at most one scrollback insert and
-//! one bottom-panel draw.
+//! One scheduling round's terminal writes: optional hard clear and at most
+//! one draw of the isolated alternate screen. Sealed history lives in
+//! `App.cells`, not here.
 
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::text::Line;
 use tokio::time::Instant;
 
 use crate::app::state::App;
-use crate::app::transcript::TranscriptLine;
 use crate::render::{frame, markdown::MarkdownRenderer};
 
 use super::scheduler::FrameScheduler;
-use super::scrollback;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FlushReport {
@@ -21,19 +19,12 @@ pub(crate) struct FlushReport {
 }
 
 #[derive(Default)]
-pub(crate) struct PendingOutput {
-    history: Vec<Line<'static>>,
-}
+pub(crate) struct PendingOutput;
 
 impl PendingOutput {
-    pub(crate) fn append(&mut self, markdown: &mut MarkdownRenderer, lines: Vec<TranscriptLine>) {
-        self.history
-            .extend(lines.iter().map(|line| markdown.commit(line)));
-    }
-
-    /// Flushes only when the scheduler grants a frame. Completed history
-    /// accumulated since the previous frame is inserted as one batch before
-    /// the bottom panel is repainted once.
+    /// Flushes only when the scheduler grants a frame. History is painted
+    /// from `App.cells` inside `frame::draw`; this type never writes
+    /// `insert_before`.
     pub(crate) fn flush<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -52,26 +43,11 @@ impl PendingOutput {
             terminal.clear()?;
             report.clears = 1;
         }
-        if !self.history.is_empty() {
-            let rendered = self.take_history_batch(usize::from(u16::MAX));
-            scrollback::append_history(terminal, &rendered)?;
-            report.inserts = 1;
-            if !self.history.is_empty() {
-                // Ratatui's insertion height is u16. Preserve an oversized
-                // queue and grant it one append-only batch on a later frame.
-                scheduler.invalidate_background(now);
-            }
-        }
         terminal.draw(|terminal_frame| {
             frame::draw(terminal_frame, app, markdown, shift_enter);
         })?;
         report.draws = 1;
         Ok(report)
-    }
-
-    fn take_history_batch(&mut self, limit: usize) -> Vec<Line<'static>> {
-        let end = std::cmp::min(limit, self.history.len());
-        self.history.drain(..end).collect()
     }
 }
 
@@ -80,13 +56,12 @@ mod tests {
     use std::time::Duration;
 
     use philo_agent_runtime::AgentEvent;
-    use ratatui::backend::{Backend, TestBackend};
-    use ratatui::layout::Position;
-    use ratatui::{TerminalOptions, Viewport};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     use crate::app::effect::Effect;
     use crate::app::status::StatusData;
-    use crate::app::transcript::{InfoLevel, LineKind};
+    use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 
     use super::*;
 
@@ -98,17 +73,7 @@ mod tests {
     }
 
     fn test_terminal() -> Terminal<TestBackend> {
-        let mut backend = TestBackend::new(80, 20);
-        backend
-            .set_cursor_position(Position::new(0, 12))
-            .expect("test cursor");
-        Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(crate::render::frame::VIEWPORT_HEIGHT),
-            },
-        )
-        .expect("test terminal")
+        Terminal::new(TestBackend::new(80, 24)).expect("test terminal")
     }
 
     fn screen_text(terminal: &Terminal<TestBackend>) -> String {
@@ -123,18 +88,18 @@ mod tests {
     }
 
     #[test]
-    fn completed_lines_are_batched_into_one_insert_and_one_draw() {
+    fn completed_lines_draw_from_cells_without_insert_before() {
         let start = Instant::now();
         let mut terminal = test_terminal();
-        let app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
+        let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
         let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
-        let mut output = PendingOutput::default();
+        let mut output = PendingOutput;
 
-        output.append(
-            &mut markdown,
-            vec![line("first completed"), line("second completed")],
-        );
+        app.ingest_appends(vec![Effect::Append(vec![
+            line("first completed"),
+            line("second completed"),
+        ])]);
         let initial = output
             .flush(
                 &mut terminal,
@@ -149,13 +114,13 @@ mod tests {
             initial,
             FlushReport {
                 clears: 0,
-                inserts: 1,
+                inserts: 0,
                 draws: 1,
             }
         );
 
         let first_delta = start + Duration::from_millis(1);
-        output.append(&mut markdown, vec![line("third completed")]);
+        app.ingest_appends(vec![Effect::Append(vec![line("third completed")])]);
         scheduler.invalidate_background(first_delta);
         assert_eq!(
             output
@@ -171,7 +136,7 @@ mod tests {
             FlushReport::default()
         );
 
-        output.append(&mut markdown, vec![line("fourth completed")]);
+        app.ingest_appends(vec![Effect::Append(vec![line("fourth completed")])]);
         scheduler.invalidate_background(start + Duration::from_millis(2));
         let batched = output
             .flush(
@@ -187,44 +152,56 @@ mod tests {
             batched,
             FlushReport {
                 clears: 0,
-                inserts: 1,
+                inserts: 0,
                 draws: 1,
             }
         );
 
         let screen = screen_text(&terminal);
-        assert!(screen.contains("third completed"));
-        assert!(screen.contains("fourth completed"));
-        assert!(screen.contains("model-a"));
-        assert!(screen.contains("s-1"));
+        assert!(screen.contains("third completed"), "{screen}");
+        assert!(screen.contains("fourth completed"), "{screen}");
+        assert!(screen.contains("model-a"), "{screen}");
+        assert!(screen.contains("s-1"), "{screen}");
     }
 
     #[test]
-    fn oversized_history_batches_keep_the_remainder_in_order() {
-        let mut markdown = MarkdownRenderer::new();
-        let mut output = PendingOutput::default();
-        output.append(&mut markdown, vec![line("one"), line("two"), line("three")]);
-
-        let first = output.take_history_batch(2);
-        let second = output.take_history_batch(2);
-        let text = |lines: Vec<Line<'static>>| {
-            lines
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(text(first), ["one", "two"]);
-        assert_eq!(text(second), ["three"]);
-    }
-
-    #[test]
-    fn ordinary_frames_never_clear_but_explicit_recovery_does() {
+    fn tall_history_keeps_the_visible_tail_in_order() {
         let start = Instant::now();
         let mut terminal = test_terminal();
-        let app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
+        let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
         let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
-        let mut output = PendingOutput::default();
+        let mut output = PendingOutput;
+
+        app.cells.append((0..40).map(|i| line(&format!("row-{i}"))));
+        output
+            .flush(
+                &mut terminal,
+                &app,
+                &mut markdown,
+                false,
+                &mut scheduler,
+                start,
+            )
+            .expect("flush");
+
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("row-39"), "{screen}");
+        assert!(
+            !screen.contains("row-0"),
+            "the oldest row should have scrolled off\n{screen}"
+        );
+    }
+
+    #[test]
+    fn ordinary_frames_never_clear_but_explicit_recovery_keeps_cells() {
+        let start = Instant::now();
+        let mut terminal = test_terminal();
+        let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
+        let mut markdown = MarkdownRenderer::new();
+        let mut scheduler = FrameScheduler::new(start);
+        let mut output = PendingOutput;
+        app.ingest_appends(vec![Effect::Append(vec![line("keep-me")])]);
         output
             .flush(
                 &mut terminal,
@@ -264,6 +241,12 @@ mod tests {
             .expect("recovery flush");
         assert_eq!(explicit.clears, 1);
         assert_eq!(explicit.draws, 1);
+        assert_eq!(explicit.inserts, 0);
+        let screen = screen_text(&terminal);
+        assert!(
+            screen.contains("keep-me"),
+            "hard clear must rebuild from cells\n{screen}"
+        );
     }
 
     #[test]
@@ -273,7 +256,7 @@ mod tests {
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
         let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
-        let mut output = PendingOutput::default();
+        let mut output = PendingOutput;
         let mut operations = output
             .flush(
                 &mut terminal,
@@ -287,14 +270,9 @@ mod tests {
 
         let expected = "x".repeat(1_000);
         for millis in 1..=1_000 {
-            let effects = app.on_agent_event(&AgentEvent::TextDelta {
+            let _effects = app.on_agent_event(&AgentEvent::TextDelta {
                 delta: "x".to_owned(),
             });
-            for effect in effects {
-                if let Effect::Append(lines) = effect {
-                    output.append(&mut markdown, lines);
-                }
-            }
             let now = start + Duration::from_millis(millis);
             scheduler.invalidate_background(now);
             let report = output
@@ -335,10 +313,9 @@ mod tests {
         assert_eq!(operations.inserts, 0);
         assert!(operations.draws <= 31);
         let screen = screen_text(&terminal);
-        assert!(screen.contains("answer"), "{screen}");
         assert!(
             screen.contains(&"x".repeat(80)),
-            "the live band should show the tail of the stream\n{screen}"
+            "the history band should show the tail of the stream\n{screen}"
         );
     }
 }

@@ -406,7 +406,8 @@ async fn compatible_continuation_uses_reconstruct_fixture_not_official_lifecycle
     assert!(first_body.get("truncation").is_none());
     assert!(first_body.get("previous_response_id").is_none());
 
-    let second_transport = StubTransport::new([StubResponse::Sse(COMPAT_MINIMAL_RESPONSE.to_vec())]);
+    let second_transport =
+        StubTransport::new([StubResponse::Sse(COMPAT_MINIMAL_RESPONSE.to_vec())]);
     let second = compatible_adapter(
         second_transport.clone(),
         store,

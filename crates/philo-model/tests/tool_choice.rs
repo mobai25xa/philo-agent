@@ -103,7 +103,8 @@ async fn a_frozen_cap_above_one_unlocks_parallel_tool_calls() {
     collect_ok(stream).await;
 
     assert_eq!(
-        transport.request_bodies()[0]["parallel_tool_calls"], true,
+        transport.request_bodies()[0]["parallel_tool_calls"],
+        true,
         "a frozen cap greater than one sends Allow"
     );
 }

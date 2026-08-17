@@ -15,8 +15,8 @@ mod snapshot;
 
 pub use compaction::{CompactionError, CompactionReport};
 pub use config::{
-    CompactionConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig,
-    ReasoningEffort, RuntimeConfig, ToolChoice,
+    CompactionConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS,
+    DEFAULT_TOOL_CANCEL_GRACE, GenerationConfig, ReasoningEffort, RuntimeConfig, ToolChoice,
 };
 pub use event::AgentEvent;
 pub use ids::{
@@ -35,9 +35,10 @@ pub use outcome::{
 };
 pub use philo_session::CancelReason;
 pub use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolFact, ToolFuture,
-    ToolHandler, ToolHandlerFuture, ToolInvocation, ToolPort, ToolPortError, ToolProgressSink,
-    ToolRegistry, ToolRegistryBuilder, ToolResult, ToolResultError, ToolSchema, ToolSchemaInput,
+    EffectClass, RichToolResult, ToolArguments, ToolCancel, ToolDefinition, ToolDisplay, ToolFact,
+    ToolFuture, ToolHandler, ToolHandlerEndFuture, ToolHandlerFuture, ToolInvocation, ToolInvokeCx,
+    ToolInvokeEnd, ToolPort, ToolPortError, ToolProgressSink, ToolRegistry, ToolRegistryBuilder,
+    ToolResult, ToolResultError, ToolSchema, ToolSchemaInput,
 };
 pub use runtime::AgentRuntime;
 pub use snapshot::{ModelCallSnapshot, TurnSnapshot};

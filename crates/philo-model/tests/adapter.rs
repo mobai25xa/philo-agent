@@ -13,7 +13,8 @@ use philo_agent_runtime::{
     UserPart,
 };
 use philo_model::{
-    DEFAULT_USER_AGENT, ModelProtocol, ModelRequestHeaders, PhiloModelAdapter, TimeoutPolicy,
+    DEFAULT_USER_AGENT, ModelCompat, ModelProtocol, ModelRequestHeaders, PhiloModelAdapter,
+    TimeoutPolicy,
 };
 use support::{
     StubResponse, StubTransport, adapter_over, collect, collect_ok, read_tool_definition, snapshot,
@@ -75,6 +76,7 @@ async fn request_maps_system_history_tools_and_generation() {
     // GenerationConfig: u32 limit passes through, f32 temperature widens to f64.
     assert_eq!(body["max_completion_tokens"], 256);
     assert_eq!(body["temperature"], 0.25);
+    assert_eq!(body["prompt_cache_key"], "session-1");
     // Frozen tool definitions pass in order with ToolChoice::Auto.
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["tools"][0]["function"]["name"], "read");
@@ -84,6 +86,34 @@ async fn request_maps_system_history_tools_and_generation() {
         "path"
     );
     assert_eq!(body["tool_choice"], "auto");
+}
+
+#[tokio::test]
+async fn compatible_chat_sends_cache_identity_and_affinity_headers() {
+    let transport =
+        StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiChat,
+        "stub-model",
+        support::STUB_ENDPOINT,
+    )
+    .compat(ModelCompat::Compatible)
+    .build_with_transport(transport.clone())
+    .expect("compatible adapter assembly");
+    let stream = adapter
+        .start(snapshot(vec![user("hello")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+
+    let body = &transport.request_bodies()[0];
+    assert_eq!(body["prompt_cache_key"], "session-1");
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    let headers = &transport.requests()[0].headers;
+    assert_eq!(headers["session_id"], "session-1");
+    assert_eq!(headers["x-client-request-id"], "session-1");
+    assert_eq!(headers["x-session-affinity"], "session-1");
 }
 
 #[tokio::test]

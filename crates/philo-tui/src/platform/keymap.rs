@@ -1,8 +1,13 @@
 //! Crossterm key-event interpretation. Semantic actions belong to app state.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::app::action::Action;
+
+/// Wrapped rows moved by one wheel tick. Same path as PageUp/PageDown.
+pub(crate) const WHEEL_ROWS: isize = 3;
 
 /// Maps one key event. Release/repeat events are ignored (kitty protocol
 /// reports them when enhanced keys are active).
@@ -30,8 +35,37 @@ pub fn interpret(key: &KeyEvent) -> Action {
         KeyCode::Down => Action::MoveDown,
         KeyCode::Home => Action::Home,
         KeyCode::End => Action::End,
+        KeyCode::PageUp => Action::PageTranscriptUp,
+        KeyCode::PageDown => Action::PageTranscriptDown,
         KeyCode::Tab => Action::Complete,
         KeyCode::Char(ch) if !ctrl => Action::InsertChar(ch),
+        _ => Action::None,
+    }
+}
+
+/// Wheel ticks scroll the sealed transcript. Left-button drag selects it.
+/// `Moved` is only a drag while a selection is already in progress, so
+/// idle pointer motion does not invalidate frames.
+pub fn interpret_mouse(mouse: &MouseEvent, selecting: bool) -> Action {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Action::ScrollTranscript(-WHEEL_ROWS),
+        MouseEventKind::ScrollDown => Action::ScrollTranscript(WHEEL_ROWS),
+        MouseEventKind::Down(MouseButton::Left) => Action::SelectStart {
+            x: mouse.column,
+            y: mouse.row,
+        },
+        MouseEventKind::Drag(MouseButton::Left) => Action::SelectDrag {
+            x: mouse.column,
+            y: mouse.row,
+        },
+        MouseEventKind::Up(MouseButton::Left) => Action::SelectEnd {
+            x: mouse.column,
+            y: mouse.row,
+        },
+        MouseEventKind::Moved if selecting => Action::SelectDrag {
+            x: mouse.column,
+            y: mouse.row,
+        },
         _ => Action::None,
     }
 }
@@ -84,6 +118,68 @@ mod tests {
             interpret(&key(KeyCode::Char('v'), KeyModifiers::CONTROL)),
             Action::Paste,
             "terminals that keep Ctrl+V for themselves send a paste event instead"
+        );
+    }
+
+    #[test]
+    fn home_and_end_map_to_composer_or_transcript_jumps() {
+        assert_eq!(
+            interpret(&key(KeyCode::Home, KeyModifiers::NONE)),
+            Action::Home
+        );
+        assert_eq!(
+            interpret(&key(KeyCode::End, KeyModifiers::NONE)),
+            Action::End
+        );
+    }
+
+    #[test]
+    fn page_up_down_map_to_transcript_scroll() {
+        assert_eq!(
+            interpret(&key(KeyCode::PageUp, KeyModifiers::NONE)),
+            Action::PageTranscriptUp
+        );
+        assert_eq!(
+            interpret(&key(KeyCode::PageDown, KeyModifiers::NONE)),
+            Action::PageTranscriptDown
+        );
+    }
+
+    #[test]
+    fn wheel_maps_to_transcript_scroll() {
+        let event = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::ScrollUp), false),
+            Action::ScrollTranscript(-WHEEL_ROWS)
+        );
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::ScrollDown), false),
+            Action::ScrollTranscript(WHEEL_ROWS)
+        );
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::Moved), false),
+            Action::None
+        );
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::Moved), true),
+            Action::SelectDrag { x: 0, y: 0 }
+        );
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::Down(MouseButton::Left)), false),
+            Action::SelectStart { x: 0, y: 0 }
+        );
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::Drag(MouseButton::Left)), false),
+            Action::SelectDrag { x: 0, y: 0 }
+        );
+        assert_eq!(
+            interpret_mouse(&event(MouseEventKind::Up(MouseButton::Left)), false),
+            Action::SelectEnd { x: 0, y: 0 }
         );
     }
 

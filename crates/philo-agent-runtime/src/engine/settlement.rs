@@ -140,43 +140,59 @@ impl TurnCx<'_> {
     }
 }
 
-/// Builds the completion marks and post-commit events for a mid-batch
-/// cancellation: executed calls keep their real results (a source-order
-/// prefix) with full event payloads, never-executed calls get `Cancelled`
-/// marks (the suffix) and still publish no execution events (M6 semantics).
+/// One call's end inside a cancelled batch: complete result, started-but-
+/// stopped, or never invoked.
+pub(super) enum BatchSlot {
+    Done(RichToolResult),
+    Stopped,
+    Unstarted,
+}
+
+/// Builds completion marks and post-commit events for a mid-batch
+/// cancellation. Every call gets one durable slot in source order.
+/// Only [`BatchSlot::Done`] publishes `ToolExecutionCompleted`.
 pub(super) fn cancellation_batch(
     turn_id: &TurnId,
     batch_id: &kernel::ToolBatchId,
     calls: &[kernel::KernelToolCall],
-    executed: &[(kernel::KernelToolCall, RichToolResult)],
+    slots: &[BatchSlot],
 ) -> (Vec<session::SessionEntryKind>, Vec<AgentEvent>) {
     let turn = session::TurnId::new(turn_id.as_str());
     let batch = session::ToolBatchId::new(batch_id.as_str());
     let mut marks = Vec::new();
     let mut executed_events = Vec::new();
-    for (index, (call, rich)) in executed.iter().enumerate() {
-        marks.push(session::SessionEntryKind::ToolResult {
-            turn_id: turn.clone(),
-            tool_batch_id: batch.clone(),
-            result: session_result(call, rich.result()),
-        });
-        executed_events.push(AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: crate::ToolBatchId::new(batch_id.as_str()),
-            tool_call_id: crate::ToolCallId::new(call.id().as_str()),
-            index,
-            tool_name: call.name().to_owned(),
-            result: rich.result().clone(),
-            display: rich.display().cloned(),
-        });
-    }
-    for call in &calls[executed.len()..] {
-        marks.push(session::SessionEntryKind::ToolResult {
-            turn_id: turn.clone(),
-            tool_batch_id: batch.clone(),
-            result: session::SessionToolResult::cancelled(session::ToolCallId::new(
-                call.id().as_str(),
-            )),
-        });
+    for (index, (call, slot)) in calls.iter().zip(slots.iter()).enumerate() {
+        match slot {
+            BatchSlot::Done(rich) => {
+                marks.push(session::SessionEntryKind::ToolResult {
+                    turn_id: turn.clone(),
+                    tool_batch_id: batch.clone(),
+                    result: session_result(call, rich.result()),
+                });
+                executed_events.push(AgentEvent::ToolExecutionCompleted {
+                    tool_batch_id: crate::ToolBatchId::new(batch_id.as_str()),
+                    tool_call_id: crate::ToolCallId::new(call.id().as_str()),
+                    index,
+                    tool_name: call.name().to_owned(),
+                    result: rich.result().clone(),
+                    display: rich.display().cloned(),
+                });
+            }
+            BatchSlot::Stopped => marks.push(session::SessionEntryKind::ToolResult {
+                turn_id: turn.clone(),
+                tool_batch_id: batch.clone(),
+                result: session::SessionToolResult::interrupted(session::ToolCallId::new(
+                    call.id().as_str(),
+                )),
+            }),
+            BatchSlot::Unstarted => marks.push(session::SessionEntryKind::ToolResult {
+                turn_id: turn.clone(),
+                tool_batch_id: batch.clone(),
+                result: session::SessionToolResult::cancelled(session::ToolCallId::new(
+                    call.id().as_str(),
+                )),
+            }),
+        }
     }
     (marks, executed_events)
 }

@@ -1,15 +1,19 @@
 //! One committed tool batch: serial or bounded-parallel execution, then the
 //! results barrier.
 
-use super::settlement::{TurnCx, cancellation_batch};
+use super::settlement::{BatchSlot, TurnCx, cancellation_batch};
 use super::tool_progress::ToolProgressBridge;
 use crate::mapping::failure::session_failure;
 use crate::mapping::tool::session_result;
 use crate::{AgentEvent, AgentFailure, AgentFailureKind, OperationPhase, RunningToolBatchPhase};
 use philo_agent_kernel as kernel;
 use philo_session as session;
-use philo_tools::{RichToolResult, ToolFuture, ToolInvocation, ToolPortError};
-use std::task::Poll;
+use philo_tools::{
+    RichToolResult, ToolFuture, ToolInvocation, ToolInvokeCx, ToolInvokeEnd, ToolPortError,
+};
+use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
+use std::time::{Duration, Instant};
 
 /// Executes and commits one tool batch. Returns the advanced context and
 /// real results; `None` when a failure or cancellation already settled the
@@ -29,22 +33,19 @@ pub(super) async fn run<'a>(
     }
 }
 
-/// Existing serial path: one invoke at a time, real prefix + Cancelled suffix.
 async fn run_serial<'a>(
     cx: TurnCx<'a>,
     effect_id: &kernel::EffectId,
     batch_id: &kernel::ToolBatchId,
     calls: &[kernel::KernelToolCall],
 ) -> Option<(TurnCx<'a>, Vec<(kernel::KernelToolCall, RichToolResult)>)> {
-    let mut results: Vec<(kernel::KernelToolCall, RichToolResult)> = Vec::new();
+    let grace = cx.ctx.config.tool_cancel_grace;
+    let mut slots: Vec<BatchSlot> = calls.iter().map(|_| BatchSlot::Unstarted).collect();
     for (index, call) in calls.iter().enumerate() {
-        // Injection point: barrier between tool calls (and before the
-        // first). The executing call always runs to completion; later
-        // calls never start.
         if cx.operation.is_cancel_requested() {
             cx.operation.cancellation_observed();
             let (marks, executed_events) =
-                cancellation_batch(cx.operation.turn_id(), batch_id, calls, &results);
+                cancellation_batch(cx.operation.turn_id(), batch_id, calls, &slots);
             cx.cancel(effect_id.clone(), marks, executed_events).await;
             return None;
         }
@@ -55,10 +56,38 @@ async fn run_serial<'a>(
             },
         ));
         publish_started(&cx, batch_id, call, index);
-        let invoked = invoke_call(&cx, batch_id, call, index).await;
-        let result = match invoked {
-            Ok(result) => result,
-            Err(error) => {
+        match await_invoke(&cx, batch_id, call, index, grace).await {
+            InvokeWait::Finished(ToolInvokeEnd::Done(result)) => {
+                slots[index] = BatchSlot::Done(result);
+            }
+            InvokeWait::Finished(ToolInvokeEnd::Stopped) | InvokeWait::Dropped => {
+                if !cx.operation.is_cancel_requested() {
+                    cx.fail(
+                        effect_id.clone(),
+                        AgentFailure::new(
+                            AgentFailureKind::ToolExecution,
+                            "tool stopped without a cancel request",
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+                slots[index] = BatchSlot::Stopped;
+                cx.operation.cancellation_observed();
+                let (marks, executed_events) =
+                    cancellation_batch(cx.operation.turn_id(), batch_id, calls, &slots);
+                cx.cancel(effect_id.clone(), marks, executed_events).await;
+                return None;
+            }
+            InvokeWait::PortError(error) => {
+                if cx.operation.is_cancel_requested() {
+                    slots[index] = BatchSlot::Stopped;
+                    cx.operation.cancellation_observed();
+                    let (marks, executed_events) =
+                        cancellation_batch(cx.operation.turn_id(), batch_id, calls, &slots);
+                    cx.cancel(effect_id.clone(), marks, executed_events).await;
+                    return None;
+                }
                 cx.fail(
                     effect_id.clone(),
                     AgentFailure::new(AgentFailureKind::ToolExecution, error.message()),
@@ -66,14 +95,12 @@ async fn run_serial<'a>(
                 .await;
                 return None;
             }
-        };
-        results.push((call.clone(), result));
+        }
     }
+    let results = done_results(calls, &slots);
     commit_results(cx, effect_id, batch_id, results).await
 }
 
-/// Bounded concurrent path: start up to `limit` invokes, never start after
-/// cancel or a `ToolPortError`, and await every in-flight future.
 async fn run_parallel<'a>(
     cx: TurnCx<'a>,
     effect_id: &kernel::EffectId,
@@ -82,16 +109,26 @@ async fn run_parallel<'a>(
     limit: usize,
 ) -> Option<(TurnCx<'a>, Vec<(kernel::KernelToolCall, RichToolResult)>)> {
     let tools = cx.ctx.tools.clone();
-    let mut slots: Vec<Option<RichToolResult>> = vec![None; calls.len()];
+    let grace = cx.ctx.config.tool_cancel_grace;
+    let mut slots: Vec<BatchSlot> = calls.iter().map(|_| BatchSlot::Unstarted).collect();
     let mut in_flight: Vec<(usize, ToolFuture<'static>)> = Vec::new();
     let mut next = 0;
     let mut stop_starting = false;
     let mut port_error: Option<ToolPortError> = None;
+    let mut grace_deadline: Option<Instant> = None;
+    let grace_waker = Arc::new(Mutex::new(None));
 
     loop {
+        if cx.operation.is_cancel_requested() {
+            stop_starting = true;
+            if grace_deadline.is_none() {
+                let deadline = Instant::now() + grace;
+                grace_deadline = Some(deadline);
+                arm_grace(deadline, Arc::clone(&grace_waker));
+            }
+        }
         while !stop_starting && in_flight.len() < limit && next < calls.len() {
             if cx.operation.is_cancel_requested() {
-                cx.operation.cancellation_observed();
                 stop_starting = true;
                 break;
             }
@@ -114,12 +151,33 @@ async fn run_parallel<'a>(
         if in_flight.is_empty() {
             break;
         }
-        let (index, invoked) = next_finished(&mut in_flight).await;
-        match invoked {
-            Ok(result) => slots[index] = Some(result),
-            Err(error) => {
-                port_error = Some(error);
-                stop_starting = true;
+        match next_finished(&mut in_flight, grace_deadline, &grace_waker).await {
+            Some((index, Ok(ToolInvokeEnd::Done(result)))) => {
+                slots[index] = BatchSlot::Done(result);
+            }
+            Some((index, Ok(ToolInvokeEnd::Stopped))) => {
+                if cx.operation.is_cancel_requested() {
+                    slots[index] = BatchSlot::Stopped;
+                    stop_starting = true;
+                } else {
+                    port_error = Some(ToolPortError::new("tool stopped without a cancel request"));
+                    stop_starting = true;
+                }
+            }
+            Some((index, Err(error))) => {
+                if cx.operation.is_cancel_requested() {
+                    slots[index] = BatchSlot::Stopped;
+                    stop_starting = true;
+                } else {
+                    port_error = Some(error);
+                    stop_starting = true;
+                }
+            }
+            None => {
+                for (index, _future) in in_flight.drain(..) {
+                    slots[index] = BatchSlot::Stopped;
+                }
+                break;
             }
         }
         set_executing(&cx, in_flight.len(), completed_count(&slots));
@@ -134,21 +192,17 @@ async fn run_parallel<'a>(
         return None;
     }
 
-    let executed: Vec<(kernel::KernelToolCall, RichToolResult)> = calls
-        .iter()
-        .zip(slots.iter_mut())
-        .map_while(|(call, slot)| slot.take().map(|result| (call.clone(), result)))
-        .collect();
-    if executed.len() < calls.len() || cx.operation.is_cancel_requested() {
-        if !cx.operation.is_cancel_requested() {
-            cx.operation.cancellation_observed();
-        }
+    if slots.iter().any(|slot| !matches!(slot, BatchSlot::Done(_)))
+        || cx.operation.is_cancel_requested()
+    {
+        cx.operation.cancellation_observed();
         let (marks, executed_events) =
-            cancellation_batch(cx.operation.turn_id(), batch_id, calls, &executed);
+            cancellation_batch(cx.operation.turn_id(), batch_id, calls, &slots);
         cx.cancel(effect_id.clone(), marks, executed_events).await;
         return None;
     }
-    commit_results(cx, effect_id, batch_id, executed).await
+    let results = done_results(calls, &slots);
+    commit_results(cx, effect_id, batch_id, results).await
 }
 
 async fn commit_results<'a>(
@@ -157,20 +211,21 @@ async fn commit_results<'a>(
     batch_id: &kernel::ToolBatchId,
     results: Vec<(kernel::KernelToolCall, RichToolResult)>,
 ) -> Option<(TurnCx<'a>, Vec<(kernel::KernelToolCall, RichToolResult)>)> {
-    // Injection point: after the last call finished, before the results
-    // barrier commits: all-real completion, empty suffix.
     if cx.operation.is_cancel_requested() {
         cx.operation.cancellation_observed();
+        let slots: Vec<BatchSlot> = results
+            .iter()
+            .map(|(_, rich)| BatchSlot::Done(rich.clone()))
+            .collect();
         let calls: Vec<_> = results.iter().map(|(call, _)| call.clone()).collect();
         let (marks, executed_events) =
-            cancellation_batch(cx.operation.turn_id(), batch_id, &calls, &results);
+            cancellation_batch(cx.operation.turn_id(), batch_id, &calls, &slots);
         cx.cancel(effect_id.clone(), marks, executed_events).await;
         return None;
     }
     cx.operation.set_phase(OperationPhase::RunningToolBatch(
         RunningToolBatchPhase::CommittingResults,
     ));
-    // Model channel only: display never enters the Session.
     let result_entries = results
         .iter()
         .map(|(call, rich)| session::SessionEntryKind::ToolResult {
@@ -214,28 +269,49 @@ async fn commit_results<'a>(
     Some((cx, results))
 }
 
-async fn invoke_call(
+enum InvokeWait {
+    Finished(ToolInvokeEnd),
+    Dropped,
+    PortError(ToolPortError),
+}
+
+async fn await_invoke(
     cx: &TurnCx<'_>,
     batch_id: &kernel::ToolBatchId,
     call: &kernel::KernelToolCall,
     index: usize,
-) -> Result<RichToolResult, ToolPortError> {
-    let (bridge, sink) = ToolProgressBridge::new(
+    grace: Duration,
+) -> InvokeWait {
+    let mut future = invoke_call_future(
+        cx.ctx.tools.clone(),
         cx.operation.shared_arc(),
-        crate::ToolBatchId::new(batch_id.as_str()),
-        crate::ToolCallId::new(call.id().as_str()),
+        batch_id,
+        call,
         index,
     );
-    let invoked = cx
-        .ctx
-        .tools
-        .invoke(
-            ToolInvocation::new(call.id().as_str(), call.name(), call.arguments()),
-            sink,
-        )
-        .await;
-    bridge.finish();
-    invoked
+    let mut deadline = None;
+    let grace_waker = Arc::new(Mutex::new(None));
+    std::future::poll_fn(|context| {
+        if cx.operation.is_cancel_requested() {
+            if deadline.is_none() {
+                let at = Instant::now() + grace;
+                deadline = Some(at);
+                arm_grace(at, Arc::clone(&grace_waker));
+            }
+            if let Ok(mut slot) = grace_waker.lock() {
+                *slot = Some(context.waker().clone());
+            }
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                return Poll::Ready(InvokeWait::Dropped);
+            }
+        }
+        match future.as_mut().poll(context) {
+            Poll::Ready(Ok(end)) => Poll::Ready(InvokeWait::Finished(end)),
+            Poll::Ready(Err(error)) => Poll::Ready(InvokeWait::PortError(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
 }
 
 fn invoke_call_future(
@@ -246,6 +322,7 @@ fn invoke_call_future(
     index: usize,
 ) -> ToolFuture<'static> {
     let invocation = ToolInvocation::new(call.id().as_str(), call.name(), call.arguments());
+    let cancel = shared.tool_cancel();
     let (bridge, sink) = ToolProgressBridge::new(
         shared,
         crate::ToolBatchId::new(batch_id.as_str()),
@@ -253,7 +330,9 @@ fn invoke_call_future(
         index,
     );
     Box::pin(async move {
-        let invoked = tools.invoke(invocation, sink).await;
+        let invoked = tools
+            .invoke(invocation, ToolInvokeCx::new(sink, cancel))
+            .await;
         bridge.finish();
         invoked
     })
@@ -283,20 +362,61 @@ fn set_executing(cx: &TurnCx<'_>, in_flight: usize, completed: usize) {
     ));
 }
 
-fn completed_count(slots: &[Option<RichToolResult>]) -> usize {
-    slots.iter().filter(|slot| slot.is_some()).count()
+fn completed_count(slots: &[BatchSlot]) -> usize {
+    slots
+        .iter()
+        .filter(|slot| !matches!(slot, BatchSlot::Unstarted))
+        .count()
+}
+
+fn done_results(
+    calls: &[kernel::KernelToolCall],
+    slots: &[BatchSlot],
+) -> Vec<(kernel::KernelToolCall, RichToolResult)> {
+    calls
+        .iter()
+        .zip(slots.iter())
+        .filter_map(|(call, slot)| match slot {
+            BatchSlot::Done(result) => Some((call.clone(), result.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn arm_grace(deadline: Instant, waker: Arc<Mutex<Option<Waker>>>) {
+    let wait = deadline.saturating_duration_since(Instant::now());
+    std::thread::spawn(move || {
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        if let Ok(mut slot) = waker.lock()
+            && let Some(waker) = slot.take()
+        {
+            waker.wake();
+        }
+    });
 }
 
 async fn next_finished(
     in_flight: &mut Vec<(usize, ToolFuture<'static>)>,
-) -> (usize, Result<RichToolResult, ToolPortError>) {
+    deadline: Option<Instant>,
+    grace_waker: &Arc<Mutex<Option<Waker>>>,
+) -> Option<(usize, Result<ToolInvokeEnd, ToolPortError>)> {
     std::future::poll_fn(|context| {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                return Poll::Ready(None);
+            }
+            if let Ok(mut slot) = grace_waker.lock() {
+                *slot = Some(context.waker().clone());
+            }
+        }
         let mut index = 0;
         while index < in_flight.len() {
             match in_flight[index].1.as_mut().poll(context) {
                 Poll::Ready(result) => {
                     let (call_index, _) = in_flight.swap_remove(index);
-                    return Poll::Ready((call_index, result));
+                    return Poll::Ready(Some((call_index, result)));
                 }
                 Poll::Pending => index += 1,
             }

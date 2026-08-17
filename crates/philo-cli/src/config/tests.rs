@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use clap::Parser;
 use philo_agent_runtime::ReasoningEffort;
 use philo_model::{ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol};
+use philo_tui::TuiScreen;
 
 use super::file::{Layer, Sourced, load_layers};
 use super::resolve::{
-    Verbosity, parse_compat, parse_continuation_policy, parse_protocol, parse_reasoning_effort,
-    parse_reasoning_format, parse_verbosity, validate_reasoning_effort,
+    Verbosity, map_ui_screen, parse_compat, parse_continuation_policy, parse_protocol,
+    parse_reasoning_effort, parse_reasoning_format, parse_verbosity, validate_reasoning_effort,
 };
 use crate::args::Cli;
 
@@ -179,7 +180,8 @@ fn every_section_reads_its_key_domain() {
          shell_timeout_secs = 90\n\
          [ui]\n\
          verbosity = \"verbose\"\n\
-         show_reasoning = false\n",
+         show_reasoning = false\n\
+         screen = \"inline\"\n",
     );
 
     let config = load_layers(Some(&path), None).expect("loads");
@@ -226,6 +228,7 @@ fn every_section_reads_its_key_domain() {
     assert_eq!(config.max_parallel_tool_calls.expect("parallel").value, 4);
     assert_eq!(config.shell_timeout_secs.expect("shell").value, 90);
     assert!(!config.show_reasoning.expect("reasoning").value);
+    assert_eq!(config.screen.expect("screen").value, "inline");
 }
 
 #[test]
@@ -331,6 +334,90 @@ fn value_parsers_cover_the_supported_vocabulary() {
     assert!(parse_continuation_policy("automatic").is_err());
     assert_eq!(parse_verbosity("quiet").unwrap(), Verbosity::Quiet);
     assert!(parse_verbosity("loud").is_err());
+}
+
+#[test]
+fn ui_screen_parses_auto_alternate_inline_and_defaults_to_auto() {
+    let dir = TempDir::new();
+    for token in ["auto", "alternate", "inline"] {
+        let path = dir.write(
+            &format!("{token}.toml"),
+            &format!("[ui]\nscreen = \"{token}\"\n"),
+        );
+        let config = load_layers(Some(&path), None).expect("loads");
+        assert_eq!(config.screen.expect("screen").value, token);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("screen"))
+        );
+    }
+
+    let omitted = load_layers(None, None).expect("no layers");
+    assert!(omitted.screen.is_none());
+
+    let settings =
+        super::resolve::resolve(&resolvable_cli(), &deployment_file()).expect("defaults resolve");
+    assert!(settings.entries.iter().any(|entry| {
+        entry.key == "screen" && entry.value == "auto" && entry.source == "default"
+    }));
+    assert_eq!(
+        settings.screen,
+        map_ui_screen("auto", std::env::var_os("ZELLIJ").is_some()).unwrap()
+    );
+
+    for (token, expected) in [
+        (
+            "auto",
+            map_ui_screen("auto", std::env::var_os("ZELLIJ").is_some()).unwrap(),
+        ),
+        ("alternate", TuiScreen::Alternate),
+        ("inline", TuiScreen::Inline),
+    ] {
+        let mut file = deployment_file();
+        file.screen = Some(Sourced {
+            value: token.to_owned(),
+            layer: Layer::Project,
+        });
+        let settings = super::resolve::resolve(&resolvable_cli(), &file).expect("resolves");
+        assert_eq!(settings.screen, expected);
+        assert!(settings.entries.iter().any(|entry| {
+            entry.key == "screen" && entry.value == token && entry.source == "project"
+        }));
+    }
+}
+
+#[test]
+fn map_ui_screen_uses_zellij_only_for_auto() {
+    assert_eq!(map_ui_screen("auto", true).unwrap(), TuiScreen::Inline);
+    assert_eq!(map_ui_screen("auto", false).unwrap(), TuiScreen::Alternate);
+    assert_eq!(
+        map_ui_screen("alternate", true).unwrap(),
+        TuiScreen::Alternate
+    );
+    assert_eq!(map_ui_screen("inline", false).unwrap(), TuiScreen::Inline);
+    assert!(map_ui_screen("fullscreen", false).is_err());
+}
+
+#[test]
+fn invalid_ui_screen_is_a_hard_error() {
+    let mut file = deployment_file();
+    file.screen = Some(Sourced {
+        value: "fullscreen".to_owned(),
+        layer: Layer::Global,
+    });
+    let error = super::resolve::resolve(&resolvable_cli(), &file)
+        .err()
+        .expect("invalid screen must fail");
+    assert!(
+        error.0.contains("invalid [ui].screen 'fullscreen'"),
+        "{error:?}"
+    );
+    assert!(
+        error.0.contains("[ui].screen in the global config"),
+        "{error:?}"
+    );
 }
 
 #[test]

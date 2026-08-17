@@ -5,6 +5,7 @@ use crate::{
     AgentEvent, OperationId, OperationOutcome, OperationPhase, OperationStatus, ToolCallId, TurnId,
 };
 use philo_session::CancelReason;
+use philo_tools::ToolCancel;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,9 @@ pub(crate) struct OperationShared {
     pub(super) turn_id: TurnId,
     pub(super) scheduler: Arc<Scheduler>,
     cancel_requested: AtomicBool,
+    /// Eager tool-port token; requested in the same moment as the
+    /// operation-level cancel flag.
+    tool_cancel: ToolCancel,
     /// First accepted cancellation reason; the winner of a user/timeout
     /// race decides how the terminal facts are recorded.
     cancel_reason: Mutex<Option<CancelReason>>,
@@ -48,6 +52,7 @@ impl OperationShared {
             turn_id,
             scheduler,
             cancel_requested: AtomicBool::new(false),
+            tool_cancel: ToolCancel::new(),
             cancel_reason: Mutex::new(None),
             deadline: Mutex::new(None),
             inner: Mutex::new(SharedInner {
@@ -120,7 +125,13 @@ impl OperationShared {
         if slot.is_none() {
             *slot = Some(reason);
             self.cancel_requested.store(true, Ordering::SeqCst);
+            self.tool_cancel.request();
         }
+    }
+
+    /// Token cloned into every in-flight `invoke`.
+    pub(crate) fn tool_cancel(&self) -> ToolCancel {
+        self.tool_cancel.clone()
     }
 
     /// The reason of the accepted cancellation; meaningful only after

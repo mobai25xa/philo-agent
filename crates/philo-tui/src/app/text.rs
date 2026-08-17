@@ -36,6 +36,7 @@ pub(crate) fn truncate(text: &str, max_width: usize) -> String {
     result
 }
 
+#[cfg(test)]
 pub(crate) fn tail(text: &str, max_width: usize) -> String {
     if width(text) <= max_width {
         return text.to_owned();
@@ -92,6 +93,29 @@ pub(crate) fn wrap(text: &str, max_width: usize) -> Vec<String> {
     rows
 }
 
+/// Inclusive-start, exclusive-end slice of `text` in terminal columns.
+/// Never splits a grapheme; a grapheme that straddles a bound is kept if
+/// it starts inside the range.
+pub(crate) fn slice_columns(text: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut col = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = width(grapheme);
+        let next = col + grapheme_width;
+        if col >= end {
+            break;
+        }
+        if next > start {
+            result.push_str(grapheme);
+        }
+        col = next;
+    }
+    result
+}
+
 /// Last `height` visual rows of `text` after wrapping to `max_width`.
 pub(crate) fn tail_rows(text: &str, max_width: usize, height: usize) -> Vec<String> {
     if height == 0 || max_width == 0 {
@@ -132,5 +156,8 @@ mod tests {
     fn wrap_and_tail_rows_keep_cjk_cells() {
         assert_eq!(wrap("中文ab", 4), ["中文", "ab"]);
         assert_eq!(tail_rows("one\ntwo\nthree", 8, 2), ["two", "three"]);
+        assert_eq!(slice_columns("中文ab", 0, 4), "中文");
+        assert_eq!(slice_columns("中文ab", 2, 6), "文ab");
+        assert_eq!(slice_columns("abc", 1, 1), "");
     }
 }

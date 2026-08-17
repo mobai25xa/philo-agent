@@ -483,6 +483,39 @@ fn both_modes_validate_the_same_effective_configuration() {
     }
 }
 
+#[test]
+fn invalid_ui_screen_is_a_hard_error() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    write_config(
+        &config_home,
+        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
+         [ui]\nscreen = \"fullscreen\"\n",
+    );
+
+    for args in [Vec::<&str>::new(), vec!["hello"]] {
+        let output = philo(&config_home)
+            .current_dir(&root.path)
+            .args(args)
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = stderr_text(&output);
+        assert!(
+            stderr.contains("invalid [ui].screen 'fullscreen'"),
+            "both entry paths resolve the same setting: {stderr}"
+        );
+        assert!(
+            stderr.contains("[ui].screen in the global config"),
+            "both entry paths retain the same source layer: {stderr}"
+        );
+        assert!(
+            !stderr.contains("needs a terminal"),
+            "configuration is resolved before TUI startup: {stderr}"
+        );
+    }
+}
+
 /// Seeds one committed session through the public store API.
 fn seed_session(root: &Path, id: &str) {
     use philo_session::{

@@ -81,10 +81,23 @@ impl StatusData {
                 fields.push((
                     4,
                     4,
-                    format!("{}/{}", compact_count(input), compact_count(window)),
+                    format!(
+                        "{}/{}{}",
+                        compact_count(input),
+                        compact_count(window),
+                        cache_suffix(usage.cache_read_tokens)
+                    ),
                 ));
             } else if let Some(input) = usage.input_tokens {
-                fields.push((4, 4, format!("in {}", compact_count(input))));
+                fields.push((
+                    4,
+                    4,
+                    format!(
+                        "in {}{}",
+                        compact_count(input),
+                        cache_suffix(usage.cache_read_tokens)
+                    ),
+                ));
             }
         }
         if self.level == InfoLevel::Verbose {
@@ -121,6 +134,13 @@ impl StatusData {
     }
 }
 
+fn cache_suffix(cache_read: Option<u64>) -> String {
+    match cache_read {
+        Some(tokens) if tokens > 0 => format!(" cache {}", compact_count(tokens)),
+        _ => String::new(),
+    }
+}
+
 fn compact_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}m", value as f64 / 1_000_000.0)
@@ -152,6 +172,17 @@ mod tests {
         assert_eq!(
             status.line(),
             "gpt-test  s-1  queued 2  1.2k/128.0k  verbose"
+        );
+
+        status.usage = Some(TokenUsage {
+            input_tokens: Some(1200),
+            output_tokens: Some(340),
+            cache_read_tokens: Some(900),
+            ..TokenUsage::default()
+        });
+        assert_eq!(
+            status.line(),
+            "gpt-test  s-1  queued 2  1.2k/128.0k cache 900  verbose"
         );
     }
 

@@ -3,6 +3,7 @@
 pub(crate) mod composer;
 pub(crate) mod frame;
 pub(crate) mod highlight;
+pub(crate) mod history;
 pub(crate) mod line;
 pub(crate) mod markdown;
 pub(crate) mod theme;

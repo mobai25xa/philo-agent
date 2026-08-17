@@ -58,7 +58,8 @@ impl FrameScheduler {
         self.frame_deadline = Some(now);
     }
 
-    /// Requests the only normal hard-clear path (`Ctrl+L` recovery).
+    /// Requests an explicit hard-clear (`Ctrl+L` or a terminal resize on
+    /// the alternate screen) plus an immediate frame.
     pub(crate) fn request_hard_redraw(&mut self, now: Instant) {
         self.hard_clear = true;
         self.invalidate_immediate(now);

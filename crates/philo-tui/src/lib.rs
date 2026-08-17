@@ -20,6 +20,6 @@ mod tests;
 
 pub use api::{
     ConfigEntry, ConfigReloadNotice, ConfirmationChannel, ConfirmationRequest,
-    ConfirmationResponse, HostError, TuiConfig, TuiExit, TuiHost,
+    ConfirmationResponse, HostError, TuiConfig, TuiExit, TuiHost, TuiScreen,
 };
 pub use driver::run;

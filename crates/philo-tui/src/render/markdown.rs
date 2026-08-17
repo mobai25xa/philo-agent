@@ -20,6 +20,7 @@ use super::theme;
 struct Fence {
     marker: char,
     language: String,
+    #[cfg(test)]
     highlighter: CodeHighlighter,
 }
 
@@ -41,6 +42,8 @@ impl MarkdownRenderer {
     }
 
     /// Renders a line that is now part of history, advancing block state.
+    /// History paint uses [`Self::preview`]; this stays for markdown tests.
+    #[cfg(test)]
     pub(crate) fn commit(&mut self, line: &TranscriptLine) -> Line<'static> {
         if line.kind != LineKind::Answer {
             return styled_line(line);

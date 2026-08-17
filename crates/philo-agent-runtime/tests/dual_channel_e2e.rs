@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Waker};
 use philo_agent_runtime::{
     AgentRuntime, EffectClass, GenerationConfig, OperationOutcome, RichToolResult, RuntimeConfig,
     SequentialIdSource, SessionId, ToolDefinition, ToolDisplay, ToolFuture, ToolInvocation,
-    ToolPort, ToolProgressSink, UserMessage,
+    ToolInvokeCx, ToolInvokeEnd, ToolPort, UserMessage,
 };
 use philo_session::{SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
@@ -62,6 +62,7 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
         max_tool_rounds,
         max_parallel_tool_calls: 1,
         operation_timeout: None,
+        tool_cancel_grace: std::time::Duration::from_millis(300),
         compaction: Default::default(),
     }
 }
@@ -132,11 +133,7 @@ impl<P: ToolPort> ToolPort for DenySystemTools<P> {
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.inner.definitions()
     }
-    fn invoke<'a>(
-        &'a self,
-        invocation: ToolInvocation,
-        progress: ToolProgressSink,
-    ) -> ToolFuture<'a> {
+    fn invoke<'a>(&'a self, invocation: ToolInvocation, cx: ToolInvokeCx) -> ToolFuture<'a> {
         let class = self
             .definitions()
             .iter()
@@ -144,12 +141,12 @@ impl<P: ToolPort> ToolPort for DenySystemTools<P> {
             .map(ToolDefinition::effect_class);
         Box::pin(async move {
             if class == Some(EffectClass::System) {
-                return Ok(RichToolResult::error(
+                return Ok(ToolInvokeEnd::Done(RichToolResult::error(
                     "denied",
                     "the approval policy declined this system command",
-                ));
+                )));
             }
-            self.inner.invoke(invocation, progress).await
+            self.inner.invoke(invocation, cx).await
         })
     }
 }

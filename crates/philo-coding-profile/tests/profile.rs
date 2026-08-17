@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::DEFAULT_MAX_PARALLEL_TOOL_CALLS;
 use philo_coding_profile::{CodingProfile, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOL_ROUNDS};
-use philo_tools::{ToolInvocation, ToolPort, ToolProgressSink};
+use philo_tools::{ToolInvocation, ToolInvokeCx, ToolPort};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
@@ -51,9 +51,11 @@ fn read_tool_is_wired_to_the_workspace_root() {
     let registry = CodingProfile::new(&root).tool_registry();
     let result = block_on(registry.invoke(
         ToolInvocation::new("call-1", "read", r#"{"path":"probe.txt"}"#),
-        ToolProgressSink::noop(),
+        ToolInvokeCx::ignore(),
     ))
-    .expect("invocation is not an infrastructure failure");
+    .expect("invocation is not an infrastructure failure")
+    .into_done()
+    .expect("read completes");
     let content = result
         .result()
         .content()

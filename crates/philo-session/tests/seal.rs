@@ -70,6 +70,23 @@ fn batch_transaction(revision: u64) -> SessionTransaction {
     )
 }
 
+fn three_call_batch_transaction(revision: u64) -> SessionTransaction {
+    SessionTransaction::linear(
+        session_id(),
+        SessionRevision::new(revision),
+        vec![SessionEntryKind::AssistantToolCallBatch {
+            turn_id: turn_id(),
+            model_call_id: "model-call-1".to_owned(),
+            tool_batch_id: ToolBatchId::new("batch-1"),
+            calls: vec![
+                SessionToolCall::new(ToolCallId::new("call-1"), "write", "{}"),
+                SessionToolCall::new(ToolCallId::new("call-2"), "shell", "{}"),
+                SessionToolCall::new(ToolCallId::new("call-3"), "read", "{}"),
+            ],
+        }],
+    )
+}
+
 fn tool_result(result: SessionToolResult) -> SessionEntryKind {
     SessionEntryKind::ToolResult {
         turn_id: turn_id(),
@@ -178,7 +195,84 @@ fn timeout_cancellation_keeps_the_cancelled_prefix_shape() {
 // ---------------------------------------------------------------- 校验矩阵
 
 #[test]
-fn interrupted_marks_are_rejected_in_user_cancellations() {
+fn interrupted_marks_are_allowed_in_user_cancellations() {
+    let mut projection = SessionProjection::empty();
+    let mut cancel = vec![
+        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-1"))),
+        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-2"))),
+    ];
+    cancel.extend(terminal_entries(CancelReason::User));
+    apply_all(
+        &mut projection,
+        &[
+            start_transaction(0),
+            batch_transaction(1),
+            SessionTransaction::linear(session_id(), SessionRevision::new(2), cancel),
+        ],
+    )
+    .expect("all-interrupted user cancellation is a valid transaction");
+}
+
+#[test]
+fn user_cancellation_accepts_success_and_interrupted() {
+    let mut projection = SessionProjection::empty();
+    let mut cancel = vec![
+        tool_result(SessionToolResult::success(ToolCallId::new("call-1"), "ok")),
+        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-2"))),
+    ];
+    cancel.extend(terminal_entries(CancelReason::User));
+    apply_all(
+        &mut projection,
+        &[
+            start_transaction(0),
+            batch_transaction(1),
+            SessionTransaction::linear(session_id(), SessionRevision::new(2), cancel),
+        ],
+    )
+    .expect("success then interrupted is a valid user cancellation");
+}
+
+#[test]
+fn user_cancellation_accepts_interrupted_and_cancelled() {
+    let mut projection = SessionProjection::empty();
+    let mut cancel = vec![
+        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-1"))),
+        tool_result(SessionToolResult::cancelled(ToolCallId::new("call-2"))),
+    ];
+    cancel.extend(terminal_entries(CancelReason::User));
+    apply_all(
+        &mut projection,
+        &[
+            start_transaction(0),
+            batch_transaction(1),
+            SessionTransaction::linear(session_id(), SessionRevision::new(2), cancel),
+        ],
+    )
+    .expect("interrupted then cancelled is a valid user cancellation");
+}
+
+#[test]
+fn user_cancellation_accepts_success_interrupted_cancelled_suffix() {
+    let mut projection = SessionProjection::empty();
+    let mut cancel = vec![
+        tool_result(SessionToolResult::success(ToolCallId::new("call-1"), "ok")),
+        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-2"))),
+        tool_result(SessionToolResult::cancelled(ToolCallId::new("call-3"))),
+    ];
+    cancel.extend(terminal_entries(CancelReason::User));
+    apply_all(
+        &mut projection,
+        &[
+            start_transaction(0),
+            three_call_batch_transaction(1),
+            SessionTransaction::linear(session_id(), SessionRevision::new(2), cancel),
+        ],
+    )
+    .expect("real then interrupted then cancelled suffix is a valid user cancellation");
+}
+
+#[test]
+fn interrupted_after_cancelled_is_rejected_in_user_cancellations() {
     let mut projection = SessionProjection::empty();
     apply_all(
         &mut projection,
@@ -187,7 +281,7 @@ fn interrupted_marks_are_rejected_in_user_cancellations() {
     .unwrap();
 
     let mut cancel = vec![
-        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-1"))),
+        tool_result(SessionToolResult::cancelled(ToolCallId::new("call-1"))),
         tool_result(SessionToolResult::interrupted(ToolCallId::new("call-2"))),
     ];
     cancel.extend(terminal_entries(CancelReason::User));
@@ -200,6 +294,25 @@ fn interrupted_marks_are_rejected_in_user_cancellations() {
         .err()
         .unwrap();
     assert_eq!(error, invalid_tool_result());
+}
+
+#[test]
+fn timeout_cancellation_accepts_interrupted_and_cancelled() {
+    let mut projection = SessionProjection::empty();
+    let mut cancel = vec![
+        tool_result(SessionToolResult::interrupted(ToolCallId::new("call-1"))),
+        tool_result(SessionToolResult::cancelled(ToolCallId::new("call-2"))),
+    ];
+    cancel.extend(terminal_entries(CancelReason::Timeout));
+    apply_all(
+        &mut projection,
+        &[
+            start_transaction(0),
+            batch_transaction(1),
+            SessionTransaction::linear(session_id(), SessionRevision::new(2), cancel),
+        ],
+    )
+    .expect("interrupted then cancelled is a valid timeout cancellation");
 }
 
 #[test]

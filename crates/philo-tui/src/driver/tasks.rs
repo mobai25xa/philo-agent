@@ -33,6 +33,7 @@ enum TaskScope {
     Config,
     Status,
     Clipboard,
+    ClipboardWrite,
     Submission(u64),
 }
 
@@ -74,6 +75,7 @@ struct SubmissionRequest {
 pub(crate) enum TaskCompletion {
     Host(HostResult),
     Clipboard(Result<ClipboardContent, String>),
+    ClipboardWrite(Result<(), String>),
     Submission(SubmissionResult),
     Superseded,
     Failed(String),
@@ -234,6 +236,15 @@ impl PendingTasks {
         self.replace(
             TaskScope::Clipboard,
             tokio::task::spawn_blocking(|| TaskCompletion::Clipboard(clipboard::read())),
+        );
+    }
+
+    pub(crate) fn start_clipboard_write(&mut self, text: String) {
+        self.replace(
+            TaskScope::ClipboardWrite,
+            tokio::task::spawn_blocking(move || {
+                TaskCompletion::ClipboardWrite(clipboard::write_text(text))
+            }),
         );
     }
 

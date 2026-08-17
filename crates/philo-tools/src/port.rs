@@ -2,7 +2,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{RichToolResult, ToolArguments, ToolDefinition, ToolInvocation, ToolProgressSink};
+use crate::{
+    RichToolResult, ToolArguments, ToolDefinition, ToolInvocation, ToolInvokeCx, ToolInvokeEnd,
+};
 
 /// Infrastructure failure that prevented a normal tool result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,9 +23,11 @@ impl ToolPortError {
 }
 
 pub type ToolFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<RichToolResult, ToolPortError>> + Send + 'a>>;
-/// Future returned by a domain handler.
+    Pin<Box<dyn Future<Output = Result<ToolInvokeEnd, ToolPortError>> + Send + 'a>>;
+/// Future returned by a domain handler that produces a complete result.
 pub type ToolHandlerFuture<'a> = Pin<Box<dyn Future<Output = RichToolResult> + Send + 'a>>;
+/// Future returned by a domain handler that may stop without a result.
+pub type ToolHandlerEndFuture<'a> = Pin<Box<dyn Future<Output = ToolInvokeEnd> + Send + 'a>>;
 
 /// Object-safe async business handler. The registry validates arguments
 /// first. Handlers produce the dual-channel outcome directly (M10): business
@@ -32,15 +36,17 @@ pub type ToolHandlerFuture<'a> = Pin<Box<dyn Future<Output = RichToolResult> + S
 pub trait ToolHandler: Send + Sync {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a>;
 
-    /// Default: ignore the sink and produce the same one-shot result as
-    /// [`ToolHandler::call`]. Streaming tools override this method.
-    fn call_with_progress<'a>(
+    /// Default: ignore the context and wrap [`ToolHandler::call`] as
+    /// [`ToolInvokeEnd::Done`]. Tools that stream or honor cancel override
+    /// this method.
+    fn call_with_cx<'a>(
         &'a self,
         arguments: ToolArguments,
-        progress: ToolProgressSink,
-    ) -> ToolHandlerFuture<'a> {
-        let _ = progress;
-        self.call(arguments)
+        cx: ToolInvokeCx,
+    ) -> ToolHandlerEndFuture<'a> {
+        let _ = cx;
+        let future = self.call(arguments);
+        Box::pin(async move { ToolInvokeEnd::Done(future.await) })
     }
 }
 
@@ -57,11 +63,7 @@ where
 /// Port used by Runtime; it has no persistence or kernel responsibilities.
 pub trait ToolPort: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
-    fn invoke<'a>(
-        &'a self,
-        invocation: ToolInvocation,
-        progress: ToolProgressSink,
-    ) -> ToolFuture<'a>;
+    fn invoke<'a>(&'a self, invocation: ToolInvocation, cx: ToolInvokeCx) -> ToolFuture<'a>;
 }
 
 pub(crate) type Handler = Arc<dyn ToolHandler>;

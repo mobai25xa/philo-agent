@@ -674,3 +674,422 @@ fn config_reload_failure_is_an_error_line() {
     assert_eq!(lines[0].kind, LineKind::Error);
     assert!(lines[0].text.contains("invalid TOML"));
 }
+
+fn concatenated_appends(effects: &[Effect]) -> Vec<TranscriptLine> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Append(lines) => Some(lines.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn submit_ingests_append_payloads_into_cells() {
+    let mut app = app();
+    let effects = run(&mut app, "hello");
+    let expected = concatenated_appends(&effects);
+    assert_eq!(
+        expected,
+        vec![
+            TranscriptLine {
+                kind: LineKind::User,
+                text: "You".to_owned(),
+            },
+            TranscriptLine {
+                kind: LineKind::User,
+                text: "  hello".to_owned(),
+            },
+        ]
+    );
+    assert_eq!(app.cells.cells(), expected.as_slice());
+}
+
+#[test]
+fn agent_events_ingest_append_lines_into_cells() {
+    use philo_agent_runtime::{OperationId, TurnId};
+
+    let mut app = app();
+    let queued = app.on_agent_event(&AgentEvent::OperationQueued {
+        operation_id: OperationId::new("op-1"),
+    });
+    let sealed = app.on_agent_event(&AgentEvent::PriorTurnSealed {
+        turn_id: TurnId::new("old-turn"),
+    });
+    let expected: Vec<_> = concatenated_appends(&queued)
+        .into_iter()
+        .chain(concatenated_appends(&sealed))
+        .collect();
+    assert!(
+        !expected.is_empty(),
+        "chosen events must emit transcript lines"
+    );
+    assert_eq!(app.cells.cells(), expected.as_slice());
+}
+
+#[test]
+fn begin_session_clears_ingested_cells() {
+    let mut app = app();
+    run(&mut app, "hello");
+    app.on_agent_event(&AgentEvent::TextDelta {
+        delta: "partial".to_owned(),
+    });
+    assert!(!app.cells.is_empty());
+    assert!(!app.cells.unsealed().is_empty());
+    app.begin_session("other");
+    assert!(app.cells.is_empty());
+    assert!(app.cells.cells().is_empty());
+    assert!(app.cells.unsealed().is_empty());
+    assert!(app.follow_bottom());
+}
+
+#[test]
+fn page_up_unfollows_after_layout_is_noted() {
+    let mut app = app();
+    app.cells.append((0..20).map(|i| TranscriptLine {
+        kind: LineKind::Meta,
+        text: format!("row-{i}"),
+    }));
+    app.note_history_layout(80, 3);
+    assert!(app.follow_bottom());
+    app.on_action(Action::PageTranscriptUp);
+    assert!(!app.follow_bottom());
+    app.on_action(Action::PageTranscriptDown);
+    assert!(app.follow_bottom());
+    app.on_action(Action::ScrollTranscript(-3));
+    assert!(!app.follow_bottom());
+}
+
+#[test]
+fn redraw_returns_hard_redraw_and_does_not_clear_cells() {
+    let mut app = app();
+    run(&mut app, "hello");
+    let before = app.cells.cells().to_vec();
+    assert!(!before.is_empty());
+    let effects = app.on_action(Action::Redraw);
+    assert_eq!(effects, vec![Effect::HardRedraw]);
+    assert_eq!(app.cells.cells(), before.as_slice());
+}
+
+fn seed_rows(app: &mut App, count: usize) {
+    app.cells.append((0..count).map(|i| TranscriptLine {
+        kind: LineKind::Meta,
+        text: format!("row-{i}"),
+    }));
+}
+
+#[test]
+fn mouse_select_unfollows_and_copies_visual_text() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    assert!(app.follow_bottom());
+
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    assert!(!app.follow_bottom());
+    app.on_action(Action::SelectDrag { x: 5, y: 0 });
+    app.on_action(Action::SelectEnd { x: 5, y: 0 });
+    assert!(app.has_selection());
+
+    let effects = app.on_action(Action::CtrlC);
+    assert_eq!(effects, vec![Effect::WriteClipboard("row-7".to_owned())]);
+    assert!(app.has_selection(), "copy keeps the highlight");
+}
+
+#[test]
+fn collapsed_click_does_not_copy() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::SelectStart { x: 1, y: 0 });
+    app.on_action(Action::SelectEnd { x: 1, y: 0 });
+    assert!(!app.has_selection());
+    let first = app.on_action(Action::CtrlC);
+    assert!(appended(&first)[0].text.contains("again to exit"));
+}
+
+#[test]
+fn click_outside_history_clears_selection() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 3, y: 0 });
+    app.on_action(Action::SelectEnd { x: 3, y: 0 });
+    assert!(app.has_selection());
+    app.on_action(Action::SelectStart { x: 0, y: 20 });
+    assert!(!app.has_selection());
+}
+
+#[test]
+fn ctrl_c_copies_before_clearing_input_or_cancelling() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    type_text(&mut app, "draft");
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 3, y: 0 });
+    app.on_action(Action::SelectEnd { x: 3, y: 0 });
+    app.set_busy(true, 0);
+
+    assert_eq!(
+        app.on_action(Action::CtrlC),
+        vec![Effect::WriteClipboard("row".to_owned())]
+    );
+    assert_eq!(app.input.text(), "draft");
+}
+
+#[test]
+fn typing_clears_selection_and_escape_clears_then_cancels() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 3, y: 0 });
+    app.on_action(Action::SelectEnd { x: 3, y: 0 });
+    app.on_action(Action::InsertChar('x'));
+    assert!(!app.has_selection());
+
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 3, y: 0 });
+    app.on_action(Action::SelectEnd { x: 3, y: 0 });
+    assert!(app.on_action(Action::Escape).is_empty());
+    assert!(!app.has_selection());
+
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 3, y: 0 });
+    app.on_action(Action::SelectEnd { x: 3, y: 0 });
+    app.set_busy(true, 0);
+    assert_eq!(app.on_action(Action::Escape), vec![Effect::CancelActive]);
+    assert!(!app.has_selection());
+}
+
+#[test]
+fn scroll_keeps_cell_space_selection() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 5, y: 0 });
+    app.on_action(Action::SelectEnd { x: 5, y: 0 });
+    app.on_action(Action::ScrollTranscript(-3));
+    assert_eq!(
+        app.on_action(Action::CtrlC),
+        vec![Effect::WriteClipboard("row-7".to_owned())]
+    );
+}
+
+#[test]
+fn overlay_does_not_start_transcript_selection() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.open_picker(vec![SessionId::new("s-1")]);
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 5, y: 0 });
+    app.on_action(Action::SelectEnd { x: 5, y: 0 });
+    assert!(!app.has_selection());
+}
+
+#[test]
+fn begin_session_clears_selection() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::SelectStart { x: 0, y: 0 });
+    app.on_action(Action::SelectDrag { x: 5, y: 0 });
+    app.on_action(Action::SelectEnd { x: 5, y: 0 });
+    app.begin_session("other");
+    assert!(!app.has_selection());
+    assert!(app.follow_bottom());
+}
+
+#[test]
+fn text_delta_without_newline_stays_unsealed() {
+    let mut app = app();
+    let effects = app.on_agent_event(&AgentEvent::TextDelta {
+        delta: "partial answer".to_owned(),
+    });
+    assert!(concatenated_appends(&effects).is_empty());
+    assert!(app.cells.cells().is_empty());
+    assert_eq!(
+        app.cells.unsealed(),
+        [TranscriptLine {
+            kind: LineKind::Answer,
+            text: "partial answer".to_owned(),
+        }]
+    );
+    let slice = app.history_slice(80, 3);
+    assert_eq!(
+        slice
+            .rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>(),
+        ["partial answer"]
+    );
+    assert_eq!(slice.rows[0].cell_index, 0);
+}
+
+#[test]
+fn newline_flushes_a_sealed_line_and_leaves_the_remainder_unsealed() {
+    let mut app = app();
+    app.on_agent_event(&AgentEvent::TextDelta {
+        delta: "hello\nworld".to_owned(),
+    });
+    assert_eq!(
+        app.cells.cells(),
+        [TranscriptLine {
+            kind: LineKind::Answer,
+            text: "hello".to_owned(),
+        }]
+    );
+    assert_eq!(
+        app.cells.unsealed(),
+        [TranscriptLine {
+            kind: LineKind::Answer,
+            text: "world".to_owned(),
+        }]
+    );
+    let texts: Vec<_> = app
+        .history_slice(80, 5)
+        .rows
+        .iter()
+        .map(|row| row.text.clone())
+        .collect();
+    assert_eq!(texts, ["hello", "world"]);
+    assert_eq!(texts.iter().filter(|text| *text == "hello").count(), 1);
+    assert_eq!(texts.iter().filter(|text| *text == "world").count(), 1);
+}
+
+#[test]
+fn show_reasoning_off_produces_no_unsealed_think_cells() {
+    let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), false);
+    app.on_agent_event(&AgentEvent::ReasoningDelta {
+        model_call_id: philo_agent_runtime::ModelCallId::new("call-1"),
+        text: "secret thoughts".to_owned(),
+    });
+    assert!(app.cells.cells().is_empty());
+    assert!(app.cells.unsealed().is_empty());
+    assert!(app.history_slice(80, 3).rows.is_empty());
+}
+
+#[test]
+fn unsealed_rows_do_not_yank_a_pinned_view() {
+    let mut app = app();
+    seed_rows(&mut app, 20);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::PageTranscriptUp);
+    let before: Vec<_> = app
+        .history_slice(80, 3)
+        .rows
+        .iter()
+        .map(|row| row.text.clone())
+        .collect();
+    assert!(!app.follow_bottom());
+
+    app.on_agent_event(&AgentEvent::TextDelta {
+        delta: "streaming tail".to_owned(),
+    });
+    let after: Vec<_> = app
+        .history_slice(80, 3)
+        .rows
+        .iter()
+        .map(|row| row.text.clone())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!app.follow_bottom());
+    assert!(
+        app.cells
+            .unsealed()
+            .iter()
+            .any(|line| line.text == "streaming tail")
+    );
+}
+
+#[test]
+fn copy_includes_unsealed_text_via_display_cell_indices() {
+    let mut app = app();
+    seed_rows(&mut app, 3);
+    app.on_agent_event(&AgentEvent::TextDelta {
+        delta: "live tail".to_owned(),
+    });
+    app.note_history_layout(80, 5);
+    let slice = app.history_slice(80, 5);
+    let last = slice.rows.last().expect("unsealed visible");
+    assert_eq!(last.text, "live tail");
+    assert_eq!(last.cell_index, 3);
+
+    app.on_action(Action::SelectStart { x: 0, y: 3 });
+    app.on_action(Action::SelectDrag { x: 9, y: 3 });
+    app.on_action(Action::SelectEnd { x: 9, y: 3 });
+    assert_eq!(
+        app.on_action(Action::CtrlC),
+        vec![Effect::WriteClipboard("live tail".to_owned())]
+    );
+}
+
+#[test]
+fn home_and_end_prefer_the_editing_line_then_jump_transcript() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    type_text(&mut app, "ab");
+    app.on_action(Action::MoveLeft);
+    assert_eq!(app.input.cursor(), (0, 1));
+
+    app.on_action(Action::Home);
+    assert_eq!(app.input.cursor(), (0, 0));
+    assert!(app.follow_bottom(), "first Home stays in the composer");
+
+    app.on_action(Action::Home);
+    assert!(!app.follow_bottom());
+    let top = app.history_slice(80, 3);
+    assert!(top.at_top);
+    assert_eq!(top.rows[0].text, "row-0");
+
+    app.on_action(Action::End);
+    assert_eq!(app.input.cursor(), (0, 2));
+    assert!(!app.follow_bottom(), "first End stays in the composer");
+
+    app.on_action(Action::End);
+    assert!(app.follow_bottom());
+    let bottom = app.history_slice(80, 3);
+    assert!(bottom.at_bottom);
+    assert_eq!(
+        bottom.rows.last().map(|row| row.text.as_str()),
+        Some("row-9")
+    );
+}
+
+#[test]
+fn home_on_an_empty_prompt_jumps_to_transcript_top() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    assert!(app.input.at_line_start());
+    assert!(app.input.at_line_end());
+    app.on_action(Action::Home);
+    assert!(!app.follow_bottom());
+    assert!(app.history_slice(80, 3).at_top);
+    app.on_action(Action::End);
+    assert!(app.follow_bottom());
+    assert!(app.history_slice(80, 3).at_bottom);
+}
+
+#[test]
+fn overlay_ignores_home_and_end() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.open_picker(vec![SessionId::new("s-1")]);
+    app.on_action(Action::Home);
+    assert!(app.follow_bottom());
+    assert!(app.picker().is_some());
+    app.on_action(Action::End);
+    assert!(app.follow_bottom());
+    assert!(app.picker().is_some());
+}

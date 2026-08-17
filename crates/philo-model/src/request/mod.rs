@@ -31,5 +31,9 @@ pub(crate) fn map_request(
         &snapshot.tools,
         snapshot.max_parallel_tool_calls,
     )?;
+    if let Ok(session) = sdk::CacheSessionId::new(snapshot.session_id.as_str()) {
+        request.cache_session = Some(session);
+    }
+    request.cache_retention = sdk::CacheRetention::Short;
     Ok(request)
 }

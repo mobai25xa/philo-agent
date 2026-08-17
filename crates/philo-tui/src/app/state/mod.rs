@@ -6,16 +6,21 @@ mod commands;
 mod composer;
 mod overlays;
 mod runtime;
+mod select;
 
 #[cfg(test)]
 mod tests;
 
+use std::cell::Cell;
+
 use super::action::Action;
 use super::activity::{ActivityState, ActivityTone, ActivityView};
 use super::attachment::Attachments;
+use super::cells::{ScrollState, TranscriptStore, VisibleSlice};
 use super::effect::Effect;
 use super::input::{InputEditor, InputHistory};
 use super::overlay::{ConfirmPrompt, OverlayFrame, SessionPicker};
+use super::select::{BandLayout, Selection};
 use super::status::StatusData;
 use super::transcript::{InfoLevel, LineKind, Transcript, TranscriptLine};
 
@@ -52,6 +57,13 @@ pub(crate) struct App {
     automatic_compacting: bool,
     /// Ephemeral operation projection; never enters transcript or Session.
     activity: ActivityState,
+    /// Sealed transcript cells for the TUI-owned viewport.
+    pub(crate) cells: TranscriptStore,
+    scroll: ScrollState,
+    layout_width: Cell<usize>,
+    layout_history_height: Cell<usize>,
+    history_band: Cell<BandLayout>,
+    selection: Option<Selection>,
 }
 
 impl App {
@@ -74,7 +86,62 @@ impl App {
             manual_compacting: false,
             automatic_compacting: false,
             activity: ActivityState::default(),
+            cells: TranscriptStore::new(),
+            scroll: ScrollState::follow(),
+            layout_width: Cell::new(80),
+            layout_history_height: Cell::new(0),
+            history_band: Cell::new(BandLayout::default()),
+            selection: None,
         }
+    }
+
+    pub(crate) fn history_slice(&self, width: usize, height: usize) -> VisibleSlice {
+        self.cells.visible_slice(width, height, &self.scroll)
+    }
+
+    /// Copies every `Effect::Append` into the sealed store, then replaces
+    /// the unsealed tail from [`Transcript::open_cells`]. Callers still
+    /// return the original effects so existing collectors keep working.
+    pub(crate) fn ingest_appends(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+        for effect in &effects {
+            if let Effect::Append(lines) = effect {
+                self.cells.append(lines.iter().cloned());
+            }
+        }
+        self.sync_unsealed();
+        effects
+    }
+
+    pub(crate) fn sync_unsealed(&mut self) {
+        self.cells.replace_unsealed(self.transcript.open_cells());
+    }
+
+    pub(crate) fn page_transcript_up(&mut self, width: usize, height: usize) {
+        self.scroll_transcript(width, height, -(height as isize));
+    }
+
+    pub(crate) fn page_transcript_down(&mut self, width: usize, height: usize) {
+        self.scroll_transcript(width, height, height as isize);
+    }
+
+    pub(crate) fn scroll_transcript(&mut self, width: usize, height: usize, delta: isize) {
+        if height == 0 || delta == 0 {
+            return;
+        }
+        self.cells.refresh_wraps(width);
+        self.scroll
+            .scroll_wrapped(&self.cells.wrap_rows(), height, delta);
+    }
+
+    pub(crate) fn jump_transcript_top(&mut self) {
+        let width = self.layout_width.get();
+        let height = self.layout_history_height.get();
+        self.cells.refresh_wraps(width);
+        self.scroll.jump_top(&self.cells.wrap_rows(), height);
+    }
+
+    pub(crate) fn jump_transcript_bottom(&mut self) {
+        self.scroll.jump_bottom();
     }
 
     #[cfg(test)]
@@ -85,6 +152,16 @@ impl App {
     #[cfg(test)]
     pub(crate) fn shows_reasoning(&self) -> bool {
         self.show_reasoning
+    }
+
+    #[cfg(test)]
+    pub(crate) fn follow_bottom(&self) -> bool {
+        self.scroll.follow_bottom()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_selection(&self) -> bool {
+        self.clamped_selection().is_some()
     }
 
     /// Images waiting for the next message (`/image`, `Ctrl+V`).
@@ -154,6 +231,11 @@ impl App {
 
     /// Handles one interpreted key action.
     pub fn on_action(&mut self, action: Action) -> Vec<Effect> {
+        let effects = self.dispatch_action(action);
+        self.ingest_appends(effects)
+    }
+
+    fn dispatch_action(&mut self, action: Action) -> Vec<Effect> {
         if let Action::ConfigReload(notice) = action {
             return self.apply_config_notice(notice);
         }
@@ -198,6 +280,28 @@ impl App {
             }
             Action::ToggleLevel => vec![Effect::Append(vec![self.toggle_level()])],
             Action::Redraw => vec![Effect::HardRedraw],
+            Action::PageTranscriptUp => {
+                self.page_transcript_up(self.layout_width.get(), self.layout_history_height.get());
+                vec![]
+            }
+            Action::PageTranscriptDown => {
+                self.page_transcript_down(
+                    self.layout_width.get(),
+                    self.layout_history_height.get(),
+                );
+                vec![]
+            }
+            Action::ScrollTranscript(delta) => {
+                self.scroll_transcript(
+                    self.layout_width.get(),
+                    self.layout_history_height.get(),
+                    delta,
+                );
+                vec![]
+            }
+            Action::SelectStart { x, y } => self.select_start(x, y),
+            Action::SelectDrag { x, y } => self.select_drag(x, y),
+            Action::SelectEnd { x, y } => self.select_end(x, y),
             Action::Complete => self.complete(),
             Action::Paste => vec![Effect::ReadClipboard],
             Action::ConfigReload(_) => unreachable!("config notices are handled first"),

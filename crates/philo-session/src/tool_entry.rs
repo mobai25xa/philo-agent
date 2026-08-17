@@ -47,11 +47,13 @@ pub enum ToolResultOutcome {
     /// fully expressed by the variant; model-facing rendering is a
     /// Runtime/Adapter mapping concern.
     Cancelled,
-    /// The process was interrupted while the call's batch was outstanding:
-    /// whether the call executed is unknown (its side effects may have
-    /// happened without the result reaching durable storage). Distinct from
-    /// [`ToolResultOutcome::Cancelled`], which asserts the call never ran.
-    /// Model-facing rendering is a Runtime/Adapter mapping concern.
+    /// The process was interrupted while the call's batch was outstanding,
+    /// or a live Runtime stopped an already-started call without a
+    /// trustworthy complete result: whether the call executed is unknown
+    /// (its side effects may have happened without the result reaching
+    /// durable storage). Distinct from [`ToolResultOutcome::Cancelled`],
+    /// which asserts the call never ran. Model-facing rendering is a
+    /// Runtime/Adapter mapping concern.
     Interrupted,
 }
 

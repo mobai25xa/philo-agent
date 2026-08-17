@@ -69,6 +69,12 @@ impl CodeHighlighter {
         self.inner.is_some()
     }
 
+    /// Highlights one streaming preview line without touching commit state.
+    pub(crate) fn preview_line(language: &str, text: &str) -> Option<Vec<(Style, String)>> {
+        let mut highlighter = Self::for_language(language);
+        highlighter.line(text)
+    }
+
     /// Styled fragments for one line, or `None` when the caller should fall
     /// back to plain code styling.
     pub(crate) fn line(&mut self, text: &str) -> Option<Vec<(Style, String)>> {

@@ -37,6 +37,7 @@ struct RunningTool {
     name: String,
     arguments: String,
     index: usize,
+    tail: String,
 }
 
 impl ActivityKind {
@@ -70,11 +71,42 @@ impl ActivityState {
     }
 
     pub(crate) fn wait_for_model(&mut self) {
-        self.set(ActivityKind::Waiting("wait  model"));
+        self.set(ActivityKind::Waiting("wait"));
+    }
+
+    /// One live-timeline row for the current tool batch.
+    pub(crate) fn timeline_row(&self, width: usize) -> Option<String> {
+        let Some(ActivityKind::Tool { running, .. }) = &self.current else {
+            return None;
+        };
+        let row = match running.as_slice() {
+            [tool] => {
+                let args = compact_args(&tool.arguments);
+                let last = last_live_line(&tool.tail);
+                if !last.is_empty() {
+                    format!("{}  {last}", tool.name)
+                } else if args.is_empty() {
+                    tool.name.clone()
+                } else {
+                    format!("{}  {args}", tool.name)
+                }
+            }
+            _ => running
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        Some(text::truncate(&row, width))
     }
 
     /// Extra rows for the live band: tool arguments and parallel call names.
-    pub(crate) fn detail_rows(&self, width: usize, height: usize) -> Vec<String> {
+    pub(crate) fn detail_rows(
+        &self,
+        width: usize,
+        height: usize,
+        tail_lines: usize,
+    ) -> Vec<String> {
         if height == 0 || width == 0 {
             return Vec::new();
         }
@@ -91,6 +123,14 @@ impl ActivityState {
                     &format!("{}  {}  {args}", tool.index + 1, tool.name),
                     width,
                 ));
+            }
+            if rows.len() >= height {
+                break;
+            }
+            if tail_lines > 0 && !tool.tail.is_empty() {
+                let remaining = height - rows.len();
+                let take = tail_lines.min(remaining);
+                rows.extend(text::tail_rows(&tool.tail, width, take));
             }
             if rows.len() >= height {
                 break;
@@ -124,15 +164,8 @@ impl ActivityState {
             ActivityKind::Tool { running, total } => {
                 let total = (*total).max(running.last().map_or(0, |tool| tool.index + 1));
                 let label = match running.as_slice() {
-                    [tool] => format!("tool {}/{total}  {}", tool.index + 1, tool.name),
-                    _ => {
-                        let names = running
-                            .iter()
-                            .map(|tool| tool.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("tools {}/{total}  {names}", running.len())
-                    }
+                    [tool] => format!("tool  {}", tool.name),
+                    _ => format!("tools  {}/{total}", running.len()),
                 };
                 (label, ActivityTone::Tool)
             }
@@ -152,19 +185,19 @@ impl ActivityState {
     pub(crate) fn on_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::OperationQueued { .. } => {
-                self.set(ActivityKind::Waiting("wait  queued"));
+                self.set(ActivityKind::Waiting("wait"));
             }
             AgentEvent::OperationStarted { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::ModelCallStarted { .. } => self.wait_for_model(),
             AgentEvent::ModelResponseStarted { .. } => {
-                self.set(ActivityKind::Waiting("wait  response"));
+                self.set(ActivityKind::Waiting("wait"));
             }
             AgentEvent::ReasoningDelta { .. } => self.set(ActivityKind::Reasoning),
             AgentEvent::TextDelta { .. } => self.set(ActivityKind::Responding),
             AgentEvent::ToolBatchRequested { call_count, .. } => {
                 self.tool_batch_size = *call_count;
-                self.set(ActivityKind::Waiting("wait  tools"));
+                self.set(ActivityKind::Waiting("wait"));
             }
             AgentEvent::ToolExecutionStarted {
                 tool_name,
@@ -184,6 +217,7 @@ impl ActivityState {
                         name: tool_name.clone(),
                         arguments: arguments.clone(),
                         index: *index,
+                        tail: String::new(),
                     });
                     running.sort_by_key(|tool| tool.index);
                 }
@@ -191,6 +225,16 @@ impl ActivityState {
                     running,
                     total: self.tool_batch_size,
                 });
+            }
+            AgentEvent::ToolExecutionProgress { index, tail, .. } => {
+                if matches!(self.current, Some(ActivityKind::Cancelling(_))) {
+                    return;
+                }
+                if let Some(ActivityKind::Tool { running, .. }) = &mut self.current {
+                    if let Some(tool) = running.iter_mut().find(|tool| tool.index == *index) {
+                        tool.tail = sanitize_live_tail(tail);
+                    }
+                }
             }
             AgentEvent::ToolExecutionCompleted { index, .. } => {
                 let next = match &self.current {
@@ -201,7 +245,7 @@ impl ActivityState {
                             .cloned()
                             .collect();
                         if running.is_empty() {
-                            Some(ActivityKind::Waiting("wait  model"))
+                            Some(ActivityKind::Waiting("wait"))
                         } else {
                             Some(ActivityKind::Tool {
                                 running,
@@ -218,7 +262,7 @@ impl ActivityState {
             AgentEvent::ContextCompactionCompleted { .. }
             | AgentEvent::ContextCompactionFailed { .. } => {
                 if matches!(self.current, Some(ActivityKind::Compacting)) {
-                    self.replace(ActivityKind::Waiting("wait  model"));
+                    self.replace(ActivityKind::Waiting("wait"));
                 }
             }
             AgentEvent::ContextCompactionStarted => self.set(ActivityKind::Compacting),
@@ -227,7 +271,7 @@ impl ActivityState {
                 self.replace(ActivityKind::Cancelling(*reason));
             }
             AgentEvent::AssistantMessageCompleted { .. } => {
-                self.set(ActivityKind::Waiting("wait  settle"));
+                self.set(ActivityKind::Waiting("wait"));
             }
             AgentEvent::TurnFailed { .. } | AgentEvent::OperationSettled { .. } => self.clear(),
             _ => {}
@@ -248,6 +292,55 @@ impl ActivityState {
     fn replace(&mut self, next: ActivityKind) {
         self.current = Some(next);
     }
+}
+
+fn last_live_line(tail: &str) -> &str {
+    tail.lines().next_back().unwrap_or("").trim()
+}
+
+fn sanitize_live_tail(raw: &str) -> String {
+    strip_controls(&apply_carriage_returns(&strip_ansi(raw)))
+}
+
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1B {
+            index += 1;
+            if index < bytes.len() && bytes[index] == b'[' {
+                index += 1;
+                while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
+                    index += 1;
+                }
+                if index < bytes.len() {
+                    index += 1;
+                }
+                continue;
+            }
+            continue;
+        }
+        let next = input[index..].chars().next().expect("valid utf-8");
+        out.push(next);
+        index += next.len_utf8();
+    }
+    out
+}
+
+fn apply_carriage_returns(input: &str) -> String {
+    input
+        .split('\n')
+        .map(|line| line.rsplit('\r').next().unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_controls(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+        .collect()
 }
 
 fn reason_text(reason: CancelReason) -> &'static str {
@@ -282,9 +375,9 @@ mod tests {
             arguments: "{\"path\":\"src/很长的文件.rs\"}".to_owned(),
         });
         let view = state.view(36).expect("activity");
-        assert!(view.text.contains("tool 1/2  read_file"), "{view:?}");
+        assert!(view.text.contains("tool  read_file"), "{view:?}");
         assert!(text::width(&view.text) <= 36);
-        assert_eq!(state.detail_rows(40, 2), ["path: src/很长的文件.rs"]);
+        assert_eq!(state.detail_rows(40, 2, 5), ["path: src/很长的文件.rs"]);
 
         state.on_event(&AgentEvent::ToolExecutionCompleted {
             tool_batch_id: ToolBatchId::new("batch"),
@@ -294,13 +387,7 @@ mod tests {
             result: ToolResult::success("ok"),
             display: None,
         });
-        assert!(
-            state
-                .view(80)
-                .expect("waiting")
-                .text
-                .contains("wait  model")
-        );
+        assert!(state.view(80).expect("waiting").text.contains("wait"));
 
         state.on_event(&AgentEvent::OperationSettled {
             operation_id: OperationId::new("op"),
@@ -332,7 +419,7 @@ mod tests {
             arguments: "{\"pattern\":\"fn\"}".to_owned(),
         });
         let view = state.view(80).expect("parallel activity");
-        assert!(view.text.contains("tools 2/3  read_file, grep"), "{view:?}");
+        assert!(view.text.contains("tools  2/3"), "{view:?}");
 
         state.on_event(&AgentEvent::ToolExecutionCompleted {
             tool_batch_id: ToolBatchId::new("batch"),
@@ -343,7 +430,7 @@ mod tests {
             display: None,
         });
         let remaining = state.view(80).expect("one still running");
-        assert!(remaining.text.contains("tool 2/3  grep"), "{remaining:?}");
+        assert!(remaining.text.contains("tool  grep"), "{remaining:?}");
     }
 
     #[test]
@@ -363,6 +450,51 @@ mod tests {
             tool_name: "late_tool".to_owned(),
             result: ToolResult::success("late"),
             display: None,
+        });
+        assert!(state.view(80).expect("activity").text.contains("cancel"));
+    }
+
+    #[test]
+    fn progress_updates_the_live_tail_and_cannot_outrank_cancel() {
+        let mut state = ActivityState::default();
+        state.on_event(&AgentEvent::ToolBatchRequested {
+            tool_batch_id: ToolBatchId::new("batch"),
+            call_count: 1,
+        });
+        state.on_event(&AgentEvent::ToolExecutionStarted {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("call"),
+            index: 0,
+            tool_name: "shell".to_owned(),
+            arguments: "{\"command\":\"echo hi\"}".to_owned(),
+        });
+        state.on_event(&AgentEvent::ToolExecutionProgress {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("call"),
+            index: 0,
+            tail: "\u{1b}[32mhello\u{1b}[0m\rworld".to_owned(),
+        });
+        let details = state.detail_rows(40, 4, 5);
+        assert!(
+            details.iter().any(|row| row.contains("world")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|row| !row.contains("hello") && !row.contains("\u{1b}")),
+            "{details:?}"
+        );
+
+        state.on_event(&AgentEvent::CancellationRequested {
+            operation_id: OperationId::new("op"),
+            reason: CancelReason::User,
+        });
+        state.on_event(&AgentEvent::ToolExecutionProgress {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("call"),
+            index: 0,
+            tail: "late-progress".to_owned(),
         });
         assert!(state.view(80).expect("activity").text.contains("cancel"));
     }

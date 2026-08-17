@@ -195,7 +195,8 @@ mod tests {
         let screen = screen_text(&terminal);
         assert!(screen.contains("third completed"));
         assert!(screen.contains("fourth completed"));
-        assert!(screen.contains("model model-a · session s-1 · idle"));
+        assert!(screen.contains("model-a"));
+        assert!(screen.contains("s-1"));
     }
 
     #[test]

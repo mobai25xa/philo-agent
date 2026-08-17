@@ -161,15 +161,12 @@ impl App {
         }
         self.quit_armed = false;
 
-        let mut lines = vec![line(
-            LineKind::User,
-            format!("> {}", text.replace('\n', "\n> ")),
-        )];
+        let mut lines = crate::app::transcript::user_message_lines(&text);
         let attachments = self.attachments.take();
         for attachment in &attachments {
             lines.push(line(
                 LineKind::User,
-                format!("> [attached {}]", attachment.label()),
+                format!("  [attached {}]", attachment.label()),
             ));
         }
         if self.status.compacting {

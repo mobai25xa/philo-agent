@@ -89,19 +89,30 @@ fn registry_synthesized_errors_have_no_display() {
         .unwrap()
         .build();
 
-    let unknown = block_on(registry.invoke(ToolInvocation::new("c", "nope", "{}"))).unwrap();
+    let unknown = block_on(registry.invoke(
+        ToolInvocation::new("c", "nope", "{}"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(unknown.result().as_error().unwrap().code(), "unknown_tool");
     assert!(unknown.display().is_none());
 
-    let bad_json =
-        block_on(registry.invoke(ToolInvocation::new("c", "strict", "not json"))).unwrap();
+    let bad_json = block_on(registry.invoke(
+        ToolInvocation::new("c", "strict", "not json"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(
         bad_json.result().as_error().unwrap().code(),
         "invalid_arguments"
     );
     assert!(bad_json.display().is_none());
 
-    let missing = block_on(registry.invoke(ToolInvocation::new("c", "strict", "{}"))).unwrap();
+    let missing = block_on(registry.invoke(
+        ToolInvocation::new("c", "strict", "{}"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(
         missing.result().as_error().unwrap().code(),
         "invalid_arguments"
@@ -121,9 +132,60 @@ fn handler_display_passes_through_untouched() {
         )
         .unwrap()
         .build();
-    let rich = block_on(registry.invoke(ToolInvocation::new("c", "probe", "{}"))).unwrap();
+    let rich = block_on(registry.invoke(
+        ToolInvocation::new("c", "probe", "{}"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(rich.result().content(), Some("truncated model view"));
     assert_eq!(rich.display().unwrap().detail(), "the full detail");
+}
+
+#[test]
+fn progress_sink_does_not_change_the_final_result() {
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_handler = Arc::clone(&seen);
+    struct StreamingEcho {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    impl ToolHandler for StreamingEcho {
+        fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
+            self.call_with_progress(arguments, ToolProgressSink::noop())
+        }
+        fn call_with_progress<'a>(
+            &'a self,
+            _arguments: ToolArguments,
+            progress: ToolProgressSink,
+        ) -> ToolHandlerFuture<'a> {
+            let seen = Arc::clone(&self.seen);
+            Box::pin(async move {
+                progress.push_text("chunk-a");
+                progress.push_text("chunk-b");
+                seen.lock().expect("seen").push("ran".to_owned());
+                RichToolResult::success("final")
+            })
+        }
+    }
+
+    let pushed = Arc::new(Mutex::new(String::new()));
+    let pushed_for_sink = Arc::clone(&pushed);
+    let sink = ToolProgressSink::from_fn(move |text| {
+        pushed_for_sink.lock().expect("pushed").push_str(text);
+    });
+    let registry = ToolRegistry::builder()
+        .register(
+            ToolDefinition::simple("echo", "echoes", EffectClass::ReadOnly),
+            StreamingEcho {
+                seen: seen_for_handler,
+            },
+        )
+        .unwrap()
+        .build();
+    let rich = block_on(registry.invoke(ToolInvocation::new("c", "echo", "{}"), sink)).unwrap();
+    assert_eq!(rich.result().content(), Some("final"));
+    assert_eq!(pushed.lock().expect("pushed").as_str(), "chunk-achunk-b");
+    assert_eq!(seen.lock().expect("seen").as_slice(), ["ran"]);
 }
 
 #[test]

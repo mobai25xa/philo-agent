@@ -9,8 +9,8 @@ use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
     AgentEvent, AgentFailureKind, AgentRuntime, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig,
-    ModelMessage, OperationHandle, OperationOutcome, OperationPhase, OperationStatus, RuntimeConfig,
-    SequentialIdSource, SessionId, SettlementDurability, UserMessage, UserPart,
+    ModelMessage, OperationHandle, OperationOutcome, OperationPhase, OperationStatus,
+    RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability, UserMessage, UserPart,
 };
 use philo_session::{
     ContextMessage, MemorySessionStore, SessionCommit, SessionContextView, SessionError,

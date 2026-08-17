@@ -1,11 +1,12 @@
 ---
 source: crates/philo-tui/src/tests/compaction.rs
+assertion_line: 135
 expression: "format!(\"START\\n{}\\n{frame_zero}\\n{frame_one}\\n\\nDUPLICATE\\n{}\\n\\nESC\\n{}\\nSTATUS {}\\n\\nBUSY\\n{}\",\nappended(&started).join(\"\\n\"), appended(&duplicate).join(\"\\n\"),\nappended(&cancelled).join(\"\\n\"), app.status.line(),\nappended(&refused_busy).join(\"\\n\"),)"
 ---
 START
 Meta: /compact
-model model-a · session s-1 · compacting [|]
-model model-a · session s-1 · compacting [/]
+model-a  s-1  compact |
+model-a  s-1  compact /
 
 DUPLICATE
 Meta: /compact
@@ -13,7 +14,7 @@ Error: error: context compaction is already running; press Esc to cancel it
 
 ESC
 Notice: context compaction cancelled
-STATUS model model-a · session s-1 · idle
+STATUS model-a  s-1
 
 BUSY
 Meta: /compact

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use philo_agent_runtime::{
     RichToolResult, ToolDefinition, ToolDisplay, ToolFuture, ToolInvocation, ToolPort,
-    ToolPortError,
+    ToolPortError, ToolProgressSink,
 };
 
 use super::gate::Gate;
@@ -25,6 +25,11 @@ pub enum FakeToolResult {
     /// Creates a deterministic mid-batch cancellation window.
     GatedSuccess {
         gate: Gate,
+        content: String,
+    },
+    /// Pushes each chunk through the progress sink, then succeeds.
+    StreamingSuccess {
+        chunks: Vec<String>,
         content: String,
     },
 }
@@ -55,6 +60,16 @@ impl FakeToolResult {
     pub fn gated_success(gate: &Gate, content: impl Into<String>) -> Self {
         Self::GatedSuccess {
             gate: gate.clone(),
+            content: content.into(),
+        }
+    }
+
+    pub fn streaming_success(
+        chunks: impl IntoIterator<Item = impl Into<String>>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::StreamingSuccess {
+            chunks: chunks.into_iter().map(Into::into).collect(),
             content: content.into(),
         }
     }
@@ -107,7 +122,11 @@ impl ToolPort for FakeTool {
         self.definitions_snapshot()
     }
 
-    fn invoke<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a> {
+    fn invoke<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        progress: ToolProgressSink,
+    ) -> ToolFuture<'a> {
         Box::pin(async move {
             self.invocations
                 .lock()
@@ -130,6 +149,12 @@ impl ToolPort for FakeTool {
                 FakeToolResult::InfrastructureError(message) => Err(ToolPortError::new(message)),
                 FakeToolResult::GatedSuccess { gate, content } => {
                     gate.wait().await;
+                    Ok(RichToolResult::success(content))
+                }
+                FakeToolResult::StreamingSuccess { chunks, content } => {
+                    for chunk in chunks {
+                        progress.push_text(&chunk);
+                    }
                     Ok(RichToolResult::success(content))
                 }
             }

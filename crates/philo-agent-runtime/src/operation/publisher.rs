@@ -66,6 +66,10 @@ impl OperationPublisher {
         &self.shared
     }
 
+    pub(crate) fn shared_arc(&self) -> Arc<OperationShared> {
+        Arc::clone(&self.shared)
+    }
+
     pub fn push(&self, event: AgentEvent) {
         self.shared.publish(event);
     }

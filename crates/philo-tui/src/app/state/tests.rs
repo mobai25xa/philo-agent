@@ -66,10 +66,16 @@ fn submit_echoes_the_message_and_requests_a_prompt() {
     assert_eq!(
         effects,
         vec![
-            Effect::Append(vec![TranscriptLine {
-                kind: LineKind::User,
-                text: "> hello".to_owned(),
-            }]),
+            Effect::Append(vec![
+                TranscriptLine {
+                    kind: LineKind::User,
+                    text: "You".to_owned(),
+                },
+                TranscriptLine {
+                    kind: LineKind::User,
+                    text: "  hello".to_owned(),
+                },
+            ]),
             Effect::Submit {
                 text: "hello".to_owned(),
                 attachments: Vec::new(),
@@ -231,9 +237,10 @@ fn a_clipboard_image_joins_the_queue_and_rides_the_next_message() {
     assert_eq!(
         texts(&appended(&effects)),
         [
-            "> what is this?",
-            "> [attached shots/a.png]",
-            "> [attached clipboard image (image/png, 2.0 KB)]",
+            "You",
+            "  what is this?",
+            "  [attached shots/a.png]",
+            "  [attached clipboard image (image/png, 2.0 KB)]",
         ]
     );
     let Effect::Submit { attachments, .. } = &effects[1] else {
@@ -510,7 +517,10 @@ fn overlays_never_swallow_agent_events() {
         status: OperationStatus::Succeeded,
         durability: SettlementDurability::Confirmed,
     });
-    assert_eq!(texts(&appended(&effects)), ["done (succeeded)"]);
+    assert!(
+        appended(&effects).is_empty(),
+        "successful settlement stays off the transcript"
+    );
 }
 
 #[test]

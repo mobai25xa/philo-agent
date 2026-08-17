@@ -62,7 +62,7 @@ fn render(app: &App, width: u16, height: u16) -> Vec<String> {
 fn composer_row(app: &App, width: u16, height: u16) -> usize {
     render(app, width, height)
         .iter()
-        .position(|line| line.contains("Message"))
+        .position(|line| line.contains('┌'))
         .expect("composer border remains visible")
 }
 
@@ -82,9 +82,9 @@ fn assert_responsive_composer(app: &App, expected_rows: &[(u16, usize)]) {
             expected_row,
             "transient state moved the {width}-column composer",
         );
-        let viewport = composer::viewport(&app.input, usize::from(width - 2), 4);
+        let viewport = composer::viewport(&app.input, usize::from(width - 2), 1);
         assert!(viewport.cursor_x < usize::from(width - 2));
-        assert!(viewport.cursor_y < 4);
+        assert!(viewport.cursor_y < 1);
         assert!(
             viewport
                 .rows
@@ -96,7 +96,7 @@ fn assert_responsive_composer(app: &App, expected_rows: &[(u16, usize)]) {
     assert!(
         render(app, 40, frame::MIN_SUPPORTED_HEIGHT)
             .iter()
-            .any(|line| line.contains("Message")),
+            .any(|line| line.contains('┌')),
         "the composer remains visible at the minimum supported height",
     );
 }
@@ -159,7 +159,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         app.activity_view(40)
             .expect("tool activity")
             .text
-            .contains("tool 1/2  read_file")
+            .contains("tool  read_file")
     );
     assert_responsive_composer(&app, &expected_rows);
     let tool_screen = indexed_screen(&app, 40, frame::VIEWPORT_HEIGHT);

@@ -62,12 +62,15 @@ fn panel_areas(area: Rect) -> PanelAreas {
     let height = area.height;
     let status_height = u16::from(height >= 2);
     let activity_height = u16::from(height >= 6);
-    let live_height = u16::from(height >= 7);
-    let minimum_popover = u16::from(height >= MIN_SUPPORTED_HEIGHT);
-    let reserved = status_height + activity_height + live_height + minimum_popover;
-    let composer_height = height.saturating_sub(reserved).min(6);
-    let popover_height =
-        height.saturating_sub(status_height + activity_height + live_height + composer_height);
+    let composer_height = if height >= MIN_SUPPORTED_HEIGHT {
+        3
+    } else {
+        height
+            .saturating_sub(status_height + activity_height)
+            .min(3)
+    };
+    let composer_height = composer_height.min(height.saturating_sub(status_height));
+    let live_height = height.saturating_sub(status_height + activity_height + composer_height);
 
     let mut y = area.y;
     let mut take = |slot_height| {
@@ -78,7 +81,7 @@ fn panel_areas(area: Rect) -> PanelAreas {
     PanelAreas {
         activity: take(activity_height),
         live: take(live_height),
-        popover: take(popover_height),
+        popover: take(0),
         composer: take(composer_height),
         status: take(status_height),
     }
@@ -112,7 +115,13 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRende
 
     let hint = app
         .completion_line()
-        .or_else(|| app.attachments().summary())
+        .or_else(|| {
+            if app.attachments().is_empty() {
+                None
+            } else {
+                app.attachments().summary()
+            }
+        })
         .map(|line| text::truncate(&line, width));
     let hint_height = u16::from(hint.is_some());
     let live_height = area.height.saturating_sub(hint_height);
@@ -120,23 +129,64 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRende
     let hint_area = Rect::new(area.x, live_area.bottom(), area.width, hint_height);
 
     if !live_area.is_empty() {
-        if let Some((kind, partial)) = app.transcript.partial() {
-            draw_live_stream(frame, markdown, live_area, kind, partial);
-        } else {
-            let details = app.activity_detail_rows(width, usize::from(live_height));
-            if details.is_empty() {
-                draw_idle_chrome(frame, app, live_area);
-            } else {
-                let lines = details
-                    .into_iter()
-                    .map(|row| Line::styled(row, theme::meta()))
-                    .collect::<Vec<_>>();
-                frame.render_widget(Paragraph::new(lines), live_area);
-            }
-        }
+        draw_timeline(frame, app, markdown, live_area);
     }
     if let Some(hint) = hint {
         frame.render_widget(Paragraph::new(Line::styled(hint, theme::meta())), hint_area);
+    }
+}
+
+fn draw_timeline(
+    frame: &mut ratatui::Frame<'_>,
+    app: &App,
+    markdown: &MarkdownRenderer,
+    area: Rect,
+) {
+    let width = usize::from(area.width);
+    let height = usize::from(area.height);
+    let think = app.transcript.live_reasoning();
+    let answer = app.transcript.live_answer();
+    let tool = app.activity_timeline_row(width);
+    let tool_height = u16::from(tool.is_some() && height > 1);
+    let stream_height = area.height.saturating_sub(tool_height);
+    let stream_area = Rect::new(area.x, area.y, area.width, stream_height);
+    let tool_area = Rect::new(area.x, stream_area.bottom(), area.width, tool_height);
+
+    if let Some(answer) = answer {
+        draw_live_stream(frame, markdown, stream_area, LineKind::Answer, answer);
+    } else if let Some(think) = think {
+        draw_live_stream(frame, markdown, stream_area, LineKind::Reasoning, think);
+    } else if stream_height > 0 {
+        let details = app.activity_detail_rows(width, usize::from(stream_height));
+        if details.is_empty() {
+            draw_idle_chrome(frame, app, stream_area);
+        } else {
+            let lines = details
+                .into_iter()
+                .map(|row| Line::styled(row, theme::meta()))
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), stream_area);
+        }
+    }
+
+    if let Some(tool) = tool {
+        if tool_area.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    text::truncate(&tool, width),
+                    theme::activity_tool(),
+                )),
+                area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    text::truncate(&tool, width),
+                    theme::activity_tool(),
+                )),
+                tool_area,
+            );
+        }
     }
 }
 
@@ -147,6 +197,9 @@ fn draw_live_stream(
     kind: LineKind,
     partial: &str,
 ) {
+    if area.is_empty() {
+        return;
+    }
     let width = usize::from(area.width);
     let height = usize::from(area.height);
     if height == 1 {
@@ -172,14 +225,6 @@ fn draw_live_stream(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn live_row(markdown: &MarkdownRenderer, kind: LineKind, preview: TranscriptLine) -> Line<'static> {
-    match kind {
-        LineKind::Answer => markdown.preview(&preview),
-        LineKind::Reasoning => Line::styled(preview.text, theme::reasoning()),
-        _ => markdown.preview(&preview),
-    }
-}
-
 fn other_label(kind: LineKind) -> &'static str {
     match kind {
         LineKind::User => "you",
@@ -189,6 +234,14 @@ fn other_label(kind: LineKind) -> &'static str {
         LineKind::Meta => "meta",
         LineKind::Answer => "answer",
         LineKind::Reasoning => "think",
+    }
+}
+
+fn live_row(markdown: &MarkdownRenderer, kind: LineKind, preview: TranscriptLine) -> Line<'static> {
+    match kind {
+        LineKind::Answer => markdown.preview(&preview),
+        LineKind::Reasoning => Line::styled(preview.text, theme::reasoning()),
+        _ => markdown.preview(&preview),
     }
 }
 
@@ -218,29 +271,12 @@ fn draw_idle_chrome(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         return;
     }
     let width = usize::from(area.width);
-    let mut lines = Vec::new();
     if area.height >= 1 {
-        lines.push(Line::styled("─".repeat(width), theme::rule()));
+        frame.render_widget(
+            Paragraph::new(Line::styled("─".repeat(width), theme::rule())),
+            area,
+        );
     }
-    if area.height >= 2 {
-        lines.push(Line::from(vec![Span::styled(
-            text::truncate(&app.status.model, width),
-            theme::activity_normal(),
-        )]));
-    }
-    if area.height >= 3 {
-        lines.push(Line::styled(
-            text::truncate(&format!("session  {}", app.status.session), width),
-            theme::meta(),
-        ));
-    }
-    if area.height >= 4 {
-        lines.push(Line::styled(
-            text::truncate("enter send  ·  ctrl+j newline  ·  /help", width),
-            theme::meta(),
-        ));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -254,11 +290,7 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     } else {
         theme::border()
     };
-    let title = composer_title(app, usize::from(area.width));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border)
-        .title(title);
+    let block = Block::default().borders(Borders::ALL).border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -270,9 +302,8 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         usize::from(inner.width),
         usize::from(inner.height),
     );
-    let placeholder = app.input.is_empty().then_some("type a message");
     frame.render_widget(
-        Paragraph::new(composer::styled_rows(&view.rows, placeholder)),
+        Paragraph::new(composer::styled_rows(&view.rows, None)),
         inner,
     );
     if app.input_focused() {
@@ -286,43 +317,30 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn composer_title(app: &App, width: usize) -> String {
-    let hint = if app.has_overlay() {
-        "draft kept"
-    } else if app.status.busy {
-        "enter queues"
-    } else if !app.attachments().is_empty() {
-        "enter send  ·  image attached"
-    } else {
-        "enter send"
-    };
-    let title = format!(" Message · {hint} ");
-    if text::width(&title) + 2 <= width {
-        title
-    } else {
-        " Message ".to_owned()
-    }
-}
-
 fn draw_status(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     if area.is_empty() {
         return;
     }
     let raw = app.status.line_for_width(usize::from(area.width));
+    let lead = if app.status.compacting || app.status.busy {
+        theme::status_busy()
+    } else {
+        theme::status_idle()
+    };
     let spans = raw
-        .split(" · ")
+        .split("  ")
         .enumerate()
         .flat_map(|(index, field)| {
-            let style = if field == "idle" {
-                theme::status_idle()
-            } else if field.starts_with("busy") || field.starts_with("compacting") {
+            let style = if index == 0 {
+                lead
+            } else if field.starts_with("compact") || field.starts_with("queued") {
                 theme::status_busy()
             } else {
                 theme::meta()
             };
             let mut parts = Vec::new();
             if index > 0 {
-                parts.push(Span::styled(" · ", theme::rule()));
+                parts.push(Span::styled("  ", theme::rule()));
             }
             parts.push(Span::styled(field.to_owned(), style));
             parts
@@ -377,8 +395,8 @@ mod tests {
     #[test]
     fn composer_geometry_is_independent_of_transient_state() {
         let baseline = panel_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT));
-        assert_eq!(baseline.composer.height, 6);
-        assert_eq!(baseline.popover.height, 3);
+        assert_eq!(baseline.composer.height, 3);
+        assert_eq!(baseline.live.height, 7);
         for height in [MIN_SUPPORTED_HEIGHT, VIEWPORT_HEIGHT, 20] {
             let areas = panel_areas(Rect::new(0, 0, 80, height));
             assert_eq!(areas.composer.bottom(), areas.status.y);
@@ -390,7 +408,7 @@ mod tests {
         let composer_row = |app: &App| {
             render(app, 80, VIEWPORT_HEIGHT)
                 .lines()
-                .position(|line| line.contains("Message"))
+                .position(|line| line.contains('┌'))
                 .expect("composer border")
         };
         let expected = composer_row(&app());
@@ -467,7 +485,7 @@ mod tests {
         )));
         let rendered = render(&app, 40, MIN_SUPPORTED_HEIGHT);
         assert!(rendered.contains("Approval required"));
-        assert!(rendered.contains("Message"));
+        assert!(rendered.contains('┌'));
         assert!(rendered.contains("draft"));
     }
 }

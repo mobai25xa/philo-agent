@@ -1,10 +1,11 @@
 ---
 source: crates/philo-tui/src/tests/compaction.rs
+assertion_line: 192
 expression: "output.join(\"\\n\")"
 ---
-status: model model-a · session s-1 · compacting [|] · tokens in 9000 out -
+status: model-a  s-1  compact |  in 9.0k
 Meta: context compacted
-status: model model-a · session s-1 · busy
+status: model-a  s-1
 Error: compaction failed: summary model unavailable; continuing without compaction
 partial: Some((Answer, "turn continues"))
-status: model model-a · session s-1 · busy · tokens in 4000 out -
+status: model-a  s-1  in 4.0k

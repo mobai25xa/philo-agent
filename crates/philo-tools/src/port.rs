@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{RichToolResult, ToolArguments, ToolDefinition, ToolInvocation};
+use crate::{RichToolResult, ToolArguments, ToolDefinition, ToolInvocation, ToolProgressSink};
 
 /// Infrastructure failure that prevented a normal tool result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +31,17 @@ pub type ToolHandlerFuture<'a> = Pin<Box<dyn Future<Output = RichToolResult> + S
 /// display detail); infrastructure failures stay a Registry/Port concern.
 pub trait ToolHandler: Send + Sync {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a>;
+
+    /// Default: ignore the sink and produce the same one-shot result as
+    /// [`ToolHandler::call`]. Streaming tools override this method.
+    fn call_with_progress<'a>(
+        &'a self,
+        arguments: ToolArguments,
+        progress: ToolProgressSink,
+    ) -> ToolHandlerFuture<'a> {
+        let _ = progress;
+        self.call(arguments)
+    }
 }
 
 impl<F, Fut> ToolHandler for F
@@ -46,7 +57,11 @@ where
 /// Port used by Runtime; it has no persistence or kernel responsibilities.
 pub trait ToolPort: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
-    fn invoke<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a>;
+    fn invoke<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        progress: ToolProgressSink,
+    ) -> ToolFuture<'a>;
 }
 
 pub(crate) type Handler = Arc<dyn ToolHandler>;

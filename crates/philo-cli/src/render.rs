@@ -53,6 +53,8 @@ pub struct Renderer {
     cancel_reason: Option<CancelReason>,
     /// `[ui].show_reasoning`: when off, reasoning never reaches stderr.
     show_reasoning: bool,
+    /// A live tool-progress line is being overwritten on stderr.
+    progress_open: bool,
 }
 
 impl Renderer {
@@ -65,6 +67,7 @@ impl Renderer {
             tool_batch_size: 0,
             cancel_reason: None,
             show_reasoning: true,
+            progress_open: false,
         }
     }
 
@@ -87,6 +90,13 @@ impl Renderer {
         if self.reasoning_open {
             outputs.push(err("\n"));
             self.reasoning_open = false;
+        }
+    }
+
+    fn close_progress(&mut self, outputs: &mut Vec<Output>) {
+        if self.progress_open {
+            outputs.push(err("\n"));
+            self.progress_open = false;
         }
     }
 
@@ -183,6 +193,16 @@ impl Renderer {
                     )));
                 }
             }
+            AgentEvent::ToolExecutionProgress { tail, .. } => {
+                self.close_reasoning(&mut outputs);
+                if !self.quiet() {
+                    let line = progress_line(tail, if self.verbose() { 160 } else { 80 });
+                    if !line.is_empty() {
+                        outputs.push(err(format!("\r{line}")));
+                        self.progress_open = true;
+                    }
+                }
+            }
             // M10: the event carries the durable result and the display
             // channel; both render to stderr only.
             AgentEvent::ToolExecutionCompleted {
@@ -192,6 +212,7 @@ impl Renderer {
                 ..
             } => {
                 self.close_reasoning(&mut outputs);
+                self.close_progress(&mut outputs);
                 let summary = match result {
                     philo_agent_runtime::ToolResult::Success { content } => {
                         format!("ok: {}", preview(content, 80))
@@ -349,6 +370,18 @@ fn preview(text: &str, max_chars: usize) -> String {
     format!("{kept}...")
 }
 
+fn progress_line(tail: &str, max_chars: usize) -> String {
+    let last = tail
+        .rsplit('\n')
+        .next()
+        .unwrap_or(tail)
+        .rsplit('\r')
+        .next()
+        .unwrap_or("")
+        .trim();
+    preview(last, max_chars)
+}
+
 fn usage_line(usage: &TokenUsage) -> String {
     let part = |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
     let mut line = format!(
@@ -447,6 +480,12 @@ mod tests {
                     text("hel"),
                     text("lo"),
                     usage(),
+                    AgentEvent::ToolExecutionProgress {
+                        tool_batch_id: ToolBatchId::new("batch"),
+                        tool_call_id: ToolCallId::new("tool"),
+                        index: 0,
+                        tail: "live-progress".to_owned(),
+                    },
                     settled(OperationStatus::Succeeded, SettlementDurability::Confirmed),
                 ],
             );
@@ -456,6 +495,35 @@ mod tests {
                 "stdout is exactly the answer plus the final newline ({verbosity:?})"
             );
         }
+    }
+
+    #[test]
+    fn tool_progress_stays_on_stderr_and_overwrites() {
+        let mut renderer = Renderer::new(Verbosity::Default);
+        let outputs = render_all(
+            &mut renderer,
+            &[
+                AgentEvent::ToolExecutionProgress {
+                    tool_batch_id: ToolBatchId::new("batch"),
+                    tool_call_id: ToolCallId::new("tool"),
+                    index: 0,
+                    tail: "first\nsecond".to_owned(),
+                },
+                AgentEvent::ToolExecutionCompleted {
+                    tool_batch_id: ToolBatchId::new("batch"),
+                    tool_call_id: ToolCallId::new("tool"),
+                    index: 0,
+                    tool_name: "shell".to_owned(),
+                    result: philo_agent_runtime::ToolResult::success("ok"),
+                    display: None,
+                },
+            ],
+        );
+        assert_eq!(stdout_text(&outputs), "");
+        let stderr = stderr_text(&outputs);
+        assert!(stderr.contains('\r'), "{stderr:?}");
+        assert!(stderr.contains("second"), "{stderr:?}");
+        assert!(stderr.contains("shell -> ok"), "{stderr:?}");
     }
 
     #[test]

@@ -36,8 +36,8 @@ pub use outcome::{
 pub use philo_session::CancelReason;
 pub use philo_tools::{
     EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolFact, ToolFuture,
-    ToolHandler, ToolHandlerFuture, ToolInvocation, ToolPort, ToolPortError, ToolRegistry,
-    ToolRegistryBuilder, ToolResult, ToolResultError, ToolSchema, ToolSchemaInput,
+    ToolHandler, ToolHandlerFuture, ToolInvocation, ToolPort, ToolPortError, ToolProgressSink,
+    ToolRegistry, ToolRegistryBuilder, ToolResult, ToolResultError, ToolSchema, ToolSchemaInput,
 };
 pub use runtime::AgentRuntime;
 pub use snapshot::{ModelCallSnapshot, TurnSnapshot};

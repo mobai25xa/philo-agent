@@ -65,10 +65,19 @@ pub enum AgentEvent {
         tool_name: String,
         arguments: String,
     },
+    /// Transient live tail for one in-flight tool call. Never written to
+    /// the Session. Published after the matching `Started` and before that
+    /// call's `Completed`. Same-call unconsumed events are replaced.
+    ToolExecutionProgress {
+        tool_batch_id: ToolBatchId,
+        tool_call_id: ToolCallId,
+        index: usize,
+        tail: String,
+    },
     /// Published only after the results barrier (or cancellation
     /// transaction) committed. `result` is same-source-same-value with the
     /// durable `SessionToolResult`; `display` is the transient display
-    /// channel's only outlet. Both reuse the `philo-tools` types directly.
+    /// channel's terminal outlet. Both reuse the `philo-tools` types directly.
     ToolExecutionCompleted {
         tool_batch_id: ToolBatchId,
         tool_call_id: ToolCallId,

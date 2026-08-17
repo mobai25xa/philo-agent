@@ -6,14 +6,7 @@
 
 use philo_session::{ContextMessage, SessionContextView, SessionUserPart, ToolResultOutcome};
 
-use super::transcript::{LineKind, TranscriptLine, compact_args, preview};
-
-fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
-    TranscriptLine {
-        kind,
-        text: text.into(),
-    }
-}
+use super::transcript::{LineKind, TranscriptLine, compact_args, line, preview};
 
 /// Replays one session's model-visible context as transcript lines.
 pub(crate) fn history_lines(view: &SessionContextView) -> Vec<TranscriptLine> {
@@ -46,7 +39,11 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
             .split('\n')
             .map(|text| line(LineKind::Notice, format!("[summary] {text}")))
             .collect(),
-        ContextMessage::User { parts } => parts.iter().map(user_part_line).collect(),
+        ContextMessage::User { parts } => {
+            let mut lines = vec![line(LineKind::User, "You")];
+            lines.extend(parts.iter().map(user_part_line));
+            lines
+        }
         ContextMessage::Assistant { content } => content
             .split('\n')
             .map(|text| line(LineKind::Answer, text.to_owned()))
@@ -61,6 +58,8 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
             })
             .collect(),
         ContextMessage::ToolResult { outcome, .. } => {
+            // Replay keeps the older `ok · {content}` summary: ToolDisplay
+            // is not durable, so live cards cannot be reconstructed.
             vec![line(
                 LineKind::Tool,
                 format!("  └ {}", outcome_text(outcome)),
@@ -71,10 +70,10 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
 
 fn user_part_line(part: &SessionUserPart) -> TranscriptLine {
     match part {
-        SessionUserPart::Text(text) => line(LineKind::User, format!("> {}", preview(text, 200))),
+        SessionUserPart::Text(text) => line(LineKind::User, format!("  {}", preview(text, 200))),
         SessionUserPart::Image { media_type, bytes } => line(
             LineKind::User,
-            format!("> [image {media_type}, {} bytes]", bytes.len()),
+            format!("  [image {media_type}, {} bytes]", bytes.len()),
         ),
     }
 }
@@ -105,7 +104,8 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "User: > count the files",
+                "User: You",
+                "User:   count the files",
                 "Tool: ▸ read_file  path: src/main.rs",
                 "Tool:   └ ok · fn main() {}",
                 "Answer: one file",
@@ -118,7 +118,10 @@ mod tests {
         let view = crate::tests::support::image_session_view("s-img");
         let lines = history_lines(&view);
         let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
-        assert_eq!(texts, ["> look at this", "> [image image/png, 4 bytes]"]);
+        assert_eq!(
+            texts,
+            ["You", "  look at this", "  [image image/png, 4 bytes]"]
+        );
     }
 
     #[test]
@@ -140,7 +143,7 @@ mod tests {
         let view = session_view("s-1");
         assert_eq!(
             preview_lines(&view, 2),
-            ["> count the files".to_owned(), "...".to_owned()]
+            ["You".to_owned(), "...".to_owned()]
         );
         let empty = crate::tests::support::empty_session_view("s-empty");
         assert_eq!(preview_lines(&empty, 4), ["(empty session)".to_owned()]);

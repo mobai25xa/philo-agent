@@ -69,7 +69,7 @@ impl Attachments {
         if self.items.is_empty() {
             return None;
         }
-        Some(format!("attach  {}", self.labels().join("  ·  ")))
+        Some(self.labels().join("  ·  "))
     }
 }
 
@@ -112,7 +112,7 @@ mod tests {
         );
         assert_eq!(
             attachments.summary(),
-            Some("attach  shots/a.png  ·  clipboard image (image/png, 2.0 KB)".to_owned())
+            Some("shots/a.png  ·  clipboard image (image/png, 2.0 KB)".to_owned())
         );
     }
 

@@ -5,7 +5,7 @@
 //! Every handler produces a dual-channel [`philo_tools::RichToolResult`]:
 //! the model channel is truncated and finalized inside the handler (the
 //! durable fact equals what the model sees), the display channel carries
-//! full untruncated detail for transient presentation.
+//! bounded human-readable detail for transient presentation.
 //!
 //! Every failure here is a business error (`ToolResult::Error` with a
 //! stable code); this crate never raises `ToolPortError` infrastructure
@@ -13,7 +13,7 @@
 //! workspace root with a two-phase containment check (lexical, then
 //! canonical — symlink escapes are rejected).
 //!
-//! The `shell` tool needs a tokio runtime (process + time); composition
+//! The `shell` tool needs a tokio runtime (io-util + process + time); composition
 //! roots provide one (`philo-cli` does). The other five tools are
 //! runtime-agnostic.
 //!
@@ -51,8 +51,9 @@ pub use grep::{DEFAULT_MAX_GREP_MATCHES, GREP_TOOL_NAME, GrepTool};
 pub use list::{DEFAULT_MAX_LIST_ENTRIES, LIST_TOOL_NAME, ListTool};
 pub use read::{DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_READ_LINES, READ_TOOL_NAME, ReadTool};
 pub use shell::{
-    DEFAULT_SHELL_MAX_OUTPUT_BYTES, DEFAULT_SHELL_MAX_OUTPUT_LINES, DEFAULT_SHELL_MAX_TIMEOUT_SECS,
-    DEFAULT_SHELL_TIMEOUT_SECS, SHELL_TOOL_NAME, ShellTool,
+    DEFAULT_SHELL_MAX_DISPLAY_BYTES, DEFAULT_SHELL_MAX_OUTPUT_BYTES,
+    DEFAULT_SHELL_MAX_OUTPUT_LINES, DEFAULT_SHELL_MAX_TIMEOUT_SECS, DEFAULT_SHELL_TIMEOUT_SECS,
+    SHELL_TOOL_NAME, ShellTool,
 };
 pub use write::{WRITE_TOOL_NAME, WriteTool};
 

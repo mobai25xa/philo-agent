@@ -1,45 +1,46 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
+assertion_line: 469
 expression: snapshot
 ---
 40 columns
-| tool 1/1  read_file
+| tool  read_file
 path: src/中 文 .rs
 
 
 
-┌ Message · enter queues ──────────────┐
-│› 中 文  é 👩‍💻  and a long draft that wrap│
+
+
+read_file  path: src/中 文 .rs
+┌──────────────────────────────────────┐
 │  s inside the composer               │
-│                                      │
-│                                      │
 └──────────────────────────────────────┘
-session session-中 文  · busy
+gpt-test  session-中 文
 
 80 columns
-| tool 1/1  read_file
+| tool  read_file
 path: src/中 文 .rs
 
 
 
-┌ Message · enter queues ──────────────────────────────────────────────────────┐
+
+
+read_file  path: src/中 文 .rs
+┌──────────────────────────────────────────────────────────────────────────────┐
 │› 中 文  é 👩‍💻  and a long draft that wraps inside the composer                   │
-│                                                                              │
-│                                                                              │
-│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-model gpt-test · session session-中 文  · busy
+gpt-test  session-中 文
 
 120 columns
-| tool 1/1  read_file
+| tool  read_file
 path: src/中 文 .rs
 
 
 
-┌ Message · enter queues ──────────────────────────────────────────────────────────────────────────────────────────────┐
+
+
+read_file  path: src/中 文 .rs
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │› 中 文  é 👩‍💻  and a long draft that wraps inside the composer                                                           │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-model gpt-test · session session-中 文  · busy
+gpt-test  session-中 文

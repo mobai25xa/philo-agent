@@ -1,15 +1,17 @@
 ---
 source: crates/philo-tui/src/tests/integration.rs
+assertion_line: 307
 expression: "format!(\"HISTORY\\n{history}\\n\\nTOOL\\n{tool_screen}\\n\\nCANCELLING\\n{cancelling_screen}\\n\\nAPPROVAL\\n{approval_screen}\")"
 ---
 HISTORY
-Reasoning: think │ checking constraints
+Reasoning: think
+Reasoning:   checking constraints
 Answer: # Stable output
 Answer: 012345678901234567890123456789012345678901234567890123456789012345678...
 Answer: ```rust
 Answer: fn main() { println!("稳定"); }
 Answer: ```
-Tool: ▸ read_file  ok · result-result-result-result-result-result-result-re...
+Tool: ▸ read_file  src/中文.rs  840 B
 Meta: context compacted
 Answer: after tool
 Answer:  late-but-preserved
@@ -17,18 +19,18 @@ Notice: turn cancelled (user)
 Meta: done (cancelled)
 
 TOOL
-00: | tool 1/2  read_file
+00: | tool  read_file
 01: path: src/中 文 .rs
 02: 
 03: 
 04: 
-05: ┌ Message · enter queues ──────────────┐
-06: │  long composer draft 中 文  é 👩‍💻        │
-07: │  long composer draft 中 文  é 👩‍💻        │
-08: │  long composer draft 中 文  é 👩‍💻        │
+05: 
+06: 
+07: read_file  path: src/中 文 .rs
+08: ┌──────────────────────────────────────┐
 09: │  long composer draft                 │
 10: └──────────────────────────────────────┘
-11: session session-m14 · busy · queued 1
+11: model-m14  session-m14  queued 1
 
 CANCELLING
 00: | cancel  user
@@ -36,13 +38,13 @@ CANCELLING
 02: late-but-preserved
 03: 
 04: 
-05: ┌ Message · enter queues ──────────────┐
-06: │  long composer draft 中 文  é 👩‍💻        │
-07: │  long composer draft 中 文  é 👩‍💻        │
-08: │  long composer draft 中 文  é 👩‍💻        │
+05: 
+06: 
+07: 
+08: ┌──────────────────────────────────────┐
 09: │  long composer draft                 │
 10: └──────────────────────────────────────┘
-11: session session-m14 · busy · queued 1
+11: model-m14  session-m14  queued 1
 
 APPROVAL
 00: ! Approval required
@@ -50,10 +52,10 @@ APPROVAL
 02: src/中 文 .rs
 03: y allow  ·  n / esc deny
 04: 
-05: ┌ Message · draft kept ────────────────┐
-06: │  long composer draft 中 文  é 👩‍💻        │
-07: │  long composer draft 中 文  é 👩‍💻        │
-08: │  long composer draft 中 文  é 👩‍💻        │
+05: 
+06: 
+07: 
+08: ┌──────────────────────────────────────┐
 09: │  long composer draft                 │
 10: └──────────────────────────────────────┘
-11: session session-m14 · idle
+11: model-m14  session-m14

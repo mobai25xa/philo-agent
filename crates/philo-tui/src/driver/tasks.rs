@@ -478,7 +478,7 @@ mod tests {
     }
 
     async fn yield_until(mut condition: impl FnMut() -> bool) {
-        for _ in 0..100 {
+        for _ in 0..256 {
             if condition() {
                 return;
             }

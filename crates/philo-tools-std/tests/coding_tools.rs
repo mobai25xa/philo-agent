@@ -8,7 +8,9 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use philo_tools::{EffectClass, RichToolResult, ToolArguments, ToolHandler, ToolResult};
+use philo_tools::{
+    EffectClass, RichToolResult, ToolArguments, ToolHandler, ToolProgressSink, ToolResult,
+};
 use philo_tools_std::{EditTool, GrepTool, ListTool, ShellTool, WriteTool, error_code};
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -445,7 +447,47 @@ fn shell_truncates_long_output_with_a_marker() {
     let display = result.display().expect("display present");
     assert!(
         display.detail().contains("line-5"),
-        "display keeps the full output"
+        "small outputs still fit in the display cap"
+    );
+}
+
+#[test]
+fn shell_streams_progress_and_caps_display() {
+    use std::sync::{Arc, Mutex};
+    let root = TempRoot::new();
+    let tool = ShellTool::new(&root.path).with_max_display_bytes(16);
+    let pushed = Arc::new(Mutex::new(String::new()));
+    let pushed_for_sink = Arc::clone(&pushed);
+    let sink = ToolProgressSink::from_fn(move |text| {
+        pushed_for_sink.lock().expect("pushed").push_str(text);
+    });
+    let command = if cfg!(windows) {
+        r#"{"command":"Write-Output \"abcdefghijklmnopqrstuvwxyz\""}"#
+    } else {
+        r#"{"command":"printf abcdefghijklmnopqrstuvwxyz"}"#
+    };
+    let arguments = ToolArguments::parse(command).expect("valid JSON");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let result = runtime.block_on(tool.call_with_progress(arguments, sink));
+    let live = pushed.lock().expect("pushed").clone();
+    assert!(
+        live.contains("abcd"),
+        "incremental output reached the sink: {live:?}"
+    );
+    let display = result.display().expect("display").detail().to_owned();
+    assert!(display.len() <= 16, "display is capped: {display:?}");
+    assert_eq!(
+        result
+            .display()
+            .unwrap()
+            .facts()
+            .iter()
+            .find(|fact| fact.name() == "truncated")
+            .map(|fact| fact.value()),
+        Some("true")
     );
 }
 

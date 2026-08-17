@@ -1,7 +1,9 @@
 //! State shared between an operation's handle, its engine, and the scheduler.
 
 use super::scheduler::Scheduler;
-use crate::{AgentEvent, OperationId, OperationOutcome, OperationPhase, OperationStatus, TurnId};
+use crate::{
+    AgentEvent, OperationId, OperationOutcome, OperationPhase, OperationStatus, ToolCallId, TurnId,
+};
 use philo_session::CancelReason;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +71,33 @@ impl OperationShared {
         let waker = {
             let mut inner = self.inner.lock().expect("operation mutex");
             inner.events.push_back(event);
+            inner.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Publishes a tool-progress snapshot, replacing any unconsumed
+    /// progress for the same `tool_call_id` instead of growing the queue.
+    pub(crate) fn publish_tool_progress(&self, event: AgentEvent) {
+        let Some(call_id) = progress_call_id(&event) else {
+            self.publish(event);
+            return;
+        };
+        let waker = {
+            let mut inner = self.inner.lock().expect("operation mutex");
+            if let Some(existing) = inner.events.iter_mut().rev().find(|queued| {
+                matches!(
+                    queued,
+                    AgentEvent::ToolExecutionProgress { tool_call_id, .. }
+                        if *tool_call_id == call_id
+                )
+            }) {
+                *existing = event;
+            } else {
+                inner.events.push_back(event);
+            }
             inner.waker.take()
         };
         if let Some(waker) = waker {
@@ -156,5 +185,12 @@ impl OperationShared {
 
     pub(super) fn register_waker(&self, cx: &std::task::Context<'_>) {
         self.inner.lock().expect("operation mutex").waker = Some(cx.waker().clone());
+    }
+}
+
+fn progress_call_id(event: &AgentEvent) -> Option<ToolCallId> {
+    match event {
+        AgentEvent::ToolExecutionProgress { tool_call_id, .. } => Some(tool_call_id.clone()),
+        _ => None,
     }
 }

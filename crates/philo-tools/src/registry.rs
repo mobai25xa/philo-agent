@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::invocation::ToolArguments;
 use crate::port::{Handler, ToolFuture};
-use crate::{RichToolResult, ToolDefinition, ToolHandler, ToolInvocation, ToolPort};
+use crate::{
+    RichToolResult, ToolDefinition, ToolHandler, ToolInvocation, ToolPort, ToolProgressSink,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
@@ -75,9 +77,14 @@ impl ToolPort for ToolRegistry {
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions()
     }
-    fn invoke<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a> {
+    fn invoke<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        progress: ToolProgressSink,
+    ) -> ToolFuture<'a> {
         Box::pin(async move {
-            // Registry-synthesized errors carry no display detail.
+            // Registry-synthesized errors carry no display detail and
+            // never touch the progress sink.
             let Some((definition, handler)) = self
                 .entries
                 .iter()
@@ -95,7 +102,7 @@ impl ToolPort for ToolRegistry {
             if let Err(message) = definition.validate_arguments(args.as_str()) {
                 return Ok(RichToolResult::error("invalid_arguments", message));
             }
-            Ok(handler.call(args).await)
+            Ok(handler.call_with_progress(args, progress).await)
         })
     }
 }

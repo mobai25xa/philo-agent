@@ -15,4 +15,5 @@ pub(crate) mod session;
 pub(crate) mod state;
 pub(crate) mod status;
 pub(crate) mod text;
+pub(crate) mod tool_card;
 pub(crate) mod transcript;

@@ -125,7 +125,18 @@ impl App {
         if self.confirm.is_some() || self.picker.is_some() {
             return Vec::new();
         }
-        self.activity.detail_rows(width, height)
+        let tail_lines = match self.level {
+            InfoLevel::Verbose => 20,
+            InfoLevel::Default => 5,
+        };
+        self.activity.detail_rows(width, height, tail_lines)
+    }
+
+    pub(crate) fn activity_timeline_row(&self, width: usize) -> Option<String> {
+        if self.confirm.is_some() || self.picker.is_some() {
+            return None;
+        }
+        self.activity.timeline_row(width)
     }
 
     pub(crate) fn has_overlay(&self) -> bool {

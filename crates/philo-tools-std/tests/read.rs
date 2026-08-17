@@ -7,7 +7,9 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use philo_tools::{RichToolResult, ToolInvocation, ToolPort, ToolRegistry, ToolResult};
+use philo_tools::{
+    RichToolResult, ToolInvocation, ToolPort, ToolProgressSink, ToolRegistry, ToolResult,
+};
 use philo_tools_std::{READ_TOOL_NAME, ReadTool, error_code};
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -61,8 +63,11 @@ fn registry(tool: ReadTool) -> ToolRegistry {
 }
 
 fn invoke(registry: &ToolRegistry, arguments: &str) -> RichToolResult {
-    block_on(registry.invoke(ToolInvocation::new("call-1", READ_TOOL_NAME, arguments)))
-        .expect("read tool never raises infrastructure errors")
+    block_on(registry.invoke(
+        ToolInvocation::new("call-1", READ_TOOL_NAME, arguments),
+        ToolProgressSink::noop(),
+    ))
+    .expect("read tool never raises infrastructure errors")
 }
 
 fn error_code_of(rich: &RichToolResult) -> &str {

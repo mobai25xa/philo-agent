@@ -59,47 +59,39 @@ impl StatusData {
     }
 
     /// Responsive status projection. Fields are admitted in preservation
-    /// priority: state, queue, session, model, usage/context, verbose.
+    /// priority: compact/queue, session, model, usage, verbose.
+    /// Idle/busy is color on the first field, not a word.
     pub(crate) fn line_for_width(&self, max_width: usize) -> String {
-        let mut state = if self.compacting {
-            format!(
-                "compacting [{}]",
-                ["|", "/", "-", "\\"][self.compaction_spinner]
-            )
-        } else if self.busy {
-            "busy".to_owned()
-        } else {
-            "idle".to_owned()
-        };
-        if self.config_reload_pending {
-            state.push_str("; reload pending");
-        }
         let mut fields = vec![
-            (0, 3, format!("model {}", self.model)),
-            (1, 2, format!("session {}", self.session)),
-            (2, 0, state),
+            (0, 6, text::truncate(&self.model, 24)),
+            (1, 2, text::truncate(&self.session, 12)),
         ];
+        if self.compacting {
+            fields.push((
+                2,
+                0,
+                format!("compact {}", ["|", "/", "-", "\\"][self.compaction_spinner]),
+            ));
+        }
         if self.queued > 0 {
             fields.push((3, 1, format!("queued {}", self.queued)));
         }
         if let Some(usage) = &self.usage {
-            let value =
-                |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
-            fields.push((
-                4,
-                4,
-                format!(
-                    "tokens in {} out {}",
-                    value(usage.input_tokens),
-                    value(usage.output_tokens)
-                ),
-            ));
             if let (Some(input), Some(window)) = (usage.input_tokens, self.context_window) {
-                fields.push((5, 5, format!("ctx {input}/{window}")));
+                fields.push((
+                    4,
+                    4,
+                    format!("{}/{}", compact_count(input), compact_count(window)),
+                ));
+            } else if let Some(input) = usage.input_tokens {
+                fields.push((4, 4, format!("in {}", compact_count(input))));
             }
         }
         if self.level == InfoLevel::Verbose {
-            fields.push((6, 6, "verbose".to_owned()));
+            fields.push((5, 5, "verbose".to_owned()));
+        }
+        if self.config_reload_pending {
+            fields.push((6, 0, "reload".to_owned()));
         }
 
         let mut admitted: Vec<(usize, String)> = Vec::new();
@@ -110,7 +102,7 @@ impl StatusData {
                 .map(|(_, value)| text::width(value))
                 .sum::<usize>()
                 + text::width(&candidate)
-                + admitted.len() * 3;
+                + admitted.len() * 2;
             if projected_width <= max_width {
                 admitted.push((order, candidate));
             }
@@ -120,25 +112,22 @@ impl StatusData {
             .into_iter()
             .map(|(_, value)| value)
             .collect::<Vec<_>>()
-            .join(" · ");
+            .join("  ");
         if line.is_empty() {
-            text::truncate(
-                if self.compacting {
-                    "compacting"
-                } else if self.busy && self.config_reload_pending {
-                    "busy; reload pending"
-                } else if self.busy {
-                    "busy"
-                } else if self.config_reload_pending {
-                    "idle; reload pending"
-                } else {
-                    "idle"
-                },
-                max_width,
-            )
+            text::truncate(&self.model, max_width)
         } else {
             line
         }
+    }
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1000 {
+        format!("{:.1}k", value as f64 / 1000.0)
+    } else {
+        value.to_string()
     }
 }
 
@@ -149,7 +138,7 @@ mod tests {
     #[test]
     fn status_line_shows_model_session_and_state() {
         let mut status = StatusData::new("gpt-test", "s-1", InfoLevel::Default);
-        assert_eq!(status.line(), "model gpt-test · session s-1 · idle");
+        assert_eq!(status.line(), "gpt-test  s-1");
 
         status.busy = true;
         status.queued = 2;
@@ -162,8 +151,7 @@ mod tests {
         status.level = InfoLevel::Verbose;
         assert_eq!(
             status.line(),
-            "model gpt-test · session s-1 · busy · queued 2 · \
-             tokens in 1200 out 340 · ctx 1200/128000 · verbose"
+            "gpt-test  s-1  queued 2  1.2k/128.0k  verbose"
         );
     }
 
@@ -173,7 +161,7 @@ mod tests {
         status.busy = true;
         status.queued = 3;
         let line = status.line_for_width(40);
-        assert_eq!(line, "session session-123 · busy · queued 3");
+        assert_eq!(line, "session-123  queued 3  verbose");
         assert!(text::width(&line) <= 40);
     }
 
@@ -182,7 +170,7 @@ mod tests {
         let mut status = StatusData::new("gpt-test", "s-1", InfoLevel::Default);
         status.busy = true;
         status.config_reload_pending = true;
-        assert!(status.line().contains("reload pending"));
-        assert!(status.line().contains("busy"));
+        assert!(status.line().contains("reload"));
+        assert!(status.line().contains("gpt-test"));
     }
 }

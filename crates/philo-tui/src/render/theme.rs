@@ -9,7 +9,9 @@ pub(crate) fn user() -> Style {
 }
 
 pub(crate) fn reasoning() -> Style {
-    Style::default().fg(Color::Magenta)
+    Style::default()
+        .fg(Color::Rgb(130, 130, 155))
+        .add_modifier(Modifier::ITALIC)
 }
 
 pub(crate) fn answer() -> Style {
@@ -71,7 +73,7 @@ pub(crate) fn activity_normal() -> Style {
 }
 
 pub(crate) fn activity_reasoning() -> Style {
-    Style::default().fg(Color::Magenta)
+    Style::default().fg(Color::Rgb(130, 130, 155))
 }
 
 pub(crate) fn activity_tool() -> Style {

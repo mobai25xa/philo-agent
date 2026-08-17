@@ -1,14 +1,15 @@
 //! Pure event-to-line projection for the scrollback transcript.
 //!
 //! History lines are append-only once produced (inline discipline: written
-//! lines are never rewritten). Streaming text accumulates in a partial line
-//! exposed separately for the live row of the bottom panel.
+//! lines are never rewritten). Streaming text accumulates in partial buffers
+//! exposed separately for the live timeline of the bottom panel.
+
+use std::collections::HashMap;
 
 use philo_agent_runtime::{AgentEvent, CancelReason, OperationStatus, SettlementDurability};
 
 use super::text;
-
-const DEFAULT_TOOL_SUMMARY_WIDTH: usize = 120;
+use super::tool_card;
 
 /// Information tier of the transcript (the TUI has no quiet tier; `Ctrl+O`
 /// toggles between these two).
@@ -46,11 +47,21 @@ pub struct TranscriptLine {
     pub text: String,
 }
 
-fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
+pub(crate) fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     TranscriptLine {
         kind,
         text: text.into(),
     }
+}
+
+/// Echoes a user message as a `You` block. Session replay uses the same
+/// header for live visual grammar; tool replay stays on the older summary.
+pub(crate) fn user_message_lines(text: &str) -> Vec<TranscriptLine> {
+    let mut lines = vec![line(LineKind::User, "You")];
+    for row in text.split('\n') {
+        lines.push(line(LineKind::User, format!("  {row}")));
+    }
+    lines
 }
 
 /// Streaming projection state for one operation's events.
@@ -58,7 +69,10 @@ fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
 pub struct Transcript {
     partial_answer: String,
     partial_reasoning: String,
+    think_header_written: bool,
     tool_batch_size: usize,
+    tool_args: HashMap<usize, String>,
+    verbose: bool,
     /// `[ui].show_reasoning`: when off, reasoning deltas are dropped rather
     /// than rendered dim (the model still receives them).
     show_reasoning: bool,
@@ -78,10 +92,12 @@ impl Transcript {
         self.show_reasoning = show_reasoning;
         if !show_reasoning {
             self.partial_reasoning.clear();
+            self.think_header_written = false;
         }
     }
 
     /// The unfinished streaming line for the live row, if any.
+    #[cfg(test)]
     pub fn partial(&self) -> Option<(LineKind, &str)> {
         if !self.partial_answer.is_empty() {
             return Some((LineKind::Answer, self.partial_answer.as_str()));
@@ -90,6 +106,22 @@ impl Transcript {
             return Some((LineKind::Reasoning, self.partial_reasoning.as_str()));
         }
         None
+    }
+
+    pub(crate) fn live_answer(&self) -> Option<&str> {
+        if self.partial_answer.is_empty() {
+            None
+        } else {
+            Some(self.partial_answer.as_str())
+        }
+    }
+
+    pub(crate) fn live_reasoning(&self) -> Option<&str> {
+        if self.partial_reasoning.is_empty() {
+            None
+        } else {
+            Some(self.partial_reasoning.as_str())
+        }
     }
 
     /// Flushes any partial content into completed lines.
@@ -103,17 +135,44 @@ impl Transcript {
         lines
     }
 
+    fn drain_think_lines(&mut self, lines: &mut Vec<TranscriptLine>) {
+        while let Some(newline) = self.partial_reasoning.find('\n') {
+            let mut completed: String = self.partial_reasoning.drain(..=newline).collect();
+            completed.pop();
+            if !completed.is_empty() {
+                self.push_think_line(lines, &completed);
+            }
+        }
+    }
+
+    fn push_think_line(&mut self, lines: &mut Vec<TranscriptLine>, row: &str) {
+        if !self.think_header_written {
+            lines.push(line(LineKind::Reasoning, "think"));
+            self.think_header_written = true;
+        }
+        lines.push(line(LineKind::Reasoning, format!("  {row}")));
+    }
+
     fn flush_reasoning(&mut self, lines: &mut Vec<TranscriptLine>) {
+        self.drain_think_lines(lines);
         if !self.partial_reasoning.is_empty() {
             let text = std::mem::take(&mut self.partial_reasoning);
-            lines.push(line(LineKind::Reasoning, format!("think │ {text}")));
+            self.push_think_line(lines, &text);
         }
+        self.think_header_written = false;
+    }
+
+    fn clear_ephemeral(&mut self) {
+        self.tool_batch_size = 0;
+        self.tool_args.clear();
+        self.think_header_written = false;
     }
 
     /// Projects one event into completed transcript lines.
     #[allow(clippy::too_many_lines)]
     pub fn on_event(&mut self, event: &AgentEvent, level: InfoLevel) -> Vec<TranscriptLine> {
-        let verbose = level == InfoLevel::Verbose;
+        self.verbose = level == InfoLevel::Verbose;
+        let verbose = self.verbose;
         let mut lines = Vec::new();
         match event {
             AgentEvent::TextDelta { delta } => {
@@ -132,13 +191,7 @@ impl Transcript {
                     lines.push(line(LineKind::Answer, answer));
                 }
                 self.partial_reasoning.push_str(text);
-                while let Some(newline) = self.partial_reasoning.find('\n') {
-                    let mut completed: String = self.partial_reasoning.drain(..=newline).collect();
-                    completed.pop();
-                    if !completed.is_empty() {
-                        lines.push(line(LineKind::Reasoning, format!("think │ {completed}")));
-                    }
-                }
+                self.drain_think_lines(&mut lines);
             }
             AgentEvent::OperationQueued { .. } => {
                 lines.push(line(LineKind::Notice, "queued behind the active turn"));
@@ -177,92 +230,43 @@ impl Transcript {
                     ));
                 }
             }
-            // Usage drives the status bar, not the transcript.
             AgentEvent::ModelUsageUpdated { .. } => {}
-            AgentEvent::ToolBatchRequested {
-                tool_batch_id,
-                call_count,
-            } => {
+            AgentEvent::ToolBatchRequested { call_count, .. } => {
                 self.flush_reasoning(&mut lines);
                 self.tool_batch_size = *call_count;
-                if verbose {
-                    lines.push(line(
-                        LineKind::Tool,
-                        format!("▸ batch {tool_batch_id}  {call_count} call(s)"),
-                    ));
-                }
+                self.tool_args.clear();
             }
             AgentEvent::ToolExecutionStarted {
-                tool_name,
-                arguments,
-                index,
-                ..
+                arguments, index, ..
             } => {
                 self.flush_reasoning(&mut lines);
-                if verbose {
-                    lines.push(line(
-                        LineKind::Tool,
-                        format!("▸ {tool_name}  {}/{}", index + 1, self.tool_batch_size),
-                    ));
-                    lines.push(line(
-                        LineKind::Tool,
-                        format!("  args  {}", compact_args(arguments)),
-                    ));
-                }
+                self.tool_args.insert(*index, arguments.clone());
             }
+            AgentEvent::ToolExecutionProgress { .. } => {}
             AgentEvent::ToolExecutionCompleted {
                 tool_name,
                 result,
                 display,
+                index,
                 ..
             } => {
                 self.flush_reasoning(&mut lines);
+                let arguments = self.tool_args.remove(index).unwrap_or_default();
                 if verbose {
-                    let (label, full) = match result {
-                        philo_agent_runtime::ToolResult::Success { content } => {
-                            ("ok", content.clone())
-                        }
-                        philo_agent_runtime::ToolResult::Error { code, message } => {
-                            ("error", format!("[{code}] {message}"))
-                        }
-                    };
-                    lines.push(line(LineKind::Tool, format!("▸ {tool_name}  {label}")));
-                    lines.extend(
-                        full.lines()
-                            .map(|result_line| line(LineKind::Tool, format!("  {result_line}"))),
-                    );
-                    if let Some(display) = display {
-                        if !display.detail().is_empty() {
-                            lines.push(line(LineKind::Tool, "  detail"));
-                            lines.extend(display.detail().lines().map(|detail_line| {
-                                line(LineKind::Tool, format!("    {detail_line}"))
-                            }));
-                        }
-                        if !display.facts().is_empty() {
-                            let facts = display
-                                .facts()
-                                .iter()
-                                .map(|fact| format!("{}={}", fact.name(), fact.value()))
-                                .collect::<Vec<_>>()
-                                .join("  ");
-                            lines.push(line(LineKind::Tool, format!("  facts  {facts}")));
-                        }
-                    }
+                    lines.extend(tool_card::verbose_card(
+                        tool_name,
+                        *index,
+                        self.tool_batch_size,
+                        &arguments,
+                        result,
+                        display.as_ref(),
+                    ));
                 } else {
-                    let summary = match result {
-                        philo_agent_runtime::ToolResult::Success { content } => {
-                            format!("ok · {}", preview(content, 80))
-                        }
-                        philo_agent_runtime::ToolResult::Error { code, message } => {
-                            format!("error {code} · {}", preview(message, 80))
-                        }
-                    };
-                    lines.push(line(
-                        LineKind::Tool,
-                        text::truncate(
-                            &format!("▸ {tool_name}  {summary}"),
-                            DEFAULT_TOOL_SUMMARY_WIDTH,
-                        ),
+                    lines.extend(tool_card::default_card(
+                        tool_name,
+                        &arguments,
+                        result,
+                        display.as_ref(),
                     ));
                 }
             }
@@ -335,12 +339,15 @@ impl Transcript {
                 status, durability, ..
             } => {
                 lines.extend(self.flush_partial());
-                let status_text = match status {
-                    OperationStatus::Succeeded => "succeeded",
-                    OperationStatus::Failed => "failed",
-                    OperationStatus::Cancelled => "cancelled",
-                };
-                lines.push(line(LineKind::Meta, format!("done ({status_text})")));
+                match status {
+                    OperationStatus::Succeeded => {}
+                    OperationStatus::Failed => {
+                        lines.push(line(LineKind::Meta, "done (failed)"));
+                    }
+                    OperationStatus::Cancelled => {
+                        lines.push(line(LineKind::Meta, "done (cancelled)"));
+                    }
+                }
                 if *durability == SettlementDurability::Unconfirmed {
                     lines.push(line(
                         LineKind::Error,
@@ -348,9 +355,8 @@ impl Transcript {
                          have durably recorded this outcome",
                     ));
                 }
-                self.tool_batch_size = 0;
+                self.clear_ephemeral();
             }
-            // Future events: tolerate quietly (#[non_exhaustive]).
             _ => {}
         }
         lines
@@ -531,7 +537,32 @@ mod snapshots {
         };
         let lines = transcript.on_event(&completed, InfoLevel::Default);
         assert_eq!(lines.len(), 1);
-        assert!(text::width(&lines[0].text) <= DEFAULT_TOOL_SUMMARY_WIDTH);
+        assert!(text::width(&lines[0].text) <= 120);
+        assert!(
+            !lines[0].text.contains("内容"),
+            "default cards must not dump model-facing content"
+        );
+    }
+
+    #[test]
+    fn tool_progress_never_writes_history() {
+        let mut transcript = Transcript::new(true);
+        let progress = AgentEvent::ToolExecutionProgress {
+            tool_batch_id: ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new("tool"),
+            index: 0,
+            tail: "live output that must stay off scrollback".to_owned(),
+        };
+        assert!(
+            transcript
+                .on_event(&progress, InfoLevel::Default)
+                .is_empty()
+        );
+        assert!(
+            transcript
+                .on_event(&progress, InfoLevel::Verbose)
+                .is_empty()
+        );
     }
 
     #[test]

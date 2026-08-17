@@ -14,10 +14,12 @@ use crate::app::transcript::{LineKind, TranscriptLine};
 
 use super::highlight::{CodeHighlighter, code_style};
 use super::line::styled_line;
+use super::theme;
 
 /// An open fenced code block.
 struct Fence {
     marker: char,
+    language: String,
     highlighter: CodeHighlighter,
 }
 
@@ -49,7 +51,7 @@ impl MarkdownRenderer {
                 self.fence = None;
                 return delimiter(text);
             }
-            let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+            let mut spans = vec![Span::styled("│ ", theme::rule())];
             match fence.highlighter.line(text) {
                 Some(regions) => spans.extend(
                     regions
@@ -64,6 +66,7 @@ impl MarkdownRenderer {
             Some((marker, language)) => {
                 self.fence = Some(Fence {
                     marker,
+                    language: language.clone(),
                     highlighter: CodeHighlighter::for_language(&language),
                 });
                 delimiter(text)
@@ -83,7 +86,16 @@ impl MarkdownRenderer {
             if closes(text, fence.marker) {
                 return delimiter(text);
             }
-            return Line::from(Span::styled(text.to_owned(), code_style()));
+            let mut spans = vec![Span::styled("│ ", theme::rule())];
+            match CodeHighlighter::preview_line(&fence.language, text) {
+                Some(regions) => spans.extend(
+                    regions
+                        .into_iter()
+                        .map(|(style, fragment)| Span::styled(fragment, style)),
+                ),
+                None => spans.push(Span::styled(text.to_owned(), code_style())),
+            }
+            return Line::from(spans);
         }
         if opens(text).is_some() {
             return delimiter(text);
@@ -138,7 +150,6 @@ fn inline(text: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut styles = vec![Style::default()];
     let mut ordered: Option<u64> = None;
-    let mut link: Option<String> = None;
 
     for event in Parser::new_ext(text, options) {
         match event {
@@ -176,23 +187,14 @@ fn inline(text: &str) -> Line<'static> {
                 styles.push(top(&styles).add_modifier(Modifier::CROSSED_OUT));
             }
             Event::End(TagEnd::Strikethrough) => pop(&mut styles),
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                link = Some(dest_url.to_string());
+            Event::Start(Tag::Link { .. }) => {
                 styles.push(
                     top(&styles)
                         .fg(Color::Blue)
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
-            Event::End(TagEnd::Link) => {
-                pop(&mut styles);
-                if let Some(url) = link.take() {
-                    spans.push(Span::styled(
-                        format!(" ({url})"),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-            }
+            Event::End(TagEnd::Link) => pop(&mut styles),
             // Indented code: styled like a fenced block, without a language.
             Event::Start(Tag::CodeBlock(_)) => styles.push(code_style()),
             Event::End(TagEnd::CodeBlock) => pop(&mut styles),

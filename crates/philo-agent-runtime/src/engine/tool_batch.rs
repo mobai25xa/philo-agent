@@ -2,6 +2,7 @@
 //! results barrier.
 
 use super::settlement::{TurnCx, cancellation_batch};
+use super::tool_progress::ToolProgressBridge;
 use crate::mapping::failure::session_failure;
 use crate::mapping::tool::session_result;
 use crate::{AgentEvent, AgentFailure, AgentFailureKind, OperationPhase, RunningToolBatchPhase};
@@ -54,15 +55,7 @@ async fn run_serial<'a>(
             },
         ));
         publish_started(&cx, batch_id, call, index);
-        let invoked = cx
-            .ctx
-            .tools
-            .invoke(ToolInvocation::new(
-                call.id().as_str(),
-                call.name(),
-                call.arguments(),
-            ))
-            .await;
+        let invoked = invoke_call(&cx, batch_id, call, index).await;
         let result = match invoked {
             Ok(result) => result,
             Err(error) => {
@@ -90,7 +83,7 @@ async fn run_parallel<'a>(
 ) -> Option<(TurnCx<'a>, Vec<(kernel::KernelToolCall, RichToolResult)>)> {
     let tools = cx.ctx.tools.clone();
     let mut slots: Vec<Option<RichToolResult>> = vec![None; calls.len()];
-    let mut in_flight: Vec<(usize, ToolFuture<'_>)> = Vec::new();
+    let mut in_flight: Vec<(usize, ToolFuture<'static>)> = Vec::new();
     let mut next = 0;
     let mut stop_starting = false;
     let mut port_error: Option<ToolPortError> = None;
@@ -109,11 +102,13 @@ async fn run_parallel<'a>(
             publish_started(&cx, batch_id, call, index);
             in_flight.push((
                 index,
-                tools.invoke(ToolInvocation::new(
-                    call.id().as_str(),
-                    call.name(),
-                    call.arguments(),
-                )),
+                invoke_call_future(
+                    tools.clone(),
+                    cx.operation.shared_arc(),
+                    batch_id,
+                    call,
+                    index,
+                ),
             ));
         }
         if in_flight.is_empty() {
@@ -219,6 +214,51 @@ async fn commit_results<'a>(
     Some((cx, results))
 }
 
+async fn invoke_call(
+    cx: &TurnCx<'_>,
+    batch_id: &kernel::ToolBatchId,
+    call: &kernel::KernelToolCall,
+    index: usize,
+) -> Result<RichToolResult, ToolPortError> {
+    let (bridge, sink) = ToolProgressBridge::new(
+        cx.operation.shared_arc(),
+        crate::ToolBatchId::new(batch_id.as_str()),
+        crate::ToolCallId::new(call.id().as_str()),
+        index,
+    );
+    let invoked = cx
+        .ctx
+        .tools
+        .invoke(
+            ToolInvocation::new(call.id().as_str(), call.name(), call.arguments()),
+            sink,
+        )
+        .await;
+    bridge.finish();
+    invoked
+}
+
+fn invoke_call_future(
+    tools: std::sync::Arc<dyn philo_tools::ToolPort>,
+    shared: std::sync::Arc<crate::operation::OperationShared>,
+    batch_id: &kernel::ToolBatchId,
+    call: &kernel::KernelToolCall,
+    index: usize,
+) -> ToolFuture<'static> {
+    let invocation = ToolInvocation::new(call.id().as_str(), call.name(), call.arguments());
+    let (bridge, sink) = ToolProgressBridge::new(
+        shared,
+        crate::ToolBatchId::new(batch_id.as_str()),
+        crate::ToolCallId::new(call.id().as_str()),
+        index,
+    );
+    Box::pin(async move {
+        let invoked = tools.invoke(invocation, sink).await;
+        bridge.finish();
+        invoked
+    })
+}
+
 fn publish_started(
     cx: &TurnCx<'_>,
     batch_id: &kernel::ToolBatchId,
@@ -247,8 +287,8 @@ fn completed_count(slots: &[Option<RichToolResult>]) -> usize {
     slots.iter().filter(|slot| slot.is_some()).count()
 }
 
-async fn next_finished<'a>(
-    in_flight: &mut Vec<(usize, ToolFuture<'a>)>,
+async fn next_finished(
+    in_flight: &mut Vec<(usize, ToolFuture<'static>)>,
 ) -> (usize, Result<RichToolResult, ToolPortError>) {
     std::future::poll_fn(|context| {
         let mut index = 0;

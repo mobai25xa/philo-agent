@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, OperationHandle, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, OperationHandle,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::fake_model::{FakeModel, ModelScript};
@@ -67,7 +67,10 @@ fn sid() -> SessionId {
     SessionId::new("s")
 }
 
-fn drive_until(wait: &mut Pin<Box<impl Future<Output = OperationOutcome>>>, ready: impl Fn() -> bool) {
+fn drive_until(
+    wait: &mut Pin<Box<impl Future<Output = OperationOutcome>>>,
+    ready: impl Fn() -> bool,
+) {
     for _ in 0..10_000 {
         if ready() {
             return;
@@ -122,16 +125,17 @@ fn limit_one_keeps_two_calls_strictly_serial() {
     drive_until(&mut wait, || tools.invocation_count() == 1);
     for _ in 0..32 {
         assert!(poll_once(&mut wait).is_pending());
-        assert_eq!(tools.invocation_count(), 1, "the second call stays unstarted");
+        assert_eq!(
+            tools.invocation_count(),
+            1,
+            "the second call stays unstarted"
+        );
     }
 
     first.release();
     drive_until(&mut wait, || tools.invocation_count() == 2);
     second.release();
-    assert!(matches!(
-        block_on(wait),
-        OperationOutcome::Succeeded { .. }
-    ));
+    assert!(matches!(block_on(wait), OperationOutcome::Succeeded { .. }));
     assert_eq!(
         result_outcomes(&sessions)
             .into_iter()
@@ -211,10 +215,7 @@ fn limit_two_overlaps_invokes_and_commits_in_source_order() {
     );
     second.release();
     first.release();
-    assert!(matches!(
-        block_on(wait),
-        OperationOutcome::Succeeded { .. }
-    ));
+    assert!(matches!(block_on(wait), OperationOutcome::Succeeded { .. }));
 
     let outcomes = result_outcomes(&sessions);
     assert_eq!(
@@ -238,7 +239,11 @@ fn limit_two_overlaps_invokes_and_commits_in_source_order() {
         ]
     );
     assert_eq!(model.calls()[0].max_parallel_tool_calls, 2);
-    assert_eq!(model.call_count(), 2, "C_k happens once before the next model call");
+    assert_eq!(
+        model.call_count(),
+        2,
+        "C_k happens once before the next model call"
+    );
 }
 
 #[test]
@@ -288,9 +293,7 @@ fn cancel_awaits_in_flight_and_marks_unstarted() {
     let completed: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ToolExecutionCompleted { tool_call_id, .. } => {
-                Some(tool_call_id.as_str())
-            }
+            AgentEvent::ToolExecutionCompleted { tool_call_id, .. } => Some(tool_call_id.as_str()),
             _ => None,
         })
         .collect();

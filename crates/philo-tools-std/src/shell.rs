@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use philo_tools::{
     EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolDisplay, ToolHandler,
-    ToolHandlerFuture, ToolResult,
+    ToolHandlerFuture, ToolProgressSink, ToolResult,
 };
+use tokio::io::AsyncReadExt;
 
 use crate::args::{optional_u64, required_string};
 use crate::error_code;
@@ -32,6 +33,9 @@ pub const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = 16 * 1024;
 /// Default upper bound of merged output lines on the model channel.
 pub const DEFAULT_SHELL_MAX_OUTPUT_LINES: usize = 400;
 
+/// Default upper bound of the final display-channel payload.
+pub const DEFAULT_SHELL_MAX_DISPLAY_BYTES: usize = 128 * 1024;
+
 /// Credential-bearing environment variables are scrubbed from the child
 /// process so secrets cannot reach either output channel. The name-pattern
 /// list is an implementation detail pinned by tests.
@@ -45,6 +49,7 @@ pub struct ShellTool {
     max_timeout_secs: u64,
     max_output_bytes: usize,
     max_output_lines: usize,
+    max_display_bytes: usize,
 }
 
 impl ShellTool {
@@ -56,6 +61,7 @@ impl ShellTool {
             max_timeout_secs: DEFAULT_SHELL_MAX_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_SHELL_MAX_OUTPUT_BYTES,
             max_output_lines: DEFAULT_SHELL_MAX_OUTPUT_LINES,
+            max_display_bytes: DEFAULT_SHELL_MAX_DISPLAY_BYTES,
         }
     }
 
@@ -84,6 +90,12 @@ impl ShellTool {
         self
     }
 
+    /// Overrides the final display-channel byte limit (minimum 1).
+    pub fn with_max_display_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_display_bytes = max_bytes.max(1);
+        self
+    }
+
     /// Returns the model-facing definition registered for this tool.
     pub fn definition() -> ToolDefinition {
         let shell_name = if cfg!(windows) { "PowerShell" } else { "sh -c" };
@@ -104,7 +116,7 @@ impl ShellTool {
         .expect("shell tool definition is valid")
     }
 
-    async fn run(&self, arguments: &ToolArguments) -> RichToolResult {
+    async fn run(&self, arguments: &ToolArguments, progress: ToolProgressSink) -> RichToolResult {
         let command_line = match required_string(arguments.as_str(), "command") {
             Ok(command) => command,
             Err(error) => return field_error("command", &error),
@@ -145,7 +157,7 @@ impl ShellTool {
         }
 
         let started = Instant::now();
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 return RichToolResult::error(
@@ -155,52 +167,41 @@ impl ShellTool {
             }
         };
 
-        let waited =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let captured = capture_output(
+            &mut child,
+            &mut stdout,
+            &mut stderr,
+            &progress,
+            started + Duration::from_secs(timeout_secs),
+        )
+        .await;
         let elapsed_ms = started.elapsed().as_millis();
-        let output = match waited {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
+        if captured.timed_out {
+            return timeout_result(
+                &command_line,
+                timeout_secs,
+                elapsed_ms,
+                &captured,
+                self.max_display_bytes,
+            );
+        }
+        let status = match captured.status {
+            Ok(status) => status,
+            Err(error) => {
                 return RichToolResult::error(
                     error_code::IO_ERROR,
                     format!("command execution failed: {}", error.kind()),
                 );
             }
-            Err(_elapsed) => {
-                // wait_with_output consumed the child; the drop path has
-                // already detached — nothing to kill through this handle, so
-                // report the obstacle. Timeout is a business error: the
-                // model may retry with a longer timeout or a cheaper command.
-                return RichToolResult::error(
-                    error_code::TIMEOUT,
-                    format!(
-                        "command did not finish within {timeout_secs}s and was \
-                         terminated: {command_line}"
-                    ),
-                )
-                .with_display(
-                    ToolDisplay::new(format!("timed out after {elapsed_ms}ms"))
-                        .with_fact("duration_ms", elapsed_ms.to_string())
-                        .with_fact("timeout_secs", timeout_secs.to_string()),
-                );
-            }
         };
-
-        let exit_code = output
-            .status
+        let stdout = captured.stdout;
+        let stderr = captured.stderr;
+        let exit_code = status
             .code()
             .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut merged = String::new();
-        merged.push_str(stdout.trim_end_matches('\n'));
-        if !stderr.trim().is_empty() {
-            if !merged.is_empty() {
-                merged.push('\n');
-            }
-            merged.push_str("[stderr]\n");
-            merged.push_str(stderr.trim_end_matches('\n'));
-        }
+        let merged = merge_output(&stdout, &stderr);
 
         let (truncated_text, truncated) =
             truncate_output(&merged, self.max_output_bytes, self.max_output_lines);
@@ -212,14 +213,15 @@ impl ShellTool {
             ));
         }
 
-        let display = ToolDisplay::new(if merged.is_empty() {
+        let (display_text, display_truncated) = cap_display(&merged, self.max_display_bytes);
+        let display = ToolDisplay::new(if display_text.is_empty() {
             format!("(no output) exit_code={exit_code}")
         } else {
-            merged.clone()
+            display_text
         })
         .with_fact("exit_code", exit_code)
         .with_fact("duration_ms", elapsed_ms.to_string())
-        .with_fact("truncated", truncated.to_string());
+        .with_fact("truncated", (truncated || display_truncated).to_string());
         RichToolResult::new(ToolResult::success(model_text)).with_display(display)
     }
 }
@@ -234,6 +236,177 @@ fn platform_command(command_line: &str) -> tokio::process::Command {
         command.args(["-c", command_line]);
         command
     }
+}
+
+struct Captured {
+    status: std::io::Result<std::process::ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+async fn capture_output(
+    child: &mut tokio::process::Child,
+    stdout: &mut Option<tokio::process::ChildStdout>,
+    stderr: &mut Option<tokio::process::ChildStderr>,
+    progress: &ToolProgressSink,
+    deadline: Instant,
+) -> Captured {
+    let mut stdout_all = Vec::new();
+    let mut stderr_all = Vec::new();
+    let mut stdout_pending = Vec::new();
+    let mut stderr_pending = Vec::new();
+    let mut out_buf = [0u8; 8192];
+    let mut err_buf = [0u8; 8192];
+    let mut stdout_done = stdout.is_none();
+    let mut stderr_done = stderr.is_none();
+    let mut status = None;
+    let mut timed_out = false;
+
+    while status.is_none() || !stdout_done || !stderr_done {
+        let until_deadline = deadline.saturating_duration_since(Instant::now());
+        tokio::select! {
+            result = child.wait(), if status.is_none() => {
+                status = Some(result);
+            }
+            result = read_opt(stdout.as_mut(), &mut out_buf), if !stdout_done => {
+                match result {
+                    Ok(0) | Err(_) => {
+                        flush_pending(&mut stdout_pending, progress);
+                        stdout_done = true;
+                    }
+                    Ok(n) => {
+                        stdout_all.extend_from_slice(&out_buf[..n]);
+                        let text = take_utf8(&mut stdout_pending, &out_buf[..n]);
+                        if !text.is_empty() {
+                            progress.push_text(&text);
+                        }
+                    }
+                }
+            }
+            result = read_opt(stderr.as_mut(), &mut err_buf), if !stderr_done => {
+                match result {
+                    Ok(0) | Err(_) => {
+                        flush_pending(&mut stderr_pending, progress);
+                        stderr_done = true;
+                    }
+                    Ok(n) => {
+                        stderr_all.extend_from_slice(&err_buf[..n]);
+                        let text = take_utf8(&mut stderr_pending, &err_buf[..n]);
+                        if !text.is_empty() {
+                            progress.push_text(&text);
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(until_deadline), if !timed_out && status.is_none() => {
+                let _ = child.start_kill();
+                timed_out = true;
+            }
+        }
+    }
+
+    Captured {
+        status: status.unwrap_or_else(|| Err(std::io::Error::other("child wait missing"))),
+        stdout: stdout_all,
+        stderr: stderr_all,
+        timed_out,
+    }
+}
+
+async fn read_opt<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<&mut R>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    match reader {
+        Some(reader) => reader.read(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn flush_pending(pending: &mut Vec<u8>, progress: &ToolProgressSink) {
+    if pending.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(pending).into_owned();
+    pending.clear();
+    if !text.is_empty() {
+        progress.push_text(&text);
+    }
+}
+
+fn timeout_result(
+    command_line: &str,
+    timeout_secs: u64,
+    elapsed_ms: u128,
+    captured: &Captured,
+    max_display_bytes: usize,
+) -> RichToolResult {
+    let merged = merge_output(&captured.stdout, &captured.stderr);
+    let (display_text, display_truncated) = cap_display(&merged, max_display_bytes);
+    RichToolResult::error(
+        error_code::TIMEOUT,
+        format!(
+            "command did not finish within {timeout_secs}s and was \
+             terminated: {command_line}"
+        ),
+    )
+    .with_display(
+        ToolDisplay::new(if display_text.is_empty() {
+            format!("timed out after {elapsed_ms}ms")
+        } else {
+            display_text
+        })
+        .with_fact("duration_ms", elapsed_ms.to_string())
+        .with_fact("timeout_secs", timeout_secs.to_string())
+        .with_fact("truncated", display_truncated.to_string()),
+    )
+}
+
+fn take_utf8(pending: &mut Vec<u8>, incoming: &[u8]) -> String {
+    pending.extend_from_slice(incoming);
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let owned = text.to_owned();
+            pending.clear();
+            owned
+        }
+        Err(error) => {
+            let valid = error.valid_up_to();
+            let owned = String::from_utf8(pending.drain(..valid).collect()).unwrap_or_default();
+            if let Some(invalid) = error.error_len() {
+                let skip = invalid.min(pending.len());
+                pending.drain(..skip);
+            }
+            owned
+        }
+    }
+}
+
+fn merge_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut merged = String::new();
+    merged.push_str(stdout.trim_end_matches('\n'));
+    if !stderr.trim().is_empty() {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str("[stderr]\n");
+        merged.push_str(stderr.trim_end_matches('\n'));
+    }
+    merged
+}
+
+fn cap_display(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (text[start..].to_owned(), true)
 }
 
 /// Dual byte/line truncation at a character boundary.
@@ -259,6 +432,14 @@ fn truncate_output(text: &str, max_bytes: usize, max_lines: usize) -> (String, b
 
 impl ToolHandler for ShellTool {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
-        Box::pin(async move { self.run(&arguments).await })
+        self.call_with_progress(arguments, ToolProgressSink::noop())
+    }
+
+    fn call_with_progress<'a>(
+        &'a self,
+        arguments: ToolArguments,
+        progress: ToolProgressSink,
+    ) -> ToolHandlerFuture<'a> {
+        Box::pin(async move { self.run(&arguments, progress).await })
     }
 }

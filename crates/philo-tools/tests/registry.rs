@@ -13,17 +13,26 @@ fn registry_is_stable_and_normalizes_errors() {
         .unwrap()
         .build();
     assert_eq!(registry.definitions()[0].name(), "echo");
-    let success =
-        futures_block_on(registry.invoke(ToolInvocation::new("c", "echo", "{}"))).unwrap();
+    let success = futures_block_on(registry.invoke(
+        ToolInvocation::new("c", "echo", "{}"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(success.result().content(), Some("ok"));
-    let invalid =
-        futures_block_on(registry.invoke(ToolInvocation::new("c", "echo", "[]"))).unwrap();
+    let invalid = futures_block_on(registry.invoke(
+        ToolInvocation::new("c", "echo", "[]"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(
         invalid.result().as_error().unwrap().code(),
         "invalid_arguments"
     );
-    let unknown =
-        futures_block_on(registry.invoke(ToolInvocation::new("c", "missing", "{}"))).unwrap();
+    let unknown = futures_block_on(registry.invoke(
+        ToolInvocation::new("c", "missing", "{}"),
+        ToolProgressSink::noop(),
+    ))
+    .unwrap();
     assert_eq!(unknown.result().as_error().unwrap().code(), "unknown_tool");
     let object: Arc<dyn ToolPort> = Arc::new(registry);
     let _ = object.definitions();

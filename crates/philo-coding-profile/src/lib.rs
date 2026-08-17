@@ -31,7 +31,7 @@
 //! struct Approval<P: ToolPort> { inner: P }
 //! impl<P: ToolPort> ToolPort for Approval<P> {
 //!     fn definitions(&self) -> Vec<ToolDefinition> { self.inner.definitions() }
-//!     fn invoke<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a> {
+//!     fn invoke<'a>(&'a self, invocation: ToolInvocation, progress: ToolProgressSink) -> ToolFuture<'a> {
 //!         let class = self.inner.definitions().iter()
 //!             .find(|d| d.name() == invocation.name())
 //!             .map(|d| d.effect_class());
@@ -42,7 +42,7 @@
 //!                         "denied", "the user declined this command"));
 //!                 }
 //!             }
-//!             self.inner.invoke(invocation).await
+//!             self.inner.invoke(invocation, progress).await
 //!         })
 //!     }
 //! }

@@ -11,6 +11,7 @@ mod seal;
 mod settlement;
 mod stream;
 mod tool_batch;
+mod tool_progress;
 
 use crate::mapping::entries::{batch_entry, start_entries, success_entries};
 use crate::mapping::failure::session_failure;

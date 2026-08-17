@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Waker};
 use philo_agent_runtime::{
     AgentRuntime, EffectClass, GenerationConfig, OperationOutcome, RichToolResult, RuntimeConfig,
     SequentialIdSource, SessionId, ToolDefinition, ToolDisplay, ToolFuture, ToolInvocation,
-    ToolPort, UserMessage,
+    ToolPort, ToolProgressSink, UserMessage,
 };
 use philo_session::{SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
@@ -132,7 +132,11 @@ impl<P: ToolPort> ToolPort for DenySystemTools<P> {
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.inner.definitions()
     }
-    fn invoke<'a>(&'a self, invocation: ToolInvocation) -> ToolFuture<'a> {
+    fn invoke<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        progress: ToolProgressSink,
+    ) -> ToolFuture<'a> {
         let class = self
             .definitions()
             .iter()
@@ -145,7 +149,7 @@ impl<P: ToolPort> ToolPort for DenySystemTools<P> {
                     "the approval policy declined this system command",
                 ));
             }
-            self.inner.invoke(invocation).await
+            self.inner.invoke(invocation, progress).await
         })
     }
 }

@@ -1,15 +1,17 @@
 //! App state-machine tests.
 
-use philo_agent_runtime::AgentEvent;
-use philo_session::SessionId;
+use philo_agent_service::{
+    ConfirmationDecision, FrontendOperationEvent, FrontendReasoningEffort, FrontendTokenUsage,
+    FrontendUpdateKind,
+};
 
 use super::*;
-use crate::api::confirmation::{ConfirmationId, ConfirmationRequest, ConfirmationResponse};
 use crate::app::action::Action;
 use crate::app::command;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::status::StatusData;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
+use crate::tests::support::frontend_update;
 
 fn app() -> App {
     App::new(StatusData::new("m", "s", InfoLevel::Default), true)
@@ -52,11 +54,8 @@ fn host_requests(effects: &[Effect]) -> Vec<HostRequest> {
         .collect()
 }
 
-fn request(title: &str) -> ConfirmationRequest {
-    ConfirmationRequest {
-        title: title.to_owned(),
-        body: format!("{title} body"),
-    }
+fn request(title: &str) -> (String, String) {
+    (title.to_owned(), format!("{title} body"))
 }
 
 #[test]
@@ -170,17 +169,12 @@ fn a_new_session_is_refused_while_a_turn_runs() {
 }
 
 #[test]
-fn model_needs_a_name_and_an_idle_runtime() {
+fn model_needs_a_name_and_works_while_busy() {
     let mut app = app();
     let lines = appended(&run(&mut app, "/model"));
     assert_eq!(lines[1].text, "usage: /model <name>");
 
     app.set_busy(true, 0);
-    let effects = run(&mut app, "/model other");
-    assert!(host_requests(&effects).is_empty(), "busy refuses");
-    assert!(appended(&effects)[1].text.contains("still on m"));
-
-    app.set_busy(false, 0);
     assert_eq!(
         host_requests(&run(&mut app, "/model other")),
         vec![HostRequest::RebuildModel("other".to_owned())]
@@ -192,9 +186,7 @@ fn reasoning_maps_levels_and_reports_bad_ones() {
     let mut app = app();
     assert_eq!(
         host_requests(&run(&mut app, "/reasoning high")),
-        vec![HostRequest::SetReasoning(
-            philo_agent_runtime::ReasoningEffort::High
-        )]
+        vec![HostRequest::SetReasoning(FrontendReasoningEffort::High)]
     );
     let effects = run(&mut app, "/reasoning turbo");
     assert!(host_requests(&effects).is_empty());
@@ -311,7 +303,7 @@ fn quit_asks_once_while_a_turn_runs() {
     let effects = run(&mut app, "/quit");
     assert!(!effects.contains(&Effect::Quit), "the first ask warns");
     assert!(appended(&effects)[1].text.contains("/quit again"));
-    assert!(run(&mut app, "/quit").contains(&Effect::Quit));
+    assert!(run(&mut app, "/quit").contains(&Effect::RequestShutdown));
 }
 
 #[test]
@@ -402,13 +394,13 @@ fn tab_without_a_slash_does_nothing() {
 #[test]
 fn the_picker_moves_the_selection_and_loads_previews_lazily() {
     let mut app = app();
-    app.open_picker(vec![SessionId::new("s-1"), SessionId::new("s-2")]);
-    assert_eq!(app.claim_preview(), Some(SessionId::new("s-1")));
+    app.open_picker(vec!["s-1".to_owned(), "s-2".to_owned()]);
+    assert_eq!(app.claim_preview(), Some("s-1".to_owned()));
 
     let effects = app.on_action(Action::MoveDown);
     assert_eq!(
         host_requests(&effects),
-        vec![HostRequest::LoadPreview(SessionId::new("s-2"))]
+        vec![HostRequest::LoadPreview("s-2".to_owned())]
     );
     assert!(
         app.on_action(Action::MoveDown).is_empty(),
@@ -424,15 +416,15 @@ fn the_picker_moves_the_selection_and_loads_previews_lazily() {
 #[test]
 fn the_picker_switches_on_enter_and_closes_on_escape() {
     let mut app = app();
-    app.open_picker(vec![SessionId::new("s-1"), SessionId::new("s-2")]);
+    app.open_picker(vec!["s-1".to_owned(), "s-2".to_owned()]);
     app.on_action(Action::MoveDown);
     assert_eq!(
         host_requests(&app.on_action(Action::Submit)),
-        vec![HostRequest::SwitchSession(SessionId::new("s-2"))]
+        vec![HostRequest::SwitchSession("s-2".to_owned())]
     );
     assert!(app.picker().is_none(), "Enter closes the overlay");
 
-    app.open_picker(vec![SessionId::new("s-1")]);
+    app.open_picker(vec!["s-1".to_owned()]);
     assert!(app.on_action(Action::Escape).is_empty());
     assert!(app.picker().is_none());
 }
@@ -441,7 +433,7 @@ fn the_picker_switches_on_enter_and_closes_on_escape() {
 fn the_picker_refuses_to_switch_while_a_turn_runs() {
     let mut app = app();
     app.set_busy(true, 0);
-    app.open_picker(vec![SessionId::new("s-1")]);
+    app.open_picker(vec!["s-1".to_owned()]);
     let effects = app.on_action(Action::Submit);
     assert!(host_requests(&effects).is_empty());
     assert_eq!(appended(&effects)[0].kind, LineKind::Error);
@@ -451,7 +443,7 @@ fn the_picker_refuses_to_switch_while_a_turn_runs() {
 #[test]
 fn the_picker_does_not_type_into_the_input() {
     let mut app = app();
-    app.open_picker(vec![SessionId::new("s-1")]);
+    app.open_picker(vec!["s-1".to_owned()]);
     app.on_action(Action::InsertChar('x'));
     app.on_paste("pasted");
     assert!(app.input.is_empty());
@@ -460,15 +452,13 @@ fn the_picker_does_not_type_into_the_input() {
 #[test]
 fn approval_answers_are_binary_and_echoed() {
     let mut app = app();
-    app.sync_confirmation(Some((ConfirmationId::for_test(1), request("run_command"))));
+    let (title, body) = request("run_command");
+    app.sync_confirmation(Some((1, title, body)));
     let effects = app.on_action(Action::InsertChar('y'));
     assert_eq!(appended(&effects)[0].text, "allowed: run_command");
     assert_eq!(
         host_requests(&effects),
-        vec![HostRequest::Respond(
-            ConfirmationId::for_test(1),
-            ConfirmationResponse::Allow
-        )]
+        vec![HostRequest::Respond(1, ConfirmationDecision::Allow)]
     );
     assert!(app.confirm_prompt().is_none());
 
@@ -476,13 +466,14 @@ fn approval_answers_are_binary_and_echoed() {
         .into_iter()
         .enumerate()
     {
-        let id = ConfirmationId::for_test(index as u64 + 2);
-        app.sync_confirmation(Some((id, request("write_file"))));
+        let id = index as u64 + 2;
+        let (title, body) = request("write_file");
+        app.sync_confirmation(Some((id, title, body)));
         let effects = app.on_action(action);
         assert_eq!(appended(&effects)[0].text, "denied: write_file");
         assert_eq!(
             host_requests(&effects),
-            vec![HostRequest::Respond(id, ConfirmationResponse::Deny)]
+            vec![HostRequest::Respond(id, ConfirmationDecision::Deny)]
         );
     }
 }
@@ -490,7 +481,8 @@ fn approval_answers_are_binary_and_echoed() {
 #[test]
 fn an_auto_denied_request_closes_the_overlay() {
     let mut app = app();
-    app.sync_confirmation(Some((ConfirmationId::for_test(1), request("run_command"))));
+    let (title, body) = request("run_command");
+    app.sync_confirmation(Some((1, title, body)));
     assert!(app.overlay_frame(4).is_some());
     // The channel denied everything when the operation settled.
     app.sync_confirmation(None);
@@ -501,8 +493,9 @@ fn an_auto_denied_request_closes_the_overlay() {
 #[test]
 fn the_approval_overlay_wins_over_the_picker() {
     let mut app = app();
-    app.open_picker(vec![SessionId::new("s-1")]);
-    app.sync_confirmation(Some((ConfirmationId::for_test(7), request("run_command"))));
+    app.open_picker(vec!["s-1".to_owned()]);
+    let (title, body) = request("run_command");
+    app.sync_confirmation(Some((7, title, body)));
     let frame = app.overlay_frame(4).expect("an overlay is painted");
     assert!(frame.title.starts_with("approval required"));
     // Answering restores the picker underneath.
@@ -513,14 +506,14 @@ fn the_approval_overlay_wins_over_the_picker() {
 
 #[test]
 fn overlays_never_swallow_agent_events() {
-    use philo_agent_runtime::{OperationId, OperationStatus, SettlementDurability};
     let mut app = app();
-    app.open_picker(vec![SessionId::new("s-1")]);
-    app.sync_confirmation(Some((ConfirmationId::for_test(1), request("run_command"))));
-    let effects = app.on_agent_event(&AgentEvent::OperationSettled {
-        operation_id: OperationId::new("op-1"),
-        status: OperationStatus::Succeeded,
-        durability: SettlementDurability::Confirmed,
+    app.open_picker(vec!["s-1".to_owned()]);
+    let (title, body) = request("run_command");
+    app.sync_confirmation(Some((1, title, body)));
+    let effects = app.on_operation_event(&FrontendOperationEvent::OperationSettled {
+        operation_id: "op-1".to_owned(),
+        status: "Succeeded".to_owned(),
+        durability: "Confirmed".to_owned(),
     });
     assert!(effects.is_empty(), "agent events write the store directly");
     assert!(
@@ -541,7 +534,7 @@ fn ctrl_c_clears_nonempty_input_first() {
 fn ctrl_c_cancels_while_busy() {
     let mut app = app();
     app.set_busy(true, 0);
-    assert_eq!(app.on_action(Action::CtrlC), vec![Effect::CancelActive]);
+    assert_eq!(app.on_action(Action::CtrlC), vec![Effect::InterruptCancel]);
 }
 
 #[test]
@@ -625,13 +618,13 @@ fn toggle_level_flips_and_reports() {
 #[test]
 fn usage_events_update_the_status_bar() {
     let mut app = app();
-    let usage = philo_agent_runtime::TokenUsage {
+    let usage = FrontendTokenUsage {
         input_tokens: Some(5),
         output_tokens: Some(7),
-        ..Default::default()
+        ..FrontendTokenUsage::default()
     };
-    app.on_agent_event(&AgentEvent::ModelUsageUpdated {
-        model_call_id: philo_agent_runtime::ModelCallId::new("m-1"),
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-1".to_owned(),
         usage,
     });
     assert_eq!(app.status.usage, Some(usage));
@@ -639,43 +632,65 @@ fn usage_events_update_the_status_bar() {
 
 #[test]
 fn config_reload_applies_show_reasoning_and_reports_success() {
-    use crate::api::types::ConfigReloadNotice;
+    use philo_agent_service::FrontendConfigEntry;
     let mut app = app();
-    let effects = app.on_action(Action::ConfigReload(ConfigReloadNotice::Applied {
-        show_reasoning: false,
-        verbose: false,
-        context_window: Some(8_000),
-        model_name: "model-b".to_owned(),
-        runtime_pending: false,
-        warnings: Vec::new(),
-    }));
+    let effects = app.apply_update(&frontend_update(
+        1,
+        FrontendUpdateKind::ConfigChanged {
+            entries: vec![
+                FrontendConfigEntry {
+                    key: "ui.show_reasoning".to_owned(),
+                    value: "false".to_owned(),
+                    source: "project".to_owned(),
+                },
+                FrontendConfigEntry {
+                    key: "context_window".to_owned(),
+                    value: "8000".to_owned(),
+                    source: "project".to_owned(),
+                },
+                FrontendConfigEntry {
+                    key: "model".to_owned(),
+                    value: "model-b".to_owned(),
+                    source: "project".to_owned(),
+                },
+            ],
+        },
+    ));
     assert!(!app.shows_reasoning());
     assert_eq!(app.status.model, "model-b");
     assert_eq!(app.status.context_window, Some(8_000));
-    assert!(!app.status.config_reload_pending);
     assert_eq!(texts(&appended(&effects)), ["config reloaded"]);
 }
 
 #[test]
-fn config_reload_pending_is_visible_and_not_repeated() {
-    use crate::api::types::ConfigReloadNotice;
+fn config_listing_is_distinct_from_hot_reload() {
+    use philo_agent_service::FrontendConfigEntry;
     let mut app = app();
-    app.set_busy(true, 0);
-    let first = app.on_action(Action::ConfigReload(ConfigReloadNotice::Pending));
-    assert!(app.status.config_reload_pending);
-    assert_eq!(texts(&appended(&first)), ["config: will apply after idle"]);
-    let second = app.on_action(Action::ConfigReload(ConfigReloadNotice::Pending));
-    assert!(second.is_empty());
+    app.expect_config_listing = true;
+    let effects = app.apply_update(&frontend_update(
+        1,
+        FrontendUpdateKind::ConfigChanged {
+            entries: vec![FrontendConfigEntry {
+                key: "model".to_owned(),
+                value: "model-b".to_owned(),
+                source: "project".to_owned(),
+            }],
+        },
+    ));
+    assert!(texts(&appended(&effects))[0].contains("config (effective)"));
 }
 
 #[test]
-fn config_reload_failure_is_an_error_line() {
-    use crate::api::types::ConfigReloadNotice;
+fn generation_install_failure_is_an_error_line() {
     let mut app = app();
-    let effects = app.on_action(Action::ConfigReload(ConfigReloadNotice::Failed {
-        message: "config not reloaded: invalid TOML".to_owned(),
-        clear_pending: false,
-    }));
+    app.pending_model_switch = true;
+    let effects = app.apply_update(&frontend_update(
+        1,
+        FrontendUpdateKind::GenerationInstallFailed {
+            name: "broken".to_owned(),
+            message: "config not reloaded: invalid TOML".to_owned(),
+        },
+    ));
     let lines = appended(&effects);
     assert_eq!(lines[0].kind, LineKind::Error);
     assert!(lines[0].text.contains("invalid TOML"));
@@ -720,14 +735,12 @@ fn submit_ingests_append_payloads_into_cells() {
 
 #[test]
 fn agent_events_apply_into_cells() {
-    use philo_agent_runtime::{OperationId, TurnId};
-
     let mut app = app();
-    let queued = app.on_agent_event(&AgentEvent::OperationQueued {
-        operation_id: OperationId::new("op-1"),
+    let queued = app.on_operation_event(&FrontendOperationEvent::OperationQueued {
+        operation_id: "op-1".to_owned(),
     });
-    let sealed = app.on_agent_event(&AgentEvent::PriorTurnSealed {
-        turn_id: TurnId::new("old-turn"),
+    let sealed = app.on_operation_event(&FrontendOperationEvent::PriorTurnSealed {
+        turn_id: "old-turn".to_owned(),
     });
     assert!(queued.is_empty(), "agent events write the store directly");
     assert!(sealed.is_empty(), "agent events write the store directly");
@@ -752,7 +765,7 @@ fn agent_events_apply_into_cells() {
 fn begin_session_clears_ingested_cells() {
     let mut app = app();
     run(&mut app, "hello");
-    app.on_agent_event(&AgentEvent::TextDelta {
+    app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "partial".to_owned(),
     });
     assert!(!app.cells.is_empty());
@@ -905,7 +918,7 @@ fn overlay_does_not_start_transcript_selection() {
     let mut app = app();
     seed_rows(&mut app, 10);
     app.note_history_layout(80, 3);
-    app.open_picker(vec![SessionId::new("s-1")]);
+    app.open_picker(vec!["s-1".to_owned()]);
     app.on_action(Action::SelectStart { x: 0, y: 0 });
     app.on_action(Action::SelectDrag { x: 5, y: 0 });
     app.on_action(Action::SelectEnd { x: 5, y: 0 });
@@ -928,7 +941,7 @@ fn begin_session_clears_selection() {
 #[test]
 fn text_delta_without_close_stays_open() {
     let mut app = app();
-    let effects = app.on_agent_event(&AgentEvent::TextDelta {
+    let effects = app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "partial answer".to_owned(),
     });
     assert!(effects.is_empty(), "agent events write the store directly");
@@ -956,7 +969,7 @@ fn text_delta_without_close_stays_open() {
 #[test]
 fn newline_stays_inside_one_open_answer_cell() {
     let mut app = app();
-    app.on_agent_event(&AgentEvent::TextDelta {
+    app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "hello\nworld".to_owned(),
     });
     assert_eq!(app.cells.open_index(), Some(0));
@@ -982,8 +995,8 @@ fn newline_stays_inside_one_open_answer_cell() {
 #[test]
 fn show_reasoning_off_produces_no_open_think_cells() {
     let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), false);
-    app.on_agent_event(&AgentEvent::ReasoningDelta {
-        model_call_id: philo_agent_runtime::ModelCallId::new("call-1"),
+    app.on_operation_event(&FrontendOperationEvent::ReasoningDelta {
+        model_call_id: "call-1".to_owned(),
         text: "secret thoughts".to_owned(),
     });
     assert!(app.cells.cells().is_empty());
@@ -1005,7 +1018,7 @@ fn open_rows_do_not_yank_a_pinned_view() {
         .collect();
     assert!(!app.follow_bottom());
 
-    app.on_agent_event(&AgentEvent::TextDelta {
+    app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "streaming tail".to_owned(),
     });
     let after: Vec<_> = app
@@ -1024,7 +1037,7 @@ fn open_rows_do_not_yank_a_pinned_view() {
 fn copy_includes_open_text_via_display_cell_indices() {
     let mut app = app();
     seed_rows(&mut app, 3);
-    app.on_agent_event(&AgentEvent::TextDelta {
+    app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "live tail".to_owned(),
     });
     app.note_history_layout(80, 5);
@@ -1095,7 +1108,7 @@ fn overlay_ignores_home_and_end() {
     let mut app = app();
     seed_rows(&mut app, 10);
     app.note_history_layout(80, 3);
-    app.open_picker(vec![SessionId::new("s-1")]);
+    app.open_picker(vec!["s-1".to_owned()]);
     app.on_action(Action::Home);
     assert!(app.follow_bottom());
     assert!(app.picker().is_some());

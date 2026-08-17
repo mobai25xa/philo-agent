@@ -102,4 +102,8 @@ impl SessionStore for FailingSessionStore {
         }
         self.inner.commit(transaction)
     }
+
+    fn list_sessions(&self) -> SessionFuture<'_, Result<Vec<SessionId>, SessionError>> {
+        self.inner.list_sessions()
+    }
 }

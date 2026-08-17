@@ -5,7 +5,7 @@
 //! implementation detail. Parsing is pure: a `/` prefix never reaches the
 //! model, and an unrecognised word yields one error line.
 
-use philo_agent_runtime::ReasoningEffort;
+use philo_agent_service::FrontendReasoningEffort;
 
 /// One command's user-facing description, shown by `/help` and the
 /// completion menu.
@@ -36,7 +36,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "model",
         usage: "/model <name>",
-        summary: "switch the model (idle only)",
+        summary: "switch the model for later operations",
     },
     CommandSpec {
         name: "reasoning",
@@ -174,28 +174,28 @@ pub fn common_prefix(names: &[&str]) -> String {
     prefix
 }
 
-/// Maps a typed level onto the runtime's reasoning vocabulary.
-pub fn parse_reasoning(level: &str) -> Option<ReasoningEffort> {
+/// Maps a typed level onto the frontend reasoning vocabulary.
+pub fn parse_reasoning(level: &str) -> Option<FrontendReasoningEffort> {
     match level.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "minimal" => Some(ReasoningEffort::Minimal),
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        "very-high" => Some(ReasoningEffort::VeryHigh),
-        "maximum" => Some(ReasoningEffort::Maximum),
+        "minimal" => Some(FrontendReasoningEffort::Minimal),
+        "low" => Some(FrontendReasoningEffort::Low),
+        "medium" => Some(FrontendReasoningEffort::Medium),
+        "high" => Some(FrontendReasoningEffort::High),
+        "very-high" => Some(FrontendReasoningEffort::VeryHigh),
+        "maximum" => Some(FrontendReasoningEffort::Maximum),
         _ => None,
     }
 }
 
 /// The display name of a reasoning level, for echoes.
-pub fn reasoning_name(effort: ReasoningEffort) -> &'static str {
+pub fn reasoning_name(effort: FrontendReasoningEffort) -> &'static str {
     match effort {
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::VeryHigh => "very-high",
-        ReasoningEffort::Maximum => "maximum",
+        FrontendReasoningEffort::Minimal => "minimal",
+        FrontendReasoningEffort::Low => "low",
+        FrontendReasoningEffort::Medium => "medium",
+        FrontendReasoningEffort::High => "high",
+        FrontendReasoningEffort::VeryHigh => "very-high",
+        FrontendReasoningEffort::Maximum => "maximum",
     }
 }
 
@@ -323,14 +323,20 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_levels_map_onto_the_runtime_vocabulary() {
-        assert_eq!(parse_reasoning("HIGH"), Some(ReasoningEffort::High));
+    fn reasoning_levels_map_onto_the_frontend_vocabulary() {
+        assert_eq!(parse_reasoning("HIGH"), Some(FrontendReasoningEffort::High));
         assert_eq!(
             parse_reasoning("very_high"),
-            Some(ReasoningEffort::VeryHigh)
+            Some(FrontendReasoningEffort::VeryHigh)
         );
-        assert_eq!(parse_reasoning(" maximum "), Some(ReasoningEffort::Maximum));
+        assert_eq!(
+            parse_reasoning(" maximum "),
+            Some(FrontendReasoningEffort::Maximum)
+        );
         assert_eq!(parse_reasoning("turbo"), None);
-        assert_eq!(reasoning_name(ReasoningEffort::VeryHigh), "very-high");
+        assert_eq!(
+            reasoning_name(FrontendReasoningEffort::VeryHigh),
+            "very-high"
+        );
     }
 }

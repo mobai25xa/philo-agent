@@ -1,11 +1,8 @@
 //! JSONL-006: Compaction entry schema v2 serialization and restart replay
 //! parity with the in-memory backend.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     ContextMessage, EntryId, MemorySessionStore, OperationId, OperationOutcome,
@@ -13,16 +10,6 @@ use philo_session::{
     SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -106,24 +93,28 @@ fn compaction(
     )
 }
 
-#[test]
-fn golden_compaction_serializes_as_schema_v2_with_opaque_boundary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_compaction_serializes_as_schema_v2_with_opaque_boundary() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    let first =
-        block_on(store.commit(successful_turn(SessionRevision::ZERO, 1))).expect("turn commits");
+    let first = store
+        .commit(successful_turn(SessionRevision::ZERO, 1))
+        .await
+        .expect("turn commits");
     let boundary = first
         .entries()
         .last()
         .expect("turn settles its operation")
         .id()
         .clone();
-    block_on(store.commit(compaction(
-        first.revision(),
-        "summary \"quoted\"\nnext",
-        boundary,
-    )))
-    .expect("compaction commits");
+    store
+        .commit(compaction(
+            first.revision(),
+            "summary \"quoted\"\nnext",
+            boundary,
+        ))
+        .await
+        .expect("compaction commits");
     drop(store);
 
     let log = std::fs::read_to_string(log_path(&root)).expect("read log");
@@ -135,8 +126,8 @@ fn golden_compaction_serializes_as_schema_v2_with_opaque_boundary() {
     );
 }
 
-#[test]
-fn schema_v1_pre_compaction_log_is_unsupported() {
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_v1_pre_compaction_log_is_unsupported() {
     let root = TempRoot::new();
     let dir = root.path.join("s-m13-jsonl");
     std::fs::create_dir_all(&dir).expect("create session dir");
@@ -157,15 +148,21 @@ fn schema_v1_pre_compaction_log_is_unsupported() {
     ));
 }
 
-#[test]
-fn compactions_roundtrip_across_restart_with_latest_boundary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn compactions_roundtrip_across_restart_with_latest_boundary() {
     let root = TempRoot::new();
     let disk = JsonlSessionStore::open(&root.path).expect("open disk store");
     let memory = MemorySessionStore::new();
 
     let first_transaction = successful_turn(SessionRevision::ZERO, 1);
-    let disk_first = block_on(disk.commit(first_transaction.clone())).expect("disk first turn");
-    let memory_first = block_on(memory.commit(first_transaction)).expect("memory first turn");
+    let disk_first = disk
+        .commit(first_transaction.clone())
+        .await
+        .expect("disk first turn");
+    let memory_first = memory
+        .commit(first_transaction)
+        .await
+        .expect("memory first turn");
     assert_eq!(disk_first, memory_first);
     let first_boundary = disk_first
         .entries()
@@ -175,8 +172,14 @@ fn compactions_roundtrip_across_restart_with_latest_boundary() {
         .clone();
 
     let second_transaction = successful_turn(disk_first.revision(), 2);
-    let disk_second = block_on(disk.commit(second_transaction.clone())).expect("disk second turn");
-    let memory_second = block_on(memory.commit(second_transaction)).expect("memory second turn");
+    let disk_second = disk
+        .commit(second_transaction.clone())
+        .await
+        .expect("disk second turn");
+    let memory_second = memory
+        .commit(second_transaction)
+        .await
+        .expect("memory second turn");
     assert_eq!(disk_second, memory_second);
     let second_boundary = disk_second
         .entries()
@@ -186,28 +189,48 @@ fn compactions_roundtrip_across_restart_with_latest_boundary() {
         .clone();
 
     let first_compaction = compaction(disk_second.revision(), "summary-1", first_boundary);
-    let disk_compaction =
-        block_on(disk.commit(first_compaction.clone())).expect("disk first compaction");
-    let memory_compaction =
-        block_on(memory.commit(first_compaction)).expect("memory first compaction");
+    let disk_compaction = disk
+        .commit(first_compaction.clone())
+        .await
+        .expect("disk first compaction");
+    let memory_compaction = memory
+        .commit(first_compaction)
+        .await
+        .expect("memory first compaction");
     assert_eq!(disk_compaction, memory_compaction);
 
     let third_transaction = successful_turn(disk_compaction.revision(), 3);
-    let disk_third = block_on(disk.commit(third_transaction.clone())).expect("disk third turn");
-    let memory_third = block_on(memory.commit(third_transaction)).expect("memory third turn");
+    let disk_third = disk
+        .commit(third_transaction.clone())
+        .await
+        .expect("disk third turn");
+    let memory_third = memory
+        .commit(third_transaction)
+        .await
+        .expect("memory third turn");
     assert_eq!(disk_third, memory_third);
 
     let second_compaction = compaction(disk_third.revision(), "summary-2", second_boundary);
-    let disk_latest =
-        block_on(disk.commit(second_compaction.clone())).expect("disk second compaction");
-    let memory_latest =
-        block_on(memory.commit(second_compaction)).expect("memory second compaction");
+    let disk_latest = disk
+        .commit(second_compaction.clone())
+        .await
+        .expect("disk second compaction");
+    let memory_latest = memory
+        .commit(second_compaction)
+        .await
+        .expect("memory second compaction");
     assert_eq!(disk_latest, memory_latest);
     drop(disk);
 
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open disk store");
-    let disk_view = block_on(reopened.context_view(&session_id())).expect("replayed view");
-    let memory_view = block_on(memory.context_view(&session_id())).expect("memory view");
+    let disk_view = reopened
+        .context_view(&session_id())
+        .await
+        .expect("replayed view");
+    let memory_view = memory
+        .context_view(&session_id())
+        .await
+        .expect("memory view");
     assert_eq!(disk_view, memory_view);
     assert_eq!(
         disk_view.messages(),

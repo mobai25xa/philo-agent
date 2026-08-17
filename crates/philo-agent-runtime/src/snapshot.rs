@@ -1,6 +1,11 @@
-//! Frozen per-turn and per-call facts handed to the model port.
+//! Frozen per-turn and per-call facts handed to the model port, plus the
+//! coordinator's observable runtime snapshot.
 
-use crate::{GenerationConfig, ModelCallId, ModelMessage, OperationId, SessionId, TurnId};
+use crate::{
+    AgentAvailability, AgentFailure, GenerationConfig, MaintenanceId, ModelCallId, ModelMessage,
+    OperationId, OperationPhase, OperationStatus, RuntimeEpoch, SessionId, SettlementDurability,
+    TurnId,
+};
 use philo_session::SessionRevision;
 use philo_tools::ToolDefinition;
 
@@ -43,4 +48,67 @@ pub struct ModelCallSnapshot {
     pub generation: GenerationConfig,
     /// Frozen concurrent invoke cap; adapters send `Allow` when this is `> 1`.
     pub max_parallel_tool_calls: u32,
+}
+
+/// Live observation of the coordinator. Updated in the same actor turn as
+/// Started/Settled transitions. Absence of `Started` on a snapshot is not
+/// a crash-recovery proof that a queued operation never began.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub epoch: RuntimeEpoch,
+    pub availability: AgentAvailability,
+    pub queued: Vec<OperationId>,
+    pub active: Option<ActiveOperationSnapshot>,
+    pub maintenance: Option<MaintenanceSnapshot>,
+    pub shutdown: ShutdownState,
+    pub last_settled: Vec<SettledOperationSnapshot>,
+    /// Monotonic coordinator publication counter. Bumped on every snapshot.
+    pub runtime_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveOperationSnapshot {
+    pub operation_id: OperationId,
+    pub turn_id: TurnId,
+    pub session_id: SessionId,
+    pub phase: OperationPhase,
+    pub started: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaintenanceSnapshot {
+    pub id: MaintenanceId,
+    pub session_id: SessionId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettledOperationSnapshot {
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+    pub durability: SettlementDurability,
+    pub failure: Option<AgentFailure>,
+}
+
+/// Coordinator shutdown mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownMode {
+    Drain,
+    Forced,
+}
+
+/// Observable shutdown state of one runtime epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownState {
+    Running,
+    Draining,
+    Forced,
+    Stopped,
+}
+
+/// Report returned by [`crate::RuntimeHandle::shutdown`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShutdownReport {
+    pub epoch: RuntimeEpoch,
+    pub shutdown: ShutdownState,
+    pub settlements: Vec<crate::EpochSettlement>,
 }

@@ -26,18 +26,30 @@ pub(super) async fn seal_stale_turns(
     session_id: &session::SessionId,
     context: session::SessionContextView,
 ) -> SealOutcome {
+    let mut sealed = Vec::new();
     match seal_stale_turns_with(ctx, session_id, context, |turn_id| {
-        operation.prior_turn_sealed(TurnId::new(turn_id.as_str()));
+        sealed.push(turn_id.clone());
     })
     .await
     {
-        Ok(context) => SealOutcome::Sealed(operation, context),
+        Ok(context) => {
+            for turn_id in sealed {
+                operation
+                    .prior_turn_sealed(TurnId::new(turn_id.as_str()))
+                    .await;
+            }
+            SealOutcome::Sealed(operation, context)
+        }
         Err(SealFailure::Commit(error)) => {
-            operation.fail_unconfirmed(session_failure("sealing stale turn", &error));
+            operation
+                .fail_unconfirmed(session_failure("sealing stale turn", &error))
+                .await;
             SealOutcome::Settled
         }
         Err(SealFailure::Refresh(error)) => {
-            operation.fail_unconfirmed(session_failure("re-reading sealed context", &error));
+            operation
+                .fail_unconfirmed(session_failure("re-reading sealed context", &error))
+                .await;
             SealOutcome::Settled
         }
     }

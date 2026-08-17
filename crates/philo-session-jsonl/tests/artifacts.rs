@@ -1,11 +1,8 @@
 //! JSONL-003: content-addressed artifact storage, UserMessage `parts` on
 //! schema v2, and recovery semantics (ADR-0002).
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     ContextMessage, MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock,
@@ -13,16 +10,6 @@ use philo_session::{
     SessionUserPart, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -127,11 +114,13 @@ fn settle_transaction(revision: u64, operation: &str, turn: &str) -> SessionTran
 
 // --- Golden format and barrier (M8-002) ---------------------------------------
 
-#[test]
-fn golden_image_transaction_stores_reference_and_fsynced_artifact() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_image_transaction_stores_reference_and_fsynced_artifact() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+    store
+        .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+        .await
         .expect("image commit");
     drop(store);
 
@@ -163,34 +152,41 @@ fn golden_image_transaction_stores_reference_and_fsynced_artifact() {
     );
 }
 
-#[test]
-fn plain_text_sessions_never_create_an_artifacts_directory() {
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_text_sessions_never_create_an_artifacts_directory() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    block_on(store.commit(start_transaction(
-        0,
-        "op-1",
-        "turn-1",
-        SessionUserPart::text_parts("plain"),
-    )))
-    .expect("text commit");
+    store
+        .commit(start_transaction(
+            0,
+            "op-1",
+            "turn-1",
+            SessionUserPart::text_parts("plain"),
+        ))
+        .await
+        .expect("text commit");
     assert!(session_dir(&root).is_dir());
     assert!(!artifacts_dir(&root).exists());
 }
 
 // --- Restart replay fidelity (M8-003) ------------------------------------------
 
-#[test]
-fn image_parts_rebuild_byte_for_byte_across_a_restart() {
+#[tokio::test(flavor = "multi_thread")]
+async fn image_parts_rebuild_byte_for_byte_across_a_restart() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+        store
+            .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+            .await
             .expect("commit");
-        block_on(store.commit(settle_transaction(1, "op-1", "turn-1"))).expect("settle");
+        store
+            .commit(settle_transaction(1, "op-1", "turn-1"))
+            .await
+            .expect("settle");
     }
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
-    let view = block_on(reopened.context_view(&session_id())).expect("view");
+    let view = reopened.context_view(&session_id()).await.expect("view");
     assert_eq!(view.revision(), SessionRevision::new(2));
     assert_eq!(
         view.messages()[0],
@@ -202,14 +198,21 @@ fn image_parts_rebuild_byte_for_byte_across_a_restart() {
 
 // --- Content addressing deduplicates (ADR-0002 invariant 2) --------------------
 
-#[test]
-fn resubmitting_the_same_image_stores_one_artifact() {
+#[tokio::test(flavor = "multi_thread")]
+async fn resubmitting_the_same_image_stores_one_artifact() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+    store
+        .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+        .await
         .expect("first image turn");
-    block_on(store.commit(settle_transaction(1, "op-1", "turn-1"))).expect("settle");
-    block_on(store.commit(start_transaction(2, "op-2", "turn-2", image_parts())))
+    store
+        .commit(settle_transaction(1, "op-1", "turn-1"))
+        .await
+        .expect("settle");
+    store
+        .commit(start_transaction(2, "op-2", "turn-2", image_parts()))
+        .await
         .expect("second image turn");
 
     let files: Vec<_> = std::fs::read_dir(artifacts_dir(&root))
@@ -227,12 +230,14 @@ fn resubmitting_the_same_image_stores_one_artifact() {
 
 // --- Crash semantics (M8-004) ---------------------------------------------------
 
-#[test]
-fn orphan_artifacts_are_tolerated_reported_and_kept() {
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_artifacts_are_tolerated_reported_and_kept() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+        store
+            .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+            .await
             .expect("commit");
     }
     // Crash residue: an unreferenced artifact and an interrupted temp file.
@@ -251,15 +256,20 @@ fn orphan_artifacts_are_tolerated_reported_and_kept() {
     assert!(artifacts_dir(&root).join("0000dead").is_file());
     assert!(artifacts_dir(&root).join("ffff.tmp").is_file());
     // The session keeps working.
-    block_on(reopened.commit(settle_transaction(1, "op-1", "turn-1"))).expect("commit works");
+    reopened
+        .commit(settle_transaction(1, "op-1", "turn-1"))
+        .await
+        .expect("commit works");
 }
 
-#[test]
-fn missing_referenced_artifact_refuses_to_open() {
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_referenced_artifact_refuses_to_open() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+        store
+            .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+            .await
             .expect("commit");
     }
     std::fs::remove_file(artifacts_dir(&root).join(IMAGE_SHA256)).expect("delete artifact");
@@ -275,12 +285,14 @@ fn missing_referenced_artifact_refuses_to_open() {
     assert!(reason.contains("unreadable"), "names the failure: {reason}");
 }
 
-#[test]
-fn tampered_artifact_content_refuses_to_open() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tampered_artifact_content_refuses_to_open() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+        store
+            .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+            .await
             .expect("commit");
     }
     // Same length, different bytes: the recorded hash no longer matches.
@@ -296,12 +308,14 @@ fn tampered_artifact_content_refuses_to_open() {
     assert!(reason.contains("hash"), "names the mismatch: {reason}");
 }
 
-#[test]
-fn wrong_length_artifact_refuses_to_open() {
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_length_artifact_refuses_to_open() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0, "op-1", "turn-1", image_parts())))
+        store
+            .commit(start_transaction(0, "op-1", "turn-1", image_parts()))
+            .await
             .expect("commit");
     }
     std::fs::write(artifacts_dir(&root).join(IMAGE_SHA256), b"abcabc").expect("grow");
@@ -318,8 +332,8 @@ fn wrong_length_artifact_refuses_to_open() {
 
 // --- v2 user_message shape (no legacy content) ---------------------------------
 
-#[test]
-fn schema_v1_legacy_content_file_is_unsupported() {
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_v1_legacy_content_file_is_unsupported() {
     let root = TempRoot::new();
     let dir = session_dir(&root);
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -340,8 +354,8 @@ fn schema_v1_legacy_content_file_is_unsupported() {
     ));
 }
 
-#[test]
-fn user_message_with_both_content_and_parts_is_corrupt() {
+#[tokio::test(flavor = "multi_thread")]
+async fn user_message_with_both_content_and_parts_is_corrupt() {
     let root = TempRoot::new();
     let dir = session_dir(&root);
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -359,8 +373,8 @@ fn user_message_with_both_content_and_parts_is_corrupt() {
     assert!(matches!(error, JsonlOpenError::Corrupt { line: 1, .. }));
 }
 
-#[test]
-fn user_message_without_parts_is_corrupt() {
+#[tokio::test(flavor = "multi_thread")]
+async fn user_message_without_parts_is_corrupt() {
     let root = TempRoot::new();
     let dir = session_dir(&root);
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -380,8 +394,8 @@ fn user_message_without_parts_is_corrupt() {
 
 // --- Backend parity extended to image parts -------------------------------------
 
-#[test]
-fn jsonl_and_memory_backends_agree_on_image_facts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn jsonl_and_memory_backends_agree_on_image_facts() {
     let root = TempRoot::new();
     let jsonl = JsonlSessionStore::open(&root.path).expect("open");
     let memory = MemorySessionStore::new();
@@ -390,15 +404,21 @@ fn jsonl_and_memory_backends_agree_on_image_facts() {
         start_transaction(0, "op-1", "turn-1", image_parts()),
         settle_transaction(1, "op-1", "turn-1"),
     ] {
-        let disk = block_on(jsonl.commit(transaction.clone())).expect("jsonl commit");
-        let ram = block_on(memory.commit(transaction)).expect("memory commit");
+        let disk = jsonl
+            .commit(transaction.clone())
+            .await
+            .expect("jsonl commit");
+        let ram = memory.commit(transaction).await.expect("memory commit");
         assert_eq!(disk.revision(), ram.revision());
         assert_eq!(disk.entries(), ram.entries(), "same ids, parents, kinds");
         assert_eq!(disk.current_leaf(), ram.current_leaf());
     }
     assert_eq!(
-        block_on(jsonl.context_view(&session_id())).expect("jsonl view"),
-        block_on(memory.context_view(&session_id())).expect("memory view"),
+        jsonl.context_view(&session_id()).await.expect("jsonl view"),
+        memory
+            .context_view(&session_id())
+            .await
+            .expect("memory view"),
         "identical context including image bytes"
     );
 }

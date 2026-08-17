@@ -346,13 +346,17 @@ impl ModelEventStream for NormalizedStream {
                         self.flush_remaining_items();
                         self.captured.sort_by_key(|item| item.index);
                         let blocks = assistant_blocks_from_captured(&self.captured);
-                        if let Err(error) = self.replay.commit(
-                            &self.client,
-                            &self.target,
-                            &self.request,
-                            self.response_id.take(),
-                            std::mem::take(&mut self.captured),
-                        ) {
+                        if let Err(error) = self
+                            .replay
+                            .commit(
+                                &self.client,
+                                &self.target,
+                                &self.request,
+                                self.response_id.take(),
+                                std::mem::take(&mut self.captured),
+                            )
+                            .await
+                        {
                             return Some(Err(error));
                         }
                         return Some(Ok(ModelEvent::Completed { blocks }));

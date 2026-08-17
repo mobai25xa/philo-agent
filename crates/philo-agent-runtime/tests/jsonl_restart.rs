@@ -3,32 +3,19 @@
 
 mod support;
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelMessage,
-    ModelToolResultOutcome, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
-    SettlementDurability, ToolDefinition, UserMessage, UserPart,
+    AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelMessage, ModelToolResultOutcome,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
+    ToolDefinition, UserMessage, UserPart,
 };
 use philo_session::{ContextMessage, SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -66,19 +53,20 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds),
         tools,
     )
+    .await
 }
 
 /// Sequential IDs with a distinct prefix. Operation/Turn IDs must stay unique
@@ -111,8 +99,8 @@ fn tool_round(call_id: &str) -> ModelScript {
 
 /// M5-001: the existing multi-round success trajectory holds on the JSONL
 /// backend with all facts durable in source order.
-#[test]
-fn multi_round_loop_succeeds_on_the_jsonl_backend() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_round_loop_succeeds_on_the_jsonl_backend() {
     let root = TempRoot::new();
     let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
     let model = Arc::new(FakeModel::new([
@@ -127,17 +115,18 @@ fn multi_round_loop_succeeds_on_the_jsonl_backend() {
             FakeToolResult::success("two"),
         ],
     ));
-    let handle = block_on(
-        runtime(model, sessions.clone(), tools, 2)
-            .prompt(SessionId::new("m5-001"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(model, sessions.clone(), tools, 2)
+        .await
+        .prompt(SessionId::new("m5-001"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "final"
     ));
 
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("m5-001")))
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("m5-001"))
+        .await
         .expect("context view");
     let kinds: Vec<&str> = view
         .messages()
@@ -159,37 +148,40 @@ fn multi_round_loop_succeeds_on_the_jsonl_backend() {
 
 /// M5-001 failure leg: a model failure settles Confirmed with the failure
 /// facts durable on disk.
-#[test]
-fn model_failure_settles_confirmed_on_the_jsonl_backend() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_failure_settles_confirmed_on_the_jsonl_backend() {
     let root = TempRoot::new();
     let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
     let model = Arc::new(FakeModel::new([ModelScript::error("provider exploded")]));
     let tools = Arc::new(FakeTool::new([echo_definition()], []));
-    let handle = block_on(
-        runtime(model, sessions.clone(), tools, 2)
-            .prompt(SessionId::new("m5-fail"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let agent = runtime(model, sessions.clone(), tools, 2).await;
+    let handle = agent
+        .prompt(SessionId::new("m5-fail"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed { failure, durability }
             if failure.kind() == AgentFailureKind::ModelCall
                 && durability == SettlementDurability::Confirmed
     ));
 
     // The failure facts survive a restart: revision covers both save points.
+    drop(handle);
+    agent.stop().await;
     drop(sessions);
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("re-open"));
-    let view =
-        block_on(reopened.context_view(&philo_session::SessionId::new("m5-fail"))).expect("view");
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
+    let view = reopened
+        .context_view(&philo_session::SessionId::new("m5-fail"))
+        .await
+        .expect("view");
     assert_eq!(view.revision(), philo_session::SessionRevision::new(2));
 }
 
 /// M5-002: after dropping the store, a fresh instance over the same root
 /// rebuilds the full history and the next turn's ModelCallSnapshot replays
 /// the interleaved tool trajectory unchanged.
-#[test]
-fn restart_continues_with_the_full_replayed_history() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_continues_with_the_full_replayed_history() {
     let root = TempRoot::new();
     let session = SessionId::new("m5-002");
 
@@ -208,20 +200,21 @@ fn restart_continues_with_the_full_replayed_history() {
                 FakeToolResult::business_error("bad_input", "round two failed"),
             ],
         ));
-        let handle = block_on(
-            runtime(model, sessions, tools, 2)
-                .prompt(session.clone(), UserMessage::new("first prompt")),
-        )
-        .unwrap();
+        let agent = runtime(model, sessions, tools, 2).await;
+        let handle = agent
+            .prompt(session.clone(), UserMessage::new("first prompt"))
+            .await;
         assert!(matches!(
-            block_on(handle.wait()),
+            handle.wait().await,
             OperationOutcome::Succeeded { .. }
         ));
+        drop(handle);
+        agent.stop().await;
         // Store dropped here: simulates the process exiting.
     }
 
     // Restart: a fresh store instance recovers the session from disk.
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("re-open store"));
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
     let report = reopened
         .recover_session(&philo_session::SessionId::new("m5-002"))
         .expect("recovery succeeds");
@@ -230,7 +223,7 @@ fn restart_continues_with_the_full_replayed_history() {
 
     let model = Arc::new(FakeModel::succeeds(&["turn two done"]));
     let tools = Arc::new(FakeTool::new([echo_definition()], []));
-    let restarted = AgentRuntime::with_tools(
+    let restarted = support::runtime::TestRuntime::with_tools(
         model.clone(),
         reopened.clone(),
         Arc::new(RestartIdSource {
@@ -238,9 +231,12 @@ fn restart_continues_with_the_full_replayed_history() {
         }),
         config(2),
         tools,
-    );
-    let handle = block_on(restarted.prompt(session, UserMessage::new("second prompt"))).unwrap();
-    let outcome = block_on(handle.wait());
+    )
+    .await;
+    let handle = restarted
+        .prompt(session, UserMessage::new("second prompt"))
+        .await;
+    let outcome = handle.wait().await;
     let OperationOutcome::Succeeded { assistant } = &outcome else {
         panic!("turn two failed: {outcome:?}");
     };
@@ -312,8 +308,10 @@ fn restart_continues_with_the_full_replayed_history() {
     assert_eq!(messages.len(), 8);
 
     // Durable facts across both turns stay interleaved in source order.
-    let view =
-        block_on(reopened.context_view(&philo_session::SessionId::new("m5-002"))).expect("view");
+    let view = reopened
+        .context_view(&philo_session::SessionId::new("m5-002"))
+        .await
+        .expect("view");
     let error_codes: Vec<&str> = view
         .messages()
         .iter()

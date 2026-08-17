@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use crate::args::Cli;
 use crate::error::UsageError;
 
-pub use resolve::{Deployment, EffectiveSetting, Settings, Verbosity};
-pub use watch::{ResolveFlags, WatchIntervals, spawn};
+pub use resolve::{Deployment, Settings, Verbosity};
+pub use watch::{ResolveFlags, WatchIntervals, WatchTask, spawn};
 
 /// Loaded global/project file layers. Raw keys and source bookkeeping remain
 /// private to the configuration implementation.

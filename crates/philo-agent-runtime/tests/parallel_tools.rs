@@ -2,35 +2,16 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, OperationHandle,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    AgentEvent, AgentFailureKind, GenerationConfig, OperationOutcome, RuntimeConfig,
+    SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.as_mut().poll(&mut context)
-}
 
 fn config(max_parallel_tool_calls: u32) -> RuntimeConfig {
     RuntimeConfig {
@@ -45,19 +26,20 @@ fn config(max_parallel_tool_calls: u32) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_parallel_tool_calls: u32,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_parallel_tool_calls),
         tools,
     )
+    .await
 }
 
 fn echo() -> ToolDefinition {
@@ -68,21 +50,11 @@ fn sid() -> SessionId {
     SessionId::new("s")
 }
 
-fn drive_until(
-    wait: &mut Pin<Box<impl Future<Output = OperationOutcome>>>,
-    ready: impl Fn() -> bool,
-) {
-    for _ in 0..10_000 {
-        if ready() {
-            return;
-        }
-        assert!(poll_once(wait).is_pending(), "operation settled too early");
-    }
-    panic!("timed out waiting for the tool batch to reach the expected state");
-}
-
-fn result_outcomes(sessions: &MemorySessionStore) -> Vec<(String, ToolResultOutcome)> {
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+async fn result_outcomes(sessions: &MemorySessionStore) -> Vec<(String, ToolResultOutcome)> {
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     view.messages()
         .iter()
         .filter_map(|message| match message {
@@ -95,16 +67,16 @@ fn result_outcomes(sessions: &MemorySessionStore) -> Vec<(String, ToolResultOutc
         .collect()
 }
 
-fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
 }
 
-#[test]
-fn limit_one_keeps_two_calls_strictly_serial() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limit_one_keeps_two_calls_strictly_serial() {
     let first = Gate::new();
     let second = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -119,13 +91,12 @@ fn limit_one_keeps_two_calls_strictly_serial() {
             FakeToolResult::gated_success(&second, "two"),
         ],
     ));
-    let agent = runtime(model.clone(), sessions.clone(), tools.clone(), 1);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
+    let agent = runtime(model.clone(), sessions.clone(), tools.clone(), 1).await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
 
-    drive_until(&mut wait, || tools.invocation_count() == 1);
+    support::runtime::wait_until(|| tools.invocation_count() == 1).await;
     for _ in 0..32 {
-        assert!(poll_once(&mut wait).is_pending());
+        tokio::task::yield_now().await;
         assert_eq!(
             tools.invocation_count(),
             1,
@@ -134,11 +105,15 @@ fn limit_one_keeps_two_calls_strictly_serial() {
     }
 
     first.release();
-    drive_until(&mut wait, || tools.invocation_count() == 2);
+    support::runtime::wait_until(|| tools.invocation_count() == 2).await;
     second.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Succeeded { .. }));
+    assert!(matches!(
+        handle.wait().await,
+        OperationOutcome::Succeeded { .. }
+    ));
     assert_eq!(
         result_outcomes(&sessions)
+            .await
             .into_iter()
             .map(|(id, outcome)| (id, matches!(outcome, ToolResultOutcome::Success { .. })))
             .collect::<Vec<_>>(),
@@ -147,8 +122,8 @@ fn limit_one_keeps_two_calls_strictly_serial() {
     assert_eq!(model.calls()[0].max_parallel_tool_calls, 1);
 }
 
-#[test]
-fn limit_one_cancel_is_still_a_real_prefix() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limit_one_cancel_is_still_a_real_prefix() {
     let tool_gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[
         (0, "call-1", "echo", "{}"),
@@ -162,16 +137,16 @@ fn limit_one_cancel_is_still_a_real_prefix() {
             FakeToolResult::success("never"),
         ],
     ));
-    let agent = runtime(model, sessions.clone(), tools.clone(), 1);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 1);
-    handle.cancel();
+    let agent = runtime(model, sessions.clone(), tools.clone(), 1).await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 1).await;
+    handle.cancel().await;
     tool_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert_eq!(tools.invocation_count(), 1);
     assert_eq!(
         result_outcomes(&sessions)
+            .await
             .into_iter()
             .map(|(id, outcome)| {
                 (
@@ -188,8 +163,8 @@ fn limit_one_cancel_is_still_a_real_prefix() {
     );
 }
 
-#[test]
-fn limit_two_overlaps_invokes_and_commits_in_source_order() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limit_two_overlaps_invokes_and_commits_in_source_order() {
     let first = Gate::new();
     let second = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -204,11 +179,10 @@ fn limit_two_overlaps_invokes_and_commits_in_source_order() {
             FakeToolResult::gated_success(&second, "two"),
         ],
     ));
-    let agent = runtime(model.clone(), sessions.clone(), tools.clone(), 2);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
+    let agent = runtime(model.clone(), sessions.clone(), tools.clone(), 2).await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
 
-    drive_until(&mut wait, || tools.invocation_count() == 2);
+    support::runtime::wait_until(|| tools.invocation_count() == 2).await;
     assert_eq!(
         tools.invocation_count(),
         2,
@@ -216,9 +190,12 @@ fn limit_two_overlaps_invokes_and_commits_in_source_order() {
     );
     second.release();
     first.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Succeeded { .. }));
+    assert!(matches!(
+        handle.wait().await,
+        OperationOutcome::Succeeded { .. }
+    ));
 
-    let outcomes = result_outcomes(&sessions);
+    let outcomes = result_outcomes(&sessions).await;
     assert_eq!(
         outcomes
             .iter()
@@ -247,8 +224,8 @@ fn limit_two_overlaps_invokes_and_commits_in_source_order() {
     );
 }
 
-#[test]
-fn cancel_awaits_in_flight_and_marks_unstarted() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_awaits_in_flight_and_marks_unstarted() {
     let first = Gate::new();
     let second = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[
@@ -265,17 +242,16 @@ fn cancel_awaits_in_flight_and_marks_unstarted() {
             FakeToolResult::success("never"),
         ],
     ));
-    let agent = runtime(model, sessions.clone(), tools.clone(), 2);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 2);
-    handle.cancel();
+    let agent = runtime(model, sessions.clone(), tools.clone(), 2).await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 2).await;
+    handle.cancel().await;
     first.release();
     second.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert_eq!(tools.invocation_count(), 2, "the third call never starts");
 
-    let outcomes = result_outcomes(&sessions);
+    let outcomes = result_outcomes(&sessions).await;
     assert_eq!(outcomes.len(), 3);
     assert!(matches!(
         &outcomes[0],
@@ -290,7 +266,7 @@ fn cancel_awaits_in_flight_and_marks_unstarted() {
         (id, ToolResultOutcome::Cancelled) if id == "call-3"
     ));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let completed: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -301,8 +277,8 @@ fn cancel_awaits_in_flight_and_marks_unstarted() {
     assert_eq!(completed, ["call-1", "call-2"]);
 }
 
-#[test]
-fn tool_port_error_awaits_other_in_flight_and_fails_the_turn() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_port_error_awaits_other_in_flight_and_fails_the_turn() {
     let second = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[
         (0, "call-1", "echo", "{}"),
@@ -316,16 +292,16 @@ fn tool_port_error_awaits_other_in_flight_and_fails_the_turn() {
             FakeToolResult::gated_success(&second, "late"),
         ],
     ));
-    let agent = runtime(model, sessions, tools.clone(), 2);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 2);
-    assert!(
-        poll_once(&mut wait).is_pending(),
+    let agent = runtime(model, sessions, tools.clone(), 2).await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 2).await;
+    assert_eq!(
+        tools.invocation_count(),
+        2,
         "the turn must await the remaining in-flight invoke"
     );
     second.release();
-    match block_on(wait) {
+    match handle.wait().await {
         OperationOutcome::Failed { failure, .. } => {
             assert_eq!(failure.kind(), AgentFailureKind::ToolExecution);
             assert!(failure.message().contains("worker down"));

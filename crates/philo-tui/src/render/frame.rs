@@ -349,8 +349,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use philo_agent_runtime::{AgentEvent, ToolBatchId, ToolCallId};
-    use philo_session::SessionId;
+    use philo_agent_service::FrontendOperationEvent;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -416,8 +415,8 @@ mod tests {
 
         let mut activity = app();
         activity.set_busy(true, 0);
-        activity.on_agent_event(&AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch"),
+        activity.on_operation_event(&FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch".to_owned(),
             call_count: 1,
         });
         assert_eq!(composer_row(&activity), expected);
@@ -432,17 +431,11 @@ mod tests {
         assert_eq!(composer_row(&attachments), expected);
 
         let mut picker = app();
-        picker.open_picker(vec![SessionId::new("one"), SessionId::new("two")]);
+        picker.open_picker(vec!["one".to_owned(), "two".to_owned()]);
         assert_eq!(composer_row(&picker), expected);
 
         let mut approval = app();
-        approval.sync_confirmation(Some((
-            crate::api::confirmation::ConfirmationId::for_test(1),
-            crate::api::ConfirmationRequest {
-                title: "write file".to_owned(),
-                body: "src/main.rs".to_owned(),
-            },
-        )));
+        approval.sync_confirmation(Some((1, "write file".to_owned(), "src/main.rs".to_owned())));
         assert_eq!(composer_row(&approval), expected);
     }
 
@@ -453,13 +446,13 @@ mod tests {
         {
             app.on_action(Action::InsertChar(ch));
         }
-        app.on_agent_event(&AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch"),
+        app.on_operation_event(&FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch".to_owned(),
             call_count: 1,
         });
-        app.on_agent_event(&AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
+        app.on_operation_event(&FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call".to_owned(),
             index: 0,
             tool_name: "read_file".to_owned(),
             arguments: "{\"path\":\"src/中文.rs\"}".to_owned(),
@@ -478,11 +471,9 @@ mod tests {
         let mut app = app();
         app.on_paste("draft 中文");
         app.sync_confirmation(Some((
-            crate::api::confirmation::ConfirmationId::for_test(7),
-            crate::api::ConfirmationRequest {
-                title: "run command".to_owned(),
-                body: "cargo test -p philo-tui".to_owned(),
-            },
+            7,
+            "run command".to_owned(),
+            "cargo test -p philo-tui".to_owned(),
         )));
         let rendered = render(&app, 40, MIN_SUPPORTED_HEIGHT);
         assert!(rendered.contains("Approval required"));
@@ -515,7 +506,7 @@ mod tests {
         assert_eq!(areas.composer.height, 3);
         assert_eq!(areas.composer.bottom(), areas.status.y);
 
-        app.on_agent_event(&AgentEvent::TextDelta {
+        app.on_operation_event(&FrontendOperationEvent::TextDelta {
             delta: "partial answer".to_owned(),
         });
         let pinned = render(&app, 80, 24);

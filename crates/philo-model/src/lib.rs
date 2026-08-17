@@ -25,8 +25,8 @@ pub use assemble::{
 };
 pub use headers::{DEFAULT_USER_AGENT, ModelRequestHeaderError, ModelRequestHeaders};
 pub use replay::{
-    FileModelReplayStore, MemoryModelReplayStore, ModelReplayStore, ReplayStoreBlob,
-    ReplayStoreError, ReplayStoreErrorCode, ReplayStorePolicy,
+    FileModelReplayStore, MemoryModelReplayStore, ModelReplayStore, REPLAY_COMMAND_CAP,
+    ReplayStoreBlob, ReplayStoreError, ReplayStoreErrorCode, ReplayStorePolicy,
 };
 
 // Assembly-time SDK vocabulary re-exported for adapter callers.

@@ -1,5 +1,8 @@
 //! MODEL-008: sidecar persistent replay lives in a private sidecar, survives
 //! fresh SDK/adapter instances, and is committed before runtime completion.
+//!
+//! The JSONL restart test drives Runtime through `RuntimeHandle::submit` and
+//! subscription drain.
 
 mod support;
 
@@ -8,21 +11,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use philo_agent_runtime::{
-    AgentRuntime, GenerationConfig, IdSource, ModelEvent, ModelMessage, ModelPort, ModelToolCall,
+    GenerationConfig, IdSource, ModelEvent, ModelMessage, ModelPort, ModelToolCall,
     ModelToolResultOutcome, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
-    ToolCallId, ToolRegistry, UserMessage, UserPart,
+    ShutdownMode, ToolCallId, ToolRegistry, UserMessage, UserPart,
 };
 use philo_model::{
     FileModelReplayStore, MemoryModelReplayStore, ModelCompat, ModelProtocol, ModelReplayStore,
     PhiloModelAdapter, ReplayStoreBlob, ReplayStoreError, ReplayStoreErrorCode, ReplayStorePolicy,
 };
-use philo_session::SessionStore;
 use philo_session_jsonl::JsonlSessionStore;
 use philo_tools_std::ReadTool;
 use serde_json::{Value, json};
 use support::{
-    StubResponse, StubTransport, assistant_tool_calls, collect, collect_ok, reasoning_snapshot, sse,
+    StubResponse, StubTransport, assistant_tool_calls, collect, collect_ok, drain_until_settled,
+    reasoning_snapshot, sse, start_runtime, submit_prompt, test_generation,
 };
 
 const RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
@@ -415,7 +419,13 @@ async fn incomplete_response_and_disabled_maintenance_call_commit_nothing() {
             .iter()
             .any(|event| matches!(event, Ok(ModelEvent::Completed { .. })))
     );
-    assert!(store.load("session-1").expect("load store").is_empty());
+    assert!(
+        store
+            .load("session-1")
+            .await
+            .expect("load store")
+            .is_empty()
+    );
 
     let maintenance_transport = StubTransport::new([StubResponse::Sse(responses_tool_body(
         "response-2",
@@ -438,7 +448,13 @@ async fn incomplete_response_and_disabled_maintenance_call_commit_nothing() {
             .expect("maintenance call starts"),
     )
     .await;
-    assert!(store.load("session-1").expect("load store").is_empty());
+    assert!(
+        store
+            .load("session-1")
+            .await
+            .expect("load store")
+            .is_empty()
+    );
 }
 
 #[derive(Debug)]
@@ -459,19 +475,30 @@ impl ModelReplayStore for CommitFailureStore {
         self.inner.policy()
     }
 
-    fn load(&self, session_id: &str) -> Result<Vec<ReplayStoreBlob>, ReplayStoreError> {
+    fn load(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<Vec<ReplayStoreBlob>, ReplayStoreError>> {
         self.inner.load(session_id)
     }
 
-    fn commit(&self, _session_id: &str, _blob: ReplayStoreBlob) -> Result<(), ReplayStoreError> {
-        Err(ReplayStoreError::new(ReplayStoreErrorCode::QuotaExceeded))
+    fn commit(
+        &self,
+        _session_id: &str,
+        _blob: ReplayStoreBlob,
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        Box::pin(async { Err(ReplayStoreError::new(ReplayStoreErrorCode::QuotaExceeded)) })
     }
 
-    fn remove(&self, session_id: &str, generation_ids: &[String]) -> Result<(), ReplayStoreError> {
+    fn remove(
+        &self,
+        session_id: &str,
+        generation_ids: &[String],
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
         self.inner.remove(session_id, generation_ids)
     }
 
-    fn delete_session(&self, session_id: &str) -> Result<(), ReplayStoreError> {
+    fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
         self.inner.delete_session(session_id)
     }
 }
@@ -535,8 +562,8 @@ async fn optional_commit_failure_degrades_and_still_completes() {
     assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
 }
 
-#[test]
-fn file_store_is_idempotent_quota_bounded_and_session_scoped() {
+#[tokio::test]
+async fn file_store_is_idempotent_quota_bounded_and_session_scoped() {
     let root = TempRoot::new("phase2-store");
     let store = FileModelReplayStore::with_policy(
         &root.path,
@@ -548,14 +575,17 @@ fn file_store_is_idempotent_quota_bounded_and_session_scoped() {
     .expect("open replay store");
     store
         .commit("session-a", ReplayStoreBlob::new("one", b"abc".to_vec()))
+        .await
         .expect("first commit");
     store
         .commit("session-a", ReplayStoreBlob::new("one", b"abc".to_vec()))
+        .await
         .expect("idempotent commit");
-    assert_eq!(store.load("session-a").expect("load").len(), 1);
+    assert_eq!(store.load("session-a").await.expect("load").len(), 1);
     assert_eq!(
         store
             .commit("session-a", ReplayStoreBlob::new("one", b"abd".to_vec()))
+            .await
             .expect_err("same id with different bytes conflicts")
             .code(),
         ReplayStoreErrorCode::Conflict
@@ -563,39 +593,56 @@ fn file_store_is_idempotent_quota_bounded_and_session_scoped() {
     assert_eq!(
         store
             .commit("session-a", ReplayStoreBlob::new("two", b"defg".to_vec()))
+            .await
             .expect_err("session quota enforced")
             .code(),
         ReplayStoreErrorCode::QuotaExceeded
     );
-    assert!(store.load("session-b").expect("other session").is_empty());
-    store.delete_session("session-a").expect("delete sidecar");
-    assert!(store.load("session-a").expect("deleted session").is_empty());
+    assert!(
+        store
+            .load("session-b")
+            .await
+            .expect("other session")
+            .is_empty()
+    );
+    store
+        .delete_session("session-a")
+        .await
+        .expect("delete sidecar");
+    assert!(
+        store
+            .load("session-a")
+            .await
+            .expect("deleted session")
+            .is_empty()
+    );
 }
 
-#[test]
-fn file_store_serializes_concurrent_writers_and_cleans_temp_files() {
+#[tokio::test]
+async fn file_store_serializes_concurrent_writers_and_cleans_temp_files() {
     let root = TempRoot::new("phase2-concurrent");
     let store = Arc::new(FileModelReplayStore::open(&root.path).expect("open replay store"));
-    let workers = (0..8)
-        .map(|index| {
-            let store = store.clone();
-            std::thread::spawn(move || {
-                store.commit(
+    let mut workers = Vec::new();
+    for index in 0..8 {
+        let store = store.clone();
+        workers.push(tokio::spawn(async move {
+            store
+                .commit(
                     "shared-session",
                     ReplayStoreBlob::new(format!("generation-{index}"), vec![index as u8; 32]),
                 )
-            })
-        })
-        .collect::<Vec<_>>();
-    for worker in workers {
-        worker.join().expect("writer thread").expect("commit");
+                .await
+        }));
     }
-    assert_eq!(store.load("shared-session").expect("load").len(), 8);
+    for worker in workers {
+        worker.await.expect("writer task").expect("commit");
+    }
+    assert_eq!(store.load("shared-session").await.expect("load").len(), 8);
 
     let replay_dir = root.path.join("s-shared-session").join("model-replay");
     std::fs::write(replay_dir.join(".interrupted.tmp"), b"partial secret")
         .expect("write interrupted temp file");
-    assert_eq!(store.load("shared-session").expect("reload").len(), 8);
+    assert_eq!(store.load("shared-session").await.expect("reload").len(), 8);
     assert!(!replay_dir.join(".interrupted.tmp").exists());
 }
 
@@ -632,7 +679,10 @@ async fn expired_or_orphaned_generations_are_not_restored() {
             .expect("first call starts"),
     )
     .await;
-    assert_eq!(store.load("session-1").expect("raw store load").len(), 1);
+    assert_eq!(
+        store.load("session-1").await.expect("raw store load").len(),
+        1
+    );
 
     let transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
     let next = response_adapter(transport.clone(), store, "stub-model");
@@ -671,35 +721,29 @@ impl IdSource for RestartIdSource {
     }
 }
 
-fn runtime(
-    model: PhiloModelAdapter,
-    sessions: Arc<dyn SessionStore>,
-    ids: Arc<dyn IdSource>,
-    workspace: &std::path::Path,
-) -> AgentRuntime {
-    let tools = ToolRegistry::builder()
-        .register(ReadTool::definition(), ReadTool::new(workspace))
-        .expect("register read tool")
-        .build();
-    AgentRuntime::with_tools(
-        Arc::new(model),
-        sessions,
-        ids,
-        RuntimeConfig {
-            system_prompt: "phase 2 test".to_owned(),
-            model_target: "stub-model".to_owned(),
-            generation: GenerationConfig::default(),
-            max_tool_rounds: 1,
-            max_parallel_tool_calls: 1,
-            operation_timeout: None,
-            tool_cancel_grace: std::time::Duration::from_millis(300),
-            compaction: Default::default(),
-        },
-        Arc::new(tools),
+fn replay_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        system_prompt: "phase 2 test".to_owned(),
+        model_target: "stub-model".to_owned(),
+        generation: GenerationConfig::default(),
+        max_tool_rounds: 1,
+        max_parallel_tool_calls: 1,
+        operation_timeout: None,
+        tool_cancel_grace: std::time::Duration::from_millis(300),
+        compaction: Default::default(),
+    }
+}
+
+fn replay_tools(workspace: &std::path::Path) -> Arc<dyn philo_agent_runtime::ToolPort> {
+    Arc::new(
+        ToolRegistry::builder()
+            .register(ReadTool::definition(), ReadTool::new(workspace))
+            .expect("register read tool")
+            .build(),
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn jsonl_session_and_private_replay_sidecar_continue_after_restart() {
     let root = TempRoot::new("phase2-e2e");
     let workspace = root.path.join("workspace");
@@ -719,41 +763,43 @@ async fn jsonl_session_and_private_replay_sidecar_continue_after_restart() {
             )),
             StubResponse::Sse(MINIMAL_RESPONSE.to_vec()),
         ]);
-        let agent = runtime(
+        let generation = test_generation(
             response_adapter(transport, replay, "stub-model"),
-            sessions,
-            Arc::new(SequentialIdSource::new()),
-            &workspace,
+            replay_tools(&workspace),
+            replay_runtime_config(),
         );
-        let handle = agent
-            .prompt(session.clone(), UserMessage::new("read a.txt"))
-            .await
-            .expect("first prompt accepted");
-        assert!(matches!(
-            handle.wait().await,
-            OperationOutcome::Succeeded { ref assistant } if assistant.content() == "hello"
-        ));
+        let (handle, mut sub) = start_runtime(sessions, Arc::new(SequentialIdSource::new()));
+        let operation_id = submit_prompt(
+            &handle,
+            session.clone(),
+            UserMessage::new("read a.txt"),
+            generation,
+        )
+        .await;
+        let (_events, outcome) = drain_until_settled(&mut sub, &operation_id).await;
+        assert!(matches!(outcome, OperationOutcome::Succeeded { .. }));
+        handle.shutdown(ShutdownMode::Drain).await;
     }
 
     let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("reopen session store"));
     let replay = Arc::new(FileModelReplayStore::open(&root.path).expect("reopen replay store"));
     let transport = StubTransport::new([StubResponse::Sse(MINIMAL_RESPONSE.to_vec())]);
-    let agent = runtime(
+    let generation = test_generation(
         response_adapter(transport.clone(), replay, "stub-model"),
+        replay_tools(&workspace),
+        replay_runtime_config(),
+    );
+    let (handle, mut sub) = start_runtime(
         sessions,
         Arc::new(RestartIdSource {
             inner: SequentialIdSource::new(),
         }),
-        &workspace,
     );
-    let handle = agent
-        .prompt(session, UserMessage::new("continue"))
-        .await
-        .expect("restart prompt accepted");
-    assert!(matches!(
-        handle.wait().await,
-        OperationOutcome::Succeeded { .. }
-    ));
+    let operation_id =
+        submit_prompt(&handle, session, UserMessage::new("continue"), generation).await;
+    let (_events, outcome) = drain_until_settled(&mut sub, &operation_id).await;
+    assert!(matches!(outcome, OperationOutcome::Succeeded { .. }));
+    handle.shutdown(ShutdownMode::Drain).await;
 
     let bodies = transport.request_bodies();
     let input = bodies[0]["input"].as_array().expect("Responses input");
@@ -777,8 +823,8 @@ async fn jsonl_session_and_private_replay_sidecar_continue_after_restart() {
 }
 
 #[cfg(unix)]
-#[test]
-fn file_store_uses_owner_only_unix_permissions() {
+#[tokio::test]
+async fn file_store_uses_owner_only_unix_permissions() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = TempRoot::new("phase2-permissions");
@@ -788,6 +834,7 @@ fn file_store_uses_owner_only_unix_permissions() {
             "session",
             ReplayStoreBlob::new("generation", b"secret".to_vec()),
         )
+        .await
         .expect("commit");
     let replay_dir = root.path.join("s-session").join("model-replay");
     let record = std::fs::read_dir(&replay_dir)

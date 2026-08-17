@@ -2,29 +2,15 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelError,
-    ModelEvent, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition,
-    UserMessage,
+    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelError, ModelEvent,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::MemorySessionStore;
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 fn config(max_tool_rounds: u32) -> RuntimeConfig {
     RuntimeConfig {
@@ -39,38 +25,39 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
     }
 }
 
-fn collect_events(mut handle: philo_agent_runtime::OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
 }
 
-fn direct_runtime(model: Arc<FakeModel>) -> AgentRuntime {
-    AgentRuntime::new(
+async fn direct_runtime(model: Arc<FakeModel>) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::new(
         model,
         Arc::new(MemorySessionStore::new()),
         Arc::new(SequentialIdSource::new()),
         config(0),
     )
+    .await
 }
 
-#[test]
-fn response_started_is_forwarded_with_metadata() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_started_is_forwarded_with_metadata() {
     let model =
         Arc::new(FakeModel::new([ModelScript::text(&["hi"])
             .with_response_started(Some("real-model-001"), Some("resp-1"))]));
-    let handle = block_on(
-        direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
-    )
-    .unwrap();
+    let handle = direct_runtime(model)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hello"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let call_started = events
         .iter()
         .position(|event| matches!(event, AgentEvent::ModelCallStarted { .. }))
@@ -110,16 +97,16 @@ fn response_started_is_forwarded_with_metadata() {
     assert_eq!(response_id.as_deref(), Some("resp-1"));
 }
 
-#[test]
-fn response_started_fields_may_be_absent() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_started_fields_may_be_absent() {
     let model = Arc::new(FakeModel::new([
         ModelScript::text(&["ok"]).with_response_started(None, None)
     ]));
-    let handle = block_on(
-        direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
-    )
-    .unwrap();
-    let events = collect_events(handle);
+    let handle = direct_runtime(model)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hello"))
+        .await;
+    let events = collect_events(&handle).await;
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::ModelResponseStarted {
@@ -130,8 +117,8 @@ fn response_started_fields_may_be_absent() {
     )));
 }
 
-#[test]
-fn each_model_call_forwards_its_own_response_started() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_model_call_forwards_its_own_response_started() {
     let definition =
         ToolDefinition::simple("echo", "echo", philo_agent_runtime::EffectClass::ReadOnly);
     let model = Arc::new(FakeModel::new([
@@ -140,21 +127,23 @@ fn each_model_call_forwards_its_own_response_started() {
         ModelScript::text(&["done"]).with_response_started(Some("m"), Some("resp-2")),
     ]));
     let tools = Arc::new(FakeTool::one(definition, FakeToolResult::success("one")));
-    let runtime = AgentRuntime::with_tools(
+    let runtime = support::runtime::TestRuntime::with_tools(
         model,
         Arc::new(MemorySessionStore::new()),
         Arc::new(SequentialIdSource::new()),
         config(1),
         tools,
-    );
-    let handle =
-        block_on(runtime.prompt(SessionId::new("session"), UserMessage::new("hi"))).unwrap();
+    )
+    .await;
+    let handle = runtime
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let mut current_call: Option<String> = None;
     let mut observed = Vec::new();
     for event in &events {
@@ -194,18 +183,18 @@ fn each_model_call_forwards_its_own_response_started() {
     assert!(first_response < batch_requested);
 }
 
-#[test]
-fn streams_without_response_started_keep_baseline_behavior() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_without_response_started_keep_baseline_behavior() {
     let model = Arc::new(FakeModel::succeeds(&["plain"]));
-    let handle = block_on(
-        direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
-    )
-    .unwrap();
+    let handle = direct_runtime(model)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hello"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "plain"
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         events
             .iter()
@@ -214,8 +203,8 @@ fn streams_without_response_started_keep_baseline_behavior() {
     );
 }
 
-#[test]
-fn duplicate_response_started_fails_the_operation() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_response_started_fails_the_operation() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::ResponseStarted {
             response_model: None,
@@ -232,19 +221,19 @@ fn duplicate_response_started_fails_the_operation() {
             }],
         }),
     ])]));
-    let handle = block_on(
-        direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
-    )
-    .unwrap();
+    let handle = direct_runtime(model)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hello"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed { failure, .. }
             if failure.kind() == AgentFailureKind::InvalidModelOutput
     ));
 }
 
-#[test]
-fn response_started_after_completed_fails_the_operation() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_started_after_completed_fails_the_operation() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::TextDelta("hi".to_owned())),
         Ok(ModelEvent::Completed {
@@ -257,19 +246,19 @@ fn response_started_after_completed_fails_the_operation() {
             response_id: None,
         }),
     ])]));
-    let handle = block_on(
-        direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
-    )
-    .unwrap();
+    let handle = direct_runtime(model)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hello"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed { failure, .. }
             if failure.kind() == AgentFailureKind::InvalidModelOutput
     ));
 }
 
-#[test]
-fn failing_stream_after_response_started_still_fails_normally() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failing_stream_after_response_started_still_fails_normally() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::ResponseStarted {
             response_model: Some("m".to_owned()),
@@ -277,16 +266,16 @@ fn failing_stream_after_response_started_still_fails_normally() {
         }),
         Err(ModelError::new("stream broke")),
     ])]));
-    let handle = block_on(
-        direct_runtime(model).prompt(SessionId::new("session"), UserMessage::new("hello")),
-    )
-    .unwrap();
+    let handle = direct_runtime(model)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hello"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed { failure, .. }
             if failure.kind() == AgentFailureKind::ModelCall && failure.message() == "stream broke"
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         events
             .iter()

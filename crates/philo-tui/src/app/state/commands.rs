@@ -107,6 +107,7 @@ impl App {
                          new session",
                     ));
                 } else {
+                    self.session_load_intent = Some(super::overlays::SessionLoadIntent::New);
                     effects.push(Effect::Host(HostRequest::NewSession));
                 }
             }
@@ -115,17 +116,8 @@ impl App {
                 lines.push(line(LineKind::Error, "usage: /model <name>"));
             }
             Ok(Command::Model { name: Some(name) }) => {
-                if self.has_activity() {
-                    lines.push(line(
-                        LineKind::Error,
-                        format!(
-                            "error: the model can only be switched while idle; still on {}",
-                            self.status.model
-                        ),
-                    ));
-                } else {
-                    effects.push(Effect::Host(HostRequest::RebuildModel(name)));
-                }
+                self.pending_model_switch = true;
+                effects.push(Effect::Host(HostRequest::RebuildModel(name)));
             }
             Ok(Command::Reasoning { level: None }) => {
                 lines.push(line(
@@ -180,7 +172,10 @@ impl App {
             }
             Ok(Command::Verbose) => lines.push(self.toggle_level()),
             Ok(Command::Status) => effects.push(Effect::Host(HostRequest::ShowStatus)),
-            Ok(Command::Config) => effects.push(Effect::Host(HostRequest::ShowConfig)),
+            Ok(Command::Config) => {
+                self.expect_config_listing = true;
+                effects.push(Effect::Host(HostRequest::ShowConfig));
+            }
             Ok(Command::Quit) => {
                 if self.has_activity() && !quit_armed {
                     self.quit_armed = true;
@@ -189,6 +184,8 @@ impl App {
                         "the agent is still active: press Esc to cancel it, or /quit again to \
                          leave anyway",
                     ));
+                } else if self.has_activity() {
+                    effects.push(Effect::RequestShutdown);
                 } else {
                     effects.push(Effect::Quit);
                 }

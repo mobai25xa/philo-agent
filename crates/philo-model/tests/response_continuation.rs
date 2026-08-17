@@ -263,6 +263,7 @@ async fn unavailable_chain_falls_back_once_and_does_not_reactivate_the_old_id() 
 
     let tombstone = store
         .load("session-1")
+        .await
         .expect("load replay store")
         .into_iter()
         .map(|blob| serde_json::from_slice::<Value>(blob.payload()).expect("stored JSON"))

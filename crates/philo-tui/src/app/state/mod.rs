@@ -26,6 +26,8 @@ use super::transcript::{InfoLevel, LineKind, Transcript, TranscriptLine};
 
 use commands::CompletionMenu;
 
+pub(crate) use overlays::SessionLoadIntent;
+
 /// Pure interaction state for one TUI session.
 pub(crate) struct App {
     pub(crate) input: InputEditor,
@@ -51,6 +53,12 @@ pub(crate) struct App {
     draft_generation: u64,
     /// `[ui].show_reasoning`, carried across session switches.
     show_reasoning: bool,
+    /// How the next `SessionLoaded` should be presented.
+    session_load_intent: Option<SessionLoadIntent>,
+    /// `/config` is waiting for a listing rather than a hot-reload notice.
+    expect_config_listing: bool,
+    /// `/model` is waiting for install success or rejection.
+    pending_model_switch: bool,
     /// Manual compaction has a standalone future owned by the driver.
     manual_compacting: bool,
     /// Automatic compaction belongs to the front operation handle.
@@ -83,6 +91,9 @@ impl App {
             attachments: Attachments::default(),
             draft_generation: 0,
             show_reasoning,
+            session_load_intent: None,
+            expect_config_listing: false,
+            pending_model_switch: false,
             manual_compacting: false,
             automatic_compacting: false,
             activity: ActivityState::default(),
@@ -232,9 +243,6 @@ impl App {
     }
 
     fn dispatch_action(&mut self, action: Action) -> Vec<Effect> {
-        if let Action::ConfigReload(notice) = action {
-            return self.apply_config_notice(notice);
-        }
         if self.confirm.is_some() {
             return self.on_confirm_action(action);
         }
@@ -300,7 +308,6 @@ impl App {
             Action::SelectEnd { x, y } => self.select_end(x, y),
             Action::Complete => self.complete(),
             Action::Paste => vec![Effect::ReadClipboard],
-            Action::ConfigReload(_) => unreachable!("config notices are handled first"),
             Action::None => vec![],
         }
     }

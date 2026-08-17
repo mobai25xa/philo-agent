@@ -42,6 +42,7 @@ pub enum FakeToolResult {
         gate: Gate,
         message: String,
     },
+    Panic(String),
 }
 
 impl FakeToolResult {
@@ -97,6 +98,10 @@ impl FakeToolResult {
             gate: gate.clone(),
             message: message.into(),
         }
+    }
+
+    pub fn panics(message: impl Into<String>) -> Self {
+        Self::Panic(message.into())
     }
 }
 
@@ -192,6 +197,7 @@ impl ToolPort for FakeTool {
                     gate.wait().await;
                     Err(ToolPortError::new(message))
                 }
+                FakeToolResult::Panic(message) => panic!("{message}"),
             }
         })
     }

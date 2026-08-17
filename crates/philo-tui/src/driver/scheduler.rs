@@ -12,8 +12,15 @@ use tokio::time::Instant;
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_334);
 pub(crate) const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FramePlan {
+    pub(crate) hard_clear: bool,
+}
+
+/// A granted draw attempt. Dirty is cleared only by [`FrameScheduler::commit_frame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FramePermit {
     pub(crate) hard_clear: bool,
 }
 
@@ -69,19 +76,44 @@ impl FrameScheduler {
         self.frame_deadline
     }
 
-    /// Returns one due plan and consumes the current dirty state. A fatal
-    /// backend error exits the driver, so no retry state is needed here.
-    pub(crate) fn take_frame(&mut self, now: Instant) -> Option<FramePlan> {
+    /// Returns a due permit without clearing dirty. Failure must
+    /// [`Self::retry_frame`]; success must [`Self::commit_frame`].
+    pub(crate) fn prepare_frame(&mut self, now: Instant) -> Option<FramePermit> {
         if !self.dirty || self.frame_deadline.is_none_or(|deadline| deadline > now) {
             return None;
         }
-        let plan = FramePlan {
+        Some(FramePermit {
             hard_clear: self.hard_clear,
-        };
+        })
+    }
+
+    /// Draw succeeded: clear dirty and advance the last-frame timestamp.
+    pub(crate) fn commit_frame(&mut self, permit: FramePermit, now: Instant) {
         self.dirty = false;
-        self.hard_clear = false;
+        if permit.hard_clear {
+            self.hard_clear = false;
+        }
         self.frame_deadline = None;
         self.last_frame = Some(now);
+    }
+
+    /// Draw failed: keep dirty (and hard-clear) so the latest frame retries.
+    pub(crate) fn retry_frame(&mut self, permit: FramePermit, _error: impl std::fmt::Display) {
+        self.dirty = true;
+        if permit.hard_clear {
+            self.hard_clear = true;
+        }
+        self.frame_deadline = Some(self.frame_deadline.unwrap_or_else(Instant::now));
+    }
+
+    /// Test helper: prepare + commit in one step.
+    #[cfg(test)]
+    pub(crate) fn take_frame(&mut self, now: Instant) -> Option<FramePlan> {
+        let permit = self.prepare_frame(now)?;
+        let plan = FramePlan {
+            hard_clear: permit.hard_clear,
+        };
+        self.commit_frame(permit, now);
         Some(plan)
     }
 
@@ -199,5 +231,19 @@ mod tests {
 
         scheduler.sync_animation(false, deadline);
         assert_eq!(scheduler.animation_deadline(), None);
+    }
+
+    #[test]
+    fn retry_keeps_dirty_and_hard_clear() {
+        let start = Instant::now();
+        let mut scheduler = FrameScheduler::new(start);
+        scheduler.request_hard_redraw(start);
+        let permit = scheduler.prepare_frame(start).expect("due");
+        assert!(permit.hard_clear);
+        scheduler.retry_frame(permit, "draw failed");
+        let again = scheduler.prepare_frame(start).expect("still dirty");
+        assert!(again.hard_clear);
+        scheduler.commit_frame(again, start);
+        assert_eq!(scheduler.take_frame(start), None);
     }
 }

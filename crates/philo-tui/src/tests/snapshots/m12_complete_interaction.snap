@@ -5,10 +5,10 @@ expression: "output.join(\"\\n\")"
 Meta: /sessions
 overlay:
 sessions  1/2
-> s-1                    | › count the files
-  s-image                | ▸ read_file  path: src/main.rs
-                         | └ ok · fn main() {}
-                         | one file
+> s-1                    | loading preview...
+  s-image                |
+                         |
+                         |
                          |
 enter switch  ·  ↑↓ select  ·  esc close
 Meta: session s-image

@@ -393,3 +393,43 @@ fn failure_cannot_terminate_an_already_terminal_turn() {
     );
     assert_eq!(block_on(store.context_view(&session_id)).unwrap(), before);
 }
+
+#[test]
+fn list_sessions_empty_store_is_empty() {
+    let store = MemorySessionStore::new();
+    assert!(block_on(store.list_sessions()).unwrap().is_empty());
+}
+
+#[test]
+fn list_sessions_returns_known_ids() {
+    let store = MemorySessionStore::new();
+    let first = SessionId::new("alpha");
+    let second = SessionId::new("beta");
+    let (operation_id, turn_id) = ids(1);
+    block_on(store.commit(start_transaction(
+        &first,
+        SessionRevision::ZERO,
+        &operation_id,
+        &turn_id,
+        "hi",
+    )))
+    .unwrap();
+    let (operation_id, turn_id) = ids(2);
+    block_on(store.commit(start_transaction(
+        &second,
+        SessionRevision::ZERO,
+        &operation_id,
+        &turn_id,
+        "hey",
+    )))
+    .unwrap();
+    let unknown = SessionId::new("ghost");
+    block_on(store.context_view(&unknown)).unwrap();
+
+    let mut listed = block_on(store.list_sessions()).unwrap();
+    listed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    assert_eq!(
+        listed.iter().map(SessionId::as_str).collect::<Vec<_>>(),
+        ["alpha", "beta"]
+    );
+}

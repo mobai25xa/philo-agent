@@ -2,14 +2,11 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelEvent,
-    ModelMessage, ModelToolCall, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
+    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelEvent, ModelMessage,
+    ModelToolCall, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
     SettlementDurability, ToolCallId, ToolDefinition, ToolPort, ToolRegistry, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
@@ -17,19 +14,9 @@ use support::failing_session::{FailingSessionStore, FailurePlan};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
-
-fn collect_events(mut handle: philo_agent_runtime::OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
@@ -57,18 +44,19 @@ fn definition(name: &str) -> ToolDefinition {
     ToolDefinition::simple(name, name, philo_agent_runtime::EffectClass::ReadOnly)
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<dyn ToolPort>,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(),
         tools,
     )
+    .await
 }
 
 fn tool_loop_model(second: ModelScript) -> Arc<FakeModel> {
@@ -78,25 +66,20 @@ fn tool_loop_model(second: ModelScript) -> Arc<FakeModel> {
     ]))
 }
 
-fn success_handle(
+async fn success_handle(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
-) -> (
-    philo_agent_runtime::OperationHandle,
-    Arc<FakeModel>,
-    Arc<FakeTool>,
-) {
-    let handle = block_on(
-        runtime(model.clone(), sessions, tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+) -> (support::runtime::TestOp, Arc<FakeModel>, Arc<FakeTool>) {
+    let handle = runtime(model.clone(), sessions, tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     (handle, model, tools)
 }
 
-#[test]
-fn shared_fixture_executes_one_tool_loop() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_fixture_executes_one_tool_loop() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["done"]),
@@ -106,17 +89,16 @@ fn shared_fixture_executes_one_tool_loop() {
         FakeToolResult::success("ok"),
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model.clone(), sessions.clone(), tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(model.clone(), sessions.clone(), tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
 
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "done"
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
     assert!(model.calls()[1].tools.is_empty());
@@ -130,7 +112,10 @@ fn shared_fixture_executes_one_tool_loop() {
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolExecutionCompleted { index: 0, .. }))
     );
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     assert!(matches!(
         view.messages()[1],
         ContextMessage::AssistantToolCalls { .. }
@@ -141,37 +126,35 @@ fn shared_fixture_executes_one_tool_loop() {
     ));
 }
 
-#[test]
-fn shared_failing_store_targets_context_read_and_barrier_a() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_failing_store_targets_context_read_and_barrier_a() {
     for plan in [FailurePlan::context_read_at(1), FailurePlan::commit_at(1)] {
         let model = Arc::new(FakeModel::succeeds(&["unused"]));
         let tools = Arc::new(FakeTool::new([], []));
         let store = Arc::new(FailingSessionStore::memory(plan));
-        let handle = block_on(
-            runtime(model.clone(), store, tools)
-                .prompt(SessionId::new("session"), UserMessage::new("hi")),
-        )
-        .unwrap();
+        let handle = runtime(model.clone(), store, tools)
+            .await
+            .prompt(SessionId::new("session"), UserMessage::new("hi"))
+            .await;
         assert!(matches!(
-            block_on(handle.wait()),
+            handle.wait().await,
             OperationOutcome::Failed { .. }
         ));
         assert_eq!(model.call_count(), 0);
     }
 }
 
-#[test]
-fn shared_failing_store_can_fail_barrier_e_only() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_failing_store_can_fail_barrier_e_only() {
     let model = Arc::new(FakeModel::start_fails("offline"));
     let tools = Arc::new(FakeTool::new([], []));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(2)));
-    let handle = block_on(
-        runtime(model.clone(), store.clone(), tools)
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(model.clone(), store.clone(), tools)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: philo_agent_runtime::SettlementDurability::Unconfirmed,
             ..
@@ -181,8 +164,8 @@ fn shared_failing_store_can_fail_barrier_e_only() {
     assert_eq!(store.commit_count(), 2);
 }
 
-#[test]
-fn one_tool_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tool_success() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{", "}"]),
         ModelScript::text(&["done"]),
@@ -192,15 +175,18 @@ fn one_tool_success() {
         FakeToolResult::success("ok"),
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let (handle, model, tools) = success_handle(model, sessions.clone(), tools);
+    let (handle, model, tools) = success_handle(model, sessions.clone(), tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "done"
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
     assert!(model.calls()[1].tools.is_empty());
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     assert!(matches!(
         view.messages()[1],
         ContextMessage::AssistantToolCalls { .. }
@@ -214,8 +200,8 @@ fn one_tool_success() {
     ));
 }
 
-#[test]
-fn multi_tool_source_order() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_tool_source_order() {
     let model = tool_loop_model(ModelScript::text(&["done"]));
     let tools = Arc::new(FakeTool::new(
         [definition("first"), definition("second")],
@@ -225,12 +211,12 @@ fn multi_tool_source_order() {
         ],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let (handle, model, tools) = success_handle(model, sessions.clone(), tools);
+    let (handle, model, tools) = success_handle(model, sessions.clone(), tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let calls = tools.invocations();
     assert_eq!(
         calls.iter().map(|call| call.call_id()).collect::<Vec<_>>(),
@@ -260,7 +246,10 @@ fn multi_tool_source_order() {
         .collect::<Vec<_>>();
     assert_eq!(started, [("call-a", 0), ("call-b", 1)]);
     assert_eq!(completed, [("call-a", 0), ("call-b", 1)]);
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     let result_ids = view
         .messages()
         .iter()
@@ -281,10 +270,10 @@ fn multi_tool_source_order() {
     assert_eq!(model_result_ids, ["call-a", "call-b"]);
 }
 
-#[test]
-fn tool_errors_continue_to_final_answer() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_errors_continue_to_final_answer() {
     let unknown = Arc::new(ToolRegistry::empty());
-    assert_tool_error_continues("missing", "{}", unknown, "unknown_tool");
+    assert_tool_error_continues("missing", "{}", unknown, "unknown_tool").await;
 
     let invalid = Arc::new(
         ToolRegistry::builder()
@@ -294,7 +283,7 @@ fn tool_errors_continue_to_final_answer() {
             .unwrap()
             .build(),
     );
-    assert_tool_error_continues("echo", "[]", invalid, "invalid_arguments");
+    assert_tool_error_continues("echo", "[]", invalid, "invalid_arguments").await;
 
     let business = Arc::new(
         ToolRegistry::builder()
@@ -304,11 +293,11 @@ fn tool_errors_continue_to_final_answer() {
             .unwrap()
             .build(),
     );
-    assert_tool_error_continues("echo", "{}", business, "domain_error");
+    assert_tool_error_continues("echo", "{}", business, "domain_error").await;
 }
 
-#[test]
-fn barrier_b_failure_prevents_tool_execution() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn barrier_b_failure_prevents_tool_execution() {
     let model = Arc::new(FakeModel::new([ModelScript::tool_call(
         0,
         Some("call-1"),
@@ -320,9 +309,9 @@ fn barrier_b_failure_prevents_tool_execution() {
         FakeToolResult::success("unused"),
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(2)));
-    let (handle, model, tools) = success_handle(model, store, tools);
+    let (handle, model, tools) = success_handle(model, store, tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -330,15 +319,15 @@ fn barrier_b_failure_prevents_tool_execution() {
     ));
     assert_eq!(model.call_count(), 1);
     assert_eq!(tools.invocation_count(), 0);
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolBatchRequested { .. } | AgentEvent::ToolExecutionStarted { .. }
     )));
 }
 
-#[test]
-fn barrier_c_failure_prevents_second_model_call() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn barrier_c_failure_prevents_second_model_call() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["must not run"]),
@@ -348,9 +337,9 @@ fn barrier_c_failure_prevents_second_model_call() {
         FakeToolResult::success("ok"),
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(3)));
-    let (handle, model, tools) = success_handle(model, store, tools);
+    let (handle, model, tools) = success_handle(model, store, tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -359,14 +348,15 @@ fn barrier_c_failure_prevents_second_model_call() {
     assert_eq!(model.call_count(), 1);
     assert_eq!(tools.invocation_count(), 1);
     assert!(
-        !collect_events(handle)
+        !collect_events(&handle)
+            .await
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolExecutionCompleted { .. }))
     );
 }
 
-#[test]
-fn tool_infrastructure_failure_settles_failed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_infrastructure_failure_settles_failed() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["must not run"]),
@@ -375,17 +365,18 @@ fn tool_infrastructure_failure_settles_failed() {
         definition("echo"),
         FakeToolResult::infrastructure_error("worker unavailable"),
     ));
-    let (handle, model, tools) = success_handle(model, Arc::new(MemorySessionStore::new()), tools);
+    let (handle, model, tools) =
+        success_handle(model, Arc::new(MemorySessionStore::new()), tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed { failure, durability: SettlementDurability::Confirmed } if failure.kind() == AgentFailureKind::ToolExecution
     ));
     assert_eq!(model.call_count(), 1);
     assert_eq!(tools.invocation_count(), 1);
 }
 
-#[test]
-fn second_tool_call_is_rejected() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_tool_call_is_rejected() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::tool_call(0, Some("call-2"), Some("echo"), &["{}"]),
@@ -394,17 +385,18 @@ fn second_tool_call_is_rejected() {
         definition("echo"),
         FakeToolResult::success("ok"),
     ));
-    let (handle, model, tools) = success_handle(model, Arc::new(MemorySessionStore::new()), tools);
+    let (handle, model, tools) =
+        success_handle(model, Arc::new(MemorySessionStore::new()), tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed { failure, durability: SettlementDurability::Confirmed } if failure.kind() == AgentFailureKind::InvalidModelOutput
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
 }
 
-#[test]
-fn final_commit_failure_prevents_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_commit_failure_prevents_success() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["done"]),
@@ -414,9 +406,9 @@ fn final_commit_failure_prevents_success() {
         FakeToolResult::success("ok"),
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(4)));
-    let (handle, model, tools) = success_handle(model, store, tools);
+    let (handle, model, tools) = success_handle(model, store, tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -425,14 +417,15 @@ fn final_commit_failure_prevents_success() {
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
     assert!(
-        !collect_events(handle)
+        !collect_events(&handle)
+            .await
             .iter()
             .any(|event| matches!(event, AgentEvent::AssistantMessageCompleted { .. }))
     );
 }
 
-#[test]
-fn persistent_session_failure_is_unconfirmed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_session_failure_is_unconfirmed() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["done"]),
@@ -444,9 +437,9 @@ fn persistent_session_failure_is_unconfirmed() {
     let store = Arc::new(FailingSessionStore::memory(
         FailurePlan::persistent_commit_at(4),
     ));
-    let (handle, model, tools) = success_handle(model, store, tools);
+    let (handle, model, tools) = success_handle(model, store, tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
@@ -454,15 +447,15 @@ fn persistent_session_failure_is_unconfirmed() {
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::TurnFailed { .. }
     )));
 }
 
-#[test]
-fn second_turn_reads_prior_tool_exchange() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_turn_reads_prior_tool_exchange() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["first answer"]),
@@ -473,16 +466,22 @@ fn second_turn_reads_prior_tool_exchange() {
         FakeToolResult::success("tool"),
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let runtime = runtime(model.clone(), sessions, tools);
+    let runtime = runtime(model.clone(), sessions, tools).await;
     assert!(matches!(
-        block_on(runtime.prompt(SessionId::new("session"), UserMessage::new("first")))
-            .map(|handle| block_on(handle.wait())),
-        Ok(OperationOutcome::Succeeded { .. })
+        runtime
+            .prompt(SessionId::new("session"), UserMessage::new("first"))
+            .await
+            .wait()
+            .await,
+        OperationOutcome::Succeeded { .. }
     ));
     assert!(matches!(
-        block_on(runtime.prompt(SessionId::new("session"), UserMessage::new("second")))
-            .map(|handle| block_on(handle.wait())),
-        Ok(OperationOutcome::Succeeded { .. })
+        runtime
+            .prompt(SessionId::new("session"), UserMessage::new("second"))
+            .await
+            .wait()
+            .await,
+        OperationOutcome::Succeeded { .. }
     ));
     let messages = &model.calls()[2].messages;
     assert!(messages.iter().any(|message| {
@@ -509,19 +508,21 @@ fn second_turn_reads_prior_tool_exchange() {
     )));
 }
 
-#[test]
-fn terminal_event_is_emitted_once() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_event_is_emitted_once() {
     let success = success_handle(
         Arc::new(FakeModel::succeeds(&["done"])),
         Arc::new(MemorySessionStore::new()),
         Arc::new(FakeTool::new([], [])),
     )
+    .await
     .0;
     let confirmed_failure = success_handle(
         Arc::new(FakeModel::start_fails("offline")),
         Arc::new(MemorySessionStore::new()),
         Arc::new(FakeTool::new([], [])),
     )
+    .await
     .0;
     let unconfirmed_failure = success_handle(
         Arc::new(FakeModel::new([
@@ -536,9 +537,10 @@ fn terminal_event_is_emitted_once() {
             FakeToolResult::success("ok"),
         )),
     )
+    .await
     .0;
     for handle in [success, confirmed_failure, unconfirmed_failure] {
-        let events = collect_events(handle);
+        let events = collect_events(&handle).await;
         assert_eq!(
             events
                 .iter()
@@ -553,20 +555,21 @@ fn terminal_event_is_emitted_once() {
     }
 }
 
-#[test]
-fn direct_answer_regression() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_answer_regression() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
     let tools = Arc::new(FakeTool::new([], []));
-    let (handle, model, tools) = success_handle(model, Arc::new(MemorySessionStore::new()), tools);
+    let (handle, model, tools) =
+        success_handle(model, Arc::new(MemorySessionStore::new()), tools).await;
     assert!(
-        matches!(block_on(handle.wait()), OperationOutcome::Succeeded { assistant } if assistant.content() == "hello")
+        matches!(handle.wait().await, OperationOutcome::Succeeded { assistant } if assistant.content() == "hello")
     );
     assert_eq!(model.call_count(), 1);
     assert_eq!(tools.invocation_count(), 0);
 }
 
-#[test]
-fn mixed_text_and_tool_call_continues_the_tool_loop() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_text_and_tool_call_continues_the_tool_loop() {
     let model = Arc::new(FakeModel::new([
         ModelScript::Events(vec![
             Ok(ModelEvent::TextDelta("calling echo".to_owned())),
@@ -596,14 +599,14 @@ fn mixed_text_and_tool_call_continues_the_tool_loop() {
         FakeToolResult::success("ok"),
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let (handle, model, tools) = success_handle(model, sessions.clone(), tools);
+    let (handle, model, tools) = success_handle(model, sessions.clone(), tools).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "done"
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         events.iter().any(
             |event| matches!(event, AgentEvent::TextDelta { delta } if delta == "calling echo")
@@ -614,14 +617,17 @@ fn mixed_text_and_tool_call_continues_the_tool_loop() {
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolBatchRequested { .. }))
     );
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     assert!(matches!(
         view.messages()[1],
         ContextMessage::AssistantToolCalls { .. }
     ));
 }
 
-fn assert_tool_error_continues(
+async fn assert_tool_error_continues(
     name: &str,
     arguments: &str,
     tools: Arc<dyn ToolPort>,
@@ -631,13 +637,12 @@ fn assert_tool_error_continues(
         ModelScript::tool_call(0, Some("call-1"), Some(name), &[arguments]),
         ModelScript::text(&["recovered"]),
     ]));
-    let handle = block_on(
-        runtime(model.clone(), Arc::new(MemorySessionStore::new()), tools)
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(model.clone(), Arc::new(MemorySessionStore::new()), tools)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(
-        matches!(block_on(handle.wait()), OperationOutcome::Succeeded { assistant } if assistant.content() == "recovered")
+        matches!(handle.wait().await, OperationOutcome::Succeeded { assistant } if assistant.content() == "recovered")
     );
     assert!(matches!(
         model.calls()[1].messages.last(),

@@ -20,6 +20,7 @@ pub enum ModelScript {
         gate: Gate,
         tail: Vec<Result<ModelEvent, ModelError>>,
     },
+    Panic(String),
 }
 
 impl ModelScript {
@@ -189,6 +190,7 @@ impl ModelScript {
                 Self::Events(head)
             }
             Self::StartError(message) => Self::StartError(message),
+            Self::Panic(message) => Self::Panic(message),
             Self::SuspendedEvents {
                 head: suspended_head,
                 gate,
@@ -217,6 +219,7 @@ impl ModelScript {
                 Self::Events(with_started)
             }
             Self::StartError(message) => Self::StartError(message),
+            Self::Panic(message) => Self::Panic(message),
             Self::SuspendedEvents { head, gate, tail } => {
                 let mut with_started = vec![started];
                 with_started.extend(head);
@@ -309,6 +312,10 @@ impl FakeModel {
         Self::new([ModelScript::StartError(message.to_owned())])
     }
 
+    pub fn panics(message: &str) -> Self {
+        Self::new([ModelScript::Panic(message.to_owned())])
+    }
+
     pub fn stream_fails_after(deltas: &[&str], message: &str) -> Self {
         let mut events = deltas
             .iter()
@@ -345,6 +352,10 @@ impl ModelPort for FakeModel {
                 .expect("fake model called more times than scripted");
             match script {
                 ModelScript::StartError(message) => Err(ModelError::new(message)),
+                ModelScript::Panic(message) => {
+                    tokio::task::yield_now().await;
+                    panic!("{message}");
+                }
                 ModelScript::Events(events) => Ok(Box::new(FakeStream {
                     events: events.into(),
                     suspension: None,

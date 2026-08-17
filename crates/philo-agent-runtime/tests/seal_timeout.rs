@@ -4,17 +4,13 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentRuntime, CancelReason, GenerationConfig, ModelMessage, ModelToolResultOutcome,
-    OperationHandle, OperationOutcome, OperationPhase, OperationStatus, RunningToolBatchPhase,
-    RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability, ToolDefinition, TurnId,
-    UserMessage,
+    AgentEvent, CancelReason, GenerationConfig, ModelMessage, ModelToolResultOutcome,
+    OperationOutcome, OperationPhase, OperationStatus, RunningToolBatchPhase, RuntimeConfig,
+    SequentialIdSource, SessionId, SettlementDurability, ToolDefinition, TurnId, UserMessage,
 };
 use philo_session::{
     ContextMessage, MemorySessionStore, SessionAssistantBlock, SessionEntryKind, SessionRevision,
@@ -24,22 +20,6 @@ use support::failing_session::{FailingSessionStore, FailurePlan};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.as_mut().poll(&mut context)
-}
 
 fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeConfig {
     RuntimeConfig {
@@ -54,20 +34,21 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
     operation_timeout: Option<Duration>,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds, operation_timeout),
         tools,
     )
+    .await
 }
 
 fn no_tools() -> Arc<FakeTool> {
@@ -86,9 +67,9 @@ fn stored_sid() -> philo_session::SessionId {
     philo_session::SessionId::new("s")
 }
 
-fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
@@ -96,52 +77,56 @@ fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
 
 /// Persists the start facts of a turn that never terminated (a crash
 /// remnant): OperationStarted + TurnStarted + UserMessage.
-fn commit_remnant_start(store: &dyn SessionStore, revision: u64, suffix: &str) {
-    block_on(store.commit(SessionTransaction::linear(
-        stored_sid(),
-        SessionRevision::new(revision),
-        vec![
-            SessionEntryKind::OperationStarted {
-                operation_id: philo_session::OperationId::new(format!("stale-op-{suffix}")),
-            },
-            SessionEntryKind::TurnStarted {
-                operation_id: philo_session::OperationId::new(format!("stale-op-{suffix}")),
-                turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
-            },
-            SessionEntryKind::UserMessage {
-                turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
-                parts: SessionUserPart::text_parts("stranded prompt"),
-            },
-        ],
-    )))
-    .expect("remnant start commits");
+async fn commit_remnant_start(store: &dyn SessionStore, revision: u64, suffix: &str) {
+    store
+        .commit(SessionTransaction::linear(
+            stored_sid(),
+            SessionRevision::new(revision),
+            vec![
+                SessionEntryKind::OperationStarted {
+                    operation_id: philo_session::OperationId::new(format!("stale-op-{suffix}")),
+                },
+                SessionEntryKind::TurnStarted {
+                    operation_id: philo_session::OperationId::new(format!("stale-op-{suffix}")),
+                    turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
+                },
+                SessionEntryKind::UserMessage {
+                    turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
+                    parts: SessionUserPart::text_parts("stranded prompt"),
+                },
+            ],
+        ))
+        .await
+        .expect("remnant start commits");
 }
 
 /// Persists a two-call batch for the given stale turn (B_k durable, no
 /// results, no terminal facts — the crash window between B_k and C_k).
-fn commit_remnant_batch(store: &dyn SessionStore, revision: u64, suffix: &str) {
-    block_on(store.commit(SessionTransaction::linear(
-        stored_sid(),
-        SessionRevision::new(revision),
-        vec![SessionEntryKind::AssistantToolCallBatch {
-            turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
-            model_call_id: "stale-model-call".to_owned(),
-            tool_batch_id: philo_session::ToolBatchId::new(format!("stale-batch-{suffix}")),
-            blocks: vec![
-                SessionAssistantBlock::ToolCall(SessionToolCall::new(
-                    philo_session::ToolCallId::new(format!("stale-call-{suffix}-1")),
-                    "write",
-                    r#"{"path":"a.txt"}"#,
-                )),
-                SessionAssistantBlock::ToolCall(SessionToolCall::new(
-                    philo_session::ToolCallId::new(format!("stale-call-{suffix}-2")),
-                    "shell",
-                    r#"{"command":"ls"}"#,
-                )),
-            ],
-        }],
-    )))
-    .expect("remnant batch commits");
+async fn commit_remnant_batch(store: &dyn SessionStore, revision: u64, suffix: &str) {
+    store
+        .commit(SessionTransaction::linear(
+            stored_sid(),
+            SessionRevision::new(revision),
+            vec![SessionEntryKind::AssistantToolCallBatch {
+                turn_id: philo_session::TurnId::new(format!("stale-turn-{suffix}")),
+                model_call_id: "stale-model-call".to_owned(),
+                tool_batch_id: philo_session::ToolBatchId::new(format!("stale-batch-{suffix}")),
+                blocks: vec![
+                    SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                        philo_session::ToolCallId::new(format!("stale-call-{suffix}-1")),
+                        "write",
+                        r#"{"path":"a.txt"}"#,
+                    )),
+                    SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                        philo_session::ToolCallId::new(format!("stale-call-{suffix}-2")),
+                        "shell",
+                        r#"{"command":"ls"}"#,
+                    )),
+                ],
+            }],
+        ))
+        .await
+        .expect("remnant batch commits");
 }
 
 fn interrupted_count(messages: &[ContextMessage]) -> usize {
@@ -161,23 +146,23 @@ fn interrupted_count(messages: &[ContextMessage]) -> usize {
 
 // ---------------------------------------------------------------- seal 端到端
 
-#[test]
-fn seal_completes_the_stranded_batch_before_the_new_turn() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seal_completes_the_stranded_batch_before_the_new_turn() {
     let sessions = Arc::new(MemorySessionStore::new());
-    commit_remnant_start(sessions.as_ref(), 0, "a");
-    commit_remnant_batch(sessions.as_ref(), 1, "a");
+    commit_remnant_start(sessions.as_ref(), 0, "a").await;
+    commit_remnant_batch(sessions.as_ref(), 1, "a").await;
 
     let model = Arc::new(FakeModel::succeeds(&["done"]));
-    let agent = runtime(model.clone(), sessions.clone(), no_tools(), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model.clone(), sessions.clone(), no_tools(), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "done"
     ));
 
     // Event order: PriorTurnSealed sits after OperationStarted, before
     // TurnStarted, and does not use the cancellation event channel.
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let started = events
         .iter()
         .position(|event| matches!(event, AgentEvent::OperationStarted { .. }))
@@ -206,7 +191,7 @@ fn seal_completes_the_stranded_batch_before_the_new_turn() {
 
     // Durable: the batch completed with Interrupted marks and the session
     // has no open turns left.
-    let view = block_on(sessions.context_view(&stored_sid())).expect("view");
+    let view = sessions.context_view(&stored_sid()).await.expect("view");
     assert!(view.open_turns().is_empty());
     assert_eq!(interrupted_count(view.messages()), 2);
 
@@ -228,42 +213,42 @@ fn seal_completes_the_stranded_batch_before_the_new_turn() {
     assert_eq!(interrupted_in_request, 2);
 }
 
-#[test]
-fn seal_without_a_stranded_batch_commits_terminal_facts_only() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seal_without_a_stranded_batch_commits_terminal_facts_only() {
     let sessions = Arc::new(MemorySessionStore::new());
-    commit_remnant_start(sessions.as_ref(), 0, "a");
+    commit_remnant_start(sessions.as_ref(), 0, "a").await;
 
     let model = Arc::new(FakeModel::succeeds(&["done"]));
-    let agent = runtime(model, sessions.clone(), no_tools(), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model, sessions.clone(), no_tools(), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
-    let view = block_on(sessions.context_view(&stored_sid())).expect("view");
+    let view = sessions.context_view(&stored_sid()).await.expect("view");
     assert!(view.open_turns().is_empty());
     assert_eq!(interrupted_count(view.messages()), 0, "no completion marks");
     // remnant(1) + seal(1) + new turn start(1) + settlement(1)
     assert_eq!(view.revision(), SessionRevision::new(4));
 }
 
-#[test]
-fn multiple_remnants_seal_in_source_order_with_independent_transactions() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_remnants_seal_in_source_order_with_independent_transactions() {
     let sessions = Arc::new(MemorySessionStore::new());
-    commit_remnant_start(sessions.as_ref(), 0, "a");
-    commit_remnant_start(sessions.as_ref(), 1, "b");
-    commit_remnant_batch(sessions.as_ref(), 2, "b");
+    commit_remnant_start(sessions.as_ref(), 0, "a").await;
+    commit_remnant_start(sessions.as_ref(), 1, "b").await;
+    commit_remnant_batch(sessions.as_ref(), 2, "b").await;
 
     let model = Arc::new(FakeModel::succeeds(&["done"]));
-    let agent = runtime(model, sessions.clone(), no_tools(), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model, sessions.clone(), no_tools(), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let sealed: Vec<&TurnId> = events
         .iter()
         .filter_map(|event| match event {
@@ -277,17 +262,17 @@ fn multiple_remnants_seal_in_source_order_with_independent_transactions() {
         "seals follow source order"
     );
 
-    let view = block_on(sessions.context_view(&stored_sid())).expect("view");
+    let view = sessions.context_view(&stored_sid()).await.expect("view");
     assert!(view.open_turns().is_empty());
     // remnants(3) + two independent seals(2) + new turn(2)
     assert_eq!(view.revision(), SessionRevision::new(7));
 }
 
-#[test]
-fn seal_commit_failure_fails_the_operation_and_retries_idempotently() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seal_commit_failure_fails_the_operation_and_retries_idempotently() {
     let memory = Arc::new(MemorySessionStore::new());
-    commit_remnant_start(memory.as_ref(), 0, "a");
-    commit_remnant_batch(memory.as_ref(), 1, "a");
+    commit_remnant_start(memory.as_ref(), 0, "a").await;
+    commit_remnant_batch(memory.as_ref(), 1, "a").await;
 
     // The first commit the runtime issues is the seal transaction: fail it.
     let failing = Arc::new(FailingSessionStore::around(
@@ -295,16 +280,16 @@ fn seal_commit_failure_fails_the_operation_and_retries_idempotently() {
         FailurePlan::commit_at(1),
     ));
     let model = Arc::new(FakeModel::succeeds(&["done"]));
-    let agent = runtime(model, failing, no_tools(), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model, failing, no_tools(), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
         }
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         !events
             .iter()
@@ -319,62 +304,64 @@ fn seal_commit_failure_fails_the_operation_and_retries_idempotently() {
     );
 
     // The remnant is still there; the next prompt reseals and proceeds.
-    let view = block_on(memory.context_view(&stored_sid())).expect("view");
+    let view = memory.context_view(&stored_sid()).await.expect("view");
     assert_eq!(view.open_turns().len(), 1);
 
     let model = Arc::new(FakeModel::succeeds(&["done"]));
-    let agent = runtime(model, memory.clone(), no_tools(), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model, memory.clone(), no_tools(), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
-    let view = block_on(memory.context_view(&stored_sid())).expect("view");
+    let view = memory.context_view(&stored_sid()).await.expect("view");
     assert!(view.open_turns().is_empty(), "idempotent progress");
 }
 
 // ------------------------------------------------------------ 占位映射（已终态）
 
-#[test]
-fn dangling_batch_of_a_terminated_turn_maps_to_placeholders_without_durable_change() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dangling_batch_of_a_terminated_turn_maps_to_placeholders_without_durable_change() {
     let sessions = Arc::new(MemorySessionStore::new());
-    commit_remnant_start(sessions.as_ref(), 0, "a");
-    commit_remnant_batch(sessions.as_ref(), 1, "a");
+    commit_remnant_start(sessions.as_ref(), 0, "a").await;
+    commit_remnant_batch(sessions.as_ref(), 1, "a").await;
     // Terminate the turn the M6 failure way: the failure transaction never
     // completes the batch.
-    block_on(sessions.commit(SessionTransaction::linear(
-        stored_sid(),
-        SessionRevision::new(2),
-        vec![
-            SessionEntryKind::TurnFailure {
-                turn_id: philo_session::TurnId::new("stale-turn-a"),
-                failure: philo_session::TurnFailure::new(
-                    philo_session::TurnFailureKind::ModelCall,
-                    "provider offline",
-                ),
-            },
-            SessionEntryKind::TurnTerminated {
-                turn_id: philo_session::TurnId::new("stale-turn-a"),
-                outcome: philo_session::TurnOutcome::Failed,
-            },
-            SessionEntryKind::OperationSettled {
-                operation_id: philo_session::OperationId::new("stale-op-a"),
-                outcome: philo_session::OperationOutcome::Failed,
-            },
-        ],
-    )))
-    .expect("failure transaction commits");
+    sessions
+        .commit(SessionTransaction::linear(
+            stored_sid(),
+            SessionRevision::new(2),
+            vec![
+                SessionEntryKind::TurnFailure {
+                    turn_id: philo_session::TurnId::new("stale-turn-a"),
+                    failure: philo_session::TurnFailure::new(
+                        philo_session::TurnFailureKind::ModelCall,
+                        "provider offline",
+                    ),
+                },
+                SessionEntryKind::TurnTerminated {
+                    turn_id: philo_session::TurnId::new("stale-turn-a"),
+                    outcome: philo_session::TurnOutcome::Failed,
+                },
+                SessionEntryKind::OperationSettled {
+                    operation_id: philo_session::OperationId::new("stale-op-a"),
+                    outcome: philo_session::OperationOutcome::Failed,
+                },
+            ],
+        ))
+        .await
+        .expect("failure transaction commits");
 
     let model = Arc::new(FakeModel::succeeds(&["done"]));
-    let agent = runtime(model.clone(), sessions.clone(), no_tools(), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model.clone(), sessions.clone(), no_tools(), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
     // No seal happened: the turn was already terminated.
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         !events
             .iter()
@@ -400,7 +387,7 @@ fn dangling_batch_of_a_terminated_turn_maps_to_placeholders_without_durable_chan
     assert_eq!(placeholders, 2);
 
     // Durable facts did not change: the batch still has zero results.
-    let view = block_on(sessions.context_view(&stored_sid())).expect("view");
+    let view = sessions.context_view(&stored_sid()).await.expect("view");
     assert_eq!(interrupted_count(view.messages()), 0);
     // remnants(2) + failure(1) + new turn(2): placeholders added nothing.
     assert_eq!(view.revision(), SessionRevision::new(5));
@@ -408,8 +395,8 @@ fn dangling_batch_of_a_terminated_turn_maps_to_placeholders_without_durable_chan
 
 // ---------------------------------------------------------------- 超时取消
 
-#[test]
-fn operation_timeout_cancels_mid_batch_with_reason_timeout() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_timeout_cancels_mid_batch_with_reason_timeout() {
     let gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[
         (0, "call-1", "echo", "{}"),
@@ -429,32 +416,28 @@ fn operation_timeout_cancels_mid_batch_with_reason_timeout() {
         tools.clone(),
         2,
         Some(Duration::from_millis(50)),
-    );
+    )
+    .await;
 
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("go"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    loop {
-        assert!(
-            poll_once(&mut wait).is_pending(),
-            "the gated call keeps the operation running"
-        );
-        if handle.phase()
-            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
-                in_flight: 1,
-                completed: 0,
-            })
-        {
-            break;
-        }
-    }
+    let handle = agent.prompt(sid(), UserMessage::new("go")).await;
+    handle
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                    in_flight: 1,
+                    completed: 0,
+                })
+            )
+        })
+        .await;
     // Let the deadline expire while the call is executing, then let the
     // call return: the injection point picks the timeout up.
-    std::thread::sleep(Duration::from_millis(80));
+    tokio::time::sleep(Duration::from_millis(80)).await;
     gate.release();
-    assert!(matches!(block_on(&mut wait), OperationOutcome::Cancelled));
-    drop(wait);
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::CancellationRequested {
@@ -479,7 +462,7 @@ fn operation_timeout_cancels_mid_batch_with_reason_timeout() {
     assert_eq!(model.call_count(), 1, "round-2 model call never starts");
 
     // Durable: real prefix + Cancelled suffix, and the session continues.
-    let view = block_on(sessions.context_view(&stored_sid())).expect("view");
+    let view = sessions.context_view(&stored_sid()).await.expect("view");
     assert!(view.open_turns().is_empty());
     assert!(view.messages().iter().any(|message| matches!(
         message,
@@ -490,8 +473,8 @@ fn operation_timeout_cancels_mid_batch_with_reason_timeout() {
     )));
 }
 
-#[test]
-fn user_cancel_wins_the_race_and_keeps_reason_user() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_cancel_wins_the_race_and_keeps_reason_user() {
     let gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[(
         0, "call-1", "echo", "{}",
@@ -501,30 +484,28 @@ fn user_cancel_wins_the_race_and_keeps_reason_user() {
         [FakeToolResult::gated_success(&gate, "one")],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(model, sessions, tools, 1, Some(Duration::from_millis(50)));
+    let agent = runtime(model, sessions, tools, 1, Some(Duration::from_millis(50))).await;
 
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("go"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    loop {
-        assert!(poll_once(&mut wait).is_pending());
-        if handle.phase()
-            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
-                in_flight: 1,
-                completed: 0,
-            })
-        {
-            break;
-        }
-    }
+    let handle = agent.prompt(sid(), UserMessage::new("go")).await;
+    handle
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                    in_flight: 1,
+                    completed: 0,
+                })
+            )
+        })
+        .await;
     // The user cancel arrives first; the timeout expires later but the
     // first accepted reason wins.
-    handle.cancel();
-    std::thread::sleep(Duration::from_millis(80));
+    handle.cancel().await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
     gate.release();
-    assert!(matches!(block_on(&mut wait), OperationOutcome::Cancelled));
-    drop(wait);
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::CancellationRequested {
@@ -541,8 +522,8 @@ fn user_cancel_wins_the_race_and_keeps_reason_user() {
     )));
 }
 
-#[test]
-fn timeout_before_barrier_a_cancels_with_zero_trace() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_before_barrier_a_cancels_with_zero_trace() {
     let sessions = Arc::new(MemorySessionStore::new());
     let model = Arc::new(FakeModel::succeeds(&["never"]));
     let agent = runtime(
@@ -551,15 +532,13 @@ fn timeout_before_barrier_a_cancels_with_zero_trace() {
         no_tools(),
         0,
         Some(Duration::ZERO),
-    );
+    )
+    .await;
 
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("go"))).unwrap();
-    assert!(matches!(
-        block_on(handle.wait()),
-        OperationOutcome::Cancelled
-    ));
+    let handle = agent.prompt(sid(), UserMessage::new("go")).await;
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::CancellationRequested {
@@ -574,7 +553,7 @@ fn timeout_before_barrier_a_cancels_with_zero_trace() {
         "zero-trace cancellation has no durable turn to cancel"
     );
     assert_eq!(model.call_count(), 0);
-    let view = block_on(sessions.context_view(&stored_sid())).expect("view");
+    let view = sessions.context_view(&stored_sid()).await.expect("view");
     assert_eq!(
         view.revision(),
         SessionRevision::ZERO,
@@ -582,8 +561,8 @@ fn timeout_before_barrier_a_cancels_with_zero_trace() {
     );
 }
 
-#[test]
-fn queued_cancel_publishes_reason_user() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_cancel_publishes_reason_user() {
     let warmup_gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::text_suspending(
         &[],
@@ -591,20 +570,22 @@ fn queued_cancel_publishes_reason_user() {
         &["done"],
     )]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(model, sessions, no_tools(), 0, None);
+    let agent = runtime(model, sessions, no_tools(), 0, None).await;
 
-    let warmup = block_on(agent.prompt(sid(), UserMessage::new("warmup"))).unwrap();
-    let mut warmup_wait = Box::pin(async move { warmup.wait().await });
-    assert!(poll_once(&mut warmup_wait).is_pending());
+    let warmup = agent.prompt(sid(), UserMessage::new("warmup")).await;
+    warmup.wait_until_busy().await;
 
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
-    assert_eq!(victim.phase(), OperationPhase::Queued);
-    victim.cancel();
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
+    victim
+        .wait_until_phase(|phase| matches!(phase, OperationPhase::Queued))
+        .await;
+    assert_eq!(victim.phase().await, OperationPhase::Queued);
+    victim.cancel().await;
     assert_eq!(
-        victim.phase(),
+        victim.phase().await,
         OperationPhase::Settled(OperationStatus::Cancelled)
     );
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::CancellationRequested {
@@ -614,5 +595,5 @@ fn queued_cancel_publishes_reason_user() {
     )));
 
     warmup_gate.release();
-    block_on(&mut warmup_wait);
+    let _ = warmup.wait().await;
 }

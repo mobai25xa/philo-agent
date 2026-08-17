@@ -15,3 +15,7 @@ serde_json = "1"
 # Content-addressed artifact files (ADR-0002) are named by SHA-256; a
 # reviewed cryptographic implementation is used instead of a hand-rolled one.
 sha2 = "0.10"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }

@@ -1,66 +1,94 @@
-//! State shared between an operation's handle, its engine, and the scheduler.
+//! State shared between a driver task and the coordinator.
 
-use super::scheduler::Scheduler;
+use crate::error::DriverExit;
+use crate::transient::{TransientDriverState, is_transient_agent};
 use crate::{
-    AgentEvent, OperationId, OperationOutcome, OperationPhase, OperationStatus, ToolCallId, TurnId,
+    AgentEvent, AgentFailure, DiagnosticId, OperationId, OperationOutcome, OperationPhase,
+    OperationStatus, TurnId,
 };
 use philo_session::CancelReason;
 use philo_tools::ToolCancel;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::{Notify, mpsc};
 
-pub(super) struct SharedInner {
-    pub(super) phase: OperationPhase,
-    /// Live event queue: publication enqueues immediately (M10 real-time
-    /// obligation), consumption pops through the handle.
-    pub(super) events: VecDeque<AgentEvent>,
-    pub(super) outcome: Option<OperationOutcome>,
-    /// The consumer waiting on events or the outcome.
-    pub(super) waker: Option<std::task::Waker>,
+/// One reliable driver-to-coordinator notification.
+pub(crate) enum DriverEvent {
+    Agent(AgentEvent),
 }
 
-/// State shared between an [`super::OperationHandle`], its engine, and the
-/// scheduler.
+/// Explicit cancel flag for a maintenance task. Dropping a handle never
+/// cancels; the coordinator must call [`MaintenanceCancel::request`].
+pub(crate) struct MaintenanceCancel {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl MaintenanceCancel {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requested: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// State shared between the coordinator and one spawned driver.
 pub(crate) struct OperationShared {
     pub(super) operation_id: OperationId,
     pub(super) turn_id: TurnId,
-    pub(super) scheduler: Arc<Scheduler>,
     cancel_requested: AtomicBool,
-    /// Eager tool-port token; requested in the same moment as the
-    /// operation-level cancel flag.
     tool_cancel: ToolCancel,
-    /// First accepted cancellation reason; the winner of a user/timeout
-    /// race decides how the terminal facts are recorded.
     cancel_reason: Mutex<Option<CancelReason>>,
-    /// Automatic-cancellation deadline, armed when driving actually starts
-    /// (dequeue time); `Queued` waiting never counts.
     deadline: Mutex<Option<Instant>>,
-    pub(super) inner: Mutex<SharedInner>,
+    notify: Notify,
+    phase: Mutex<OperationPhase>,
+    exit: Mutex<Option<DriverExit>>,
+    failure: Mutex<Option<AgentFailure>>,
+    events: mpsc::Sender<DriverEvent>,
+    transient: TransientDriverState,
 }
 
 impl OperationShared {
     pub(crate) fn new(
         operation_id: OperationId,
         turn_id: TurnId,
-        scheduler: Arc<Scheduler>,
+        events: mpsc::Sender<DriverEvent>,
         phase: OperationPhase,
     ) -> Self {
         Self {
             operation_id,
             turn_id,
-            scheduler,
             cancel_requested: AtomicBool::new(false),
             tool_cancel: ToolCancel::new(),
             cancel_reason: Mutex::new(None),
             deadline: Mutex::new(None),
-            inner: Mutex::new(SharedInner {
-                phase,
-                events: VecDeque::new(),
-                outcome: None,
-                waker: None,
-            }),
+            notify: Notify::new(),
+            phase: Mutex::new(phase),
+            exit: Mutex::new(None),
+            failure: Mutex::new(None),
+            events,
+            transient: TransientDriverState::new(),
         }
     }
 
@@ -71,137 +99,137 @@ impl OperationShared {
         &self.turn_id
     }
 
-    /// Publishes one event: enqueued and consumable immediately.
-    pub(crate) fn publish(&self, event: AgentEvent) {
-        let waker = {
-            let mut inner = self.inner.lock().expect("operation mutex");
-            inner.events.push_back(event);
-            inner.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
+    pub(crate) async fn publish(&self, event: AgentEvent) {
+        if is_transient_agent(&event) {
+            self.transient.publish_agent(event);
+            return;
         }
+        self.transient.seal_model_stream();
+        let _ = self.events.send(DriverEvent::Agent(event)).await;
     }
 
-    /// Publishes a tool-progress snapshot, replacing any unconsumed
-    /// progress for the same `tool_call_id` instead of growing the queue.
     pub(crate) fn publish_tool_progress(&self, event: AgentEvent) {
-        let Some(call_id) = progress_call_id(&event) else {
-            self.publish(event);
-            return;
-        };
-        let waker = {
-            let mut inner = self.inner.lock().expect("operation mutex");
-            if let Some(existing) = inner.events.iter_mut().rev().find(|queued| {
-                matches!(
-                    queued,
-                    AgentEvent::ToolExecutionProgress { tool_call_id, .. }
-                        if *tool_call_id == call_id
-                )
-            }) {
-                *existing = event;
-            } else {
-                inner.events.push_back(event);
-            }
-            inner.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.transient.publish_agent(event);
     }
 
     pub(crate) fn set_phase(&self, phase: OperationPhase) {
-        self.inner.lock().expect("operation mutex").phase = phase;
+        *lock(&self.phase) = phase.clone();
+        self.transient.publish_phase(phase);
+    }
+
+    pub(crate) fn drain_transients(&self) -> (Option<OperationPhase>, Vec<AgentEvent>) {
+        self.transient.drain()
+    }
+
+    pub(crate) fn drain_model_stream(&self) -> Vec<AgentEvent> {
+        self.transient.drain_model_stream()
+    }
+
+    pub(crate) fn drain_tool_progress(&self) -> Vec<AgentEvent> {
+        self.transient.drain_tool_progress()
+    }
+
+    pub(crate) async fn wait_transients(&self) {
+        self.transient.wait().await;
     }
 
     pub(crate) fn phase(&self) -> OperationPhase {
-        self.inner.lock().expect("operation mutex").phase.clone()
+        lock(&self.phase).clone()
     }
 
-    /// Accepts a cancellation request with its reason; the first acceptance
-    /// wins a user/timeout race and later requests change nothing.
     pub(crate) fn request_cancel(&self, reason: CancelReason) {
-        let mut slot = self.cancel_reason.lock().expect("cancel reason mutex");
+        let mut slot = lock(&self.cancel_reason);
         if slot.is_none() {
             *slot = Some(reason);
             self.cancel_requested.store(true, Ordering::SeqCst);
             self.tool_cancel.request();
+            self.notify.notify_waiters();
         }
     }
 
-    /// Token cloned into every in-flight `invoke`.
     pub(crate) fn tool_cancel(&self) -> ToolCancel {
         self.tool_cancel.clone()
     }
 
-    /// The reason of the accepted cancellation; meaningful only after
-    /// [`OperationShared::is_cancel_requested`] returned true.
     pub(crate) fn cancel_reason(&self) -> CancelReason {
-        self.cancel_reason
-            .lock()
-            .expect("cancel reason mutex")
-            .unwrap_or(CancelReason::User)
+        lock(&self.cancel_reason).unwrap_or(CancelReason::User)
     }
 
-    /// Arms the automatic-cancellation deadline at drive start.
     pub(crate) fn arm_deadline(&self, timeout: Option<Duration>) {
-        *self.deadline.lock().expect("deadline mutex") =
-            timeout.map(|timeout| Instant::now() + timeout);
+        *lock(&self.deadline) = timeout.map(|timeout| Instant::now() + timeout);
     }
 
-    /// Lazily checked at the M6 injection points (and between stream
-    /// events): an expired deadline requests cancellation with reason
-    /// `Timeout`, losing gracefully if a user cancel arrived first.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        *lock(&self.deadline)
+    }
+
     pub(crate) fn is_cancel_requested(&self) -> bool {
         if !self.cancel_requested.load(Ordering::SeqCst)
-            && self
-                .deadline
-                .lock()
-                .expect("deadline mutex")
-                .is_some_and(|deadline| Instant::now() >= deadline)
+            && lock(&self.deadline).is_some_and(|deadline| Instant::now() >= deadline)
         {
             self.request_cancel(CancelReason::Timeout);
         }
         self.cancel_requested.load(Ordering::SeqCst)
     }
 
-    pub(super) fn settle(&self, outcome: OperationOutcome) {
+    pub(crate) async fn wait_until_cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancel_requested() {
+                return;
+            }
+            if let Some(deadline) = self.deadline() {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(wait) => {
+                        self.request_cancel(CancelReason::Timeout);
+                        return;
+                    }
+                }
+            } else {
+                notified.await;
+            }
+        }
+    }
+
+    pub(crate) fn settle(&self, outcome: OperationOutcome) {
         let status = match &outcome {
             OperationOutcome::Succeeded { .. } => OperationStatus::Succeeded,
             OperationOutcome::Failed { .. } => OperationStatus::Failed,
             OperationOutcome::Cancelled => OperationStatus::Cancelled,
         };
-        let waker = {
-            let mut inner = self.inner.lock().expect("operation mutex");
-            inner.phase = OperationPhase::Settled(status);
-            inner.outcome = Some(outcome);
-            inner.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
+        *lock(&self.phase) = OperationPhase::Settled(status);
+        if let OperationOutcome::Failed { failure, .. } = &outcome {
+            *lock(&self.failure) = Some(failure.clone());
         }
+        *lock(&self.exit) = Some(match &outcome {
+            OperationOutcome::Succeeded { .. } => DriverExit::Succeeded,
+            OperationOutcome::Failed {
+                durability: crate::SettlementDurability::Confirmed,
+                ..
+            } => DriverExit::FailedConfirmed,
+            OperationOutcome::Failed {
+                durability: crate::SettlementDurability::Unconfirmed,
+                ..
+            } => DriverExit::FailedUnconfirmed,
+            OperationOutcome::Cancelled => DriverExit::CancelledConfirmed,
+        });
     }
 
-    pub(super) fn settled_outcome(&self) -> Option<OperationOutcome> {
-        self.inner.lock().expect("operation mutex").outcome.clone()
+    pub(crate) fn failure(&self) -> Option<AgentFailure> {
+        lock(&self.failure).clone()
     }
 
-    pub(super) fn pop_event(&self) -> Option<AgentEvent> {
-        self.inner
-            .lock()
-            .expect("operation mutex")
-            .events
-            .pop_front()
-    }
-
-    pub(super) fn register_waker(&self, cx: &std::task::Context<'_>) {
-        self.inner.lock().expect("operation mutex").waker = Some(cx.waker().clone());
+    pub(crate) fn take_exit(&self) -> DriverExit {
+        lock(&self.exit).take().unwrap_or(DriverExit::Aborted {
+            diagnostic_id: DiagnosticId::new("driver-missing-exit"),
+        })
     }
 }
 
-fn progress_call_id(event: &AgentEvent) -> Option<ToolCallId> {
-    match event {
-        AgentEvent::ToolExecutionProgress { tool_call_id, .. } => Some(tool_call_id.clone()),
-        _ => None,
-    }
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

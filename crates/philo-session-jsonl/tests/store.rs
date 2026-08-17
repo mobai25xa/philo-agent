@@ -1,10 +1,7 @@
 //! JSONL-001: golden schema v2 format, recovery, locking, and backend parity.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock, SessionEntryKind,
@@ -12,16 +9,6 @@ use philo_session::{
     SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -131,14 +118,17 @@ fn settle_transaction(revision: u64) -> SessionTransaction {
     )
 }
 
-fn commit_full_turn(store: &dyn SessionStore) {
+async fn commit_full_turn(store: &dyn SessionStore) {
     for transaction in [
         start_transaction(0),
         batch_transaction(1),
         results_transaction(2),
         settle_transaction(3),
     ] {
-        block_on(store.commit(transaction)).expect("valid transaction commits");
+        store
+            .commit(transaction)
+            .await
+            .expect("valid transaction commits");
     }
 }
 
@@ -148,11 +138,11 @@ fn log_path(root: &TempRoot) -> PathBuf {
 
 // --- Golden format (M5-007 schema pinning) ----------------------------------
 
-#[test]
-fn golden_schema_v2_format_and_directory_encoding() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_schema_v2_format_and_directory_encoding() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    commit_full_turn(&store);
+    commit_full_turn(&store).await;
     drop(store);
 
     // Directory encoding is pinned: lowercase/digits/-/_ pass, rest is %XX.
@@ -180,19 +170,21 @@ fn golden_schema_v2_format_and_directory_encoding() {
     );
 }
 
-#[test]
-fn golden_directory_encoding_escapes_unsafe_and_uppercase_bytes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_directory_encoding_escapes_unsafe_and_uppercase_bytes() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     let id = SessionId::new("Team/Chat:01 你");
-    block_on(store.commit(SessionTransaction::linear(
-        id.clone(),
-        SessionRevision::ZERO,
-        vec![SessionEntryKind::OperationStarted {
-            operation_id: OperationId::new("op-1"),
-        }],
-    )))
-    .expect("commit");
+    store
+        .commit(SessionTransaction::linear(
+            id.clone(),
+            SessionRevision::ZERO,
+            vec![SessionEntryKind::OperationStarted {
+                operation_id: OperationId::new("op-1"),
+            }],
+        ))
+        .await
+        .expect("commit");
     // "T"=%54, "/"=%2F, "C"=%43, ":"=%3A, " "=%20, "你"=%E4%BD%A0 (UTF-8).
     assert!(
         root.path
@@ -204,40 +196,49 @@ fn golden_directory_encoding_escapes_unsafe_and_uppercase_bytes() {
 
 // --- Durability and restart continuation (M5-002 / M5-007) ------------------
 
-#[test]
-fn committed_transactions_are_visible_to_a_fresh_store_instance() {
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_transactions_are_visible_to_a_fresh_store_instance() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        commit_full_turn(&store);
+        commit_full_turn(&store).await;
     }
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
-    let view = block_on(reopened.context_view(&session_id())).expect("view");
+    let view = reopened.context_view(&session_id()).await.expect("view");
     assert_eq!(view.revision(), SessionRevision::new(4));
     assert_eq!(view.messages().len(), 4, "user, calls, result, assistant");
 }
 
-#[test]
-fn restart_continues_revisions_and_entry_ids_seamlessly() {
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_continues_revisions_and_entry_ids_seamlessly() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
         for transaction in [start_transaction(0), batch_transaction(1)] {
-            block_on(store.commit(transaction)).expect("commit");
+            store.commit(transaction).await.expect("commit");
         }
     }
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
-    let commit = block_on(reopened.commit(results_transaction(2))).expect("commit continues");
+    let commit = reopened
+        .commit(results_transaction(2))
+        .await
+        .expect("commit continues");
     assert_eq!(commit.revision(), SessionRevision::new(3));
     assert_eq!(commit.entries()[0].id().as_str(), "golden:entry:5");
-    block_on(reopened.commit(settle_transaction(3))).expect("settle");
+    reopened
+        .commit(settle_transaction(3))
+        .await
+        .expect("settle");
 }
 
-#[test]
-fn unknown_session_context_view_creates_no_directory() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_session_context_view_creates_no_directory() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    let view = block_on(store.context_view(&SessionId::new("ghost"))).expect("view");
+    let view = store
+        .context_view(&SessionId::new("ghost"))
+        .await
+        .expect("view");
     assert_eq!(view.revision(), SessionRevision::ZERO);
     assert!(view.messages().is_empty());
     assert!(!root.path.join("s-ghost").exists());
@@ -245,13 +246,13 @@ fn unknown_session_context_view_creates_no_directory() {
 
 // --- Torn tail (M5-003) ------------------------------------------------------
 
-#[test]
-fn torn_tail_is_truncated_reported_and_appendable() {
+#[tokio::test(flavor = "multi_thread")]
+async fn torn_tail_is_truncated_reported_and_appendable() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
         for transaction in [start_transaction(0), batch_transaction(1)] {
-            block_on(store.commit(transaction)).expect("commit");
+            store.commit(transaction).await.expect("commit");
         }
     }
     // Simulate a crash mid-append: a partial line without a terminator.
@@ -276,16 +277,19 @@ fn torn_tail_is_truncated_reported_and_appendable() {
     );
 
     // Later commits append normally from the recovered revision.
-    let commit = block_on(reopened.commit(results_transaction(2))).expect("commit after recovery");
+    let commit = reopened
+        .commit(results_transaction(2))
+        .await
+        .expect("commit after recovery");
     assert_eq!(commit.revision(), SessionRevision::new(3));
 }
 
-#[test]
-fn torn_json_with_terminator_at_eof_is_crash_residue() {
+#[tokio::test(flavor = "multi_thread")]
+async fn torn_json_with_terminator_at_eof_is_crash_residue() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0))).expect("commit");
+        store.commit(start_transaction(0)).await.expect("commit");
     }
     let mut bytes = std::fs::read(log_path(&root)).expect("read");
     bytes.extend_from_slice(b"{\"v\":2,\"revision\":2\n");
@@ -299,13 +303,13 @@ fn torn_json_with_terminator_at_eof_is_crash_residue() {
 
 // --- Mid-log corruption (M5-004) ---------------------------------------------
 
-#[test]
-fn mid_log_corruption_refuses_to_open_with_the_line_number() {
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_log_corruption_refuses_to_open_with_the_line_number() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
         for transaction in [start_transaction(0), batch_transaction(1)] {
-            block_on(store.commit(transaction)).expect("commit");
+            store.commit(transaction).await.expect("commit");
         }
     }
     // Corrupt line 1 while line 2 stays complete: never silently repaired.
@@ -324,17 +328,20 @@ fn mid_log_corruption_refuses_to_open_with_the_line_number() {
     assert_eq!(line, 1);
 
     // The trait path reports the same condition as a store failure.
-    let trait_error = block_on(reopened.context_view(&session_id())).expect_err("refused");
+    let trait_error = reopened
+        .context_view(&session_id())
+        .await
+        .expect_err("refused");
     assert!(matches!(trait_error, SessionError::StoreUnavailable { .. }));
 }
 
-#[test]
-fn revision_discontinuity_is_corruption() {
+#[tokio::test(flavor = "multi_thread")]
+async fn revision_discontinuity_is_corruption() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
         for transaction in [start_transaction(0), batch_transaction(1)] {
-            block_on(store.commit(transaction)).expect("commit");
+            store.commit(transaction).await.expect("commit");
         }
     }
     // Drop line 1, keeping line 2 whose revision no longer matches its position.
@@ -349,8 +356,8 @@ fn revision_discontinuity_is_corruption() {
     assert!(matches!(error, JsonlOpenError::Corrupt { line: 1, .. }));
 }
 
-#[test]
-fn unsupported_schema_version_refuses_to_open() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_schema_version_refuses_to_open() {
     let root = TempRoot::new();
     let dir = root.path.join("s-golden");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -373,11 +380,11 @@ fn unsupported_schema_version_refuses_to_open() {
 
 // --- Single-writer lock (M5-005) ---------------------------------------------
 
-#[test]
-fn second_writer_is_rejected_and_release_allows_reopen() {
+#[tokio::test(flavor = "multi_thread")]
+async fn second_writer_is_rejected_and_release_allows_reopen() {
     let root = TempRoot::new();
     let first = JsonlSessionStore::open(&root.path).expect("open first");
-    block_on(first.commit(start_transaction(0))).expect("commit");
+    first.commit(start_transaction(0)).await.expect("commit");
 
     let second = JsonlSessionStore::open(&root.path).expect("open second store");
     let error = second.recover_session(&session_id()).expect_err("locked");
@@ -385,7 +392,10 @@ fn second_writer_is_rejected_and_release_allows_reopen() {
         matches!(error, JsonlOpenError::Locked { .. }),
         "lock conflicts are distinguishable: {error:?}"
     );
-    let trait_error = block_on(second.commit(batch_transaction(1))).expect_err("locked");
+    let trait_error = second
+        .commit(batch_transaction(1))
+        .await
+        .expect_err("locked");
     let SessionError::StoreUnavailable { reason } = &trait_error else {
         panic!("expected StoreUnavailable, got {trait_error:?}");
     };
@@ -400,13 +410,16 @@ fn second_writer_is_rejected_and_release_allows_reopen() {
         .recover_session(&session_id())
         .expect("reopen after release");
     assert_eq!(report.transactions(), 1);
-    block_on(second.commit(batch_transaction(1))).expect("commit after takeover");
+    second
+        .commit(batch_transaction(1))
+        .await
+        .expect("commit after takeover");
 }
 
 // --- Backend parity (M5-006) --------------------------------------------------
 
-#[test]
-fn jsonl_and_memory_backends_agree_on_facts_and_errors() {
+#[tokio::test(flavor = "multi_thread")]
+async fn jsonl_and_memory_backends_agree_on_facts_and_errors() {
     let root = TempRoot::new();
     let jsonl = JsonlSessionStore::open(&root.path).expect("open");
     let memory = MemorySessionStore::new();
@@ -417,15 +430,21 @@ fn jsonl_and_memory_backends_agree_on_facts_and_errors() {
         results_transaction(2),
         settle_transaction(3),
     ] {
-        let disk = block_on(jsonl.commit(transaction.clone())).expect("jsonl commit");
-        let ram = block_on(memory.commit(transaction)).expect("memory commit");
+        let disk = jsonl
+            .commit(transaction.clone())
+            .await
+            .expect("jsonl commit");
+        let ram = memory.commit(transaction).await.expect("memory commit");
         assert_eq!(disk.revision(), ram.revision());
         assert_eq!(disk.entries(), ram.entries(), "same ids, parents, kinds");
         assert_eq!(disk.current_leaf(), ram.current_leaf());
     }
     assert_eq!(
-        block_on(jsonl.context_view(&session_id())).expect("jsonl view"),
-        block_on(memory.context_view(&session_id())).expect("memory view")
+        jsonl.context_view(&session_id()).await.expect("jsonl view"),
+        memory
+            .context_view(&session_id())
+            .await
+            .expect("memory view")
     );
 
     // The same invalid transaction is rejected with the same validation error.
@@ -437,19 +456,19 @@ fn jsonl_and_memory_backends_agree_on_facts_and_errors() {
             parts: SessionUserPart::text_parts("turn already terminated"),
         }],
     );
-    let jsonl_error = block_on(jsonl.commit(invalid.clone())).expect_err("rejected");
-    let memory_error = block_on(memory.commit(invalid)).expect_err("rejected");
+    let jsonl_error = jsonl.commit(invalid.clone()).await.expect_err("rejected");
+    let memory_error = memory.commit(invalid).await.expect_err("rejected");
     assert_eq!(jsonl_error, memory_error);
 
     // Same revision-conflict classification too.
-    let stale = block_on(jsonl.commit(start_transaction(0))).expect_err("stale");
+    let stale = jsonl.commit(start_transaction(0)).await.expect_err("stale");
     assert!(matches!(stale, SessionError::RevisionConflict { .. }));
 }
 
 // --- Misc --------------------------------------------------------------------
 
-#[test]
-fn empty_log_after_crash_between_dir_and_first_commit_is_an_empty_session() {
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_log_after_crash_between_dir_and_first_commit_is_an_empty_session() {
     let root = TempRoot::new();
     // Simulate: directory and lock exist, log was never created.
     std::fs::create_dir_all(root.path.join("s-golden")).expect("mkdir");
@@ -457,11 +476,14 @@ fn empty_log_after_crash_between_dir_and_first_commit_is_an_empty_session() {
     let report = store.recover_session(&session_id()).expect("recover");
     assert_eq!(report.transactions(), 0);
     assert!(!report.tail_was_truncated());
-    block_on(store.commit(start_transaction(0))).expect("first commit works");
+    store
+        .commit(start_transaction(0))
+        .await
+        .expect("first commit works");
 }
 
-#[test]
-fn recover_session_without_directory_reports_zero_and_creates_nothing() {
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_session_without_directory_reports_zero_and_creates_nothing() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     let report = store

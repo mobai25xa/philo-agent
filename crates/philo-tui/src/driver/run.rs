@@ -1,46 +1,226 @@
-//! The interactive event loop: merges agent events and terminal input,
+//! The interactive event loop: merges frontend updates and terminal input,
 //! feeds the pure state machine, and performs its effects. Terminal writes
 //! are granted only by the frame scheduler.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::Duration;
 
-use crossterm::event::{Event as TermEvent, EventStream};
-use philo_agent_runtime::{AgentEvent, OperationHandle, SessionId};
+use philo_agent_service::{
+    CommandSubmitResult, FrontendAvailability, FrontendClient, FrontendCommand, FrontendRequestId,
+    FrontendRevision, FrontendUpdate, FrontendUpdateKind,
+};
+use ratatui::Terminal;
+use ratatui::backend::Backend;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::api::host::TuiHost;
-use crate::api::types::{TuiConfig, TuiExit, TuiScreen};
+use crate::api::types::{RestoreReport, TuiLaunchConfig, TuiOutcome, TuiRunReport, TuiScreen};
 use crate::app::effect::{Effect, HostRequest};
-use crate::app::state::App;
+use crate::app::overlay::Preview;
+use crate::app::state::{App, SessionLoadIntent};
 use crate::app::status::StatusData;
 use crate::app::transcript::InfoLevel;
 use crate::platform::clipboard::ClipboardContent;
+use crate::platform::input::{
+    CrosstermInputSource, InputFaultTracker, TerminalInput, TerminalInputFault, TerminalInputSource,
+};
 use crate::platform::keymap;
 use crate::platform::terminal::TerminalSession;
 use crate::render::markdown::MarkdownRenderer;
 
-use super::events::{self, AgentItem, Step};
+use super::events::{self, Step};
+use super::interrupt::{self, CtrlCDecision, CtrlCPhase};
 use super::output::{FlushReport, PendingOutput};
 use super::scheduler::FrameScheduler;
-use super::tasks::{PendingTasks, SubmissionResult, TaskCompletion};
-use super::{host_effects, media, tasks};
+use super::tasks::{MediaResult, PendingTasks, TaskCompletion};
+use super::{media, tasks};
 
-/// ConfirmationChannel currently has no wake stream. While an operation is
-/// active, poll its front without producing a frame unless the overlay changed.
-const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DRAW_FAILURE_BUDGET: u32 = 3;
+const INPUT_ERROR_BUDGET: u32 = 8;
 
-/// Runs the interactive session until the user quits.
-///
-/// Terminal ownership: raw mode and the configured screen (alternate buffer
-/// or inline viewport) are held for the whole call and restored on every
-/// exit path (the guard also covers panics). The session never switches
-/// screen mode. Errors after the loop starts surface as `io::Error`.
-pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<TuiExit> {
-    let mut session = TerminalSession::enter(config.screen)?;
+/// Production entry: enter the terminal, drive the loop, restore on every path.
+pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRunReport {
+    let screen = config.screen;
+    let mut session = match TerminalSession::enter(screen) {
+        Ok(session) => session,
+        Err(error) => {
+            return TuiRunReport {
+                outcome: TuiOutcome::FallbackRequested {
+                    fault: error.to_string(),
+                },
+                restore: RestoreReport::default(),
+            };
+        }
+    };
     let shift_enter = session.shift_enter;
+    let mut input = CrosstermInputSource::new();
+    let outcome = run_loop(
+        client,
+        config,
+        &mut session.terminal,
+        &mut input,
+        shift_enter,
+        screen,
+    )
+    .await;
+    let restore = session.restore();
+    TuiRunReport { outcome, restore }
+}
 
+/// Alias of [`run_async`]. The production path is `run_async` only.
+pub async fn run(client: FrontendClient, config: TuiLaunchConfig) -> TuiRunReport {
+    run_async(client, config).await
+}
+
+struct FrontendSync {
+    epoch: Option<philo_agent_service::FrontendEpoch>,
+    revision: FrontendRevision,
+    awaiting_snapshot: bool,
+    snapshot_request: Option<FrontendRequestId>,
+    preview_request: Option<FrontendRequestId>,
+    preview_session_id: Option<String>,
+    model_request: Option<FrontendRequestId>,
+}
+
+impl FrontendSync {
+    fn new() -> Self {
+        Self {
+            epoch: None,
+            revision: FrontendRevision::ZERO,
+            awaiting_snapshot: false,
+            snapshot_request: None,
+            preview_request: None,
+            preview_session_id: None,
+            model_request: None,
+        }
+    }
+
+    fn accept(&mut self, update: &FrontendUpdate) -> bool {
+        if let Some(epoch) = self.epoch {
+            if update.epoch < epoch {
+                return false;
+            }
+            if update.epoch > epoch {
+                self.epoch = Some(update.epoch);
+                self.revision = update.revision;
+                self.awaiting_snapshot = false;
+                return true;
+            }
+        } else {
+            self.epoch = Some(update.epoch);
+        }
+        if update.revision < self.revision {
+            return false;
+        }
+        if self.awaiting_snapshot
+            && !matches!(
+                update.kind,
+                FrontendUpdateKind::SnapshotReady(_) | FrontendUpdateKind::ResyncRequired { .. }
+            )
+        {
+            return false;
+        }
+        if let Some(id) = update.request_id {
+            if matches!(update.kind, FrontendUpdateKind::SessionPreviewed { .. })
+                && self.preview_request.is_some_and(|expected| expected != id)
+            {
+                return false;
+            }
+            if matches!(
+                update.kind,
+                FrontendUpdateKind::GenerationInstalled { .. }
+                    | FrontendUpdateKind::GenerationInstallFailed { .. }
+            ) && self.model_request.is_some_and(|expected| expected != id)
+            {
+                return false;
+            }
+            if matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+                && self
+                    .snapshot_request
+                    .is_some_and(|expected| expected.is_valid() && expected != id)
+            {
+                return false;
+            }
+        }
+        self.revision = update.revision;
+        if matches!(update.kind, FrontendUpdateKind::SnapshotReady(_)) {
+            self.awaiting_snapshot = false;
+        }
+        true
+    }
+}
+
+struct LoopState {
+    client: FrontendClient,
+    sync: FrontendSync,
+    preview_generation: u64,
+    active_operation_id: Option<String>,
+    maintenance_id: Option<String>,
+    ctrl_c: CtrlCPhase,
+}
+
+impl LoopState {
+    fn send(&self, command: FrontendCommand) -> CommandSubmitResult {
+        self.client.try_command(command)
+    }
+}
+
+fn ctrl_c_decision(state: &mut LoopState, treat_unknown_as_busy: bool) -> CtrlCDecision {
+    if let Some(id) = state.active_operation_id.clone() {
+        state.ctrl_c.observe_busy(id);
+    } else if treat_unknown_as_busy && matches!(state.ctrl_c, CtrlCPhase::Idle) {
+        state.ctrl_c = CtrlCPhase::Busy { operation_id: None };
+    }
+    state.ctrl_c.on_ctrl_c()
+}
+
+fn apply_ctrl_c_decision(
+    state: &mut LoopState,
+    exit_requested: &mut Option<TuiOutcome>,
+    decision: CtrlCDecision,
+) {
+    match decision {
+        CtrlCDecision::UserExit => {
+            *exit_requested = Some(TuiOutcome::UserExit);
+        }
+        CtrlCDecision::Cancel { operation_id } => {
+            let _ = state.send(FrontendCommand::CancelOperation { operation_id });
+        }
+        CtrlCDecision::WaitForId => {}
+        CtrlCDecision::ForcedExit { code } => {
+            *exit_requested = Some(TuiOutcome::ForcedExitRequested { code });
+        }
+    }
+}
+
+fn apply_interrupt_pulses(
+    state: &mut LoopState,
+    interrupt: Option<&mut watch::Receiver<u64>>,
+    seen: &mut u64,
+    exit_requested: &mut Option<TuiOutcome>,
+) -> Vec<Effect> {
+    let Some(rx) = interrupt else {
+        return Vec::new();
+    };
+    let delta = interrupt::take_pulses(rx, seen);
+    for _ in 0..delta {
+        if exit_requested.is_some() {
+            break;
+        }
+        let decision = ctrl_c_decision(state, false);
+        apply_ctrl_c_decision(state, exit_requested, decision);
+    }
+    Vec::new()
+}
+
+/// Testable event loop. Does not own or restore a real terminal session.
+pub(crate) async fn run_loop<B: Backend>(
+    client: FrontendClient,
+    config: TuiLaunchConfig,
+    terminal: &mut Terminal<B>,
+    input: &mut impl TerminalInputSource,
+    shift_enter: bool,
+    screen: TuiScreen,
+) -> TuiOutcome {
     let mut status = StatusData::new(
         &config.model_name,
         &config.session_id,
@@ -57,186 +237,171 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
     let start = Instant::now();
     let mut scheduler = FrameScheduler::new(start);
     let mut output = PendingOutput::default();
-    let mut tasks = PendingTasks::new(Arc::clone(&host));
-    // Durable history is loaded as the first owned host task. The initial
-    // panel and terminal input remain live while a slow store responds.
-    tasks.start_host(HostRequest::SwitchSession(philo_session::SessionId::new(
-        &config.session_id,
-    )));
-    let mut term_events = EventStream::new();
-    // Operations queue FIFO (M6); the loop consumes the front handle's
-    // events until it settles, then moves on.
-    let mut handles: VecDeque<OperationHandle> = VecDeque::new();
-    let mut compaction: Option<events::CompactionFuture> = None;
-    let mut config_notices = config.config_notices;
-    let mut exit_requested = false;
+    let mut tasks = PendingTasks::new();
+    let mut input_faults = InputFaultTracker::new(INPUT_ERROR_BUDGET);
+    let mut pending_zero_resize = false;
+    let mut draw_failures: u32 = 0;
+    let mut exit_requested = None;
+    let mut rebuild_deadline = None;
 
-    let exit = loop {
-        let now = Instant::now();
-        if app.sync_confirmation(host.confirmations().front()) {
-            scheduler.invalidate_immediate(now);
+    let mut state = LoopState {
+        client,
+        sync: FrontendSync::new(),
+        preview_generation: 0,
+        active_operation_id: None,
+        maintenance_id: None,
+        ctrl_c: CtrlCPhase::Idle,
+    };
+    let mut interrupt = config.interrupt;
+    let mut interrupt_seen = 0u64;
+    if let Some(rx) = interrupt.as_mut() {
+        interrupt_seen = *rx.borrow_and_update();
+    }
+
+    if config.session_id.is_empty() {
+        let id = state.client.request_snapshot(FrontendRevision::ZERO);
+        state.sync.snapshot_request = Some(id);
+        state.sync.awaiting_snapshot = true;
+    } else {
+        app.expect_session_load(SessionLoadIntent::Switch);
+        if let CommandSubmitResult::Disconnected = state.send(FrontendCommand::LoadSession {
+            session_id: config.session_id.clone(),
+        }) {
+            return TuiOutcome::FrontendRestartRequested {
+                fault: "frontend disconnected on load".to_owned(),
+            };
         }
+    }
+
+    loop {
+        let now = Instant::now();
         scheduler.sync_animation(app.animation_active(), now);
 
-        let report = output.flush(
-            &mut session.terminal,
-            &app,
-            &mut markdown,
-            shift_enter,
-            &mut scheduler,
-            now,
-        )?;
-        assert_single_round_writes(report);
-        if exit_requested {
-            break TuiExit::Normal;
+        if !pending_zero_resize {
+            let report = output.flush(
+                terminal,
+                &app,
+                &mut markdown,
+                shift_enter,
+                &mut scheduler,
+                now,
+            );
+            assert_single_round_writes(report);
+            if report.failed {
+                draw_failures = draw_failures.saturating_add(1);
+                if draw_failures >= DRAW_FAILURE_BUDGET {
+                    return TuiOutcome::FrontendRestartRequested {
+                        fault: "draw failed repeatedly".to_owned(),
+                    };
+                }
+            } else {
+                draw_failures = 0;
+            }
+        }
+        if let Some(outcome) = exit_requested {
+            return outcome;
         }
 
-        let confirmation_poll = (!handles.is_empty()).then_some(now + CONFIRMATION_POLL_INTERVAL);
         let step = events::next_step(
-            &mut handles,
+            &state.client,
             &mut tasks,
-            &mut compaction,
-            &mut term_events,
+            input,
             scheduler.frame_deadline(),
             scheduler.animation_deadline(),
-            confirmation_poll,
-            &mut config_notices,
+            rebuild_deadline,
+            interrupt.as_mut(),
         )
         .await;
         let event_time = Instant::now();
 
         let effects = match step {
-            Step::Agent(first) => {
-                let mut effects = Vec::new();
-                for item in events::drain_ready_agent_items(&mut handles, first) {
-                    if let AgentItem::Event(event) = item {
-                        effects.extend(app.on_agent_event(&event));
-                        if is_terminal_operation_event(&event) {
-                            // A cancellation or terminal event must not leave
-                            // an external approval decorator waiting.
-                            host.confirmations().deny_all();
-                        }
-                    }
-                }
-                sync_busy(&mut app, &handles, &tasks, compaction.is_some());
-                scheduler.invalidate_background(event_time);
-                effects
-            }
-            Step::Task(completion) => {
-                let effects = match completion {
-                    TaskCompletion::Host(result) => {
-                        if result.resets_session() {
-                            markdown.reset();
-                        }
-                        host_effects::apply(&mut app, result)
-                    }
-                    TaskCompletion::Clipboard(result) => {
-                        let effects = finish_clipboard(&mut app, result);
-                        app.ingest_appends(effects)
-                    }
-                    TaskCompletion::ClipboardWrite(result) => match result {
-                        Ok(()) => Vec::new(),
-                        Err(error) => app.ingest_appends(vec![Effect::Append(tasks::task_error(
-                            format!("copy failed: {error}"),
-                        ))]),
+            Step::Update(first) => {
+                let updates = events::drain_ready_updates(&state.client, first);
+                apply_updates(&mut app, &mut markdown, &mut state, updates).unwrap_or_else(
+                    |outcome| {
+                        exit_requested = Some(outcome);
+                        Vec::new()
                     },
-                    TaskCompletion::Submission(SubmissionResult::Accepted(handle)) => {
-                        handles.push_back(handle);
-                        Vec::new()
-                    }
-                    TaskCompletion::Submission(SubmissionResult::Rejected(error)) => {
-                        app.ingest_appends(vec![Effect::Append(tasks::task_error(error))])
-                    }
-                    TaskCompletion::Submission(SubmissionResult::MediaRefused {
-                        text,
-                        kept,
-                        errors,
-                        draft_generation,
-                    }) => {
-                        let restored = app.restore_draft_if_current(draft_generation, &text, kept);
-                        app.ingest_appends(vec![Effect::Append(media::refusal_lines_for_restore(
-                            &errors, restored,
-                        ))])
-                    }
-                    TaskCompletion::Failed(error) => {
-                        app.ingest_appends(vec![Effect::Append(tasks::task_error(error))])
-                    }
-                    TaskCompletion::Superseded => Vec::new(),
-                };
-                tasks.resume_submissions(SessionId::new(&app.status.session));
-                sync_busy(&mut app, &handles, &tasks, compaction.is_some());
-                scheduler.invalidate_background(event_time);
-                effects
+                )
             }
-            Step::Compaction(result) => {
-                compaction.take();
-                let effects = app.finish_manual_compaction(result);
-                sync_busy(&mut app, &handles, &tasks, false);
-                scheduler.invalidate_background(event_time);
-                effects
-            }
-            Step::Term(Ok(event)) => match event {
-                TermEvent::Key(key) => {
-                    scheduler.invalidate_immediate(event_time);
-                    let action = keymap::interpret(&key);
-                    if matches!(action, crate::app::action::Action::Escape) {
-                        tasks.cancel_transient();
-                        tasks.resume_submissions(SessionId::new(&app.status.session));
-                    }
-                    app.on_action(action)
-                }
-                TermEvent::Paste(text) => {
-                    scheduler.invalidate_immediate(event_time);
-                    app.on_paste(&text)
-                }
-                TermEvent::Mouse(mouse) => {
-                    let action = keymap::interpret_mouse(&mouse, app.is_selecting());
-                    if matches!(action, crate::app::action::Action::None) {
-                        Vec::new()
-                    } else {
-                        scheduler.invalidate_immediate(event_time);
-                        app.on_action(action)
-                    }
-                }
-                TermEvent::Resize(..) => {
-                    // Alternate may wipe the alt buffer. Inline must not
-                    // request a hard clear: `terminal.clear()` would wipe
-                    // the main buffer and leave stacked ghost frames.
-                    if session.screen == TuiScreen::Alternate {
-                        scheduler.request_hard_redraw(event_time);
-                    } else {
-                        scheduler.invalidate_immediate(event_time);
-                    }
-                    Vec::new()
-                }
-                _ => Vec::new(),
-            },
-            Step::Term(Err(error)) => return Err(error),
-            Step::TermClosed => {
-                // Flush any completed history already accepted by the App
-                // before restoring the terminal.
-                scheduler.invalidate_immediate(event_time);
-                exit_requested = true;
+            Step::UpdatesDisconnected => {
+                exit_requested = Some(TuiOutcome::FrontendRestartRequested {
+                    fault: "frontend update stream closed".to_owned(),
+                });
                 Vec::new()
             }
-            Step::ConfigNotice(notice) => {
-                scheduler.invalidate_background(event_time);
-                app.on_action(crate::app::action::Action::ConfigReload(notice))
+            Step::Task(completion) => match apply_task_with_submit(&mut app, &state, completion) {
+                Ok(effects) => effects,
+                Err(outcome) => {
+                    exit_requested = Some(outcome);
+                    Vec::new()
+                }
+            },
+            Step::Input(Ok(event)) => apply_input(
+                &mut app,
+                &mut tasks,
+                &mut scheduler,
+                screen,
+                event_time,
+                &mut pending_zero_resize,
+                event,
+            ),
+            Step::Input(Err(fault)) => {
+                match handle_input_fault(
+                    fault,
+                    &mut input_faults,
+                    &mut pending_zero_resize,
+                    event_time,
+                ) {
+                    Ok(InputFaultAction::Continue) => Vec::new(),
+                    Ok(InputFaultAction::ScheduleRebuild(deadline)) => {
+                        app.status.input_rebuilding = true;
+                        rebuild_deadline = Some(deadline);
+                        scheduler.invalidate_immediate(event_time);
+                        Vec::new()
+                    }
+                    Err(outcome) => {
+                        exit_requested = Some(outcome);
+                        Vec::new()
+                    }
+                }
             }
-            Step::FrameDeadline | Step::ConfirmationPoll => Vec::new(),
+            Step::InputClosed => {
+                exit_requested = Some(TuiOutcome::FrontendRestartRequested {
+                    fault: "terminal input stream terminated".to_owned(),
+                });
+                Vec::new()
+            }
+            Step::InputRebuildDue => {
+                rebuild_deadline = None;
+                match input.rebuild() {
+                    Ok(()) => {
+                        app.status.input_rebuilding = false;
+                        scheduler.invalidate_immediate(event_time);
+                    }
+                    Err(error) => {
+                        exit_requested = Some(TuiOutcome::FallbackRequested {
+                            fault: format!("input rebuild failed: {error:?}"),
+                        });
+                    }
+                }
+                Vec::new()
+            }
+            Step::FrameDeadline => Vec::new(),
             Step::AnimationDeadline => {
                 if scheduler.take_animation_tick(event_time) && app.on_tick() {
                     scheduler.invalidate_background(event_time);
                 }
                 Vec::new()
             }
+            Step::Interrupt => apply_interrupt_pulses(
+                &mut state,
+                interrupt.as_mut(),
+                &mut interrupt_seen,
+                &mut exit_requested,
+            ),
         };
 
-        let mut quit = false;
-        // Completed host results can request follow-up work (opening the picker
-        // requests its first preview), so the queue is drained rather than
-        // iterated. Transcript lines are already in `App.cells`; Append only
-        // dirties the next granted frame.
         let mut pending: VecDeque<Effect> = effects.into();
         while let Some(effect) = pending.pop_front() {
             match effect {
@@ -245,60 +410,285 @@ pub async fn run(host: Arc<dyn TuiHost>, config: TuiConfig) -> std::io::Result<T
                 }
                 Effect::Submit { text, attachments } => {
                     let draft_generation = app.draft_generation();
-                    tasks.enqueue_submission(
-                        SessionId::new(&app.status.session),
-                        text,
-                        attachments,
-                        draft_generation,
-                    );
-                    sync_busy(&mut app, &handles, &tasks, compaction.is_some());
+                    tasks.enqueue_media(text, attachments, draft_generation);
                     scheduler.invalidate_immediate(Instant::now());
                 }
-                Effect::ReadClipboard => {
-                    tasks.start_clipboard();
-                }
-                Effect::WriteClipboard(text) => {
-                    tasks.start_clipboard_write(text);
-                }
+                Effect::ReadClipboard => tasks.start_clipboard(),
+                Effect::WriteClipboard(text) => tasks.start_clipboard_write(text),
                 Effect::CancelActive => {
-                    if let Some(handle) = handles.front() {
-                        handle.cancel();
+                    if let Some(operation_id) = state.active_operation_id.clone() {
+                        let _ = state.send(FrontendCommand::CancelOperation { operation_id });
                     } else {
-                        tasks.cancel_submissions();
-                        sync_busy(&mut app, &handles, &tasks, compaction.is_some());
+                        tasks.cancel_media();
+                    }
+                }
+                Effect::InterruptCancel => {
+                    if state.active_operation_id.is_none() && !app.status.busy {
+                        tasks.cancel_media();
+                    } else {
+                        let decision = ctrl_c_decision(&mut state, true);
+                        apply_ctrl_c_decision(&mut state, &mut exit_requested, decision);
                     }
                 }
                 Effect::StartCompaction => {
-                    debug_assert!(compaction.is_none(), "only one manual compaction may run");
-                    compaction = Some(host.compact(SessionId::new(&app.status.session)));
+                    let _ = state.send(FrontendCommand::StartCompaction {
+                        session_id: app.status.session.clone(),
+                    });
                 }
                 Effect::CancelCompaction => {
-                    compaction.take();
-                    sync_busy(&mut app, &handles, &tasks, false);
+                    if let Some(maintenance_id) = state.maintenance_id.clone() {
+                        let _ = state.send(FrontendCommand::CancelMaintenance { maintenance_id });
+                    }
                 }
-                Effect::Quit => quit = true,
+                Effect::Quit => {
+                    scheduler.invalidate_immediate(Instant::now());
+                    exit_requested = Some(TuiOutcome::UserExit);
+                }
+                Effect::RequestShutdown => {
+                    let _ = state.send(FrontendCommand::ShutdownRequested);
+                    exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
+                }
                 Effect::HardRedraw => {
                     scheduler.request_hard_redraw(Instant::now());
                 }
                 Effect::Host(request) => {
-                    if let HostRequest::Respond(id, response) = request {
-                        host.confirmations().respond(id, response);
-                    } else {
-                        tasks.start_host(request);
-                        tasks.resume_submissions(SessionId::new(&app.status.session));
+                    if let Some(outcome) = dispatch_host(&mut state, &mut app, request) {
+                        exit_requested = Some(outcome);
                     }
                     scheduler.invalidate_immediate(Instant::now());
                 }
             }
         }
-        if quit {
-            // Preserve any append emitted earlier in this effect queue.
-            scheduler.invalidate_immediate(Instant::now());
-            exit_requested = true;
+    }
+}
+
+fn apply_updates(
+    app: &mut App,
+    markdown: &mut MarkdownRenderer,
+    state: &mut LoopState,
+    updates: Vec<FrontendUpdate>,
+) -> Result<Vec<Effect>, TuiOutcome> {
+    let mut effects = Vec::new();
+    for update in updates {
+        if !state.sync.accept(&update) {
+            continue;
         }
+        track_identities(state, &update);
+        if matches!(
+            update.kind,
+            FrontendUpdateKind::SessionLoaded { .. } | FrontendUpdateKind::SnapshotReady(_)
+        ) {
+            markdown.reset();
+        }
+        if let FrontendUpdateKind::ResyncRequired { .. } = &update.kind {
+            let id = state.client.request_snapshot(state.sync.revision);
+            state.sync.snapshot_request = Some(id);
+            state.sync.awaiting_snapshot = true;
+            continue;
+        }
+        if let FrontendUpdateKind::CommandRejected { reason } = &update.kind
+            && let Some(expected) = state.sync.preview_request
+            && update.request_id == Some(expected)
+            && let Some(session_id) = state.sync.preview_session_id.take()
+        {
+            state.sync.preview_request = None;
+            app.set_preview(&session_id, Preview::Failed(reason.clone()));
+            continue;
+        }
+        effects.extend(app.apply_update(&update));
+    }
+    Ok(effects)
+}
+
+fn track_identities(state: &mut LoopState, update: &FrontendUpdate) {
+    match &update.kind {
+        FrontendUpdateKind::OperationAccepted { operation_id, .. } => {
+            let waiting = matches!(state.ctrl_c, CtrlCPhase::Cancelling { operation_id: None });
+            state.active_operation_id = Some(operation_id.clone());
+            state.ctrl_c.observe_busy(operation_id.clone());
+            if waiting {
+                if let Some(id) = state.ctrl_c.pending_cancel_id() {
+                    let _ = state.send(FrontendCommand::CancelOperation {
+                        operation_id: id.to_owned(),
+                    });
+                }
+            }
+        }
+        FrontendUpdateKind::AvailabilityChanged { availability, .. } => match availability {
+            FrontendAvailability::Busy { operation_id } => {
+                state.active_operation_id = Some(operation_id.clone());
+                state.ctrl_c.observe_busy(operation_id.clone());
+            }
+            FrontendAvailability::Idle => {
+                state.active_operation_id = None;
+                state.maintenance_id = None;
+                state.ctrl_c.observe_idle();
+            }
+            FrontendAvailability::Compacting { .. } => {}
+        },
+        FrontendUpdateKind::MaintenanceChanged(maintenance) => {
+            state.maintenance_id = Some(maintenance.id.clone());
+        }
+        _ => {}
+    }
+}
+
+fn apply_task(app: &mut App, completion: TaskCompletion) -> Vec<Effect> {
+    match completion {
+        TaskCompletion::Clipboard(result) => {
+            let effects = finish_clipboard(app, result);
+            app.ingest_appends(effects)
+        }
+        TaskCompletion::ClipboardWrite(result) => match result {
+            Ok(()) => Vec::new(),
+            Err(error) => app.ingest_appends(vec![Effect::Append(tasks::task_error(format!(
+                "copy failed: {error}"
+            )))]),
+        },
+        TaskCompletion::Media(MediaResult::Ready { .. }) => Vec::new(),
+        TaskCompletion::Media(MediaResult::Refused {
+            text,
+            kept,
+            errors,
+            draft_generation,
+        }) => {
+            let restored = app.restore_draft_if_current(draft_generation, &text, kept);
+            app.ingest_appends(vec![Effect::Append(media::refusal_lines_for_restore(
+                &errors, restored,
+            ))])
+        }
+        TaskCompletion::Failed(error) => {
+            app.ingest_appends(vec![Effect::Append(tasks::task_error(error))])
+        }
+    }
+}
+
+fn apply_input(
+    app: &mut App,
+    tasks: &mut PendingTasks,
+    scheduler: &mut FrameScheduler,
+    screen: TuiScreen,
+    event_time: Instant,
+    pending_zero_resize: &mut bool,
+    event: TerminalInput,
+) -> Vec<Effect> {
+    match event {
+        TerminalInput::Key(key) => {
+            scheduler.invalidate_immediate(event_time);
+            let action = keymap::interpret(&key);
+            if matches!(action, crate::app::action::Action::Escape) {
+                tasks.cancel_transient();
+            }
+            app.on_action(action)
+        }
+        TerminalInput::Paste(text) => {
+            scheduler.invalidate_immediate(event_time);
+            app.on_paste(&text)
+        }
+        TerminalInput::Mouse(mouse) => {
+            let action = keymap::interpret_mouse(&mouse, app.is_selecting());
+            if matches!(action, crate::app::action::Action::None) {
+                Vec::new()
+            } else {
+                scheduler.invalidate_immediate(event_time);
+                app.on_action(action)
+            }
+        }
+        TerminalInput::Resize { .. } => {
+            *pending_zero_resize = false;
+            if screen == TuiScreen::Alternate {
+                scheduler.request_hard_redraw(event_time);
+            } else {
+                scheduler.invalidate_immediate(event_time);
+            }
+            Vec::new()
+        }
+    }
+}
+
+enum InputFaultAction {
+    Continue,
+    ScheduleRebuild(Instant),
+}
+
+fn handle_input_fault(
+    fault: TerminalInputFault,
+    tracker: &mut InputFaultTracker,
+    pending_zero_resize: &mut bool,
+    now: Instant,
+) -> Result<InputFaultAction, TuiOutcome> {
+    match fault {
+        TerminalInputFault::Interrupted | TerminalInputFault::WouldBlock => {
+            tracker.ok();
+            Ok(InputFaultAction::Continue)
+        }
+        TerminalInputFault::ZeroSizeResize => {
+            tracker.ok();
+            *pending_zero_resize = true;
+            Ok(InputFaultAction::Continue)
+        }
+        TerminalInputFault::InvalidHandle => {
+            if tracker.fail() || tracker.rebuilds_exhausted() {
+                return Err(TuiOutcome::FallbackRequested {
+                    fault: "terminal input handle rebuild budget exceeded".to_owned(),
+                });
+            }
+            Ok(InputFaultAction::ScheduleRebuild(
+                now + tracker.rebuild_backoff(),
+            ))
+        }
+        TerminalInputFault::StreamTerminated => Err(TuiOutcome::FrontendRestartRequested {
+            fault: "terminal input stream terminated".to_owned(),
+        }),
+        TerminalInputFault::ErrorBudgetExceeded { message } => {
+            Err(TuiOutcome::FallbackRequested { fault: message })
+        }
+    }
+}
+
+fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> Option<TuiOutcome> {
+    let command = match request {
+        HostRequest::NewSession => FrontendCommand::CreateSession,
+        HostRequest::OpenSessions => FrontendCommand::ListSessions,
+        HostRequest::LoadPreview(session_id) => {
+            state.preview_generation = state.preview_generation.saturating_add(1);
+            state.sync.preview_session_id = Some(session_id.clone());
+            FrontendCommand::PreviewSession {
+                session_id,
+                request_generation: state.preview_generation,
+            }
+        }
+        HostRequest::SwitchSession(session_id) => FrontendCommand::LoadSession { session_id },
+        HostRequest::RebuildModel(name) => FrontendCommand::InstallModel { name },
+        HostRequest::SetReasoning(effort) => FrontendCommand::SetReasoning { effort },
+        HostRequest::ShowConfig => FrontendCommand::ReadConfig,
+        HostRequest::ShowStatus => FrontendCommand::ReadStatus,
+        HostRequest::Respond(confirmation_id, decision) => FrontendCommand::RespondConfirmation {
+            confirmation_id,
+            decision,
+        },
     };
-    drop(session);
-    Ok(exit)
+    match state.send(command.clone()) {
+        CommandSubmitResult::Accepted(id) => {
+            match &command {
+                FrontendCommand::PreviewSession { .. } => state.sync.preview_request = Some(id),
+                FrontendCommand::InstallModel { .. } | FrontendCommand::SetReasoning { .. } => {
+                    state.sync.model_request = Some(id);
+                }
+                _ => {}
+            }
+            None
+        }
+        CommandSubmitResult::Backpressured => {
+            let _ = app.ingest_appends(vec![Effect::Append(tasks::task_error(
+                "frontend command backpressured",
+            ))]);
+            None
+        }
+        CommandSubmitResult::Disconnected => Some(TuiOutcome::FrontendRestartRequested {
+            fault: "frontend disconnected".to_owned(),
+        }),
+    }
 }
 
 fn assert_single_round_writes(report: FlushReport) {
@@ -308,33 +698,6 @@ fn assert_single_round_writes(report: FlushReport) {
     debug_assert!(report.inserts == 0 || report.draws == 1);
 }
 
-fn is_terminal_operation_event(event: &AgentEvent) -> bool {
-    matches!(
-        event,
-        AgentEvent::CancellationRequested { .. }
-            | AgentEvent::TurnCancelled { .. }
-            | AgentEvent::OperationSettled { .. }
-    )
-}
-
-fn sync_busy(
-    app: &mut App,
-    handles: &VecDeque<OperationHandle>,
-    tasks: &PendingTasks,
-    maintenance_active: bool,
-) {
-    let operations = handles.len() + tasks.submission_count();
-    let queued = if maintenance_active {
-        operations
-    } else {
-        operations.saturating_sub(1)
-    };
-    app.set_busy(operations > 0, queued);
-}
-
-/// `Ctrl+V` when the terminal did not turn it into a bracketed paste: an
-/// image joins the pending attachments, text lands in the draft, and any
-/// failure degrades to a hint without disturbing the input.
 fn finish_clipboard(app: &mut App, result: Result<ClipboardContent, String>) -> Vec<Effect> {
     match result {
         Ok(ClipboardContent::Image { media_type, bytes }) => {
@@ -343,5 +706,314 @@ fn finish_clipboard(app: &mut App, result: Result<ClipboardContent, String>) -> 
         Ok(ClipboardContent::Text(text)) => app.on_paste(&text),
         Ok(ClipboardContent::Empty) => app.clipboard_unavailable("it holds no image or text"),
         Err(reason) => app.clipboard_unavailable(&reason),
+    }
+}
+
+/// After media decode succeeds, submit the already-decoded attachments.
+fn submit_ready(
+    state: &LoopState,
+    app: &App,
+    draft: String,
+    attachments: Vec<philo_agent_service::FrontendAttachment>,
+) -> Option<TuiOutcome> {
+    match state.send(FrontendCommand::Submit {
+        session_id: app.status.session.clone(),
+        draft,
+        attachments,
+    }) {
+        CommandSubmitResult::Accepted(_) | CommandSubmitResult::Backpressured => None,
+        CommandSubmitResult::Disconnected => Some(TuiOutcome::FrontendRestartRequested {
+            fault: "frontend disconnected on submit".to_owned(),
+        }),
+    }
+}
+
+// Wire media-ready into the task path by submitting here.
+fn apply_task_with_submit(
+    app: &mut App,
+    state: &LoopState,
+    completion: TaskCompletion,
+) -> Result<Vec<Effect>, TuiOutcome> {
+    match completion {
+        TaskCompletion::Media(MediaResult::Ready {
+            draft, attachments, ..
+        }) => {
+            if let Some(outcome) = submit_ready(state, app, draft, attachments) {
+                return Err(outcome);
+            }
+            Ok(Vec::new())
+        }
+        other => Ok(apply_task(app, other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::platform::input::{FakeInputSource, TerminalInput, TerminalInputFault};
+
+    use super::*;
+
+    fn launch_config() -> TuiLaunchConfig {
+        TuiLaunchConfig {
+            session_id: "s-1".to_owned(),
+            model_name: "base".to_owned(),
+            verbose: false,
+            show_reasoning: true,
+            context_window: None,
+            screen: TuiScreen::Inline,
+            interrupt: None,
+        }
+    }
+
+    fn ctrl_d() -> TerminalInput {
+        TerminalInput::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+    }
+
+    #[tokio::test]
+    async fn interrupted_and_zero_resize_do_not_exit() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let mut input = FakeInputSource::new([
+            Err(TerminalInputFault::Interrupted),
+            Err(TerminalInputFault::WouldBlock),
+            Err(TerminalInputFault::ZeroSizeResize),
+            Ok(TerminalInput::Resize {
+                width: 80,
+                height: 24,
+            }),
+            Ok(ctrl_d()),
+        ]);
+        let outcome = run_loop(
+            client,
+            launch_config(),
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert_eq!(outcome, TuiOutcome::UserExit);
+    }
+
+    #[tokio::test]
+    async fn stream_terminated_requests_frontend_restart() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let mut input = FakeInputSource::new([Err(TerminalInputFault::StreamTerminated)]);
+        let outcome = run_loop(
+            client,
+            launch_config(),
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            TuiOutcome::FrontendRestartRequested { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_rebuild_backoff_consumes_frontend_updates() {
+        let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let injector = client.clone();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let notified = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut input =
+            FakeInputSource::new([Err(TerminalInputFault::InvalidHandle), Ok(ctrl_d())]);
+        input.notify_on_invalid_handle(notified.clone());
+
+        let inject = async move {
+            notified.notified().await;
+            let _ = injector.try_command(philo_agent_service::FrontendCommand::ReadStatus);
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        };
+        tokio::spawn(inject);
+
+        let outcome = run_loop(
+            client,
+            launch_config(),
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert_eq!(outcome, TuiOutcome::UserExit);
+        assert_eq!(input.rebuilds(), 1);
+        drop(service);
+    }
+
+    fn ctrl_c_key() -> TerminalInput {
+        TerminalInput::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+    }
+
+    fn busy_events(runtime: &philo_agent_service::testing::FakeRuntimeHandle, operation_id: &str) {
+        runtime.emit(philo_agent_service::RuntimeEvent::OperationAccepted {
+            operation_id: philo_agent_runtime::OperationId::new(operation_id),
+            turn_id: philo_agent_runtime::TurnId::new("turn-1"),
+        });
+        runtime.emit(philo_agent_service::RuntimeEvent::AvailabilityChanged {
+            availability: philo_agent_runtime::AgentAvailability::Busy {
+                operation_id: philo_agent_runtime::OperationId::new(operation_id),
+            },
+            queued: 0,
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_rebuild_backoff_consumes_forced_signal() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let notified = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut input = FakeInputSource::new([Err(TerminalInputFault::InvalidHandle)]);
+        input.notify_on_invalid_handle(notified.clone());
+        let mut config = launch_config();
+        config.interrupt = Some(rx);
+
+        let inject = async move {
+            notified.notified().await;
+            tx.send_modify(|n| *n = n.saturating_add(1));
+        };
+        tokio::spawn(inject);
+
+        let outcome = run_loop(
+            client,
+            config,
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert_eq!(outcome, TuiOutcome::UserExit);
+    }
+
+    #[tokio::test]
+    async fn busy_second_interrupt_requests_forced_exit() {
+        let (service, client, runtime) = philo_agent_service::testing::start_test_service();
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let notified = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut input = FakeInputSource::new([Err(TerminalInputFault::InvalidHandle)]);
+        input.notify_on_invalid_handle(notified.clone());
+        let mut config = launch_config();
+        config.interrupt = Some(rx);
+
+        let inject = async move {
+            notified.notified().await;
+            busy_events(&runtime, "op-1");
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            tx.send_modify(|n| *n = n.saturating_add(1));
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            tx.send_modify(|n| *n = n.saturating_add(1));
+        };
+        tokio::spawn(inject);
+
+        let outcome = run_loop(
+            client,
+            config,
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert_eq!(outcome, TuiOutcome::ForcedExitRequested { code: 130 });
+        drop(service);
+    }
+
+    #[tokio::test]
+    async fn settled_operation_resets_interrupt_to_first_press() {
+        let (service, client, runtime) = philo_agent_service::testing::start_test_service();
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let notified = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut input = FakeInputSource::new([Err(TerminalInputFault::InvalidHandle)]);
+        input.notify_on_invalid_handle(notified.clone());
+        let mut config = launch_config();
+        config.interrupt = Some(rx);
+
+        let inject = async move {
+            notified.notified().await;
+            busy_events(&runtime, "op-1");
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            tx.send_modify(|n| *n = n.saturating_add(1));
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            runtime.emit(philo_agent_service::RuntimeEvent::AvailabilityChanged {
+                availability: philo_agent_runtime::AgentAvailability::Idle,
+                queued: 0,
+            });
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            tx.send_modify(|n| *n = n.saturating_add(1));
+        };
+        tokio::spawn(inject);
+
+        let outcome = run_loop(
+            client,
+            config,
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert_eq!(outcome, TuiOutcome::UserExit);
+        drop(service);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_second_keyboard_ctrl_c_requests_forced_exit() {
+        let (service, client, runtime) = philo_agent_service::testing::start_test_service();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let notified = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut input = FakeInputSource::new([
+            Err(TerminalInputFault::InvalidHandle),
+            Ok(ctrl_c_key()),
+            Ok(ctrl_c_key()),
+        ]);
+        input.notify_on_invalid_handle(notified.clone());
+
+        let inject = async move {
+            notified.notified().await;
+            busy_events(&runtime, "op-1");
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        };
+        tokio::spawn(inject);
+
+        let outcome = run_loop(
+            client,
+            launch_config(),
+            &mut terminal,
+            &mut input,
+            false,
+            TuiScreen::Inline,
+        )
+        .await;
+        assert_eq!(outcome, TuiOutcome::ForcedExitRequested { code: 130 });
+        drop(service);
     }
 }

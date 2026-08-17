@@ -4,14 +4,14 @@
 use std::path::{Path, PathBuf};
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
-    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolCancel, ToolDefinition, ToolHandler,
+    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::{optional_string, required_string};
 use crate::display::card;
 use crate::error_code;
-use crate::helpers::{field_error, path_error, stopped_if_cancelled};
+use crate::helpers::{field_error, path_error, stopped_if_requested};
 use crate::path::resolve_in_root;
 
 /// Stable registry name of the grep tool.
@@ -19,6 +19,10 @@ pub const GREP_TOOL_NAME: &str = "grep";
 
 /// Default upper bound of returned matches.
 pub const DEFAULT_MAX_GREP_MATCHES: usize = 200;
+
+/// Cooperative cancel is observed at the start of each file/directory and
+/// every this many lines within a file.
+const GREP_CANCEL_LINE_INTERVAL: usize = 64;
 
 /// Recursive regex search constrained to a root directory. Hidden
 /// directories (names starting with `.`) and non-UTF-8 files are skipped.
@@ -56,44 +60,47 @@ impl GrepTool {
         .expect("grep tool definition is valid")
     }
 
-    fn grep(&self, arguments: &ToolArguments) -> RichToolResult {
+    fn grep(&self, arguments: &ToolArguments, cancel: &ToolCancel) -> ToolInvokeEnd {
+        if let Some(stopped) = stopped_if_requested(cancel) {
+            return stopped;
+        }
         let pattern = match required_string(arguments.as_str(), "pattern") {
             Ok(pattern) => pattern,
-            Err(error) => return field_error("pattern", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("pattern", &error)),
         };
         let regex = match regex::Regex::new(&pattern) {
             Ok(regex) => regex,
             Err(error) => {
-                return RichToolResult::error(
+                return ToolInvokeEnd::Done(RichToolResult::error(
                     error_code::INVALID_REGEX,
                     format!("invalid regular expression '{pattern}': {error}"),
-                );
+                ));
             }
         };
         let path = match optional_string(arguments.as_str(), "path") {
             Ok(path) => path.unwrap_or_else(|| ".".to_owned()),
-            Err(error) => return field_error("path", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("path", &error)),
         };
         let glob = match optional_string(arguments.as_str(), "glob") {
             Ok(glob) => glob,
-            Err(error) => return field_error("glob", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("glob", &error)),
         };
         let matcher = match glob.as_deref() {
             None => None,
             Some(pattern) => match globset::Glob::new(pattern) {
                 Ok(glob) => Some(glob.compile_matcher()),
                 Err(error) => {
-                    return RichToolResult::error(
+                    return ToolInvokeEnd::Done(RichToolResult::error(
                         error_code::INVALID_GLOB,
                         format!("invalid glob '{pattern}': {error}"),
-                    );
+                    ));
                 }
             },
         };
 
         let target = match resolve_in_root(&self.root, &path, true) {
             Ok(target) => target,
-            Err(error) => return path_error(&path, &error),
+            Err(error) => return ToolInvokeEnd::Done(path_error(&path, &error)),
         };
 
         let mut matches: Vec<String> = Vec::new();
@@ -102,6 +109,9 @@ impl GrepTool {
         let mut total_matches = 0usize;
         let mut stack = vec![target.clone()];
         while let Some(current) = stack.pop() {
+            if let Some(stopped) = stopped_if_requested(cancel) {
+                return stopped;
+            }
             if current.is_dir() {
                 let Ok(reader) = std::fs::read_dir(&current) else {
                     continue;
@@ -120,6 +130,9 @@ impl GrepTool {
                 // Deterministic traversal order.
                 children.sort();
                 for child in children.into_iter().rev() {
+                    if let Some(stopped) = stopped_if_requested(cancel) {
+                        return stopped;
+                    }
                     stack.push(child);
                 }
                 continue;
@@ -145,12 +158,21 @@ impl GrepTool {
             files_scanned += 1;
             let relative = display_path(&target, &current, &path);
             for (index, line) in text.lines().enumerate() {
+                if index > 0
+                    && index % GREP_CANCEL_LINE_INTERVAL == 0
+                    && let Some(stopped) = stopped_if_requested(cancel)
+                {
+                    return stopped;
+                }
                 if regex.is_match(line) {
                     total_matches += 1;
                     let line_no = index + 1;
                     locs.push(format!("{relative}:{line_no}"));
                     matches.push(format!("{relative}:{line_no}:{line}"));
                 }
+            }
+            if let Some(stopped) = stopped_if_requested(cancel) {
+                return stopped;
             }
         }
 
@@ -179,7 +201,9 @@ impl GrepTool {
             .with_fact("files_scanned", files_scanned.to_string())
             .with_fact("matches_total", total_matches.to_string())
             .with_fact("truncated", truncated.to_string());
-        RichToolResult::new(ToolResult::success(model_text)).with_display(display)
+        ToolInvokeEnd::Done(
+            RichToolResult::new(ToolResult::success(model_text)).with_display(display),
+        )
     }
 }
 
@@ -195,7 +219,11 @@ fn display_path(base: &Path, file: &Path, requested: &str) -> String {
 
 impl ToolHandler for GrepTool {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
-        Box::pin(async move { self.grep(&arguments) })
+        Box::pin(async move {
+            self.grep(&arguments, &ToolCancel::none())
+                .into_done()
+                .expect("grep cannot stop without a requested cancel")
+        })
     }
 
     fn call_with_cx<'a>(
@@ -203,11 +231,6 @@ impl ToolHandler for GrepTool {
         arguments: ToolArguments,
         cx: ToolInvokeCx,
     ) -> ToolHandlerEndFuture<'a> {
-        Box::pin(async move {
-            if let Some(stopped) = stopped_if_cancelled(&cx) {
-                return stopped;
-            }
-            ToolInvokeEnd::Done(self.grep(&arguments))
-        })
+        Box::pin(async move { self.grep(&arguments, cx.cancel()) })
     }
 }

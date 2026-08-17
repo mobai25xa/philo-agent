@@ -17,14 +17,22 @@ pub(super) async fn next_or_cancel(
     stream: &mut dyn ModelEventStream,
     shared: &OperationShared,
 ) -> StreamStep {
-    let mut next = stream.next();
-    std::future::poll_fn(move |cx| {
-        if shared.is_cancel_requested() {
-            return std::task::Poll::Ready(StreamStep::CancelObserved);
-        }
-        next.as_mut().poll(cx).map(StreamStep::Event)
-    })
-    .await
+    tokio::select! {
+        biased;
+        _ = shared.wait_until_cancelled() => StreamStep::CancelObserved,
+        event = stream.next() => StreamStep::Event(event),
+    }
+}
+
+pub(super) async fn next_or_maintenance_cancel(
+    stream: &mut dyn ModelEventStream,
+    ctx: &super::EngineContext,
+) -> StreamStep {
+    tokio::select! {
+        biased;
+        _ = ctx.wait_maintenance_cancel() => StreamStep::CancelObserved,
+        event = stream.next() => StreamStep::Event(event),
+    }
 }
 
 /// Accumulates streamed deltas for live UI and diagnostics. The
@@ -64,7 +72,14 @@ impl OutputAssembler {
         let mut ids = HashSet::new();
         let mut calls = Vec::new();
         for index in self.order {
-            let parts = self.calls.get(&index).expect("recorded call index exists");
+            let parts = match self.calls.get(&index) {
+                Some(parts) => parts,
+                None => {
+                    return Err(AgentFailure::invalid_model_output(
+                        "assembler missing recorded call index",
+                    ));
+                }
+            };
             if parts.id.is_empty() || parts.name.trim().is_empty() || !ids.insert(parts.id.clone())
             {
                 return Err(AgentFailure::invalid_model_output(

@@ -2,6 +2,7 @@
 members = [
     "crates/philo-agent-kernel",
     "crates/philo-agent-runtime",
+    "crates/philo-agent-service",
     "crates/philo-cli",
     "crates/philo-coding-profile",
     "crates/philo-model",

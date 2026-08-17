@@ -24,4 +24,4 @@ mod schema;
 mod store;
 
 pub use error::JsonlOpenError;
-pub use store::{JsonlSessionStore, RecoveryReport};
+pub use store::{JsonlSessionStore, RecoveryReport, STORE_COMMAND_CAP};

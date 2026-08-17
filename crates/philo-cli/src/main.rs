@@ -1,11 +1,11 @@
 //! `philo` — coding agent CLI: interactive session, or one-shot turn.
 //!
-//! Composition root only: scenario knowledge lives in
-//! `philo-coding-profile`, persistence in `philo-session-jsonl`, model
-//! access in `philo-model`, presentation of the interactive session in
-//! `philo-tui`. Channel discipline for the single-shot path: stdout carries
-//! the model's answer text and (for `sessions`) the listing; everything else
-//! is stderr.
+//! Composition root: parse flags, construct an explicit multi-thread Tokio
+//! runtime, inject real adapters into `AgentService`, then either consume a
+//! oneshot frontend or hand the main thread to `ProcessSupervisor`.
+//!
+//! Process exit codes come only from returning [`ExitCode`]. Workers must
+//! never call `process::exit`.
 
 mod args;
 mod assembly;
@@ -19,15 +19,14 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let mut cli = args::Cli::parse();
     let result = match cli.command.take() {
         Some(args::Command::Sessions { data_dir }) => command::sessions::run(data_dir),
-        // A message argument means single-shot; a bare `philo` opens the
-        // interactive session.
-        None if cli.message.is_some() => command::oneshot::run(cli).await,
-        None => command::interactive::run(cli).await,
+        None if cli.message.is_some() => {
+            multi_thread_runtime().and_then(|rt| rt.block_on(command::oneshot::run(cli)))
+        }
+        None => multi_thread_runtime().and_then(|rt| command::interactive::run(rt, cli)),
     };
     match result {
         Ok(code) => code,
@@ -36,4 +35,11 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn multi_thread_runtime() -> Result<tokio::runtime::Runtime, error::UsageError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error::UsageError::new(format!("cannot start the runtime: {error}")))
 }

@@ -57,6 +57,19 @@ impl ToolBatchRecord {
 }
 
 impl LifecycleProjection {
+    pub(super) fn settled_turns(&self) -> Vec<(OperationId, TurnId)> {
+        let mut rows: Vec<(OperationId, TurnId)> = self
+            .operations
+            .iter()
+            .filter_map(|(operation_id, record)| {
+                record.outcome.as_ref()?;
+                Some((operation_id.clone(), record.turn_id.clone()?))
+            })
+            .collect();
+        rows.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        rows
+    }
+
     pub(super) fn open_turns(&self) -> Vec<OpenTurnInfo> {
         self.open_turn_ids
             .iter()

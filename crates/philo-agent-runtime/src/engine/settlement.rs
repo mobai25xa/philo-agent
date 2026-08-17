@@ -73,11 +73,13 @@ impl TurnCx<'_> {
             ))
             .await;
         match commit {
-            Ok(_) => {
+            Ok(commit) => {
                 for event in executed_events {
-                    self.operation.push(event);
+                    self.operation.push(event).await;
                 }
-                self.operation.cancel_committed();
+                self.operation
+                    .cancel_committed(commit.revision().get())
+                    .await;
             }
             Err(error) => {
                 self.fail(
@@ -102,7 +104,7 @@ impl TurnCx<'_> {
         ) {
             Ok(value) => value,
             Err(_) => {
-                self.operation.fail_unconfirmed(failure);
+                self.operation.fail_unconfirmed(failure).await;
                 return;
             }
         };
@@ -113,7 +115,7 @@ impl TurnCx<'_> {
         ) {
             Ok(value) => value,
             Err(_) => {
-                self.operation.fail_unconfirmed(failure);
+                self.operation.fail_unconfirmed(failure).await;
                 return;
             }
         };
@@ -127,15 +129,23 @@ impl TurnCx<'_> {
             ))
             .await;
         match commit {
-            Ok(_) => self.operation.fail_confirmed(failure),
-            Err(error) => self.operation.fail_unconfirmed(AgentFailure::new(
-                failure.kind(),
-                format!(
-                    "{}; failure settlement unconfirmed: {}",
-                    failure.message(),
-                    describe_session_error(&error)
-                ),
-            )),
+            Ok(commit) => {
+                self.operation
+                    .fail_confirmed(failure, commit.revision().get())
+                    .await
+            }
+            Err(error) => {
+                self.operation
+                    .fail_unconfirmed(AgentFailure::new(
+                        failure.kind(),
+                        format!(
+                            "{}; failure settlement unconfirmed: {}",
+                            failure.message(),
+                            describe_session_error(&error)
+                        ),
+                    ))
+                    .await
+            }
         }
     }
 }

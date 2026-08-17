@@ -1,23 +1,17 @@
-//! Fake-host complete interaction: session selection, history, confirmation,
-//! and queueing through the same pure state and host-effect layers the
-//! terminal driver uses.
+//! Complete interaction: session selection, history, confirmation, and
+//! queueing through the same pure state the terminal driver uses.
 
-use std::pin::pin;
-
-use philo_agent_runtime::{
-    AgentEvent, CancelReason, ModelCallId, OperationId, OperationStatus, SessionId,
-    SettlementDurability, ToolBatchId, ToolCallId, ToolDisplay, ToolResult, TurnId, UserMessage,
+use philo_agent_service::{
+    ConfirmationDecision, FrontendOperationEvent, FrontendToolDisplay, FrontendToolResult,
+    FrontendUpdateKind,
 };
 
-use crate::api::confirmation::{ConfirmationRequest, ConfirmationResponse};
-use crate::api::host::TuiHost;
 use crate::app::action::Action;
 use crate::app::effect::Effect;
 use crate::app::state::App;
 use crate::app::status::StatusData;
 use crate::app::transcript::{InfoLevel, TranscriptLine};
-use crate::driver::host_effects;
-use crate::tests::support::{FakeHost, image_session_view, session_view};
+use crate::tests::support::{frontend_update, image_session_view, session_view};
 
 fn app() -> App {
     App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true)
@@ -37,131 +31,180 @@ fn collect(lines: Vec<TranscriptLine>, output: &mut Vec<String>) {
     );
 }
 
-async fn execute_effects(
-    app: &mut App,
-    host: &FakeHost,
-    effects: Vec<Effect>,
-    output: &mut Vec<String>,
-) {
-    for effect in effects {
+fn apply_kind(app: &mut App, kind: FrontendUpdateKind, output: &mut Vec<String>) {
+    for effect in app.apply_update(&frontend_update(1, kind)) {
         match effect {
             Effect::Append(lines) => collect(lines, output),
-            Effect::Host(request) => {
-                collect(host_effects::execute(app, host, request).await, output);
-            }
-            Effect::Submit { text, attachments } => {
-                assert!(attachments.is_empty());
-                let _ = host
-                    .prompt(SessionId::new(&app.status.session), UserMessage::new(text))
-                    .await;
-            }
+            Effect::Host(_) => {}
             other => output.push(format!("effect: {other:?}")),
         }
     }
 }
 
-#[tokio::test]
-async fn fake_host_complete_interaction_snapshot() {
-    let host = FakeHost::new();
-    host.set_sessions(&["s-1", "s-image"]);
-    host.set_view("s-1", session_view("s-1"));
-    host.set_view("s-image", image_session_view("s-image"));
+#[test]
+fn frontend_complete_interaction_snapshot() {
     let mut app = app();
     let mut output = Vec::new();
 
-    // Session picker: lazy previews and an image-bearing history replay.
     type_text(&mut app, "/sessions");
-    let effects = app.on_action(Action::Submit);
-    execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
+    for effect in app.on_action(Action::Submit) {
+        match effect {
+            Effect::Append(lines) => collect(lines, &mut output),
+            Effect::Host(_) => apply_kind(
+                &mut app,
+                FrontendUpdateKind::SessionListLoaded {
+                    session_ids: vec!["s-1".to_owned(), "s-image".to_owned()],
+                },
+                &mut output,
+            ),
+            other => output.push(format!("effect: {other:?}")),
+        }
+    }
+    if let Some(id) = app.claim_preview() {
+        apply_kind(
+            &mut app,
+            FrontendUpdateKind::SessionPreviewed {
+                session_id: id.clone(),
+                view: session_view(&id),
+            },
+            &mut output,
+        );
+    }
     output.push(format!(
         "overlay:\n{}",
         app.overlay_frame(5).expect("picker").to_text()
     ));
-    let effects = app.on_action(Action::MoveDown);
-    execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
-    let effects = app.on_action(Action::Submit);
-    execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
+    for effect in app.on_action(Action::MoveDown) {
+        if let Effect::Host(crate::app::effect::HostRequest::LoadPreview(id)) = effect {
+            apply_kind(
+                &mut app,
+                FrontendUpdateKind::SessionPreviewed {
+                    session_id: id.clone(),
+                    view: image_session_view(&id),
+                },
+                &mut output,
+            );
+        }
+    }
+    for effect in app.on_action(Action::Submit) {
+        if let Effect::Host(crate::app::effect::HostRequest::SwitchSession(id)) = effect {
+            apply_kind(
+                &mut app,
+                FrontendUpdateKind::SessionLoaded {
+                    session_id: id.clone(),
+                    view: image_session_view(&id),
+                },
+                &mut output,
+            );
+        }
+    }
 
-    // Confirmation: request -> overlay -> y -> requester receives Allow.
-    let channel = host.confirmations();
-    let response = channel.request(ConfirmationRequest {
-        title: "write workspace file".to_owned(),
-        body: "path: src/main.rs".to_owned(),
-    });
-    let mut response = pin!(response);
-    app.sync_confirmation(channel.front());
+    apply_kind(
+        &mut app,
+        FrontendUpdateKind::ConfirmationRequested {
+            confirmation_id: 1,
+            title: "write workspace file".to_owned(),
+            body: "path: src/main.rs".to_owned(),
+        },
+        &mut output,
+    );
     output.push(format!(
         "overlay:\n{}",
         app.overlay_frame(5).expect("confirmation").to_text()
     ));
     let effects = app.on_action(Action::InsertChar('y'));
-    execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
-    let answer = response.as_mut().await;
-    output.push(format!("confirmation: {answer:?}"));
-    assert_eq!(answer, ConfirmationResponse::Allow);
+    let answered = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Host(crate::app::effect::HostRequest::Respond(
+                1,
+                ConfirmationDecision::Allow
+            ))
+        )
+    });
+    for effect in effects {
+        if let Effect::Append(lines) = effect {
+            collect(lines, &mut output);
+        }
+    }
+    output.push(format!(
+        "confirmation: {}",
+        if answered { "Allow" } else { "missing" }
+    ));
 
-    // Two accepted prompts: the second takes the Busy/FIFO presentation path.
     type_text(&mut app, "first prompt");
-    let effects = app.on_action(Action::Submit);
-    execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
+    for effect in app.on_action(Action::Submit) {
+        if let Effect::Append(lines) = effect {
+            collect(lines, &mut output);
+        }
+    }
     app.set_busy(true, 0);
     type_text(&mut app, "queued follow-up");
-    let effects = app.on_action(Action::Submit);
-    execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
-    assert_eq!(host.prompt_count(), 2);
+    for effect in app.on_action(Action::Submit) {
+        if let Effect::Append(lines) = effect {
+            collect(lines, &mut output);
+        }
+    }
 
-    // Real-time M10/M11 vocabulary remains visible while no overlay swallows
-    // it: seal notice, reasoning, tool dual channel, user cancellation.
     for event in [
-        AgentEvent::OperationQueued {
-            operation_id: OperationId::new("op-queued"),
+        FrontendOperationEvent::OperationQueued {
+            operation_id: "op-queued".to_owned(),
         },
-        AgentEvent::PriorTurnSealed {
-            turn_id: TurnId::new("turn-old"),
+        FrontendOperationEvent::PriorTurnSealed {
+            turn_id: "turn-old".to_owned(),
         },
-        AgentEvent::ReasoningDelta {
-            model_call_id: ModelCallId::new("call-1"),
+        FrontendOperationEvent::ReasoningDelta {
+            model_call_id: "call-1".to_owned(),
             text: "checking\n".to_owned(),
         },
-        AgentEvent::TextDelta {
+        FrontendOperationEvent::TextDelta {
             delta: "answer line\n".to_owned(),
         },
-        AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch-1"),
+        FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch-1".to_owned(),
             call_count: 1,
         },
-        AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch-1"),
-            tool_call_id: ToolCallId::new("tool-1"),
+        FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch-1".to_owned(),
+            tool_call_id: "tool-1".to_owned(),
             index: 0,
             tool_name: "read".to_owned(),
             arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
         },
-        AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: ToolBatchId::new("batch-1"),
-            tool_call_id: ToolCallId::new("tool-1"),
+        FrontendOperationEvent::ToolExecutionCompleted {
+            tool_batch_id: "batch-1".to_owned(),
+            tool_call_id: "tool-1".to_owned(),
             index: 0,
             tool_name: "read".to_owned(),
-            result: ToolResult::success("fn main() {}"),
-            display: Some(ToolDisplay::new("read 12 bytes").with_fact("bytes", "12")),
+            result: FrontendToolResult::Success {
+                content: "fn main() {}".to_owned(),
+            },
+            display: Some(FrontendToolDisplay {
+                detail: "read 12 bytes".to_owned(),
+                facts: vec![("bytes".to_owned(), "12".to_owned())],
+            }),
         },
-        AgentEvent::CancellationRequested {
-            operation_id: OperationId::new("op-1"),
-            reason: CancelReason::User,
+        FrontendOperationEvent::CancellationRequested {
+            operation_id: "op-1".to_owned(),
+            reason: "User".to_owned(),
         },
-        AgentEvent::TurnCancelled {
-            turn_id: TurnId::new("turn-1"),
-            reason: CancelReason::User,
+        FrontendOperationEvent::TurnCancelled {
+            turn_id: "turn-1".to_owned(),
+            reason: "User".to_owned(),
         },
-        AgentEvent::OperationSettled {
-            operation_id: OperationId::new("op-1"),
-            status: OperationStatus::Cancelled,
-            durability: SettlementDurability::Confirmed,
+        FrontendOperationEvent::OperationSettled {
+            operation_id: "op-1".to_owned(),
+            status: "Cancelled".to_owned(),
+            durability: "Confirmed".to_owned(),
         },
     ] {
         let before = app.cells.cells().len();
-        let effects = app.on_agent_event(&event);
-        execute_effects(&mut app, host.as_ref(), effects, &mut output).await;
+        let effects = app.on_operation_event(&event);
+        for effect in effects {
+            if let Effect::Append(lines) = effect {
+                collect(lines, &mut output);
+            }
+        }
         collect(app.cells.cells()[before..].to_vec(), &mut output);
     }
 

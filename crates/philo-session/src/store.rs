@@ -23,4 +23,7 @@ pub trait SessionStore: Send + Sync {
         &'a self,
         transaction: SessionTransaction,
     ) -> SessionFuture<'a, Result<SessionCommit, SessionError>>;
+
+    /// Lists known session identifiers. Order is not specified.
+    fn list_sessions(&self) -> SessionFuture<'_, Result<Vec<SessionId>, SessionError>>;
 }

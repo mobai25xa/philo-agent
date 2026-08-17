@@ -1,17 +1,13 @@
 //! Overlay state and its pure frame projection.
 //!
 //! Two overlays exist in v1: the session picker (`/sessions`) and the
-//! approval prompt fed by the confirmation channel. Both project to an
+//! approval prompt fed by `ConfirmationRequested`. Both project to an
 //! [`OverlayFrame`] of plain text so the content is snapshot-testable and
 //! the terminal shell only has to paint it. Overlays are transient bottom
 //! panel content: they never touch the scrollback and never intercept
-//! agent events.
+//! frontend updates.
 
 use std::collections::HashMap;
-
-use philo_session::SessionId;
-
-use crate::api::confirmation::{ConfirmationId, ConfirmationRequest};
 
 use super::text;
 
@@ -53,14 +49,14 @@ pub enum Preview {
 /// highlighted session, and a selection cursor.
 #[derive(Clone, Debug)]
 pub struct SessionPicker {
-    sessions: Vec<SessionId>,
+    sessions: Vec<String>,
     selected: usize,
     previews: HashMap<String, Preview>,
 }
 
 impl SessionPicker {
     /// Opens a picker over a non-empty session list.
-    pub(crate) fn new(sessions: Vec<SessionId>) -> Self {
+    pub(crate) fn new(sessions: Vec<String>) -> Self {
         debug_assert!(
             !sessions.is_empty(),
             "the picker needs at least one session"
@@ -73,7 +69,7 @@ impl SessionPicker {
     }
 
     /// The highlighted session.
-    pub fn selected(&self) -> &SessionId {
+    pub fn selected(&self) -> &str {
         &self.sessions[self.selected]
     }
 
@@ -98,19 +94,18 @@ impl SessionPicker {
     /// Claims the preview load for the current selection: yields the id
     /// the first time it is needed and marks it loading, so a preview is
     /// fetched at most once per session per overlay.
-    pub(crate) fn claim_preview(&mut self) -> Option<SessionId> {
-        let id = self.selected().clone();
-        if self.previews.contains_key(id.as_str()) {
+    pub(crate) fn claim_preview(&mut self) -> Option<String> {
+        let id = self.selected().to_owned();
+        if self.previews.contains_key(&id) {
             return None;
         }
-        self.previews
-            .insert(id.as_str().to_owned(), Preview::Loading);
+        self.previews.insert(id.clone(), Preview::Loading);
         Some(id)
     }
 
     /// Records a finished preview load.
-    pub(crate) fn set_preview(&mut self, id: &SessionId, preview: Preview) {
-        self.previews.insert(id.as_str().to_owned(), preview);
+    pub(crate) fn set_preview(&mut self, id: &str, preview: Preview) {
+        self.previews.insert(id.to_owned(), preview);
     }
 
     /// Projects the overlay content for a body of `height` rows.
@@ -140,7 +135,7 @@ impl SessionPicker {
                     || " ".repeat(list_width + 2),
                     |id| {
                         let marker = if index == self.selected { ">" } else { " " };
-                        format!("{marker} {}", cell(id.as_str(), list_width))
+                        format!("{marker} {}", cell(id, list_width))
                     },
                 );
                 if !show_preview {
@@ -163,7 +158,7 @@ impl SessionPicker {
     }
 
     fn preview_rows(&self) -> Vec<String> {
-        match self.previews.get(self.selected().as_str()) {
+        match self.previews.get(self.selected()) {
             None | Some(Preview::Loading) => vec!["loading preview...".to_owned()],
             Some(Preview::Ready(lines)) => lines.clone(),
             Some(Preview::Failed(message)) => vec![format!("preview unavailable: {message}")],
@@ -172,22 +167,27 @@ impl SessionPicker {
 }
 
 /// The approval overlay: one confirmation request at a time (FIFO), with a
-/// binary answer. Approval semantics live in the external decorator; this
-/// only carries the question in and the answer out.
+/// binary answer. Approval semantics live in the service; this only carries
+/// the question in and the decision out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmPrompt {
-    pub(crate) id: ConfirmationId,
-    pub(crate) request: ConfirmationRequest,
+    pub(crate) id: u64,
+    pub(crate) title: String,
+    pub(crate) body: String,
 }
 
 impl ConfirmPrompt {
-    pub(crate) fn new(id: ConfirmationId, request: ConfirmationRequest) -> Self {
-        Self { id, request }
+    pub(crate) fn new(id: u64, title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id,
+            title: title.into(),
+            body: body.into(),
+        }
     }
 
     /// The question's title, echoed with the decision.
     pub fn title(&self) -> &str {
-        &self.request.title
+        &self.title
     }
 
     /// Projects the overlay content for a body of `height` rows.
@@ -198,17 +198,13 @@ impl ConfirmPrompt {
 
     pub(crate) fn frame_for(&self, height: usize, width: usize) -> OverlayFrame {
         let body = self
-            .request
             .body
             .lines()
             .take(height.max(1))
             .map(|line| text::truncate(line, width))
             .collect();
         OverlayFrame {
-            title: text::truncate(
-                &format!("approval required  ·  {}", self.request.title),
-                width,
-            ),
+            title: text::truncate(&format!("approval required  ·  {}", self.title), width),
             body,
             footer: text::truncate("y allow  ·  n / esc deny", width),
         }
@@ -225,25 +221,18 @@ mod tests {
     use super::*;
 
     fn picker() -> SessionPicker {
-        SessionPicker::new(vec![
-            SessionId::new("s-1"),
-            SessionId::new("s-2"),
-            SessionId::new("s-3"),
-        ])
+        SessionPicker::new(vec!["s-1".to_owned(), "s-2".to_owned(), "s-3".to_owned()])
     }
 
     #[test]
     fn previews_are_claimed_once_per_session() {
         let mut picker = picker();
-        assert_eq!(picker.claim_preview(), Some(SessionId::new("s-1")));
+        assert_eq!(picker.claim_preview(), Some("s-1".to_owned()));
         assert_eq!(picker.claim_preview(), None, "already loading");
-        picker.set_preview(
-            &SessionId::new("s-1"),
-            Preview::Ready(vec!["hello".to_owned()]),
-        );
+        picker.set_preview("s-1", Preview::Ready(vec!["hello".to_owned()]));
         assert_eq!(picker.claim_preview(), None, "already loaded");
         assert!(picker.move_down());
-        assert_eq!(picker.claim_preview(), Some(SessionId::new("s-2")));
+        assert_eq!(picker.claim_preview(), Some("s-2".to_owned()));
     }
 
     #[test]
@@ -253,7 +242,7 @@ mod tests {
         assert!(picker.move_down());
         assert!(picker.move_down());
         assert!(!picker.move_down(), "already at the bottom");
-        assert_eq!(picker.selected(), &SessionId::new("s-3"));
+        assert_eq!(picker.selected(), "s-3");
     }
 
     #[test]
@@ -271,29 +260,39 @@ mod tests {
         let mut picker = picker();
         picker.claim_preview();
         picker.set_preview(
-            &SessionId::new("s-1"),
+            "s-1",
             Preview::Ready(vec!["> count the files".to_owned(), "one file".to_owned()]),
         );
         crate::tests::assert_tui_snapshot!("session_picker_overlay", picker.frame(5).to_text());
     }
 
     #[test]
+    fn failed_preview_renders_the_error_in_the_pane() {
+        let mut picker = picker();
+        picker.claim_preview();
+        picker.set_preview("s-1", Preview::Failed("store busy".to_owned()));
+        let frame = picker.frame(2);
+        assert!(
+            frame.body[0].contains("preview unavailable: store busy"),
+            "{frame:?}"
+        );
+    }
+
+    #[test]
     fn confirm_frame_snapshot() {
         let prompt = ConfirmPrompt::new(
-            ConfirmationId::for_test(1),
-            ConfirmationRequest {
-                title: "run_command".to_owned(),
-                body: "cargo test -p philo-tui\nworking directory: /repo".to_owned(),
-            },
+            1,
+            "run_command",
+            "cargo test -p philo-tui\nworking directory: /repo",
         );
         crate::tests::assert_tui_snapshot!("confirmation_overlay", prompt.frame(5).to_text());
     }
 
     #[test]
     fn long_ids_truncate_inside_the_column() {
-        let picker = SessionPicker::new(vec![SessionId::new(
-            "session-with-a-very-long-identifier-indeed",
-        )]);
+        let picker = SessionPicker::new(vec![
+            "session-with-a-very-long-identifier-indeed".to_owned(),
+        ]);
         let frame = picker.frame(1);
         assert!(
             frame.body[0].starts_with("> session-with-a-very..."),
@@ -303,7 +302,7 @@ mod tests {
 
     #[test]
     fn narrow_picker_omits_preview_and_respects_cell_width() {
-        let picker = SessionPicker::new(vec![SessionId::new("中文-session-name")]);
+        let picker = SessionPicker::new(vec!["中文-session-name".to_owned()]);
         let frame = picker.frame_for(2, 20);
         assert!(frame.body.iter().all(|line| text::width(line) <= 20));
         assert!(!frame.body[0].contains(" | "));

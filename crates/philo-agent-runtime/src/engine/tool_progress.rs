@@ -80,7 +80,9 @@ impl ToolProgressBridge {
         let sink_batch = batch_id.clone();
         let sink_call = call_id.clone();
         let sink = ToolProgressSink::from_fn(move |text| {
-            let mut window = sink_state.lock().expect("progress window");
+            let mut window = sink_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             window.push(text);
             if window.should_flush() {
                 if let Some(tail) = window.take_tail() {
@@ -107,7 +109,10 @@ impl ToolProgressBridge {
     }
 
     pub(crate) fn finish(self) {
-        let mut window = self.state.lock().expect("progress window");
+        let mut window = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(tail) = window.take_tail() {
             drop(window);
             self.shared

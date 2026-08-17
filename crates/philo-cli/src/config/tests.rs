@@ -15,6 +15,8 @@ use crate::args::Cli;
 
 struct TempDir(PathBuf);
 
+static WATCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -829,6 +831,9 @@ fn watch_flags() -> super::watch::ResolveFlags {
 
 #[test]
 fn load_and_resolve_do_not_start_a_watch_task() {
+    let _guard = WATCH_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     assert_eq!(super::watch::active_watch_count(), 0);
     let _ = super::LoadedConfig::load();
     assert_eq!(
@@ -888,8 +893,11 @@ fn corrupt_toml_is_a_reload_error() {
     }
 }
 
-#[tokio::test]
-async fn spawned_watch_is_tracked_until_drop() {
+#[test]
+fn spawned_watch_is_tracked_until_drop() {
+    let _guard = WATCH_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = TempDir::new();
     let paths = super::watch::WatchedPaths {
         global: None,
@@ -908,4 +916,79 @@ async fn spawned_watch_is_tracked_until_drop() {
     assert_eq!(super::watch::active_watch_count(), 1);
     drop(task);
     assert_eq!(super::watch::active_watch_count(), 0);
+}
+
+fn write_project_toml(path: &std::path::Path, model: &str, stamp: u64) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create project config dir");
+    }
+    std::fs::write(
+        path,
+        format!("[deployment]\nmodel = \"{model}\"\nendpoint = \"https://example.test\"\n"),
+    )
+    .expect("write project toml");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open project toml");
+    file.set_modified(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + stamp),
+    )
+    .expect("bump mtime");
+}
+
+#[test]
+fn consecutive_config_changes_emit_only_the_latest_candidate() {
+    let _guard = WATCH_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new();
+    let project = dir.0.join(".philo").join("config.toml");
+    write_project_toml(&project, "model-a", 1);
+    let paths = super::watch::WatchedPaths {
+        global: None,
+        project: project.clone(),
+    };
+    let flags = watch_flags();
+    let (models_tx, models_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (task, driver) = super::watch::spawn_manual(
+        paths,
+        super::watch::WatchIntervals {
+            poll: std::time::Duration::from_millis(20),
+            debounce: std::time::Duration::from_millis(5),
+        },
+        {
+            let project = project.clone();
+            move || super::watch::reload_from_layers(&flags, None, Some(&project))
+        },
+        move |result| {
+            models_tx
+                .send(result.map(|(settings, _)| settings.deployment.model))
+                .expect("record candidate");
+        },
+        move || {
+            let _ = ready_tx.send(());
+        },
+    );
+
+    driver.tick();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("watch actor completed the baseline poll");
+
+    write_project_toml(&project, "model-b", 2);
+    write_project_toml(&project, "model-c", 3);
+    driver.tick();
+    driver.tick();
+    let model = models_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("latest candidate")
+        .expect("reload succeeded");
+    assert_eq!(model, "model-c");
+    assert!(
+        models_rx.try_recv().is_err(),
+        "intermediate candidates must not be emitted"
+    );
+    drop(task);
 }

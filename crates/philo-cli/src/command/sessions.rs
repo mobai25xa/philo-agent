@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use philo_session::SessionStore;
 use philo_session_jsonl::JsonlSessionStore;
 
 use crate::config::LoadedConfig;
@@ -26,7 +27,19 @@ pub fn run(data_dir_flag: Option<PathBuf>) -> Result<ExitCode, UsageError> {
             return Ok(ExitCode::from(1));
         }
     };
-    match store.list_sessions() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: cannot start the runtime: {error}");
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let listed = runtime.block_on(SessionStore::list_sessions(&store));
+    let _ = store.shutdown();
+    match listed {
         Ok(mut sessions) => {
             sessions.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             for session in sessions {
@@ -35,7 +48,7 @@ pub fn run(data_dir_flag: Option<PathBuf>) -> Result<ExitCode, UsageError> {
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => {
-            eprintln!("error: cannot list sessions: {error}");
+            eprintln!("error: cannot list sessions: {error:?}");
             Ok(ExitCode::from(1))
         }
     }

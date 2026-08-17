@@ -1,10 +1,10 @@
-//! Turning pending attachments into user-message parts.
+//! Turning pending attachments into frontend submit attachments.
 //!
 //! The app state keeps `/image` paths verbatim, so the read happens here,
 //! on the way out. A file that cannot be read stops the send instead of
 //! quietly dropping what the user attached.
 
-use philo_agent_runtime::UserPart;
+use philo_agent_service::FrontendAttachment;
 
 use crate::app::attachment::PendingAttachment;
 use crate::app::transcript::{LineKind, TranscriptLine};
@@ -12,8 +12,8 @@ use crate::platform::image_file;
 
 /// The outcome of resolving one message's attachments.
 pub(crate) struct Resolved {
-    /// Image parts, in the order they were queued.
-    pub(crate) parts: Vec<UserPart>,
+    /// Image attachments, in the order they were queued.
+    pub(crate) attachments: Vec<FrontendAttachment>,
     /// The attachments that did resolve, decoded so that a retry after a
     /// refused send never re-reads the file.
     pub(crate) kept: Vec<PendingAttachment>,
@@ -23,7 +23,7 @@ pub(crate) struct Resolved {
 
 pub(crate) fn resolve(attachments: Vec<PendingAttachment>) -> Resolved {
     let mut resolved = Resolved {
-        parts: Vec::new(),
+        attachments: Vec::new(),
         kept: Vec::new(),
         errors: Vec::new(),
     };
@@ -31,7 +31,7 @@ pub(crate) fn resolve(attachments: Vec<PendingAttachment>) -> Resolved {
         match attachment {
             PendingAttachment::Path(path) => match image_file::read(&path) {
                 Ok((media_type, bytes)) => {
-                    resolved.parts.push(UserPart::Image {
+                    resolved.attachments.push(FrontendAttachment {
                         media_type: media_type.clone(),
                         bytes: bytes.clone(),
                     });
@@ -48,7 +48,7 @@ pub(crate) fn resolve(attachments: Vec<PendingAttachment>) -> Resolved {
                 bytes,
                 origin,
             } => {
-                resolved.parts.push(UserPart::Image {
+                resolved.attachments.push(FrontendAttachment {
                     media_type: media_type.clone(),
                     bytes: bytes.clone(),
                 });
@@ -112,8 +112,8 @@ mod tests {
 
         assert!(resolved.errors.is_empty());
         assert_eq!(
-            resolved.parts,
-            [UserPart::Image {
+            resolved.attachments,
+            [FrontendAttachment {
                 media_type: "image/png".to_owned(),
                 bytes: vec![1, 2, 3, 4],
             }]
@@ -140,6 +140,10 @@ mod tests {
         assert_eq!(resolved.errors.len(), 1);
         assert!(resolved.errors[0].contains("cannot read image"));
         assert_eq!(resolved.kept, [clipboard]);
-        assert_eq!(resolved.parts.len(), 1, "the readable one is still mapped");
+        assert_eq!(
+            resolved.attachments.len(),
+            1,
+            "the readable one is still mapped"
+        );
     }
 }

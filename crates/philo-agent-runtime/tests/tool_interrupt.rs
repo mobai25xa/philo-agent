@@ -3,36 +3,17 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentRuntime, DEFAULT_TOOL_CANCEL_GRACE, GenerationConfig, OperationHandle,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    AgentEvent, DEFAULT_TOOL_CANCEL_GRACE, GenerationConfig, OperationOutcome, RuntimeConfig,
+    SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.as_mut().poll(&mut context)
-}
 
 fn config(max_parallel: u32, grace: Duration) -> RuntimeConfig {
     RuntimeConfig {
@@ -47,20 +28,21 @@ fn config(max_parallel: u32, grace: Duration) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_parallel: u32,
     grace: Duration,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_parallel, grace),
         tools,
     )
+    .await
 }
 
 fn echo() -> ToolDefinition {
@@ -71,27 +53,19 @@ fn sid() -> SessionId {
     SessionId::new("s")
 }
 
-fn drive_until<F: Future + ?Sized>(future: &mut Pin<Box<F>>, ready: impl Fn() -> bool) {
-    for _ in 0..10_000 {
-        if ready() {
-            return;
-        }
-        let _ = poll_once(future);
-        std::thread::yield_now();
-    }
-    panic!("timed out waiting for tool progress");
-}
-
-fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
 }
 
-fn result_outcomes(sessions: &MemorySessionStore) -> Vec<(String, ToolResultOutcome)> {
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+async fn result_outcomes(sessions: &MemorySessionStore) -> Vec<(String, ToolResultOutcome)> {
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     view.messages()
         .iter()
         .filter_map(|message| match message {
@@ -104,8 +78,8 @@ fn result_outcomes(sessions: &MemorySessionStore) -> Vec<(String, ToolResultOutc
         .collect()
 }
 
-#[test]
-fn stops_on_cancel_records_interrupted_without_completed_event() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stops_on_cancel_records_interrupted_without_completed_event() {
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[(
         0, "call-1", "echo", "{}",
     )])]));
@@ -117,24 +91,25 @@ fn stops_on_cancel_records_interrupted_without_completed_event() {
         tools.clone(),
         1,
         DEFAULT_TOOL_CANCEL_GRACE,
-    );
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 1);
-    handle.cancel();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    )
+    .await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 1).await;
+    handle.cancel().await;
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert!(matches!(
-        result_outcomes(&sessions).as_slice(),
+        result_outcomes(&sessions).await.as_slice(),
         [(id, ToolResultOutcome::Interrupted)] if id == "call-1"
     ));
-    let completed = collect_events(handle)
+    let completed = collect_events(&handle)
+        .await
         .iter()
         .any(|event| matches!(event, AgentEvent::ToolExecutionCompleted { .. }));
     assert!(!completed, "Stopped does not publish Completed");
 }
 
-#[test]
-fn completion_wins_when_gated_tool_finishes_after_cancel() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_wins_when_gated_tool_finishes_after_cancel() {
     let gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[(
         0, "call-1", "echo", "{}",
@@ -150,40 +125,39 @@ fn completion_wins_when_gated_tool_finishes_after_cancel() {
         tools.clone(),
         1,
         DEFAULT_TOOL_CANCEL_GRACE,
-    );
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 1);
-    handle.cancel();
+    )
+    .await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 1).await;
+    handle.cancel().await;
     gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert!(matches!(
-        result_outcomes(&sessions).as_slice(),
+        result_outcomes(&sessions).await.as_slice(),
         [(id, ToolResultOutcome::Success { content })] if id == "call-1" && content == "done"
     ));
 }
 
-#[test]
-fn grace_zero_drops_ignore_cancel_as_interrupted() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grace_zero_drops_ignore_cancel_as_interrupted() {
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[(
         0, "call-1", "echo", "{}",
     )])]));
     let sessions = Arc::new(MemorySessionStore::new());
     let tools = Arc::new(FakeTool::new([echo()], [FakeToolResult::ignores_cancel()]));
-    let agent = runtime(model, sessions.clone(), tools.clone(), 1, Duration::ZERO);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 1);
-    handle.cancel();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    let agent = runtime(model, sessions.clone(), tools.clone(), 1, Duration::ZERO).await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 1).await;
+    handle.cancel().await;
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert!(matches!(
-        result_outcomes(&sessions).as_slice(),
+        result_outcomes(&sessions).await.as_slice(),
         [(id, ToolResultOutcome::Interrupted)] if id == "call-1"
     ));
 }
 
-#[test]
-fn parallel_stopped_and_unstarted_use_per_slot_marks() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_stopped_and_unstarted_use_per_slot_marks() {
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[
         (0, "call-1", "echo", "{}"),
         (1, "call-2", "echo", "{}"),
@@ -204,14 +178,14 @@ fn parallel_stopped_and_unstarted_use_per_slot_marks() {
         tools.clone(),
         2,
         DEFAULT_TOOL_CANCEL_GRACE,
-    );
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 2);
-    handle.cancel();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    )
+    .await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 2).await;
+    handle.cancel().await;
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert_eq!(tools.invocation_count(), 2);
-    let outcomes = result_outcomes(&sessions);
+    let outcomes = result_outcomes(&sessions).await;
     assert_eq!(outcomes.len(), 3);
     assert!(matches!(
         &outcomes[0],
@@ -227,8 +201,8 @@ fn parallel_stopped_and_unstarted_use_per_slot_marks() {
     ));
 }
 
-#[test]
-fn port_error_after_cancel_stays_cancelled() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn port_error_after_cancel_stays_cancelled() {
     let gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::tool_calls(&[(
         0, "call-1", "echo", "{}",
@@ -244,15 +218,15 @@ fn port_error_after_cancel_stays_cancelled() {
         tools.clone(),
         1,
         DEFAULT_TOOL_CANCEL_GRACE,
-    );
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("hi"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    drive_until(&mut wait, || tools.invocation_count() == 1);
-    handle.cancel();
+    )
+    .await;
+    let handle = agent.prompt(sid(), UserMessage::new("hi")).await;
+    support::runtime::wait_until(|| tools.invocation_count() == 1).await;
+    handle.cancel().await;
     gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     assert!(matches!(
-        result_outcomes(&sessions).as_slice(),
+        result_outcomes(&sessions).await.as_slice(),
         [(id, ToolResultOutcome::Interrupted)] if id == "call-1"
     ));
 }

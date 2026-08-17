@@ -4,17 +4,13 @@
 
 mod support;
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentRuntime, CompactionConfig, GenerationConfig, ModelAssistantBlock,
-    ModelMessage, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, UserMessage,
-    UserPart,
+    AgentEvent, CompactionConfig, GenerationConfig, ModelAssistantBlock, ModelMessage,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, UserMessage, UserPart,
 };
 use philo_session::{
     ContextMessage, OperationId, OperationOutcome as StoredOperationOutcome, SessionAssistantBlock,
@@ -22,17 +18,6 @@ use philo_session::{
 };
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
-            return output;
-        }
-        std::thread::yield_now();
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -69,44 +54,48 @@ fn log_path(root: &TempRoot) -> PathBuf {
     root.path.join("s-m13-integration").join("log.jsonl")
 }
 
-fn seed_turn(store: &dyn SessionStore, index: usize) -> String {
-    let revision = block_on(store.context_view(&stored_session_id()))
+async fn seed_turn(store: &dyn SessionStore, index: usize) -> String {
+    let revision = store
+        .context_view(&stored_session_id())
+        .await
         .expect("seed context")
         .revision();
     let operation_id = OperationId::new(format!("seed-operation-{index}"));
     let turn_id = TurnId::new(format!("seed-turn-{index}"));
-    let commit = block_on(store.commit(SessionTransaction::linear(
-        stored_session_id(),
-        revision,
-        vec![
-            SessionEntryKind::OperationStarted {
-                operation_id: operation_id.clone(),
-            },
-            SessionEntryKind::TurnStarted {
-                operation_id: operation_id.clone(),
-                turn_id: turn_id.clone(),
-            },
-            SessionEntryKind::UserMessage {
-                turn_id: turn_id.clone(),
-                parts: SessionUserPart::text_parts(format!("seed question {index}")),
-            },
-            SessionEntryKind::AssistantMessage {
-                turn_id: turn_id.clone(),
-                blocks: vec![SessionAssistantBlock::Text {
-                    text: format!("seed answer {index}"),
-                }],
-            },
-            SessionEntryKind::TurnTerminated {
-                turn_id,
-                outcome: TurnOutcome::Succeeded,
-            },
-            SessionEntryKind::OperationSettled {
-                operation_id,
-                outcome: StoredOperationOutcome::Succeeded,
-            },
-        ],
-    )))
-    .expect("seed turn");
+    let commit = store
+        .commit(SessionTransaction::linear(
+            stored_session_id(),
+            revision,
+            vec![
+                SessionEntryKind::OperationStarted {
+                    operation_id: operation_id.clone(),
+                },
+                SessionEntryKind::TurnStarted {
+                    operation_id: operation_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                SessionEntryKind::UserMessage {
+                    turn_id: turn_id.clone(),
+                    parts: SessionUserPart::text_parts(format!("seed question {index}")),
+                },
+                SessionEntryKind::AssistantMessage {
+                    turn_id: turn_id.clone(),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: format!("seed answer {index}"),
+                    }],
+                },
+                SessionEntryKind::TurnTerminated {
+                    turn_id,
+                    outcome: TurnOutcome::Succeeded,
+                },
+                SessionEntryKind::OperationSettled {
+                    operation_id,
+                    outcome: StoredOperationOutcome::Succeeded,
+                },
+            ],
+        ))
+        .await
+        .expect("seed turn");
     commit.current_leaf().as_str().to_owned()
 }
 
@@ -132,33 +121,35 @@ fn text_part(text: &str) -> Vec<UserPart> {
     vec![UserPart::Text(text.to_owned())]
 }
 
-#[test]
-fn automatic_compaction_is_append_only_and_reopens_to_the_exact_model_projection() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_compaction_is_append_only_and_reopens_to_the_exact_model_projection() {
     let root = TempRoot::new();
     let store = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
-    seed_turn(store.as_ref(), 1);
-    let expected_boundary = seed_turn(store.as_ref(), 2);
-    seed_turn(store.as_ref(), 3);
+    seed_turn(store.as_ref(), 1).await;
+    let expected_boundary = seed_turn(store.as_ref(), 2).await;
+    seed_turn(store.as_ref(), 3).await;
     let before = std::fs::read_to_string(log_path(&root)).expect("read original log");
 
     let model = Arc::new(FakeModel::new([
         ModelScript::summary("durable summary"),
         ModelScript::text(&["continued answer"]),
     ]));
-    let agent = AgentRuntime::new(
+    let agent = support::runtime::TestRuntime::new(
         model.clone(),
         store.clone(),
         Arc::new(SequentialIdSource::new()),
         config(),
-    );
-    let mut handle = block_on(agent.prompt(session_id(), UserMessage::new("continue")))
-        .expect("prompt accepted");
+    )
+    .await;
+    let handle = agent
+        .prompt(session_id(), UserMessage::new("continue"))
+        .await;
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { ref assistant }
             if assistant.content() == "continued answer"
     ));
@@ -215,10 +206,13 @@ fn automatic_compaction_is_append_only_and_reopens_to_the_exact_model_projection
     assert!(compaction_line.contains(&format!(r#""covers_up_to":"{expected_boundary}""#)));
 
     drop(handle);
-    drop(agent);
+    agent.stop().await;
     drop(store);
-    let reopened = JsonlSessionStore::open(&root.path).expect("reopen store");
-    let view = block_on(reopened.context_view(&stored_session_id())).expect("replayed context");
+    let reopened = support::jsonl::reopen(&root.path).await;
+    let view = reopened
+        .context_view(&stored_session_id())
+        .await
+        .expect("replayed context");
     assert_eq!(
         view.messages(),
         [
@@ -246,18 +240,18 @@ fn automatic_compaction_is_append_only_and_reopens_to_the_exact_model_projection
     );
 }
 
-#[test]
-fn summary_model_failure_warns_without_blocking_the_turn_or_leaving_a_trace() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_model_failure_warns_without_blocking_the_turn_or_leaving_a_trace() {
     let root = TempRoot::new();
     let store = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
-    seed_turn(store.as_ref(), 1);
-    seed_turn(store.as_ref(), 2);
+    seed_turn(store.as_ref(), 1).await;
+    seed_turn(store.as_ref(), 2).await;
     let before = std::fs::read_to_string(log_path(&root)).expect("read original log");
     let model = Arc::new(FakeModel::new([
         ModelScript::error("summary provider unavailable"),
         ModelScript::text(&["normal answer"]),
     ]));
-    let agent = AgentRuntime::new(
+    let agent = support::runtime::TestRuntime::new(
         model,
         store.clone(),
         Arc::new(SequentialIdSource::new()),
@@ -268,16 +262,18 @@ fn summary_model_failure_warns_without_blocking_the_turn_or_leaving_a_trace() {
             },
             ..config()
         },
-    );
+    )
+    .await;
 
-    let mut handle = block_on(agent.prompt(session_id(), UserMessage::new("continue")))
-        .expect("prompt accepted");
+    let handle = agent
+        .prompt(session_id(), UserMessage::new("continue"))
+        .await;
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { ref assistant } if assistant.content() == "normal answer"
     ));
     let failed = events.iter().position(|event| {
@@ -295,6 +291,9 @@ fn summary_model_failure_warns_without_blocking_the_turn_or_leaving_a_trace() {
     let after = std::fs::read_to_string(log_path(&root)).expect("read final log");
     assert!(after.as_bytes().starts_with(before.as_bytes()));
     assert!(!after.contains(r#""type":"compaction""#));
-    let view = block_on(store.context_view(&stored_session_id())).expect("context");
+    let view = store
+        .context_view(&stored_session_id())
+        .await
+        .expect("context");
     assert!(view.latest_compaction_boundary().is_none());
 }

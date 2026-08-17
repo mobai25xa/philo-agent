@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Publishes events and phase transitions while an operation is driven and
-/// settles the shared state exactly once. Publication is immediate (M10):
-/// the barrier-ordering guarantee lives at the call sites, which only push
+/// settles the shared state exactly once. Publication is immediate: the
+/// barrier-ordering guarantee lives at the call sites, which only push
 /// after the corresponding barrier committed.
 pub(crate) struct OperationPublisher {
     shared: Arc<OperationShared>,
@@ -22,25 +22,31 @@ impl OperationPublisher {
     /// cancellation deadline. `TurnStarted` follows separately through
     /// [`OperationPublisher::turn_started`] so seal notifications (M11) can
     /// land between the two.
-    pub fn begin(shared: Arc<OperationShared>, operation_timeout: Option<Duration>) -> Self {
+    pub async fn begin(shared: Arc<OperationShared>, operation_timeout: Option<Duration>) -> Self {
         shared.arm_deadline(operation_timeout);
-        shared.publish(AgentEvent::OperationStarted {
-            operation_id: shared.operation_id().clone(),
-        });
+        shared
+            .publish(AgentEvent::OperationStarted {
+                operation_id: shared.operation_id().clone(),
+            })
+            .await;
         shared.set_phase(OperationPhase::PreparingTurn);
         Self { shared }
     }
 
     /// Publishes `TurnStarted` once every stale prior turn is sealed.
-    pub fn turn_started(&self) {
-        self.shared.publish(AgentEvent::TurnStarted {
-            turn_id: self.shared.turn_id().clone(),
-        });
+    pub async fn turn_started(&self) {
+        self.shared
+            .publish(AgentEvent::TurnStarted {
+                turn_id: self.shared.turn_id().clone(),
+            })
+            .await;
     }
 
     /// Publishes `PriorTurnSealed` after one seal transaction committed.
-    pub fn prior_turn_sealed(&self, turn_id: TurnId) {
-        self.shared.publish(AgentEvent::PriorTurnSealed { turn_id });
+    pub async fn prior_turn_sealed(&self, turn_id: TurnId) {
+        self.shared
+            .publish(AgentEvent::PriorTurnSealed { turn_id })
+            .await;
     }
 
     pub fn operation_id(&self) -> &OperationId {
@@ -70,8 +76,8 @@ impl OperationPublisher {
         Arc::clone(&self.shared)
     }
 
-    pub fn push(&self, event: AgentEvent) {
-        self.shared.publish(event);
+    pub async fn push(&self, event: AgentEvent) {
+        self.shared.publish(event).await;
     }
 
     pub fn set_phase(&self, phase: OperationPhase) {
@@ -80,74 +86,109 @@ impl OperationPublisher {
 
     /// Publishes `CancellationRequested` when a cancel signal is observed at
     /// an injection point.
-    pub fn cancellation_observed(&self) {
-        self.shared.publish(AgentEvent::CancellationRequested {
-            operation_id: self.shared.operation_id().clone(),
-            reason: self.shared.cancel_reason(),
-        });
+    pub async fn cancellation_observed(&self) {
+        self.shared
+            .publish(AgentEvent::CancellationRequested {
+                operation_id: self.shared.operation_id().clone(),
+                reason: self.shared.cancel_reason(),
+            })
+            .await;
     }
 
-    pub fn succeed(self, assistant: AssistantMessage) {
-        self.shared.publish(AgentEvent::AssistantMessageCompleted {
-            turn_id: self.shared.turn_id().clone(),
-            message: assistant.clone(),
-        });
-        self.shared.publish(AgentEvent::OperationSettled {
-            operation_id: self.shared.operation_id().clone(),
-            status: OperationStatus::Succeeded,
-            durability: SettlementDurability::Confirmed,
-        });
+    pub async fn succeed(self, assistant: AssistantMessage, session_revision: u64) {
+        self.shared
+            .publish(AgentEvent::AssistantMessageCompleted {
+                turn_id: self.shared.turn_id().clone(),
+                message: assistant.clone(),
+            })
+            .await;
+        self.publish_settled(
+            OperationStatus::Succeeded,
+            SettlementDurability::Confirmed,
+            Some(session_revision),
+        )
+        .await;
         self.shared
             .settle(OperationOutcome::Succeeded { assistant });
     }
 
-    pub fn fail_confirmed(self, failure: AgentFailure) {
-        self.shared.publish(AgentEvent::TurnFailed {
-            turn_id: self.shared.turn_id().clone(),
-            failure: failure.clone(),
-        });
-        self.fail(failure, SettlementDurability::Confirmed);
+    pub async fn fail_confirmed(self, failure: AgentFailure, session_revision: u64) {
+        self.shared
+            .publish(AgentEvent::TurnFailed {
+                turn_id: self.shared.turn_id().clone(),
+                failure: failure.clone(),
+            })
+            .await;
+        self.fail(
+            failure,
+            SettlementDurability::Confirmed,
+            Some(session_revision),
+        )
+        .await;
     }
 
-    pub fn fail_unconfirmed(self, failure: AgentFailure) {
-        self.fail(failure, SettlementDurability::Unconfirmed);
+    pub async fn fail_unconfirmed(self, failure: AgentFailure) {
+        self.fail(failure, SettlementDurability::Unconfirmed, None)
+            .await;
     }
 
-    fn fail(self, failure: AgentFailure, durability: SettlementDurability) {
-        self.shared.publish(AgentEvent::OperationSettled {
-            operation_id: self.shared.operation_id().clone(),
-            status: OperationStatus::Failed,
-            durability,
-        });
+    async fn fail(
+        self,
+        failure: AgentFailure,
+        durability: SettlementDurability,
+        session_revision: Option<u64>,
+    ) {
         self.shared.settle(OperationOutcome::Failed {
             failure,
             durability,
         });
+        self.publish_settled(OperationStatus::Failed, durability, session_revision)
+            .await;
     }
 
     /// Settles as cancelled before any turn fact was persisted: no
     /// `TurnCancelled` because durably no turn exists.
-    pub fn cancel_zero_trace(self) {
-        self.shared.publish(AgentEvent::OperationSettled {
-            operation_id: self.shared.operation_id().clone(),
-            status: OperationStatus::Cancelled,
-            durability: SettlementDurability::Confirmed,
-        });
+    pub async fn cancel_zero_trace(self) {
+        self.publish_settled(
+            OperationStatus::Cancelled,
+            SettlementDurability::Confirmed,
+            None,
+        )
+        .await;
         self.shared.settle(OperationOutcome::Cancelled);
     }
 
     /// Settles as cancelled after the cancellation transaction committed:
     /// publishes `TurnCancelled` before the terminal event.
-    pub fn cancel_committed(self) {
-        self.shared.publish(AgentEvent::TurnCancelled {
-            turn_id: self.shared.turn_id().clone(),
-            reason: self.shared.cancel_reason(),
-        });
-        self.shared.publish(AgentEvent::OperationSettled {
-            operation_id: self.shared.operation_id().clone(),
-            status: OperationStatus::Cancelled,
-            durability: SettlementDurability::Confirmed,
-        });
+    pub async fn cancel_committed(self, session_revision: u64) {
+        self.shared
+            .publish(AgentEvent::TurnCancelled {
+                turn_id: self.shared.turn_id().clone(),
+                reason: self.shared.cancel_reason(),
+            })
+            .await;
+        self.publish_settled(
+            OperationStatus::Cancelled,
+            SettlementDurability::Confirmed,
+            Some(session_revision),
+        )
+        .await;
         self.shared.settle(OperationOutcome::Cancelled);
+    }
+
+    async fn publish_settled(
+        &self,
+        status: OperationStatus,
+        durability: SettlementDurability,
+        session_revision: Option<u64>,
+    ) {
+        self.shared
+            .publish(AgentEvent::OperationSettled {
+                operation_id: self.shared.operation_id().clone(),
+                status,
+                durability,
+                session_revision,
+            })
+            .await;
     }
 }

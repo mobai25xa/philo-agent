@@ -69,12 +69,25 @@ pub enum SessionError {
         /// Stable, human-readable failure description.
         reason: String,
     },
+    /// The store command queue is full; the caller should retry later.
+    /// Used by actor backends when `try_send` cannot enqueue work.
+    StoreBusy {
+        /// Stable, human-readable failure description.
+        reason: String,
+    },
 }
 
 impl SessionError {
     /// Creates a backend-unavailable failure with stable diagnostic text.
     pub fn store_unavailable(reason: impl Into<String>) -> Self {
         Self::StoreUnavailable {
+            reason: reason.into(),
+        }
+    }
+
+    /// Creates a store-busy failure with stable diagnostic text.
+    pub fn store_busy(reason: impl Into<String>) -> Self {
+        Self::StoreBusy {
             reason: reason.into(),
         }
     }

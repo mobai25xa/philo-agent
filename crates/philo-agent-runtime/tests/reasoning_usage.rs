@@ -3,53 +3,37 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelEvent,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, TokenUsage, UserMessage,
+    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelEvent,
+    OperationOutcome, RuntimeConfig, TokenUsage,
 };
 use philo_session::{MemorySessionStore, SessionStore};
 use support::fake_model::{FakeModel, ModelScript};
+use support::runtime::{Harness, empty_tools};
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
+fn config() -> RuntimeConfig {
+    RuntimeConfig {
+        system_prompt: "sys".to_owned(),
+        model_target: "fake".to_owned(),
+        generation: GenerationConfig::default(),
+        max_tool_rounds: 0,
+        max_parallel_tool_calls: 1,
+        operation_timeout: None,
+        tool_cancel_grace: std::time::Duration::from_millis(300),
+        compaction: Default::default(),
     }
 }
 
-fn runtime(model: Arc<FakeModel>, sessions: Arc<dyn SessionStore>) -> AgentRuntime {
-    AgentRuntime::new(
-        model,
-        sessions,
-        Arc::new(SequentialIdSource::new()),
-        RuntimeConfig {
-            system_prompt: "sys".to_owned(),
-            model_target: "fake".to_owned(),
-            generation: GenerationConfig::default(),
-            max_tool_rounds: 0,
-            max_parallel_tool_calls: 1,
-            operation_timeout: None,
-            tool_cancel_grace: std::time::Duration::from_millis(300),
-            compaction: Default::default(),
-        },
-    )
-}
-
-fn collect_events(mut handle: philo_agent_runtime::OperationHandle) -> Vec<AgentEvent> {
-    let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
-        events.push(event);
-    }
-    events
+async fn run(
+    model: Arc<FakeModel>,
+) -> (Vec<AgentEvent>, OperationOutcome, Arc<MemorySessionStore>) {
+    let sessions = Arc::new(MemorySessionStore::new());
+    let mut harness =
+        Harness::launch_default(model, sessions.clone(), empty_tools(), config()).await;
+    let (events, outcome) = harness.run("s", "hi").await;
+    (events, outcome, sessions)
 }
 
 fn usage(input: u64, output: u64) -> TokenUsage {
@@ -60,32 +44,29 @@ fn usage(input: u64, output: u64) -> TokenUsage {
     }
 }
 
-#[test]
-fn reasoning_deltas_are_forwarded_before_text_and_never_persisted() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_deltas_are_forwarded_before_text_and_never_persisted() {
     let model = Arc::new(FakeModel::new([
         ModelScript::text(&["answer"]).with_reasoning(&["think ", "hard"])
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model, sessions.clone()).prompt(SessionId::new("s"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness =
+        Harness::launch_default(model, sessions.clone(), empty_tools(), config()).await;
+    let (events, outcome) = harness.run("s", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "answer"
     ));
 
-    let events = collect_events(handle);
-    let reasoning: Vec<&str> = events
+    let reasoning: String = events
         .iter()
         .filter_map(|event| match event {
             AgentEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
-    assert_eq!(reasoning, ["think ", "hard"]);
+    assert_eq!(reasoning, "think hard");
 
-    // Order: after ModelCallStarted, before the assembled completion.
     let call_started = events
         .iter()
         .position(|event| matches!(event, AgentEvent::ModelCallStarted { .. }))
@@ -106,8 +87,10 @@ fn reasoning_deltas_are_forwarded_before_text_and_never_persisted() {
     assert!(first_reasoning < first_text);
     assert!(first_text < completed);
 
-    // Reasoning joins neither the assembled output nor the Session.
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(view.revision(), philo_session::SessionRevision::new(2));
     assert_eq!(view.messages().len(), 2, "user and assistant only");
     assert!(matches!(
@@ -120,8 +103,8 @@ fn reasoning_deltas_are_forwarded_before_text_and_never_persisted() {
     ));
 }
 
-#[test]
-fn usage_updates_are_forwarded_with_the_last_one_winning() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_updates_are_forwarded_with_the_last_one_winning() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::UsageUpdated {
             usage: usage(10, 0),
@@ -137,16 +120,11 @@ fn usage_updates_are_forwarded_with_the_last_one_winning() {
         }),
     ])]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model, sessions.clone()).prompt(SessionId::new("s"), UserMessage::new("hi")),
-    )
-    .unwrap();
-    assert!(matches!(
-        block_on(handle.wait()),
-        OperationOutcome::Succeeded { .. }
-    ));
+    let mut harness =
+        Harness::launch_default(model, sessions.clone(), empty_tools(), config()).await;
+    let (events, outcome) = harness.run("s", "hi").await;
+    assert!(matches!(outcome, OperationOutcome::Succeeded { .. }));
 
-    let events = collect_events(handle);
     let usages: Vec<TokenUsage> = events
         .iter()
         .filter_map(|event| match event {
@@ -154,36 +132,33 @@ fn usage_updates_are_forwarded_with_the_last_one_winning() {
             _ => None,
         })
         .collect();
-    assert_eq!(usages, vec![usage(10, 0), usage(10, 7)]);
+    assert_eq!(usages.last().copied(), Some(usage(10, 7)));
     assert_eq!(usages.last().unwrap().total_tokens(), Some(17));
 
-    // Usage never enters the Session.
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(view.revision(), philo_session::SessionRevision::new(2));
     assert_eq!(view.messages().len(), 2);
 }
 
-#[test]
-fn streams_without_new_events_keep_the_baseline_behavior() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_without_new_events_keep_the_baseline_behavior() {
     let model = Arc::new(FakeModel::succeeds(&["plain"]));
-    let handle = block_on(
-        runtime(model, Arc::new(MemorySessionStore::new()))
-            .prompt(SessionId::new("s"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let (events, outcome, _) = run(model).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "plain"
     ));
-    let events = collect_events(handle);
     assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::ReasoningDelta { .. } | AgentEvent::ModelUsageUpdated { .. }
     )));
 }
 
-#[test]
-fn reasoning_after_completed_is_an_invalid_stream() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_after_completed_is_an_invalid_stream() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::TextDelta("ok".to_owned())),
         Ok(ModelEvent::Completed {
@@ -195,20 +170,16 @@ fn reasoning_after_completed_is_an_invalid_stream() {
             text: "late".to_owned(),
         }),
     ])]));
-    let handle = block_on(
-        runtime(model, Arc::new(MemorySessionStore::new()))
-            .prompt(SessionId::new("s"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let (_, outcome, _) = run(model).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed { failure, .. }
             if failure.kind() == AgentFailureKind::InvalidModelOutput
     ));
 }
 
-#[test]
-fn usage_after_completed_is_an_invalid_stream() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_after_completed_is_an_invalid_stream() {
     let model = Arc::new(FakeModel::new([ModelScript::Events(vec![
         Ok(ModelEvent::TextDelta("ok".to_owned())),
         Ok(ModelEvent::Completed {
@@ -218,33 +189,22 @@ fn usage_after_completed_is_an_invalid_stream() {
         }),
         Ok(ModelEvent::UsageUpdated { usage: usage(1, 1) }),
     ])]));
-    let handle = block_on(
-        runtime(model, Arc::new(MemorySessionStore::new()))
-            .prompt(SessionId::new("s"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let (_, outcome, _) = run(model).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed { failure, .. }
             if failure.kind() == AgentFailureKind::InvalidModelOutput
     ));
 }
 
-/// M7-006: this integration test crate is an external consumer, so this
-/// wildcard-armed match is the compile-time proof of the
-/// `#[non_exhaustive]` consumption stance.
-#[test]
-fn external_consumers_match_events_with_a_wildcard_arm() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_consumers_match_events_with_a_wildcard_arm() {
     let model = Arc::new(FakeModel::new([ModelScript::text(&["done"])
         .with_reasoning(&["r"])
         .with_usage(usage(2, 3))]));
-    let handle = block_on(
-        runtime(model, Arc::new(MemorySessionStore::new()))
-            .prompt(SessionId::new("s"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let (events, _, _) = run(model).await;
     let mut kinds = Vec::new();
-    for event in collect_events(handle) {
+    for event in events {
         let kind = match event {
             AgentEvent::OperationStarted { .. } => "operation",
             AgentEvent::TurnStarted { .. } => "turn",

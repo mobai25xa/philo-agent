@@ -1,10 +1,7 @@
 //! JSONL-002: cancelled outcomes on schema v2, with required `reason`.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     CancelReason, ContextMessage, MemorySessionStore, OperationId, OperationOutcome,
@@ -13,16 +10,6 @@ use philo_session::{
     ToolResultOutcome, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -131,23 +118,26 @@ fn cancel_transaction(revision: u64) -> SessionTransaction {
     )
 }
 
-fn commit_cancelled_turn(store: &dyn SessionStore) {
+async fn commit_cancelled_turn(store: &dyn SessionStore) {
     for transaction in [
         start_transaction(0),
         batch_transaction(1),
         cancel_transaction(2),
     ] {
-        block_on(store.commit(transaction)).expect("valid transaction commits");
+        store
+            .commit(transaction)
+            .await
+            .expect("valid transaction commits");
     }
 }
 
 // --- Golden format for cancellation lines ------------------------------------
 
-#[test]
-fn golden_cancellation_transaction_uses_schema_v2() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_cancellation_transaction_uses_schema_v2() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
-    commit_cancelled_turn(&store);
+    commit_cancelled_turn(&store).await;
     drop(store);
 
     let log = std::fs::read_to_string(log_path(&root)).expect("read log");
@@ -165,8 +155,8 @@ fn golden_cancellation_transaction_uses_schema_v2() {
 
 // --- v1 files are refused ------------------------------------------------------
 
-#[test]
-fn schema_v1_file_is_unsupported() {
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_v1_file_is_unsupported() {
     let root = TempRoot::new();
     let dir = root.path.join("s-golden");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -191,15 +181,15 @@ fn schema_v1_file_is_unsupported() {
 
 // --- Roundtrip: write, reopen, project ----------------------------------------
 
-#[test]
-fn cancellation_roundtrips_across_a_restart() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_roundtrips_across_a_restart() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        commit_cancelled_turn(&store);
+        commit_cancelled_turn(&store).await;
     }
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
-    let view = block_on(reopened.context_view(&session_id())).expect("view");
+    let view = reopened.context_view(&session_id()).await.expect("view");
     assert_eq!(view.revision(), SessionRevision::new(3));
     let messages = view.messages();
     assert_eq!(
@@ -240,15 +230,18 @@ fn cancellation_roundtrips_across_a_restart() {
             },
         ],
     );
-    let commit = block_on(reopened.commit(next)).expect("commit after cancellation");
+    let commit = reopened
+        .commit(next)
+        .await
+        .expect("commit after cancellation");
     assert_eq!(commit.revision(), SessionRevision::new(4));
     assert_eq!(commit.entries()[0].id().as_str(), "golden:entry:9");
 }
 
 // --- Backend parity extended to cancellation -----------------------------------
 
-#[test]
-fn jsonl_and_memory_backends_agree_on_cancellation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn jsonl_and_memory_backends_agree_on_cancellation() {
     let root = TempRoot::new();
     let jsonl = JsonlSessionStore::open(&root.path).expect("open");
     let memory = MemorySessionStore::new();
@@ -258,15 +251,21 @@ fn jsonl_and_memory_backends_agree_on_cancellation() {
         batch_transaction(1),
         cancel_transaction(2),
     ] {
-        let disk = block_on(jsonl.commit(transaction.clone())).expect("jsonl commit");
-        let ram = block_on(memory.commit(transaction)).expect("memory commit");
+        let disk = jsonl
+            .commit(transaction.clone())
+            .await
+            .expect("jsonl commit");
+        let ram = memory.commit(transaction).await.expect("memory commit");
         assert_eq!(disk.revision(), ram.revision());
         assert_eq!(disk.entries(), ram.entries(), "same ids, parents, kinds");
         assert_eq!(disk.current_leaf(), ram.current_leaf());
     }
     assert_eq!(
-        block_on(jsonl.context_view(&session_id())).expect("jsonl view"),
-        block_on(memory.context_view(&session_id())).expect("memory view")
+        jsonl.context_view(&session_id()).await.expect("jsonl view"),
+        memory
+            .context_view(&session_id())
+            .await
+            .expect("memory view")
     );
 
     // The same illegal cancellation shape is rejected identically: a plain
@@ -275,8 +274,11 @@ fn jsonl_and_memory_backends_agree_on_cancellation() {
     let jsonl2 = JsonlSessionStore::open(&root2.path).expect("open");
     let memory2 = MemorySessionStore::new();
     for transaction in [start_transaction(0), batch_transaction(1)] {
-        block_on(jsonl2.commit(transaction.clone())).expect("jsonl commit");
-        block_on(memory2.commit(transaction)).expect("memory commit");
+        jsonl2
+            .commit(transaction.clone())
+            .await
+            .expect("jsonl commit");
+        memory2.commit(transaction).await.expect("memory commit");
     }
     let illegal = SessionTransaction::linear(
         session_id(),
@@ -294,7 +296,7 @@ fn jsonl_and_memory_backends_agree_on_cancellation() {
             },
         ],
     );
-    let jsonl_error = block_on(jsonl2.commit(illegal.clone())).expect_err("rejected");
-    let memory_error = block_on(memory2.commit(illegal)).expect_err("rejected");
+    let jsonl_error = jsonl2.commit(illegal.clone()).await.expect_err("rejected");
+    let memory_error = memory2.commit(illegal).await.expect_err("rejected");
     assert_eq!(jsonl_error, memory_error);
 }

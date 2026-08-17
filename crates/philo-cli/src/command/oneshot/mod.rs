@@ -1,14 +1,12 @@
 //! Single-shot turn orchestration.
 
-mod drive;
+pub(crate) mod drive;
 mod message;
 
 use std::process::ExitCode;
 
-use philo_agent_runtime::AgentRuntime;
-
 use crate::args::Cli;
-use crate::assembly::RunAssembly;
+use crate::assembly;
 use crate::config::{LoadedConfig, Verbosity};
 use crate::error::UsageError;
 use crate::ids::fresh_session_id;
@@ -30,34 +28,36 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
     }
     let user_message = message::build(&cli, message_text)?;
 
-    let assembly = RunAssembly::prepare(&cli, settings)?;
+    let bootstrap = assembly::bootstrap(&cli, settings)?;
     let (session_id, is_new_session) = match &cli.session {
         Some(id) => (id.clone(), false),
         None => (fresh_session_id(), true),
     };
-    if is_new_session && assembly.settings.verbosity != Verbosity::Quiet {
+    if is_new_session && bootstrap.settings.verbosity != Verbosity::Quiet {
         eprintln!("session: {session_id}");
     }
 
-    let verbosity = assembly.settings.verbosity;
-    let show_reasoning = assembly.settings.show_reasoning;
-    let sessions = assembly.sessions;
-    let runtime = AgentRuntime::with_tools(
-        assembly.model,
-        sessions.clone(),
-        assembly.ids,
-        assembly.runtime_config,
-        assembly.tools,
-    );
-
-    Ok(drive::run(drive::Request {
-        runtime,
-        sessions,
+    let verbosity = bootstrap.settings.verbosity;
+    let show_reasoning = bootstrap.settings.show_reasoning;
+    let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
+    tokio::spawn(crate::command::ctrl_c::forward_os_ctrl_c(interrupt_tx));
+    let report = drive::run(drive::Request {
+        client: bootstrap.client.clone(),
+        sessions: Some(bootstrap.sessions.clone()),
         session_id,
         continues_existing: cli.session.is_some(),
-        user_message,
+        user_message: Some(user_message),
         verbosity,
         show_reasoning,
+        success_exit: 0,
+        interrupt: interrupt_rx,
     })
-    .await)
+    .await;
+    if report.forced {
+        drop(bootstrap);
+        Ok(report.exit_code())
+    } else {
+        assembly::shutdown(bootstrap).await;
+        Ok(report.exit_code())
+    }
 }

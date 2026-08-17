@@ -1,163 +1,104 @@
-//! Fair selection across agent events, terminal input, task completion, and
+//! Fair selection across frontend updates, terminal input, workers, and
 //! render/animation deadlines.
 
-use std::collections::VecDeque;
-use std::future::Future;
 use std::future::poll_fn;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant as StdInstant};
 
-use crossterm::event::{Event as TermEvent, EventStream};
-use futures_core::Stream;
-use philo_agent_runtime::{
-    AgentEvent, CompactionError, CompactionReport, OperationHandle, RuntimeFuture,
-};
+use philo_agent_service::{FrontendClient, RecvOutcome};
+use tokio::sync::watch;
+use tokio::time::Instant;
 
-use crate::api::types::ConfigReloadNotice;
+use crate::platform::input::{TerminalInput, TerminalInputFault, TerminalInputSource};
 
 use super::tasks::{PendingTasks, TaskCompletion};
 
-pub(crate) type CompactionFuture =
-    RuntimeFuture<'static, Result<CompactionReport, CompactionError>>;
+/// A ready frontend source is drained only to this bound before the loop
+/// returns to fair selection with terminal/control sources.
+pub(crate) const MAX_UPDATES_PER_ROUND: usize = 64;
 
 pub(crate) enum Step {
-    Agent(Option<AgentEvent>),
+    Update(philo_agent_service::FrontendUpdate),
+    UpdatesDisconnected,
     Task(TaskCompletion),
-    Compaction(Result<CompactionReport, CompactionError>),
-    Term(std::io::Result<TermEvent>),
-    TermClosed,
+    Input(Result<TerminalInput, TerminalInputFault>),
+    InputClosed,
+    InputRebuildDue,
     FrameDeadline,
     AnimationDeadline,
-    ConfirmationPoll,
-    ConfigNotice(ConfigReloadNotice),
+    /// Supervisor Ctrl+C pulse. Never process-exit; the loop decides cancel/force.
+    Interrupt,
 }
 
-pub(crate) enum AgentItem {
-    Event(AgentEvent),
-    Settled,
-}
-
-/// A ready AgentEvent source is drained only to this bound before the loop
-/// returns to fair selection with terminal/control sources.
-pub(crate) const MAX_AGENT_EVENTS_PER_ROUND: usize = 64;
-
-/// Rebuilding the handle future each poll is sound: event arrival wakes
-/// the task and the rebuilt future resolves immediately.
 pub(crate) async fn next_step(
-    handles: &mut VecDeque<OperationHandle>,
+    client: &FrontendClient,
     tasks: &mut PendingTasks,
-    compaction: &mut Option<CompactionFuture>,
-    term_events: &mut EventStream,
-    frame_deadline: Option<tokio::time::Instant>,
-    animation_deadline: Option<tokio::time::Instant>,
-    confirmation_poll: Option<tokio::time::Instant>,
-    config_notices: &mut Option<tokio::sync::mpsc::UnboundedReceiver<ConfigReloadNotice>>,
+    input: &mut impl TerminalInputSource,
+    frame_deadline: Option<Instant>,
+    animation_deadline: Option<Instant>,
+    rebuild_deadline: Option<Instant>,
+    interrupt: Option<&mut watch::Receiver<u64>>,
 ) -> Step {
     tokio::select! {
-        event = next_agent_event(handles) => Step::Agent(event),
+        outcome = client.recv_until_async(StdInstant::now() + Duration::from_secs(60 * 60)) => {
+            match outcome {
+                RecvOutcome::Update(update) => Step::Update(update),
+                RecvOutcome::Disconnected => Step::UpdatesDisconnected,
+                RecvOutcome::Timeout => Step::FrameDeadline,
+            }
+        }
         completion = tasks.next_completion() => Step::Task(completion),
-        result = next_compaction(compaction) => Step::Compaction(result),
-        event = next_terminal_event(term_events) => match event {
-            Some(result) => Step::Term(result),
-            None => Step::TermClosed,
+        item = poll_input(input, rebuild_deadline.is_some()) => match item {
+            Some(result) => Step::Input(result),
+            None => Step::InputClosed,
         },
+        _ = wait_for(rebuild_deadline) => Step::InputRebuildDue,
         _ = wait_for(frame_deadline) => Step::FrameDeadline,
         _ = wait_for(animation_deadline) => Step::AnimationDeadline,
-        _ = wait_for(confirmation_poll) => Step::ConfirmationPoll,
-        notice = next_config_notice(config_notices) => Step::ConfigNotice(notice),
+        _ = wait_interrupt(interrupt) => Step::Interrupt,
     }
 }
 
-/// Includes the item selected by `next_step`, then polls already-ready
-/// events without waiting. Closed handles are popped in sequence so FIFO
-/// operations can advance within the same bounded round.
-pub(crate) fn drain_ready_agent_items(
-    handles: &mut VecDeque<OperationHandle>,
-    first: Option<AgentEvent>,
-) -> Vec<AgentItem> {
-    let first = classify_agent_item(handles, first);
-    take_bounded(first, MAX_AGENT_EVENTS_PER_ROUND, || {
-        let event = poll_agent_event(handles)?;
-        Some(classify_agent_item(handles, event))
-    })
+async fn poll_input(
+    input: &mut impl TerminalInputSource,
+    rebuilding: bool,
+) -> Option<Result<TerminalInput, TerminalInputFault>> {
+    if rebuilding {
+        std::future::pending().await
+    } else {
+        poll_fn(|cx| input.poll_next(cx)).await
+    }
 }
 
-fn classify_agent_item(
-    handles: &mut VecDeque<OperationHandle>,
-    event: Option<AgentEvent>,
-) -> AgentItem {
-    match event {
-        Some(event) => AgentItem::Event(event),
-        None => {
-            handles.pop_front();
-            AgentItem::Settled
+/// After the first update, drain already-ready updates without waiting.
+pub(crate) fn drain_ready_updates(
+    client: &FrontendClient,
+    first: philo_agent_service::FrontendUpdate,
+) -> Vec<philo_agent_service::FrontendUpdate> {
+    let mut updates = vec![first];
+    while updates.len() < MAX_UPDATES_PER_ROUND {
+        match client.try_recv() {
+            RecvOutcome::Update(update) => updates.push(update),
+            RecvOutcome::Timeout | RecvOutcome::Disconnected => break,
         }
     }
+    updates
 }
 
-fn poll_agent_event(handles: &mut VecDeque<OperationHandle>) -> Option<Option<AgentEvent>> {
-    let handle = handles.front_mut()?;
-    let mut future = std::pin::pin!(handle.next_event());
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(event) => Some(event),
-        Poll::Pending => None,
-    }
-}
-
-fn take_bounded<T>(first: T, limit: usize, mut next_ready: impl FnMut() -> Option<T>) -> Vec<T> {
-    debug_assert!(limit > 0);
-    let mut items = Vec::with_capacity(limit);
-    items.push(first);
-    while items.len() < limit {
-        let Some(item) = next_ready() else {
-            break;
-        };
-        items.push(item);
-    }
-    items
-}
-
-async fn wait_for(deadline: Option<tokio::time::Instant>) {
+async fn wait_for(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending::<()>().await,
     }
 }
 
-async fn next_compaction(
-    compaction: &mut Option<CompactionFuture>,
-) -> Result<CompactionReport, CompactionError> {
-    match compaction {
-        Some(future) => future.as_mut().await,
-        None => std::future::pending::<Result<CompactionReport, CompactionError>>().await,
-    }
-}
-
-async fn next_agent_event(handles: &mut VecDeque<OperationHandle>) -> Option<AgentEvent> {
-    match handles.front_mut() {
-        Some(handle) => handle.next_event().await,
-        None => std::future::pending::<Option<AgentEvent>>().await,
-    }
-}
-
-async fn next_terminal_event(term_events: &mut EventStream) -> Option<std::io::Result<TermEvent>> {
-    poll_fn(|cx| Pin::new(&mut *term_events).poll_next(cx)).await
-}
-
-async fn next_config_notice(
-    notices: &mut Option<tokio::sync::mpsc::UnboundedReceiver<ConfigReloadNotice>>,
-) -> ConfigReloadNotice {
-    match notices.as_mut() {
-        Some(rx) => match rx.recv().await {
-            Some(notice) => notice,
-            None => {
-                *notices = None;
-                std::future::pending().await
+async fn wait_interrupt(rx: Option<&mut watch::Receiver<u64>>) {
+    match rx {
+        Some(rx) => {
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
             }
-        },
-        None => std::future::pending().await,
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -165,13 +106,35 @@ async fn next_config_notice(
 mod tests {
     use super::*;
 
-    #[test]
-    fn bounded_ready_drain_preserves_order_and_leaves_work_for_fair_selection() {
-        let mut ready: VecDeque<usize> = (1..=MAX_AGENT_EVENTS_PER_ROUND + 5).collect();
-        let drained = take_bounded(0, MAX_AGENT_EVENTS_PER_ROUND, || ready.pop_front());
+    use super::super::tasks::PendingTasks;
+    use crate::platform::input::FakeInputSource;
 
-        assert_eq!(drained.len(), MAX_AGENT_EVENTS_PER_ROUND);
-        assert_eq!(drained, (0..MAX_AGENT_EVENTS_PER_ROUND).collect::<Vec<_>>());
-        assert_eq!(ready.front(), Some(&MAX_AGENT_EVENTS_PER_ROUND));
+    #[test]
+    fn update_budget_is_the_frontend_cap() {
+        assert_eq!(MAX_UPDATES_PER_ROUND, 64);
+    }
+
+    #[tokio::test]
+    async fn rebuild_wait_prefers_frontend_update_over_closed_input() {
+        let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let _ = client.try_command(philo_agent_service::FrontendCommand::ReadStatus);
+        let mut input = FakeInputSource::new([]);
+        let mut tasks = PendingTasks::new();
+        let rebuild = Instant::now() + Duration::from_secs(60);
+        let step = next_step(
+            &client,
+            &mut tasks,
+            &mut input,
+            None,
+            None,
+            Some(rebuild),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(step, Step::Update(_)),
+            "rebuild wait must not poll a closed input source"
+        );
+        drop(service);
     }
 }

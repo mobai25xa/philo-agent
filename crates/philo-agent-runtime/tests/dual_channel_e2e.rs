@@ -3,15 +3,12 @@
 
 mod support;
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentRuntime, EffectClass, GenerationConfig, OperationOutcome, RichToolResult, RuntimeConfig,
+    EffectClass, GenerationConfig, OperationOutcome, RichToolResult, RuntimeConfig,
     SequentialIdSource, SessionId, ToolDefinition, ToolDisplay, ToolFuture, ToolInvocation,
     ToolInvokeCx, ToolInvokeEnd, ToolPort, UserMessage,
 };
@@ -19,17 +16,6 @@ use philo_session::{SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -69,8 +55,8 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
 
 /// M10-002 on the durable backend: the display detail travels on events but
 /// leaves zero bytes in the JSONL log.
-#[test]
-fn display_leaves_no_trace_in_the_jsonl_log() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_leaves_no_trace_in_the_jsonl_log() {
     let root = TempRoot::new();
     let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
     let model = Arc::new(FakeModel::new([
@@ -85,24 +71,26 @@ fn display_leaves_no_trace_in_the_jsonl_log() {
             ToolDisplay::new(secret_detail).with_fact("marker", secret_detail),
         ),
     ));
-    let agent = AgentRuntime::with_tools(
+    let agent = support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(1),
         tools,
-    );
+    )
+    .await;
 
-    let mut handle =
-        block_on(agent.prompt(SessionId::new("m10-002"), UserMessage::new("hi"))).unwrap();
+    let handle = agent
+        .prompt(SessionId::new("m10-002"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
     // The display is visible on the event...
     let mut saw_display = false;
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         if let philo_agent_runtime::AgentEvent::ToolExecutionCompleted { display, .. } = event {
             saw_display = display.is_some_and(|d| d.detail() == secret_detail);
         }
@@ -151,8 +139,8 @@ impl<P: ToolPort> ToolPort for DenySystemTools<P> {
     }
 }
 
-#[test]
-fn deny_decorator_rejects_system_tools_through_plain_error_semantics() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_decorator_rejects_system_tools_through_plain_error_semantics() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_calls(&[(0, "call-1", "shell", r#"{"command":"rm -rf /"}"#)]),
         ModelScript::text(&["understood, not running that"]),
@@ -165,26 +153,31 @@ fn deny_decorator_rejects_system_tools_through_plain_error_semantics() {
         ],
         [FakeToolResult::success("never reached")],
     );
-    let agent = AgentRuntime::with_tools(
+    let agent = support::runtime::TestRuntime::with_tools(
         model,
         sessions.clone(),
         Arc::new(SequentialIdSource::new()),
         config(1),
         Arc::new(DenySystemTools { inner }),
-    );
+    )
+    .await;
 
-    let handle =
-        block_on(agent.prompt(SessionId::new("m10-007"), UserMessage::new("clean up"))).unwrap();
+    let handle = agent
+        .prompt(SessionId::new("m10-007"), UserMessage::new("clean up"))
+        .await;
     // The loop continues past the denial to a normal final answer.
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant }
             if assistant.content() == "understood, not running that"
     ));
 
     // The denial is an ordinary durable business error; no new entry kinds,
     // no kernel/session awareness of "approval".
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("m10-007"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("m10-007"))
+        .await
+        .unwrap();
     let durable = view
         .messages()
         .iter()

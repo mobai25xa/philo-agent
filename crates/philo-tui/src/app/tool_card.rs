@@ -1,10 +1,10 @@
-//! Default-mode tool cards as a generic `ToolDisplay` projection.
+//! Default-mode tool cards as a generic `FrontendToolDisplay` projection.
 //!
 //! Session replay keeps the older `ok · {content}` summary in `session.rs`.
 //! Live default cards read frozen facts (`verb`, `subject`, `body`, counts)
-//! and never dump `ToolResult` content.
+//! and never dump `FrontendToolResult` content.
 
-use philo_tools::{ToolDisplay, ToolResult};
+use philo_agent_service::{FrontendToolDisplay, FrontendToolResult};
 
 use super::text;
 use super::transcript::{TranscriptLine, compact_args, preview};
@@ -18,8 +18,8 @@ const BODY_COLS: usize = 200;
 pub(crate) fn default_card(
     tool_name: &str,
     arguments: &str,
-    result: &ToolResult,
-    display: Option<&ToolDisplay>,
+    result: &FrontendToolResult,
+    display: Option<&FrontendToolDisplay>,
 ) -> Vec<TranscriptLine> {
     let verb = fact(display, "verb").unwrap_or(tool_name);
     let subject = subject(arguments, display);
@@ -28,7 +28,7 @@ pub(crate) fn default_card(
         &header(verb, subject.as_deref(), &counts),
         CARD_WIDTH,
     ))];
-    if let ToolResult::Error { code, message } = result {
+    if let FrontendToolResult::Error { code, message } = result {
         lines.push(line(format!("  └ error {code} · {}", preview(message, 80))));
         return lines;
     }
@@ -42,8 +42,8 @@ pub(crate) fn verbose_card(
     index: usize,
     batch_size: usize,
     arguments: &str,
-    result: &ToolResult,
-    display: Option<&ToolDisplay>,
+    result: &FrontendToolResult,
+    display: Option<&FrontendToolDisplay>,
 ) -> Vec<TranscriptLine> {
     let total = batch_size.max(index + 1);
     let mut lines = vec![line(format!("▸ {tool_name}  {}/{total}", index + 1))];
@@ -51,30 +51,25 @@ pub(crate) fn verbose_card(
         lines.push(line(format!("  args  {}", compact_args(arguments))));
     }
     match result {
-        ToolResult::Success { content } => {
+        FrontendToolResult::Success { content } => {
             lines.push(line("  ok"));
             lines.extend(content.lines().map(|row| line(format!("  {row}"))));
         }
-        ToolResult::Error { code, message } => {
+        FrontendToolResult::Error { code, message } => {
             lines.push(line(format!("  error {code}")));
             lines.extend(message.lines().map(|row| line(format!("  {row}"))));
         }
     }
     if let Some(display) = display {
-        if !display.detail().is_empty() {
+        if !display.detail.is_empty() {
             lines.push(line("  detail"));
-            lines.extend(
-                display
-                    .detail()
-                    .lines()
-                    .map(|row| line(format!("    {row}"))),
-            );
+            lines.extend(display.detail.lines().map(|row| line(format!("    {row}"))));
         }
-        if !display.facts().is_empty() {
+        if !display.facts.is_empty() {
             let facts = display
-                .facts()
+                .facts
                 .iter()
-                .map(|fact| format!("{}={}", fact.name(), fact.value()))
+                .map(|(name, value)| format!("{name}={value}"))
                 .collect::<Vec<_>>()
                 .join("  ");
             lines.push(line(format!("  facts  {facts}")));
@@ -101,7 +96,7 @@ fn header(verb: &str, subject: Option<&str>, counts: &str) -> String {
     format!("• {}", parts.join("  "))
 }
 
-fn subject(arguments: &str, display: Option<&ToolDisplay>) -> Option<String> {
+fn subject(arguments: &str, display: Option<&FrontendToolDisplay>) -> Option<String> {
     if let Some(value) = fact(display, "subject") {
         let preview = preview(value, KEY_WIDTH);
         if !preview.is_empty() {
@@ -144,16 +139,16 @@ fn json_string_field(raw: &str, key: &str) -> Option<String> {
     None
 }
 
-fn fact<'a>(display: Option<&'a ToolDisplay>, name: &str) -> Option<&'a str> {
+fn fact<'a>(display: Option<&'a FrontendToolDisplay>, name: &str) -> Option<&'a str> {
     display?
-        .facts()
+        .facts
         .iter()
-        .find(|fact| fact.name() == name)
-        .map(philo_tools::ToolFact::value)
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
 }
 
-fn counts(result: &ToolResult, display: Option<&ToolDisplay>) -> String {
-    if let ToolResult::Error { code, .. } = result {
+fn counts(result: &FrontendToolResult, display: Option<&FrontendToolDisplay>) -> String {
+    if let FrontendToolResult::Error { code, .. } = result {
         return format!("error {code}");
     }
     let mut parts = Vec::new();
@@ -189,13 +184,16 @@ fn counts(result: &ToolResult, display: Option<&ToolDisplay>) -> String {
     parts.join("  ")
 }
 
-fn push_body(lines: &mut Vec<TranscriptLine>, display: Option<&ToolDisplay>) -> Option<usize> {
+fn push_body(
+    lines: &mut Vec<TranscriptLine>,
+    display: Option<&FrontendToolDisplay>,
+) -> Option<usize> {
     let display = display?;
     match fact(Some(display), "body") {
-        Some("diff") => push_capped_body(lines, display.detail(), false),
-        Some("output") => push_capped_body(lines, display.detail(), true),
+        Some("diff") => push_capped_body(lines, &display.detail, false),
+        Some("output") => push_capped_body(lines, &display.detail, true),
         Some("locs") => {
-            push_locs_body(lines, display.detail());
+            push_locs_body(lines, &display.detail);
             None
         }
         _ => None,
@@ -233,7 +231,7 @@ fn body_row(row: &str, indent: bool) -> String {
     }
 }
 
-fn success_marker(display: Option<&ToolDisplay>) -> Option<String> {
+fn success_marker(display: Option<&FrontendToolDisplay>) -> Option<String> {
     let truncated = fact(display, "truncated") == Some("true");
     let exit = fact(display, "exit_code");
     let failed_exit = exit.is_some_and(|value| value != "0");
@@ -267,7 +265,7 @@ fn format_ms(ms: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use philo_tools::{ToolDisplay, ToolResult};
+    use philo_agent_service::{FrontendToolDisplay, FrontendToolResult};
 
     use super::*;
 
@@ -275,18 +273,45 @@ mod tests {
         lines.iter().map(|line| line.text.as_str()).collect()
     }
 
+    fn display(detail: impl Into<String>, facts: &[(&str, &str)]) -> FrontendToolDisplay {
+        FrontendToolDisplay {
+            detail: detail.into(),
+            facts: facts
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn success(content: impl Into<String>) -> FrontendToolResult {
+        FrontendToolResult::Success {
+            content: content.into(),
+        }
+    }
+
+    fn error(code: &str, message: &str) -> FrontendToolResult {
+        FrontendToolResult::Error {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+
     #[test]
     fn read_with_body_none_is_header_only() {
-        let display = ToolDisplay::new("fn main() {}")
-            .with_fact("verb", "Read")
-            .with_fact("subject", "src/main.rs")
-            .with_fact("body", "none")
-            .with_fact("start_line", "1")
-            .with_fact("end_line", "40");
+        let display = display(
+            "fn main() {}",
+            &[
+                ("verb", "Read"),
+                ("subject", "src/main.rs"),
+                ("body", "none"),
+                ("start_line", "1"),
+                ("end_line", "40"),
+            ],
+        );
         let lines = default_card(
             "read",
             r#"{"path":"src/main.rs"}"#,
-            &ToolResult::success("1| fn main() {}"),
+            &success("1| fn main() {}"),
             Some(&display),
         );
         assert_eq!(texts(&lines), ["• Read  src/main.rs  L1–L40"]);
@@ -295,16 +320,20 @@ mod tests {
 
     #[test]
     fn edit_diff_shows_plus_and_minus_lines() {
-        let edit = ToolDisplay::new("-foo\n+bar")
-            .with_fact("verb", "Edited")
-            .with_fact("subject", "src/lib.rs")
-            .with_fact("body", "diff")
-            .with_fact("added", "1")
-            .with_fact("removed", "1");
+        let edit = display(
+            "-foo\n+bar",
+            &[
+                ("verb", "Edited"),
+                ("subject", "src/lib.rs"),
+                ("body", "diff"),
+                ("added", "1"),
+                ("removed", "1"),
+            ],
+        );
         let lines = default_card(
             "edit",
             r#"{"path":"src/lib.rs"}"#,
-            &ToolResult::success("replaced src/lib.rs (12 → 34 bytes)"),
+            &success("replaced src/lib.rs (12 → 34 bytes)"),
             Some(&edit),
         );
         assert_eq!(
@@ -316,16 +345,20 @@ mod tests {
 
     #[test]
     fn write_diff_shows_added_lines_not_model_confirmation() {
-        let write = ToolDisplay::new("+hello\n+world")
-            .with_fact("verb", "Added")
-            .with_fact("subject", "src/a.rs")
-            .with_fact("body", "diff")
-            .with_fact("added", "2")
-            .with_fact("removed", "0");
+        let write = display(
+            "+hello\n+world",
+            &[
+                ("verb", "Added"),
+                ("subject", "src/a.rs"),
+                ("body", "diff"),
+                ("added", "2"),
+                ("removed", "0"),
+            ],
+        );
         let lines = default_card(
             "write",
             r#"{"path":"src/a.rs"}"#,
-            &ToolResult::success("wrote src/a.rs (11 bytes, created)"),
+            &success("wrote src/a.rs (11 bytes, created)"),
             Some(&write),
         );
         assert_eq!(
@@ -341,15 +374,19 @@ mod tests {
             .map(|i| format!("src/lib.rs:{i}: hit {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let display = ToolDisplay::new(locs)
-            .with_fact("verb", "Searched")
-            .with_fact("subject", "'hit' in src")
-            .with_fact("body", "locs")
-            .with_fact("matches_total", "8");
+        let display = display(
+            locs,
+            &[
+                ("verb", "Searched"),
+                ("subject", "'hit' in src"),
+                ("body", "locs"),
+                ("matches_total", "8"),
+            ],
+        );
         let lines = default_card(
             "grep",
             r#"{"pattern":"hit","path":"src"}"#,
-            &ToolResult::success("dump of every match for the model"),
+            &success("dump of every match for the model"),
             Some(&display),
         );
         assert_eq!(
@@ -373,15 +410,19 @@ mod tests {
 
     #[test]
     fn list_with_body_none_is_header_only() {
-        let display = ToolDisplay::new("src/main.rs\nsrc/lib.rs")
-            .with_fact("verb", "Listed")
-            .with_fact("subject", ".")
-            .with_fact("body", "none")
-            .with_fact("entries_total", "8");
+        let display = display(
+            "src/main.rs\nsrc/lib.rs",
+            &[
+                ("verb", "Listed"),
+                ("subject", "."),
+                ("body", "none"),
+                ("entries_total", "8"),
+            ],
+        );
         let lines = default_card(
             "list",
             r#"{"path":"."}"#,
-            &ToolResult::success("src/main.rs\nsrc/lib.rs"),
+            &success("src/main.rs\nsrc/lib.rs"),
             Some(&display),
         );
         assert_eq!(texts(&lines), ["• Listed  .  8 entries"]);
@@ -390,16 +431,20 @@ mod tests {
 
     #[test]
     fn shell_output_is_indented_and_nonzero_exit_keeps_a_footer() {
-        let ok = ToolDisplay::new("ok\npassed")
-            .with_fact("verb", "Ran")
-            .with_fact("subject", "cargo test")
-            .with_fact("body", "output")
-            .with_fact("exit_code", "0")
-            .with_fact("duration_ms", "1200");
+        let ok = display(
+            "ok\npassed",
+            &[
+                ("verb", "Ran"),
+                ("subject", "cargo test"),
+                ("body", "output"),
+                ("exit_code", "0"),
+                ("duration_ms", "1200"),
+            ],
+        );
         let lines = default_card(
             "shell",
             r#"{"command":"cargo test"}"#,
-            &ToolResult::success("exit_code: 0\nok"),
+            &success("exit_code: 0\nok"),
             Some(&ok),
         );
         assert_eq!(
@@ -407,16 +452,20 @@ mod tests {
             ["• Ran  cargo test  exit 0 · 1.2s", "  ok", "  passed"]
         );
 
-        let failed = ToolDisplay::new("boom")
-            .with_fact("verb", "Ran")
-            .with_fact("subject", "cargo test")
-            .with_fact("body", "output")
-            .with_fact("exit_code", "1")
-            .with_fact("duration_ms", "1200");
+        let failed = display(
+            "boom",
+            &[
+                ("verb", "Ran"),
+                ("subject", "cargo test"),
+                ("body", "output"),
+                ("exit_code", "1"),
+                ("duration_ms", "1200"),
+            ],
+        );
         let lines = default_card(
             "shell",
             r#"{"command":"cargo test"}"#,
-            &ToolResult::success("exit_code: 1\nbloom"),
+            &success("exit_code: 1\nbloom"),
             Some(&failed),
         );
         assert_eq!(
@@ -431,7 +480,7 @@ mod tests {
         let error = default_card(
             "edit",
             r#"{"path":"src/lib.rs"}"#,
-            &ToolResult::error("not_unique", "3 matches"),
+            &error("not_unique", "3 matches"),
             None,
         );
         assert_eq!(
@@ -449,16 +498,20 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let display = ToolDisplay::new(detail)
-            .with_fact("verb", "Ran")
-            .with_fact("subject", "seq")
-            .with_fact("body", "output")
-            .with_fact("exit_code", "0")
-            .with_fact("truncated", "true");
+        let display = display(
+            detail,
+            &[
+                ("verb", "Ran"),
+                ("subject", "seq"),
+                ("body", "output"),
+                ("exit_code", "0"),
+                ("truncated", "true"),
+            ],
+        );
         let lines = default_card(
             "shell",
             r#"{"command":"seq"}"#,
-            &ToolResult::success("model dump 20"),
+            &success("model dump 20"),
             Some(&display),
         );
         assert_eq!(lines[0].text, "• Ran  seq  exit 0");
@@ -472,12 +525,11 @@ mod tests {
 
     #[test]
     fn missing_body_fact_never_dumps_display_detail() {
-        let display =
-            ToolDisplay::new("read completed\nfull display detail").with_fact("bytes", "840");
+        let display = display("read completed\nfull display detail", &[("bytes", "840")]);
         let lines = default_card(
             "read_file",
             r#"{"path":"src/main.rs"}"#,
-            &ToolResult::success("fn main() {}"),
+            &success("fn main() {}"),
             Some(&display),
         );
         assert_eq!(texts(&lines), ["• read_file  src/main.rs"]);

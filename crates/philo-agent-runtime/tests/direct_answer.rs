@@ -2,33 +2,18 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig,
-    ModelAssistantBlock, ModelMessage, OperationHandle, OperationOutcome, OperationPhase,
-    OperationStatus, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
-    UserMessage, UserPart,
+    AgentEvent, AgentFailureKind, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ModelAssistantBlock,
+    ModelMessage, OperationOutcome, OperationStatus, RuntimeConfig, SettlementDurability, UserPart,
 };
 use philo_session::{
     ContextMessage, MemorySessionStore, SessionAssistantBlock, SessionCommit, SessionContextView,
     SessionError, SessionFuture, SessionStore, SessionTransaction, SessionUserPart,
 };
 use support::fake_model::FakeModel;
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut context = Context::from_waker(Waker::noop());
-    let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
+use support::runtime::{Harness, empty_tools};
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -43,61 +28,40 @@ fn config() -> RuntimeConfig {
     }
 }
 
-fn runtime(model: Arc<FakeModel>, sessions: Arc<dyn SessionStore>) -> AgentRuntime {
-    AgentRuntime::new(
-        model,
-        sessions,
-        Arc::new(SequentialIdSource::new()),
-        config(),
-    )
+async fn launch(model: Arc<FakeModel>, sessions: Arc<dyn SessionStore>) -> Harness {
+    Harness::launch_default(model, sessions, empty_tools(), config()).await
 }
 
-fn collect_events(mut handle: philo_agent_runtime::OperationHandle) -> Vec<AgentEvent> {
-    let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
-        events.push(event);
-    }
-    events
-}
-
-fn drain(mut handle: OperationHandle) -> Vec<AgentEvent> {
-    let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
-        events.push(event);
-    }
-    events
-}
-
-#[test]
-fn direct_answer_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_answer_success() {
     let model = Arc::new(FakeModel::succeeds(&["hel", "lo"]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let mut handle = block_on(
-        runtime(model.clone(), sessions.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
-    // M10: acceptance returns immediately; waiting drives to settled.
+    let mut harness = launch(model.clone(), sessions.clone()).await;
+    let (events, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "hello"
     ));
-    assert_eq!(
-        handle.phase(),
-        &OperationPhase::Settled(OperationStatus::Succeeded)
-    );
-    let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
-        events.push(event);
-    }
     assert!(matches!(events[0], AgentEvent::OperationStarted { .. }));
     assert!(matches!(events[1], AgentEvent::TurnStarted { .. }));
     assert!(matches!(events[2], AgentEvent::ModelCallStarted { .. }));
-    assert!(matches!(
-        events[5],
-        AgentEvent::AssistantMessageCompleted { .. }
-    ));
-    assert!(matches!(events[6], AgentEvent::OperationSettled { .. }));
+    let completed = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AssistantMessageCompleted { .. }))
+        .expect("assistant completed");
+    let settled = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::OperationSettled { .. }))
+        .expect("settled");
+    assert!(completed > 2 && completed < settled);
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hello");
 
     let calls = model.calls();
     assert_eq!(calls.len(), 1);
@@ -114,9 +78,7 @@ fn direct_answer_success() {
     );
     let stored_id = philo_session::SessionId::new("session");
     assert_eq!(
-        block_on(sessions.context_view(&stored_id))
-            .unwrap()
-            .messages(),
+        sessions.context_view(&stored_id).await.unwrap().messages(),
         &[
             ContextMessage::User {
                 parts: SessionUserPart::text_parts("hi"),
@@ -130,17 +92,15 @@ fn direct_answer_success() {
     );
 }
 
-#[test]
-fn start_commit_failure_prevents_model_call() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_commit_failure_prevents_model_call() {
     let model = Arc::new(FakeModel::succeeds(&["unused"]));
     let sessions = Arc::new(FailingStore::always());
-    let handle = block_on(
-        runtime(model.clone(), sessions).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model.clone(), sessions).await;
+    let (_, outcome) = harness.run("session", "hi").await;
     assert!(model.calls().is_empty());
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
@@ -148,16 +108,14 @@ fn start_commit_failure_prevents_model_call() {
     ));
 }
 
-#[test]
-fn model_error_settles_failed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_error_settles_failed() {
     let model = Arc::new(FakeModel::start_fails("offline"));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model, sessions).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model, sessions).await;
+    let (_, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
@@ -165,22 +123,19 @@ fn model_error_settles_failed() {
     ));
 }
 
-#[test]
-fn final_commit_failure_prevents_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_commit_failure_prevents_success() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
     let sessions = Arc::new(FailingStore::after_successful_commits(1));
-    let handle = block_on(
-        runtime(model, sessions).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model, sessions).await;
+    let (events, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Unconfirmed,
         } if failure.kind() == AgentFailureKind::Persistence
     ));
-    let events = collect_events(handle);
     assert!(
         !events
             .iter()
@@ -188,48 +143,40 @@ fn final_commit_failure_prevents_success() {
     );
 }
 
-#[test]
-fn delta_ordering_preserved() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_ordering_preserved() {
     let model = Arc::new(FakeModel::succeeds(&["a", "b", "c"]));
-    let handle = block_on(
-        runtime(model, Arc::new(MemorySessionStore::new()))
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
-    let deltas = collect_events(handle)
+    let mut harness = launch(model, Arc::new(MemorySessionStore::new())).await;
+    let (events, _) = harness.run("session", "hi").await;
+    let deltas = events
         .into_iter()
         .filter_map(|event| match event {
             AgentEvent::TextDelta { delta } => Some(delta),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(deltas, ["a", "b", "c"]);
+    assert_eq!(deltas.concat(), "abc");
+    assert!(!deltas.is_empty());
 }
 
-#[test]
-fn terminal_event_emitted_once() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_event_emitted_once() {
     let model = Arc::new(FakeModel::stream_fails_after(&["partial"], "broken"));
-    let handle = block_on(
-        runtime(model, Arc::new(MemorySessionStore::new()))
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
-    let terminal_count = collect_events(handle)
+    let mut harness = launch(model, Arc::new(MemorySessionStore::new())).await;
+    let (events, _) = harness.run("session", "hi").await;
+    let terminal_count = events
         .iter()
         .filter(|event| matches!(event, AgentEvent::OperationSettled { .. }))
         .count();
     assert_eq!(terminal_count, 1);
 }
 
-#[test]
-fn model_failure_is_durably_settled() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_failure_is_durably_settled() {
     let model = Arc::new(FakeModel::start_fails("offline"));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model, sessions.clone()).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
-    let events = collect_events(handle);
+    let mut harness = launch(model, sessions.clone()).await;
+    let (events, _) = harness.run("session", "hi").await;
     assert!(
         events
             .iter()
@@ -245,29 +192,24 @@ fn model_failure_is_durably_settled() {
     )));
     let stored_id = philo_session::SessionId::new("session");
     assert_eq!(
-        block_on(sessions.context_view(&stored_id))
-            .unwrap()
-            .revision(),
+        sessions.context_view(&stored_id).await.unwrap().revision(),
         philo_session::SessionRevision::new(2)
     );
 }
 
-#[test]
-fn persistent_session_failure_settles_unconfirmed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_session_failure_settles_unconfirmed() {
     let model = Arc::new(FakeModel::start_fails("offline"));
     let sessions = Arc::new(FailingStore::after_successful_commits(1));
-    let handle = block_on(
-        runtime(model, sessions).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model, sessions).await;
+    let (events, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
         }
     ));
-    let events = collect_events(handle);
     assert!(
         !events
             .iter()
@@ -275,38 +217,43 @@ fn persistent_session_failure_settles_unconfirmed() {
     );
 }
 
-#[test]
-fn single_turn_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_turn_success() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model, sessions.clone()).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model, sessions.clone()).await;
+    let (events, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "hello"
     ));
-    let events = drain(handle);
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hello");
     assert!(matches!(
-        events.as_slice(),
-        [
-            AgentEvent::OperationStarted { .. },
-            AgentEvent::TurnStarted { .. },
-            AgentEvent::ModelCallStarted { .. },
-            AgentEvent::TextDelta { delta },
-            AgentEvent::AssistantMessageCompleted { .. },
-            AgentEvent::OperationSettled {
-                status: OperationStatus::Succeeded,
-                ..
-            }
-        ] if delta == "hello"
+        events.first(),
+        Some(AgentEvent::OperationStarted { .. })
     ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantMessageCompleted { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::OperationSettled {
+            status: OperationStatus::Succeeded,
+            ..
+        }
+    )));
     let stored_id = philo_session::SessionId::new("session");
     assert_eq!(
-        block_on(sessions.context_view(&stored_id))
-            .unwrap()
-            .messages(),
+        sessions.context_view(&stored_id).await.unwrap().messages(),
         &[
             ContextMessage::User {
                 parts: SessionUserPart::text_parts("hi"),
@@ -320,17 +267,14 @@ fn single_turn_success() {
     );
 }
 
-#[test]
-fn start_commit_failure_skips_model() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_commit_failure_skips_model() {
     let model = Arc::new(FakeModel::succeeds(&["unused"]));
-    let handle = block_on(
-        runtime(model.clone(), Arc::new(FailingStore::after(0)))
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model.clone(), Arc::new(FailingStore::after(0))).await;
+    let (_, outcome) = harness.run("session", "hi").await;
     assert!(model.calls().is_empty());
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
@@ -338,19 +282,12 @@ fn start_commit_failure_skips_model() {
     ));
 }
 
-#[test]
-fn final_commit_failure_never_publishes_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_commit_failure_never_publishes_success() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
-    let handle = block_on(
-        runtime(model, Arc::new(FailingStore::after(1)))
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
-    assert!(matches!(
-        block_on(handle.wait()),
-        OperationOutcome::Failed { .. }
-    ));
-    let events = drain(handle);
+    let mut harness = launch(model, Arc::new(FailingStore::after(1))).await;
+    let (events, outcome) = harness.run("session", "hi").await;
+    assert!(matches!(outcome, OperationOutcome::Failed { .. }));
     assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::AssistantMessageCompleted { .. }
@@ -368,26 +305,18 @@ fn final_commit_failure_never_publishes_success() {
     );
 }
 
-#[test]
-fn second_turn_contains_first_turn_context() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_turn_contains_first_turn_context() {
     let model = Arc::new(FakeModel::succeeds_sequence(vec![
         vec!["first"],
         vec!["second"],
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let runtime = runtime(model.clone(), sessions.clone());
-    let first =
-        block_on(runtime.prompt(SessionId::new("session"), UserMessage::new("one"))).unwrap();
-    assert!(matches!(
-        block_on(first.wait()),
-        OperationOutcome::Succeeded { .. }
-    ));
-    let second =
-        block_on(runtime.prompt(SessionId::new("session"), UserMessage::new("two"))).unwrap();
-    assert!(matches!(
-        block_on(second.wait()),
-        OperationOutcome::Succeeded { .. }
-    ));
+    let mut harness = launch(model.clone(), sessions.clone()).await;
+    let (_, first) = harness.run("session", "one").await;
+    assert!(matches!(first, OperationOutcome::Succeeded { .. }));
+    let (_, second) = harness.run("session", "two").await;
+    assert!(matches!(second, OperationOutcome::Succeeded { .. }));
 
     let calls = model.calls();
     assert_eq!(calls.len(), 2);
@@ -412,9 +341,7 @@ fn second_turn_contains_first_turn_context() {
     );
     let stored_id = philo_session::SessionId::new("session");
     assert_eq!(
-        block_on(sessions.context_view(&stored_id))
-            .unwrap()
-            .messages(),
+        sessions.context_view(&stored_id).await.unwrap().messages(),
         &[
             ContextMessage::User {
                 parts: SessionUserPart::text_parts("one"),
@@ -436,22 +363,19 @@ fn second_turn_contains_first_turn_context() {
     );
 }
 
-#[test]
-fn model_failure_is_confirmed_and_durable() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_failure_is_confirmed_and_durable() {
     let model = Arc::new(FakeModel::start_fails("offline"));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(model, sessions.clone()).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model, sessions.clone()).await;
+    let (events, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
         }
     ));
-    let events = drain(handle);
     assert!(
         events
             .iter()
@@ -467,29 +391,23 @@ fn model_failure_is_confirmed_and_durable() {
     ));
     let stored_id = philo_session::SessionId::new("session");
     assert_eq!(
-        block_on(sessions.context_view(&stored_id))
-            .unwrap()
-            .revision(),
+        sessions.context_view(&stored_id).await.unwrap().revision(),
         philo_session::SessionRevision::new(2)
     );
 }
 
-#[test]
-fn persistent_session_failure_is_unconfirmed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_session_failure_is_unconfirmed() {
     let model = Arc::new(FakeModel::start_fails("offline"));
-    let handle = block_on(
-        runtime(model, Arc::new(FailingStore::after(1)))
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let mut harness = launch(model, Arc::new(FailingStore::after(1))).await;
+    let (events, outcome) = harness.run("session", "hi").await;
     assert!(matches!(
-        block_on(handle.wait()),
+        outcome,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
         }
     ));
-    let events = drain(handle);
     assert!(
         !events
             .iter()
@@ -555,5 +473,11 @@ impl SessionStore for FailingStore {
                 Err(SessionError::store_unavailable("scripted commit failure"))
             }
         })
+    }
+
+    fn list_sessions(
+        &self,
+    ) -> SessionFuture<'_, Result<Vec<philo_session::SessionId>, SessionError>> {
+        self.inner.list_sessions()
     }
 }

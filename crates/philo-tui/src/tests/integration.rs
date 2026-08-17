@@ -1,17 +1,10 @@
 //! Aggregate acceptance across streaming, tools, compaction, cancellation,
-//! and overlays: one presentation flow also covers Unicode and slow host work.
+//! and overlays: one presentation flow also covers Unicode.
 
-use std::sync::Arc;
-
-use philo_agent_runtime::{
-    AgentEvent, CancelReason, ModelCallId, OperationId, OperationStatus, SessionId,
-    SettlementDurability, ToolBatchId, ToolCallId, ToolDisplay, ToolResult, TurnId, UserMessage,
-};
+use philo_agent_service::{FrontendOperationEvent, FrontendToolDisplay, FrontendToolResult};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use crate::api::confirmation::{ConfirmationId, ConfirmationRequest};
-use crate::api::host::TuiHost;
 use crate::app::action::Action;
 use crate::app::effect::Effect;
 use crate::app::state::App;
@@ -19,7 +12,6 @@ use crate::app::status::StatusData;
 use crate::app::text;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 use crate::render::{composer, frame, markdown::MarkdownRenderer};
-use crate::tests::support::{FakeHost, session_view};
 
 fn app() -> App {
     App::new(
@@ -28,11 +20,11 @@ fn app() -> App {
     )
 }
 
-fn apply_event(app: &mut App, event: AgentEvent) {
-    let effects = app.on_agent_event(&event);
+fn apply_event(app: &mut App, event: FrontendOperationEvent) {
+    let effects = app.on_operation_event(&event);
     assert!(
         effects.is_empty(),
-        "agent events write the transcript store directly: {effects:?}"
+        "operation events write the transcript store directly: {effects:?}"
     );
 }
 
@@ -154,8 +146,8 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     app.set_busy(true, 1);
     apply_event(
         &mut app,
-        AgentEvent::ReasoningDelta {
-            model_call_id: ModelCallId::new("model-call-1"),
+        FrontendOperationEvent::ReasoningDelta {
+            model_call_id: "model-call-1".to_owned(),
             text: "checking constraints\n".to_owned(),
         },
     );
@@ -167,7 +159,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     for ch in first_answer.chars() {
         apply_event(
             &mut app,
-            AgentEvent::TextDelta {
+            FrontendOperationEvent::TextDelta {
                 delta: ch.to_string(),
             },
         );
@@ -175,17 +167,17 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
 
     apply_event(
         &mut app,
-        AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch-1"),
+        FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch-1".to_owned(),
             call_count: 2,
         },
     );
     let before_started = app.cells.cells().len();
     apply_event(
         &mut app,
-        AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch-1"),
-            tool_call_id: ToolCallId::new("tool-1"),
+        FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch-1".to_owned(),
+            tool_call_id: "tool-1".to_owned(),
             index: 0,
             tool_name: "read_file".to_owned(),
             arguments: r#"{"path":"src/中文.rs"}"#.to_owned(),
@@ -207,15 +199,18 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
 
     apply_event(
         &mut app,
-        AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: ToolBatchId::new("batch-1"),
-            tool_call_id: ToolCallId::new("tool-1"),
+        FrontendOperationEvent::ToolExecutionCompleted {
+            tool_batch_id: "batch-1".to_owned(),
+            tool_call_id: "tool-1".to_owned(),
             index: 0,
             tool_name: "read_file".to_owned(),
-            result: ToolResult::success(format!("{} 完成", "result-".repeat(120))),
-            display: Some(
-                ToolDisplay::new("read completed\nfull display detail").with_fact("bytes", "840"),
-            ),
+            result: FrontendToolResult::Success {
+                content: format!("{} 完成", "result-".repeat(120)),
+            },
+            display: Some(FrontendToolDisplay {
+                detail: "read completed\nfull display detail".to_owned(),
+                facts: vec![("bytes".to_owned(), "840".to_owned())],
+            }),
         },
     );
     let tool_lines = app
@@ -252,7 +247,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     );
     assert!(text::width(&tool_lines[0].text) <= 120);
 
-    apply_event(&mut app, AgentEvent::ContextCompactionStarted);
+    apply_event(&mut app, FrontendOperationEvent::ContextCompactionStarted);
     assert!(
         app.activity_view(40)
             .expect("compaction activity")
@@ -261,27 +256,27 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     );
     apply_event(
         &mut app,
-        AgentEvent::ContextCompactionCompleted {
+        FrontendOperationEvent::ContextCompactionCompleted {
             covers_up_to: "entry-42".to_owned(),
         },
     );
 
     apply_event(
         &mut app,
-        AgentEvent::TextDelta {
+        FrontendOperationEvent::TextDelta {
             delta: "after tool".to_owned(),
         },
     );
     apply_event(
         &mut app,
-        AgentEvent::CancellationRequested {
-            operation_id: OperationId::new("op-1"),
-            reason: CancelReason::User,
+        FrontendOperationEvent::CancellationRequested {
+            operation_id: "op-1".to_owned(),
+            reason: "User".to_owned(),
         },
     );
     apply_event(
         &mut app,
-        AgentEvent::TextDelta {
+        FrontendOperationEvent::TextDelta {
             delta: " late-but-preserved".to_owned(),
         },
     );
@@ -297,17 +292,17 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
 
     apply_event(
         &mut app,
-        AgentEvent::TurnCancelled {
-            turn_id: TurnId::new("turn-1"),
-            reason: CancelReason::User,
+        FrontendOperationEvent::TurnCancelled {
+            turn_id: "turn-1".to_owned(),
+            reason: "User".to_owned(),
         },
     );
     apply_event(
         &mut app,
-        AgentEvent::OperationSettled {
-            operation_id: OperationId::new("op-1"),
-            status: OperationStatus::Cancelled,
-            durability: SettlementDurability::Confirmed,
+        FrontendOperationEvent::OperationSettled {
+            operation_id: "op-1".to_owned(),
+            status: "Cancelled".to_owned(),
+            durability: "Confirmed".to_owned(),
         },
     );
     app.set_busy(false, 0);
@@ -340,18 +335,13 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         "a terminal cancellation fact cannot overtake accepted text",
     );
 
-    app.open_picker(vec![
-        philo_session::SessionId::new("session-m14"),
-        philo_session::SessionId::new("session-next"),
-    ]);
+    app.open_picker(vec!["session-m14".to_owned(), "session-next".to_owned()]);
     assert_responsive_composer(&app, &expected_rows);
     app.on_action(Action::Escape);
     app.sync_confirmation(Some((
-        ConfirmationId::for_test(14),
-        ConfirmationRequest {
-            title: "write workspace file".to_owned(),
-            body: "src/中文.rs".to_owned(),
-        },
+        14,
+        "write workspace file".to_owned(),
+        "src/中文.rs".to_owned(),
     )));
     assert_responsive_composer(&app, &expected_rows);
     assert_eq!(app.input.text(), draft, "overlays never consume the draft");
@@ -366,20 +356,8 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     );
 }
 
-#[tokio::test]
-async fn slow_host_work_leaves_input_animation_cancel_and_completion_live() {
-    let host = FakeHost::new();
-    host.set_view("slow", session_view("slow"));
-    let view_gate = host.delay_view("slow");
-    let view_task = tokio::spawn({
-        let host = Arc::clone(&host);
-        async move {
-            host.context_view(&philo_session::SessionId::new("slow"))
-                .await
-        }
-    });
-    yield_until(|| host.view_calls() == ["slow"]).await;
-
+#[test]
+fn animation_and_cancel_stay_live_without_runtime_handles() {
     let mut app = app();
     app.set_busy(true, 0);
     app.on_paste("草稿 e\u{301} 👩‍💻");
@@ -388,48 +366,27 @@ async fn slow_host_work_leaves_input_animation_cancel_and_completion_live() {
     let after_tick = app.activity_view(40).expect("animated activity").text;
     assert_ne!(
         before_tick, after_tick,
-        "spinner advances while Host is pending"
+        "spinner advances while the frontend waits"
     );
     assert_eq!(app.on_action(Action::Escape), [Effect::CancelActive]);
     assert_eq!(app.input.text(), "草稿 e\u{301} 👩‍💻");
-
-    view_gate.notify_one();
-    let view = view_task
-        .await
-        .expect("view task joins")
-        .expect("delayed view succeeds");
-    assert_eq!(view.messages().len(), 4);
-
-    host.delay_prompts();
-    let prompt_task = tokio::spawn({
-        let host = Arc::clone(&host);
-        async move {
-            host.prompt(SessionId::new("slow"), UserMessage::new("queued prompt"))
-                .await
-        }
-    });
-    yield_until(|| host.pending_prompts() == 1).await;
-    app.on_action(Action::MoveLeft);
-    app.on_action(Action::Backspace);
-    assert!(
-        app.on_tick(),
-        "animation remains live during prompt admission"
-    );
-    prompt_task.abort();
-    host.wait_for_prompt_cancellation().await;
-    assert_eq!(host.prompt_cancellations(), 1);
-    assert!(
-        !app.input.text().is_empty(),
-        "cancelling work preserves the draft"
-    );
 }
 
-async fn yield_until(mut ready: impl FnMut() -> bool) {
-    for _ in 0..256 {
-        if ready() {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(ready(), "background fixture did not become ready");
+#[tokio::test]
+async fn start_test_service_client_accepts_attach_and_load() {
+    let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+    let accepted = client.try_command(philo_agent_service::FrontendCommand::FrontendAttached {
+        frontend_instance_id: philo_agent_service::FrontendInstanceId::new("tui-test"),
+    });
+    assert!(matches!(
+        accepted,
+        philo_agent_service::CommandSubmitResult::Accepted(_)
+    ));
+    let loaded = client.try_command(philo_agent_service::FrontendCommand::LoadSession {
+        session_id: "s-1".to_owned(),
+    });
+    assert!(matches!(
+        loaded,
+        philo_agent_service::CommandSubmitResult::Accepted(_)
+    ));
 }

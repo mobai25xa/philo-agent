@@ -1,22 +1,19 @@
-//! Interactive command startup and TUI handoff.
+//! Interactive command startup and ProcessSupervisor handoff.
 
-mod host;
-mod runtime_control;
+mod supervisor;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use philo_tui::{TuiConfig, TuiExit};
-
-use self::host::CliHost;
 use crate::args::Cli;
-use crate::assembly::RunAssembly;
+use crate::assembly;
 use crate::config::{LoadedConfig, ResolveFlags, Verbosity, WatchIntervals};
 use crate::error::UsageError;
 use crate::ids::fresh_session_id;
 
-pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
+use self::supervisor::ProcessSupervisor;
+
+pub fn run(runtime: tokio::runtime::Runtime, cli: Cli) -> Result<ExitCode, UsageError> {
     // Configuration errors deliberately precede terminal validation so both
     // execution modes validate the same effective settings.
     let config = LoadedConfig::load()?;
@@ -38,46 +35,51 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
 
     let session_id = cli.session.clone().unwrap_or_else(fresh_session_id);
     let flags = ResolveFlags::from_cli(&cli);
-    let tui_config_model = settings.deployment.model.clone();
-    let tui_verbose = settings.verbosity == Verbosity::Verbose;
-    let tui_show_reasoning = settings.show_reasoning;
-    let tui_context_window = settings.context_window;
-    let tui_screen = settings.screen;
-    let assembly = RunAssembly::prepare(&cli, settings)?;
-    let host = Arc::new(CliHost::new(assembly, flags.clone()));
-    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
-    let watch_host = Arc::clone(&host);
-    let poll_host = Arc::clone(&host);
-    let poll_tx = notice_tx.clone();
-    let _watch = crate::config::spawn(
+    // AgentRuntime::start spawns on Handle::try_current(). The interactive
+    // path owns the Runtime value but has not yet block_on'd, so enter first.
+    let bootstrap = {
+        let _enter = runtime.enter();
+        assembly::bootstrap(&cli, settings)?
+    };
+    let watch_client = bootstrap.client.clone();
+    let watch_assembler = bootstrap.assembler.clone();
+    let watch = crate::config::spawn(
         flags,
         WatchIntervals::default(),
-        move |result| {
-            if let Some(notice) = watch_host.on_reloaded_files(result) {
-                let _ = notice_tx.send(notice);
-            }
-        },
-        move || {
-            if let Some(notice) = poll_host.on_watch_poll() {
-                let _ = poll_tx.send(notice);
-            }
-        },
+        move |result| assembly::apply_config_reload(&watch_client, &watch_assembler, result),
+        || {},
     )?;
-    let tui_config = TuiConfig {
-        session_id,
-        model_name: tui_config_model,
-        verbose: tui_verbose,
-        show_reasoning: tui_show_reasoning,
-        context_window: tui_context_window,
-        screen: tui_screen,
-        config_notices: Some(notice_rx),
-    };
 
-    match philo_tui::run(host, tui_config).await {
-        Ok(TuiExit::Normal) => Ok(ExitCode::SUCCESS),
-        Err(error) => {
-            eprintln!("error: the interactive session ended abnormally: {error}");
-            Ok(ExitCode::from(1))
+    ProcessSupervisor::new(runtime, bootstrap, watch).run(session_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use philo_agent_runtime::{AgentRuntime, RuntimeDeps};
+
+    #[test]
+    fn agent_runtime_start_requires_the_cli_runtime_to_be_entered() {
+        match AgentRuntime::start(RuntimeDeps::default()) {
+            Err(error) => assert!(
+                error.message().contains("Tokio runtime"),
+                "{}",
+                error.message()
+            ),
+            Ok(_) => panic!("AgentRuntime::start must fail without a Tokio context"),
         }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = {
+            let _enter = runtime.enter();
+            AgentRuntime::start(RuntimeDeps::default())
+        };
+        assert!(
+            started.is_ok(),
+            "{}",
+            started.err().map(|error| error.message().to_owned()).unwrap_or_default()
+        );
     }
 }

@@ -98,9 +98,10 @@ impl ModelPort for PhiloModelAdapter {
             let server_continuation = request.persist_replay
                 && self.continuation_policy
                     == ModelContinuationPolicy::PreferPreviousResponseIdWithLocalFallback;
-            let replayed =
-                self.replay
-                    .load(&self.client, &self.target, &request, server_continuation)?;
+            let replayed = self
+                .replay
+                .load(&self.client, &self.target, &request, server_continuation)
+                .await?;
             let mut mapped = map_request(&request, native_error_status, &replayed)?;
             let continuing =
                 server_continuation && replayed.has_continuation() && mapped.continuation.is_some();
@@ -120,7 +121,8 @@ impl ModelPort for PhiloModelAdapter {
                             == Some(sdk::ContinuationFailure::PreviousResponseUnavailable) =>
                 {
                     self.replay
-                        .invalidate_continuation(request.session_id.as_str(), &replayed);
+                        .invalidate_continuation(request.session_id.as_str(), &replayed)
+                        .await;
                     tracing::warn!(
                         code = "previous_response_unavailable",
                         fallback_attempt = 1_u8,

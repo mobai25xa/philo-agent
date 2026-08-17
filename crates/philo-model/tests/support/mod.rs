@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -19,6 +19,9 @@ use philo_agent_runtime::{
     ModelEventStream, ModelMessage, ModelToolCall, OperationId, ToolDefinition, TurnId,
 };
 use philo_model::{ModelCompat, ModelProtocol, PhiloModelAdapter};
+
+mod runtime;
+pub use runtime::*;
 
 /// Observes whether the HTTP response body stream has been dropped, proving
 /// that dropping the normalized event stream aborts the underlying call.

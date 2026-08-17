@@ -7,15 +7,20 @@
 //! durable fact equals what the model sees), the display channel carries
 //! bounded human-readable detail for transient presentation.
 //!
-//! Every failure here is a business error (`ToolResult::Error` with a
-//! stable code); this crate never raises `ToolPortError` infrastructure
-//! failures. Path-taking tools are constrained to the assembly-injected
-//! workspace root with a two-phase containment check (lexical, then
-//! canonical — symlink escapes are rejected).
+//! Tool business failures are `ToolResult::Error` with a stable code.
+//! [`philo_tools::ToolPortError`] is produced only by the blocking filesystem
+//! pool: saturation (`try_acquire_owned` finds no running or queue slot) and a
+//! panicked `spawn_blocking` worker. Path-taking tools are constrained to the
+//! assembly-injected workspace root with a two-phase containment check
+//! (lexical, then canonical — symlink escapes are rejected).
 //!
-//! The `shell` tool needs a tokio runtime (io-util + process + time); composition
-//! roots provide one (`philo-cli` does). The other five tools are
-//! runtime-agnostic.
+//! Filesystem tools (`read`, `list`, `grep`, `write`, `edit`) still complete
+//! inline when invoked directly (tests and simple handlers stay
+//! runtime-agnostic). Production assembly should wrap them with
+//! [`BlockingPool::wrap_handler`] and/or [`BlockingToolExecutor`] so the
+//! work runs on `tokio::task::spawn_blocking` under a bounded semaphore.
+//! `shell` stays native async (io-util + process + time) and must not enter
+//! the blocking pool.
 //!
 //! # Stable business-error codes
 //!
@@ -37,6 +42,7 @@
 //! | `io_error` | any other filesystem I/O failure |
 
 mod args;
+mod blocking;
 mod display;
 mod edit;
 mod grep;
@@ -47,6 +53,10 @@ mod read;
 mod shell;
 mod write;
 
+pub use blocking::{
+    BlockingFsHandler, BlockingPool, BlockingToolExecutor, DEFAULT_BLOCKING_TOOL_CONCURRENCY,
+    DEFAULT_BLOCKING_TOOL_QUEUE, blocking_fs_handler,
+};
 pub use edit::{EDIT_TOOL_NAME, EditTool};
 pub use grep::{DEFAULT_MAX_GREP_MATCHES, GREP_TOOL_NAME, GrepTool};
 pub use list::{DEFAULT_MAX_LIST_ENTRIES, LIST_TOOL_NAME, ListTool};

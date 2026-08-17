@@ -2,7 +2,7 @@
 
 use super::EngineContext;
 use super::seal;
-use super::stream::{StreamStep, next_or_cancel};
+use super::stream::{StreamStep, next_or_cancel, next_or_maintenance_cancel};
 use crate::mapping::failure::session_failure;
 use crate::mapping::messages::context_messages;
 use crate::operation::OperationPublisher;
@@ -29,31 +29,33 @@ pub(super) async fn maybe_auto_compact(
     if !should_auto_compact(ctx, runtime_session_id, &context) {
         return AutoCompactionOutcome::Ready(operation, context);
     }
-    let Some(covers_up_to) = select_boundary(&context, ctx.config.compaction.keep_recent_turns)
+    let Some(covers_up_to) = select_boundary(&context, ctx.config().compaction.keep_recent_turns)
     else {
         return AutoCompactionOutcome::Ready(operation, context);
     };
 
-    operation.push(AgentEvent::ContextCompactionStarted);
+    operation.push(AgentEvent::ContextCompactionStarted).await;
     let summary = match generate_summary(ctx, Some(&operation), runtime_session_id, &context).await
     {
         Ok(summary) => summary,
         Err(SummaryFailure::Cancelled) => {
-            operation.cancellation_observed();
-            operation.cancel_zero_trace();
+            operation.cancellation_observed().await;
+            operation.cancel_zero_trace().await;
             return AutoCompactionOutcome::Settled;
         }
         Err(SummaryFailure::Failed(error)) => {
-            operation.push(AgentEvent::ContextCompactionFailed {
-                message: error.message().to_owned(),
-            });
+            operation
+                .push(AgentEvent::ContextCompactionFailed {
+                    message: error.message().to_owned(),
+                })
+                .await;
             return AutoCompactionOutcome::Ready(operation, context);
         }
     };
 
     if operation.is_cancel_requested() {
-        operation.cancellation_observed();
-        operation.cancel_zero_trace();
+        operation.cancellation_observed().await;
+        operation.cancel_zero_trace().await;
         return AutoCompactionOutcome::Settled;
     }
     let commit = ctx
@@ -68,29 +70,35 @@ pub(super) async fn maybe_auto_compact(
         ))
         .await;
     if let Err(error) = commit {
-        operation.push(AgentEvent::ContextCompactionFailed {
-            message: format!("committing context compaction: {error:?}"),
-        });
+        operation
+            .push(AgentEvent::ContextCompactionFailed {
+                message: format!("committing context compaction: {error:?}"),
+            })
+            .await;
         return AutoCompactionOutcome::Ready(operation, context);
     }
 
-    operation.push(AgentEvent::ContextCompactionCompleted {
-        covers_up_to: covers_up_to.as_str().to_owned(),
-    });
+    operation
+        .push(AgentEvent::ContextCompactionCompleted {
+            covers_up_to: covers_up_to.as_str().to_owned(),
+        })
+        .await;
     // A cancellation that arrives after the atomic maintenance commit keeps
     // that useful fact but still prevents Barrier A from creating a turn.
     if operation.is_cancel_requested() {
-        operation.cancellation_observed();
-        operation.cancel_zero_trace();
+        operation.cancellation_observed().await;
+        operation.cancel_zero_trace().await;
         return AutoCompactionOutcome::Settled;
     }
     match ctx.sessions.context_view(stored_session_id).await {
         Ok(context) => AutoCompactionOutcome::Ready(operation, context),
         Err(error) => {
-            operation.fail_unconfirmed(session_failure(
-                "re-reading compacted session context",
-                &error,
-            ));
+            operation
+                .fail_unconfirmed(session_failure(
+                    "re-reading compacted session context",
+                    &error,
+                ))
+                .await;
             AutoCompactionOutcome::Settled
         }
     }
@@ -100,6 +108,11 @@ pub(crate) async fn compact_manually(
     ctx: &EngineContext,
     runtime_session_id: &SessionId,
 ) -> Result<CompactionReport, CompactionError> {
+    if ctx.maintenance_cancelled() {
+        return Err(CompactionError::Session {
+            message: "compaction cancelled".to_owned(),
+        });
+    }
     let stored_session_id = session::SessionId::new(runtime_session_id.as_str());
     let context = ctx
         .sessions
@@ -112,17 +125,22 @@ pub(crate) async fn compact_manually(
             seal::SealFailure::Commit(error) => session_error("sealing stale turn", error),
             seal::SealFailure::Refresh(error) => session_error("re-reading sealed context", error),
         })?;
-    let Some(covers_up_to) = select_boundary(&context, ctx.config.compaction.keep_recent_turns)
+    let Some(covers_up_to) = select_boundary(&context, ctx.config().compaction.keep_recent_turns)
     else {
         return Ok(CompactionReport::NothingToCompact);
     };
+    if ctx.maintenance_cancelled() {
+        return Err(CompactionError::Session {
+            message: "compaction cancelled".to_owned(),
+        });
+    }
     let summary = generate_summary(ctx, None, runtime_session_id, &context)
         .await
         .map_err(|failure| match failure {
             SummaryFailure::Failed(error) => error,
-            SummaryFailure::Cancelled => {
-                unreachable!("manual compaction has no operation cancellation source")
-            }
+            SummaryFailure::Cancelled => CompactionError::Session {
+                message: "compaction cancelled".to_owned(),
+            },
         })?;
     ctx.sessions
         .commit(session::SessionTransaction::linear(
@@ -145,14 +163,14 @@ fn should_auto_compact(
     session_id: &SessionId,
     context: &session::SessionContextView,
 ) -> bool {
-    let Some(budget) = ctx.config.compaction.context_budget else {
+    let Some(budget) = ctx.config().compaction.context_budget else {
         return false;
     };
     let observed = ctx.last_input_tokens(session_id).unwrap_or_else(|| {
         let bytes = context_bytes(context);
-        bytes / u64::from(ctx.config.compaction.estimate_bytes_per_token.max(1))
+        bytes / u64::from(ctx.config().compaction.estimate_bytes_per_token.max(1))
     });
-    (observed as f32) >= ctx.config.compaction.auto_threshold * (budget as f32)
+    (observed as f32) >= ctx.config().compaction.auto_threshold * (budget as f32)
 }
 
 fn select_boundary(
@@ -185,7 +203,8 @@ async fn generate_summary(
     session_id: &SessionId,
     context: &session::SessionContextView,
 ) -> Result<String, SummaryFailure> {
-    if operation.is_some_and(OperationPublisher::is_cancel_requested) {
+    if operation.is_some_and(OperationPublisher::is_cancel_requested) || ctx.maintenance_cancelled()
+    {
         return Err(SummaryFailure::Cancelled);
     }
     let synthetic_prefix = format!(
@@ -194,7 +213,7 @@ async fn generate_summary(
         context.revision().get()
     );
     let mut messages = vec![ModelMessage::System {
-        content: ctx.config.system_prompt.clone(),
+        content: ctx.config().system_prompt.clone(),
     }];
     messages.extend(context_messages(context));
     messages.push(ModelMessage::User {
@@ -213,11 +232,11 @@ async fn generate_summary(
         session_revision: context.revision(),
         messages,
         tools: Vec::new(),
-        model_target: ctx.config.model_target.clone(),
-        generation: ctx.config.generation.clone(),
-        max_parallel_tool_calls: ctx.config.max_parallel_tool_calls.max(1),
+        model_target: ctx.config().model_target.clone(),
+        generation: ctx.config().generation.clone(),
+        max_parallel_tool_calls: ctx.config().max_parallel_tool_calls.max(1),
     };
-    let mut stream = ctx.model.start(request).await.map_err(|error| {
+    let mut stream = ctx.model().start(request).await.map_err(|error| {
         SummaryFailure::Failed(CompactionError::Model {
             message: error.message().to_owned(),
         })
@@ -227,7 +246,7 @@ async fn generate_summary(
     loop {
         let step = match operation {
             Some(operation) => next_or_cancel(stream.as_mut(), operation.shared()).await,
-            None => StreamStep::Event(stream.next().await),
+            None => next_or_maintenance_cancel(stream.as_mut(), ctx).await,
         };
         match step {
             StreamStep::CancelObserved => {
@@ -269,7 +288,14 @@ async fn generate_summary(
             }
         }
     }
-    let blocks = completed_blocks.expect("Completed was observed before the stream ended");
+    let blocks = match completed_blocks {
+        Some(blocks) => blocks,
+        None => {
+            return Err(invalid_summary(
+                "summary stream ended before Completed was recorded",
+            ));
+        }
+    };
     if blocks
         .iter()
         .any(|block| matches!(block, ModelAssistantBlock::ToolCall(_)))

@@ -1,23 +1,24 @@
-//! Session-history projection: durable context messages become transcript
+//! Session-history projection: durable frontend views become transcript
 //! lines. Pure and read-only — the TUI never writes a session, and images
 //! render as placeholder text (no inline terminal graphics).
 //!
 //! This is session replay, not the composer's input-history recall.
 
-use philo_session::{
-    ContextMessage, SessionAssistantBlock, SessionContextView, SessionUserPart, ToolResultOutcome,
+use philo_agent_service::{
+    DurableSessionView, FrontendAssistantBlock, FrontendContextMessage, FrontendToolResultOutcome,
+    FrontendUserPart,
 };
 
 use super::transcript::{LineKind, TranscriptLine, compact_args, line, preview, user_block};
 
 /// Replays one session's model-visible context as transcript lines.
-pub(crate) fn history_lines(view: &SessionContextView) -> Vec<TranscriptLine> {
-    view.messages().iter().flat_map(message_lines).collect()
+pub(crate) fn history_lines(view: &DurableSessionView) -> Vec<TranscriptLine> {
+    view.messages.iter().flat_map(message_lines).collect()
 }
 
 /// Condensed preview for the session picker: the opening lines of the
 /// session, truncated with a marker when more follows.
-pub(crate) fn preview_lines(view: &SessionContextView, max_lines: usize) -> Vec<String> {
+pub(crate) fn preview_lines(view: &DurableSessionView, max_lines: usize) -> Vec<String> {
     let lines = history_lines(view);
     if lines.is_empty() {
         return vec!["(empty session)".to_owned()];
@@ -39,16 +40,18 @@ pub(crate) fn preview_lines(view: &SessionContextView, max_lines: usize) -> Vec<
     texts
 }
 
-fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
+fn message_lines(message: &FrontendContextMessage) -> Vec<TranscriptLine> {
     match message {
-        ContextMessage::Summary { text } => text
+        FrontendContextMessage::Summary { text } => text
             .split('\n')
             .map(|text| line(LineKind::Notice, format!("[summary] {text}")))
             .collect(),
-        ContextMessage::User { parts } => user_block(parts.iter().map(user_part_text)),
-        ContextMessage::Assistant { blocks } => assistant_block_lines(blocks, false),
-        ContextMessage::AssistantToolCalls { blocks, .. } => assistant_block_lines(blocks, true),
-        ContextMessage::ToolResult { outcome, .. } => {
+        FrontendContextMessage::User { parts } => user_block(parts.iter().map(user_part_text)),
+        FrontendContextMessage::Assistant { blocks } => assistant_block_lines(blocks, false),
+        FrontendContextMessage::AssistantToolCalls { blocks, .. } => {
+            assistant_block_lines(blocks, true)
+        }
+        FrontendContextMessage::ToolResult { outcome, .. } => {
             // Replay keeps the older `ok · {content}` summary: ToolDisplay
             // is not durable, so live cards cannot be reconstructed.
             vec![line(
@@ -60,49 +63,53 @@ fn message_lines(message: &ContextMessage) -> Vec<TranscriptLine> {
 }
 
 fn assistant_block_lines(
-    blocks: &[SessionAssistantBlock],
+    blocks: &[FrontendAssistantBlock],
     include_tool_calls: bool,
 ) -> Vec<TranscriptLine> {
     let mut lines = Vec::new();
     for block in blocks {
         match block {
-            SessionAssistantBlock::Text { text } => {
+            FrontendAssistantBlock::Text { text } => {
                 lines.push(line(LineKind::Answer, text.clone()));
             }
-            SessionAssistantBlock::ToolCall(call) if include_tool_calls => lines.push(line(
+            FrontendAssistantBlock::ToolCall {
+                name, arguments, ..
+            } if include_tool_calls => lines.push(line(
                 LineKind::Tool,
-                format!("▸ {}  {}", call.name(), compact_args(call.arguments())),
+                format!("▸ {name}  {}", compact_args(arguments)),
             )),
-            SessionAssistantBlock::ToolCall(_) => {}
+            FrontendAssistantBlock::ToolCall { .. } => {}
         }
     }
     lines
 }
 
-fn user_part_text(part: &SessionUserPart) -> String {
+fn user_part_text(part: &FrontendUserPart) -> String {
     match part {
-        SessionUserPart::Text(text) => preview(text, 200),
-        SessionUserPart::Image { media_type, bytes } => {
+        FrontendUserPart::Text(text) => preview(text, 200),
+        FrontendUserPart::Image { media_type, bytes } => {
             format!("[image {media_type}, {} bytes]", bytes.len())
         }
     }
 }
 
-fn outcome_text(outcome: &ToolResultOutcome) -> String {
+fn outcome_text(outcome: &FrontendToolResultOutcome) -> String {
     match outcome {
-        ToolResultOutcome::Success { content } => format!("ok · {}", preview(content, 80)),
-        ToolResultOutcome::Error { code, message } => {
+        FrontendToolResultOutcome::Success { content } => format!("ok · {}", preview(content, 80)),
+        FrontendToolResultOutcome::Error { code, message } => {
             format!("error {code} · {}", preview(message, 80))
         }
-        ToolResultOutcome::Cancelled => "cancelled (never executed)".to_owned(),
-        ToolResultOutcome::Interrupted => "interrupted (execution state unknown)".to_owned(),
+        FrontendToolResultOutcome::Cancelled => "cancelled (never executed)".to_owned(),
+        FrontendToolResultOutcome::Interrupted => {
+            "interrupted (execution state unknown)".to_owned()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::support::session_view;
+    use crate::tests::support::{empty_session_view, image_session_view, session_view};
 
     #[test]
     fn history_renders_user_assistant_and_tool_facts() {
@@ -126,7 +133,7 @@ mod tests {
 
     #[test]
     fn images_render_as_placeholder_text() {
-        let view = crate::tests::support::image_session_view("s-img");
+        let view = image_session_view("s-img");
         let lines = history_lines(&view);
         let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
@@ -137,20 +144,18 @@ mod tests {
 
     #[test]
     fn tool_batch_renders_text_and_calls_in_block_order() {
-        use philo_session::{SessionToolCall, ToolBatchId, ToolCallId};
-
-        let lines = message_lines(&ContextMessage::AssistantToolCalls {
-            tool_batch_id: ToolBatchId::new("batch"),
+        let lines = message_lines(&FrontendContextMessage::AssistantToolCalls {
+            tool_batch_id: "batch".to_owned(),
             blocks: vec![
-                SessionAssistantBlock::Text {
+                FrontendAssistantBlock::Text {
                     text: "let me look\nthen call".to_owned(),
                 },
-                SessionAssistantBlock::ToolCall(SessionToolCall::new(
-                    ToolCallId::new("c"),
-                    "read_file",
-                    r#"{"path":"src/main.rs"}"#,
-                )),
-                SessionAssistantBlock::Text {
+                FrontendAssistantBlock::ToolCall {
+                    id: "c".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                },
+                FrontendAssistantBlock::Text {
                     text: "after".to_owned(),
                 },
             ],
@@ -167,7 +172,7 @@ mod tests {
 
     #[test]
     fn compacted_history_marks_the_summary_as_prior_context() {
-        let lines = message_lines(&ContextMessage::Summary {
+        let lines = message_lines(&FrontendContextMessage::Summary {
             text: "earlier request\nearlier answer".to_owned(),
         });
         assert_eq!(
@@ -186,7 +191,7 @@ mod tests {
             preview_lines(&view, 2),
             ["› count the files".to_owned(), "...".to_owned()]
         );
-        let empty = crate::tests::support::empty_session_view("s-empty");
+        let empty = empty_session_view("s-empty");
         assert_eq!(preview_lines(&empty, 4), ["(empty session)".to_owned()]);
     }
 }

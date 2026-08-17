@@ -3,16 +3,13 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentEvent, AgentFailureKind, AgentRuntime, CancelReason, GenerationConfig,
-    ModelCallId, ModelCallPhase, OperationHandle, OperationId, OperationOutcome, OperationPhase,
-    OperationStatus, RunningToolBatchPhase, RuntimeConfig, SequentialIdSource, SessionId,
-    SettlementDurability, ToolBatchId, ToolCallId, ToolDefinition, TurnId, UserMessage,
+    AgentAvailability, AgentEvent, AgentFailureKind, CancelReason, GenerationConfig, ModelCallId,
+    ModelCallPhase, OperationId, OperationOutcome, OperationPhase, OperationStatus,
+    RunningToolBatchPhase, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
+    ToolBatchId, ToolCallId, ToolDefinition, TurnId, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::failing_session::{FailingSessionStore, FailurePlan};
@@ -21,29 +18,13 @@ use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
 use support::gated_session::GatedSessionStore;
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.as_mut().poll(&mut context)
-}
-
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
@@ -59,6 +40,7 @@ fn runtime(
         },
         tools,
     )
+    .await
 }
 
 fn no_tools() -> Arc<FakeTool> {
@@ -73,9 +55,9 @@ fn sid() -> SessionId {
     SessionId::new("s")
 }
 
-fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
@@ -94,56 +76,52 @@ fn settled_count(events: &[AgentEvent]) -> usize {
 /// releasing the gate. The future outputs the warmup's `OperationOutcome`.
 macro_rules! suspended_warmup {
     ($runtime:expr, $gate:expr) => {{
-        let handle = block_on($runtime.prompt(sid(), UserMessage::new("warmup"))).unwrap();
-        let mut warmup = Box::pin(async move { handle.wait().await });
-        assert!(poll_once(&mut warmup).is_pending(), "warmup must suspend");
-        warmup
+        let handle = $runtime.prompt(sid(), UserMessage::new("warmup")).await;
+        handle.wait_until_busy().await;
+        handle
     }};
 }
 
 // --- Injection point 1: cancel while queued (M6-005) -------------------------
 
-#[test]
-fn queued_cancel_settles_immediately_with_zero_trace() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_cancel_settles_immediately_with_zero_trace() {
     let warmup_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
         ModelScript::text_suspending(&[], &warmup_gate, &["done"]),
         ModelScript::text(&["third"]),
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(model, sessions.clone(), no_tools(), 1);
+    let agent = runtime(model, sessions.clone(), no_tools(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
-    let third = block_on(agent.prompt(sid(), UserMessage::new("third"))).unwrap();
-    assert_eq!(victim.phase(), OperationPhase::Queued);
-    assert_eq!(third.phase(), OperationPhase::Queued);
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
+    let third = agent.prompt(sid(), UserMessage::new("third")).await;
+    assert_eq!(victim.phase().await, OperationPhase::Queued);
+    assert_eq!(third.phase().await, OperationPhase::Queued);
 
-    victim.cancel();
+    victim.cancel().await;
     assert_eq!(
-        victim.phase(),
+        victim.phase().await,
         OperationPhase::Settled(OperationStatus::Cancelled)
     );
-    assert!(matches!(
-        block_on(victim.wait()),
-        OperationOutcome::Cancelled
-    ));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     warmup_gate.release();
     assert!(matches!(
-        block_on(&mut warmup),
+        warmup.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
     // The queue continues past the removed entry.
     assert!(matches!(
-        block_on(third.wait()),
+        third.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "third"
     ));
 
     let victim_id = OperationId::new("operation-2");
     assert_eq!(
-        collect_events(victim),
+        collect_events(&victim).await,
         vec![
             AgentEvent::OperationQueued {
                 operation_id: victim_id.clone(),
@@ -156,20 +134,24 @@ fn queued_cancel_settles_immediately_with_zero_trace() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
+                session_revision: None,
             },
         ]
     );
 
     // Zero persistent trace: only warmup and third committed anything.
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(view.revision(), philo_session::SessionRevision::new(4));
     assert_eq!(view.messages().len(), 4, "two turns, user+assistant each");
 }
 
 // --- Injection point 2: cancel before Barrier A persists ---------------------
 
-#[test]
-fn cancel_before_barrier_a_leaves_zero_trace() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_before_barrier_a_leaves_zero_trace() {
     let warmup_gate = Gate::new();
     let read_gate = Gate::new();
     let model = Arc::new(FakeModel::new([ModelScript::text_suspending(
@@ -178,26 +160,24 @@ fn cancel_before_barrier_a_leaves_zero_trace() {
         &["done"],
     )]));
     let sessions = Arc::new(GatedSessionStore::memory().gate_context_read_at(2, &read_gate));
-    let agent = runtime(model, sessions.clone(), no_tools(), 1);
+    let agent = runtime(model, sessions.clone(), no_tools(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(
-        poll_once(&mut wait).is_pending(),
-        "suspends in context read"
-    );
-    assert_eq!(victim.phase(), OperationPhase::PreparingTurn);
-    victim.cancel();
+    victim
+        .wait_until_phase(|phase| matches!(phase, OperationPhase::PreparingTurn))
+        .await;
+    assert_eq!(victim.phase().await, OperationPhase::PreparingTurn);
+    victim.cancel().await;
     read_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     let victim_id = OperationId::new("operation-2");
     assert_eq!(
-        collect_events(victim),
+        collect_events(&victim).await,
         vec![
             AgentEvent::OperationQueued {
                 operation_id: victim_id.clone(),
@@ -216,12 +196,16 @@ fn cancel_before_barrier_a_leaves_zero_trace() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
+                session_revision: None,
             },
         ],
         "no TurnCancelled: durably no turn ever existed"
     );
 
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(
         view.revision(),
         philo_session::SessionRevision::new(2),
@@ -231,8 +215,8 @@ fn cancel_before_barrier_a_leaves_zero_trace() {
 
 // --- Injection point 3: cancel during the model stream (M6-001) --------------
 
-#[test]
-fn cancel_during_model_stream_discards_output_and_commits_terminal_facts() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_during_model_stream_discards_output_and_commits_terminal_facts() {
     let warmup_gate = Gate::new();
     let victim_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -240,25 +224,31 @@ fn cancel_during_model_stream_discards_output_and_commits_terminal_facts() {
         ModelScript::text_suspending(&["par"], &victim_gate, &["tial"]),
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(model, sessions.clone(), no_tools(), 1);
+    let agent = runtime(model, sessions.clone(), no_tools(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending(), "suspends mid-stream");
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningModelCall(ModelCallPhase::Streaming)
+            )
+        })
+        .await;
     assert_eq!(
-        victim.phase(),
+        victim.phase().await,
         OperationPhase::RunningModelCall(ModelCallPhase::Streaming)
     );
-    victim.cancel();
+    victim.cancel().await;
     // The victim gate is never released: the stream is dropped instead.
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     let victim_id = OperationId::new("operation-2");
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert_eq!(
         events,
         vec![
@@ -289,13 +279,17 @@ fn cancel_during_model_stream_discards_output_and_commits_terminal_facts() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
+                session_revision: Some(4),
             },
         ]
     );
     assert_eq!(settled_count(&events), 1);
 
     // No AssistantMessage; the cancellation transaction advanced the session.
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(view.revision(), philo_session::SessionRevision::new(4));
     assert!(matches!(
         view.messages().last(),
@@ -306,8 +300,8 @@ fn cancel_during_model_stream_discards_output_and_commits_terminal_facts() {
 
 // --- Injection point 3 variant: between rounds after C_k (M6-003) ------------
 
-#[test]
-fn cancel_between_rounds_commits_terminal_entries_only() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_between_rounds_commits_terminal_entries_only() {
     let warmup_gate = Gate::new();
     let commit_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -317,22 +311,31 @@ fn cancel_between_rounds_commits_terminal_entries_only() {
     // Warmup: commits 1..2. Victim: A=3, batch=4, results=5 (gated).
     let sessions = Arc::new(GatedSessionStore::memory().gate_commit_at(5, &commit_gate));
     let tools = Arc::new(FakeTool::new([echo()], [FakeToolResult::success("one")]));
-    let agent = runtime(model.clone(), sessions.clone(), tools, 2);
+    let agent = runtime(model.clone(), sessions.clone(), tools, 2).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending(), "suspends in C_k commit");
-    victim.cancel();
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::CommittingResults)
+            )
+        })
+        .await;
+    victim.cancel().await;
     commit_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     // C_k succeeded, so the executed call keeps its real persisted result and
     // the cancellation transaction carries only the two terminal entries.
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     let result_messages: Vec<_> = view
         .messages()
         .iter()
@@ -347,7 +350,7 @@ fn cancel_between_rounds_commits_terminal_entries_only() {
         ToolResultOutcome::Success { content } if content == "one"
     ));
 
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     let completed_index = events
         .iter()
         .position(|event| matches!(event, AgentEvent::ToolExecutionCompleted { .. }))
@@ -371,8 +374,8 @@ fn cancel_between_rounds_commits_terminal_entries_only() {
 
 // --- Injection point 4: cancel mid tool batch (M6-002) -----------------------
 
-#[test]
-fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
     let warmup_gate = Gate::new();
     let tool_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -387,31 +390,40 @@ fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
             FakeToolResult::success("never"),
         ],
     ));
-    let agent = runtime(model, sessions.clone(), tools.clone(), 1);
+    let agent = runtime(model, sessions.clone(), tools.clone(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending(), "call-1 is executing");
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                    in_flight: 1,
+                    completed: 0,
+                })
+            )
+        })
+        .await;
     assert_eq!(
-        victim.phase(),
+        victim.phase().await,
         OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
             in_flight: 1,
             completed: 0,
         })
     );
-    victim.cancel();
+    victim.cancel().await;
     tool_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     assert_eq!(tools.invocation_count(), 1, "call-2 never executes");
 
     let victim_id = OperationId::new("operation-2");
     let batch_id = ToolBatchId::new("turn-2:tool-batch:1");
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert_eq!(
         events,
         vec![
@@ -458,12 +470,16 @@ fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
+                session_revision: Some(5),
             },
         ]
     );
 
     // Real prefix + Cancelled suffix persisted atomically with the terminals.
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(view.revision(), philo_session::SessionRevision::new(5));
     let outcomes: Vec<_> = view
         .messages()
@@ -489,8 +505,8 @@ fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
 
 // --- Injection point 4 variant: zero executed calls (M6-003) ------------------
 
-#[test]
-fn cancel_after_batch_commit_marks_every_call_cancelled() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_batch_commit_marks_every_call_cancelled() {
     let warmup_gate = Gate::new();
     let commit_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -500,22 +516,28 @@ fn cancel_after_batch_commit_marks_every_call_cancelled() {
     // Warmup: commits 1..2. Victim: A=3, batch commit B_k=4 (gated).
     let sessions = Arc::new(GatedSessionStore::memory().gate_commit_at(4, &commit_gate));
     let tools = Arc::new(FakeTool::new([echo()], []));
-    let agent = runtime(model, sessions.clone(), tools.clone(), 1);
+    let agent = runtime(model, sessions.clone(), tools.clone(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending(), "suspends in B_k commit");
-    victim.cancel();
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::Preparing)
+            )
+        })
+        .await;
+    victim.cancel().await;
     commit_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     assert_eq!(tools.invocation_count(), 0, "no call ever executes");
 
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert!(
         !events
             .iter()
@@ -524,7 +546,10 @@ fn cancel_after_batch_commit_marks_every_call_cancelled() {
     );
     assert_eq!(settled_count(&events), 1);
 
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     let outcomes: Vec<_> = view
         .messages()
         .iter()
@@ -543,8 +568,8 @@ fn cancel_after_batch_commit_marks_every_call_cancelled() {
 
 // --- Injection point 5: cancel after the kernel's final decision (M6-006) ----
 
-#[test]
-fn cancel_after_final_decision_is_a_no_op() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_final_decision_is_a_no_op() {
     let warmup_gate = Gate::new();
     let commit_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -553,27 +578,25 @@ fn cancel_after_final_decision_is_a_no_op() {
     ]));
     // Warmup: commits 1..2. Victim: A=3, final settlement=4 (gated).
     let sessions = Arc::new(GatedSessionStore::memory().gate_commit_at(4, &commit_gate));
-    let agent = runtime(model, sessions.clone(), no_tools(), 1);
+    let agent = runtime(model, sessions.clone(), no_tools(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(
-        poll_once(&mut wait).is_pending(),
-        "suspends in final commit"
-    );
-    assert_eq!(victim.phase(), OperationPhase::Finalizing);
-    victim.cancel();
+    victim
+        .wait_until_phase(|phase| matches!(phase, OperationPhase::Finalizing))
+        .await;
+    assert_eq!(victim.phase().await, OperationPhase::Finalizing);
+    victim.cancel().await;
     commit_gate.release();
     assert!(matches!(
-        block_on(wait),
+        victim.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "fin"
     ));
 
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert!(
         !events.iter().any(|event| matches!(
             event,
@@ -582,7 +605,7 @@ fn cancel_after_final_decision_is_a_no_op() {
         "an ineffective cancel publishes nothing"
     );
     assert!(matches!(
-        block_on(sessions.context_view(&philo_session::SessionId::new("s")))
+        sessions.context_view(&philo_session::SessionId::new("s")).await
             .unwrap()
             .messages()
             .last(),
@@ -596,8 +619,8 @@ fn cancel_after_final_decision_is_a_no_op() {
 
 // --- Idempotency (M6-009) ------------------------------------------------------
 
-#[test]
-fn cancel_is_idempotent_and_late_cancels_are_no_ops() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_is_idempotent_and_late_cancels_are_no_ops() {
     let warmup_gate = Gate::new();
     let victim_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -605,44 +628,45 @@ fn cancel_is_idempotent_and_late_cancels_are_no_ops() {
         ModelScript::text_suspending(&["x"], &victim_gate, &["y"]),
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(model, sessions, no_tools(), 1);
+    let agent = runtime(model, sessions, no_tools(), 1).await;
 
     // Keep the warmup handle borrowable: the settled no-op check needs it.
-    let warmup = block_on(agent.prompt(sid(), UserMessage::new("warmup"))).unwrap();
-    let mut warmup_wait = Box::pin(warmup.wait());
-    assert!(
-        poll_once(&mut warmup_wait).is_pending(),
-        "warmup must suspend"
-    );
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = agent.prompt(sid(), UserMessage::new("warmup")).await;
+    warmup.wait_until_busy().await;
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
     assert!(matches!(
-        block_on(&mut warmup_wait),
+        warmup.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
-    drop(warmup_wait);
 
     // Cancelling a settled (succeeded) operation is a no-op.
-    warmup.cancel();
+    warmup.cancel().await;
     assert!(matches!(
-        block_on(warmup.wait()),
+        warmup.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending());
-    victim.cancel();
-    victim.cancel();
-    victim.cancel();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningModelCall(ModelCallPhase::Streaming)
+            )
+        })
+        .await;
+    victim.cancel().await;
+    victim.cancel().await;
+    victim.cancel().await;
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     // Cancel after settlement: no state change, no extra events.
-    victim.cancel();
+    victim.cancel().await;
     assert_eq!(
-        victim.phase(),
+        victim.phase().await,
         OperationPhase::Settled(OperationStatus::Cancelled)
     );
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert_eq!(
         events
             .iter()
@@ -656,8 +680,8 @@ fn cancel_is_idempotent_and_late_cancels_are_no_ops() {
 
 // --- Cancel commit failure takes the failure path (M6-007) --------------------
 
-#[test]
-fn cancel_commit_failure_settles_failed_confirmed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_commit_failure_settles_failed_confirmed() {
     let warmup_gate = Gate::new();
     let victim_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -667,17 +691,23 @@ fn cancel_commit_failure_settles_failed_confirmed() {
     // Warmup: commits 1..2. Victim: A=3, cancel transaction=4 fails once,
     // failure settlement=5 succeeds.
     let sessions = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(4)));
-    let agent = runtime(model, sessions, no_tools(), 1);
+    let agent = runtime(model, sessions, no_tools(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending());
-    victim.cancel();
-    let outcome = block_on(wait);
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningModelCall(ModelCallPhase::Streaming)
+            )
+        })
+        .await;
+    victim.cancel().await;
+    let outcome = victim.wait().await;
     let OperationOutcome::Failed {
         failure,
         durability,
@@ -689,7 +719,7 @@ fn cancel_commit_failure_settles_failed_confirmed() {
     assert!(failure.message().contains("committing cancellation"));
     assert_eq!(durability, SettlementDurability::Confirmed);
 
-    let events = collect_events(victim);
+    let events = collect_events(&victim).await;
     assert!(
         events
             .iter()
@@ -711,8 +741,8 @@ fn cancel_commit_failure_settles_failed_confirmed() {
     )));
 }
 
-#[test]
-fn cancel_commit_persistent_failure_settles_unconfirmed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_commit_persistent_failure_settles_unconfirmed() {
     let warmup_gate = Gate::new();
     let victim_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -723,18 +753,24 @@ fn cancel_commit_persistent_failure_settles_unconfirmed() {
     let sessions = Arc::new(FailingSessionStore::memory(
         FailurePlan::persistent_commit_at(4),
     ));
-    let agent = runtime(model, sessions, no_tools(), 1);
+    let agent = runtime(model, sessions, no_tools(), 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending());
-    victim.cancel();
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningModelCall(ModelCallPhase::Streaming)
+            )
+        })
+        .await;
+    victim.cancel().await;
     assert!(matches!(
-        block_on(wait),
+        victim.wait().await,
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Unconfirmed,
@@ -744,8 +780,8 @@ fn cancel_commit_persistent_failure_settles_unconfirmed() {
 
 // --- FIFO queue and start timing (M6-004) -------------------------------------
 
-#[test]
-fn queue_is_fifo_and_operations_start_at_dequeue() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_is_fifo_and_operations_start_at_dequeue() {
     let warmup_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
         ModelScript::text_suspending(&[], &warmup_gate, &["done"]),
@@ -757,71 +793,64 @@ fn queue_is_fifo_and_operations_start_at_dequeue() {
         Arc::new(MemorySessionStore::new()),
         no_tools(),
         1,
+    )
+    .await;
+
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let first = agent.prompt(sid(), UserMessage::new("first")).await;
+    let second = agent.prompt(sid(), UserMessage::new("second")).await;
+    assert_eq!(first.phase().await, OperationPhase::Queued);
+    assert_eq!(second.phase().await, OperationPhase::Queued);
+    assert_eq!(
+        second.phase().await,
+        OperationPhase::Queued,
+        "no queue jumping"
     );
-
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let first = block_on(agent.prompt(sid(), UserMessage::new("first"))).unwrap();
-    let second = block_on(agent.prompt(sid(), UserMessage::new("second"))).unwrap();
-    assert_eq!(first.phase(), OperationPhase::Queued);
-    assert_eq!(second.phase(), OperationPhase::Queued);
-
-    // The queue is strictly FIFO: the second operation cannot start while the
-    // first still waits, even when polled.
-    let mut second_wait = Box::pin(second.wait());
-    assert!(poll_once(&mut second_wait).is_pending());
-    assert_eq!(second.phase(), OperationPhase::Queued, "no queue jumping");
 
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
-
-    assert!(poll_once(&mut second_wait).is_pending());
-    assert_eq!(
-        second.phase(),
-        OperationPhase::Queued,
-        "still blocked behind the first queued operation"
-    );
+    let _ = warmup.wait().await;
 
     // Scripts are consumed in FIFO order: first gets "alpha", second "beta".
     assert!(matches!(
-        block_on(first.wait()),
+        first.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "alpha"
     ));
     assert!(matches!(
-        block_on(second_wait),
+        second.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "beta"
     ));
 
     // OperationStarted publishes at dequeue: it follows OperationQueued.
-    let events = collect_events(first);
+    let events = collect_events(&first).await;
     assert!(matches!(events[0], AgentEvent::OperationQueued { .. }));
     assert!(matches!(events[1], AgentEvent::OperationStarted { .. }));
 }
 
 // --- AgentAvailability (M6-004) -------------------------------------------------
 
-#[test]
-fn availability_reflects_the_actively_driven_operation() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_reflects_the_actively_driven_operation() {
     let warmup_gate = Gate::new();
     let victim_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
         ModelScript::text_suspending(&[], &warmup_gate, &["done"]),
         ModelScript::text_suspending(&[], &victim_gate, &["late"]),
     ]));
-    let agent = runtime(model, Arc::new(MemorySessionStore::new()), no_tools(), 1);
+    let agent = runtime(model, Arc::new(MemorySessionStore::new()), no_tools(), 1).await;
 
-    assert_eq!(agent.availability(), AgentAvailability::Idle);
+    assert_eq!(agent.availability().await, AgentAvailability::Idle);
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
+    let warmup = suspended_warmup!(agent, warmup_gate);
     assert_eq!(
-        agent.availability(),
+        agent.availability().await,
         AgentAvailability::Busy {
             operation_id: OperationId::new("operation-1"),
         }
     );
 
-    let follow_up = block_on(agent.prompt(sid(), UserMessage::new("follow"))).unwrap();
+    let follow_up = agent.prompt(sid(), UserMessage::new("follow")).await;
     assert_eq!(
-        agent.availability(),
+        agent.availability().await,
         AgentAvailability::Busy {
             operation_id: OperationId::new("operation-1"),
         },
@@ -829,27 +858,27 @@ fn availability_reflects_the_actively_driven_operation() {
     );
 
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
-    assert_eq!(agent.availability(), AgentAvailability::Idle);
-
-    let mut wait = Box::pin(follow_up.wait());
-    assert!(poll_once(&mut wait).is_pending());
+    let _ = warmup.wait().await;
+    follow_up.wait_until_busy().await;
     assert_eq!(
-        agent.availability(),
+        agent.availability().await,
         AgentAvailability::Busy {
             operation_id: OperationId::new("operation-2"),
         }
     );
 
     victim_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Succeeded { .. }));
-    assert_eq!(agent.availability(), AgentAvailability::Idle);
+    assert!(matches!(
+        follow_up.wait().await,
+        OperationOutcome::Succeeded { .. }
+    ));
+    assert_eq!(agent.availability().await, AgentAvailability::Idle);
 }
 
 // --- Cancelled results replay into later turns ---------------------------------
 
-#[test]
-fn cancelled_marks_replay_into_the_next_turn_context() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_marks_replay_into_the_next_turn_context() {
     let warmup_gate = Gate::new();
     let tool_gate = Gate::new();
     let model = Arc::new(FakeModel::new([
@@ -862,24 +891,30 @@ fn cancelled_marks_replay_into_the_next_turn_context() {
         [echo()],
         [FakeToolResult::gated_success(&tool_gate, "one")],
     ));
-    let agent = runtime(model.clone(), sessions, tools, 1);
+    let agent = runtime(model.clone(), sessions, tools, 1).await;
 
-    let mut warmup = suspended_warmup!(agent, warmup_gate);
-    let victim = block_on(agent.prompt(sid(), UserMessage::new("victim"))).unwrap();
+    let warmup = suspended_warmup!(agent, warmup_gate);
+    let victim = agent.prompt(sid(), UserMessage::new("victim")).await;
     warmup_gate.release();
-    let _ = block_on(&mut warmup);
+    let _ = warmup.wait().await;
 
-    let mut wait = Box::pin(victim.wait());
-    assert!(poll_once(&mut wait).is_pending());
-    victim.cancel();
+    victim
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing { .. })
+            )
+        })
+        .await;
+    victim.cancel().await;
     tool_gate.release();
-    assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+    assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
 
     // The next turn's model call replays the cancelled turn's partial tool
     // trajectory, including the Cancelled outcome mirror.
-    let next = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let next = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(next.wait()),
+        next.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "next"
     ));
     let calls = model.calls();

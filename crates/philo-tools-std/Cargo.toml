@@ -11,7 +11,7 @@ license.workspace = true
 philo-tools = { path = "../philo-tools" }
 globset = "0.4"
 regex = "1"
-tokio = { version = "1", features = ["io-util", "macros", "process", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "process", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "process", "sync", "time"] }

@@ -4,14 +4,14 @@
 use std::path::PathBuf;
 
 use philo_tools::{
-    EffectClass, RichToolResult, ToolArguments, ToolDefinition, ToolHandler, ToolHandlerEndFuture,
-    ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
+    EffectClass, RichToolResult, ToolArguments, ToolCancel, ToolDefinition, ToolHandler,
+    ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
 use crate::args::{optional_string, required_string};
 use crate::display::card;
 use crate::error_code;
-use crate::helpers::{field_error, io_error, path_error, stopped_if_cancelled};
+use crate::helpers::{field_error, io_error, path_error, stopped_if_requested};
 use crate::path::resolve_in_root;
 
 /// Stable registry name of the list tool.
@@ -56,45 +56,54 @@ impl ListTool {
         .expect("list tool definition is valid")
     }
 
-    fn list(&self, arguments: &ToolArguments) -> RichToolResult {
+    fn list(&self, arguments: &ToolArguments, cancel: &ToolCancel) -> ToolInvokeEnd {
+        if let Some(stopped) = stopped_if_requested(cancel) {
+            return stopped;
+        }
         let path = match required_string(arguments.as_str(), "path") {
             Ok(path) => path,
-            Err(error) => return field_error("path", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("path", &error)),
         };
         let glob = match optional_string(arguments.as_str(), "glob") {
             Ok(glob) => glob,
-            Err(error) => return field_error("glob", &error),
+            Err(error) => return ToolInvokeEnd::Done(field_error("glob", &error)),
         };
         let matcher = match glob.as_deref() {
             None => None,
             Some(pattern) => match globset::Glob::new(pattern) {
                 Ok(glob) => Some(glob.compile_matcher()),
                 Err(error) => {
-                    return RichToolResult::error(
+                    return ToolInvokeEnd::Done(RichToolResult::error(
                         error_code::INVALID_GLOB,
                         format!("invalid glob '{pattern}': {error}"),
-                    );
+                    ));
                 }
             },
         };
 
         let target = match resolve_in_root(&self.root, &path, true) {
             Ok(target) => target,
-            Err(error) => return path_error(&path, &error),
+            Err(error) => return ToolInvokeEnd::Done(path_error(&path, &error)),
         };
         if !target.is_dir() {
-            return RichToolResult::error(
+            return ToolInvokeEnd::Done(RichToolResult::error(
                 error_code::NOT_A_DIRECTORY,
                 format!("path is not a directory: {path}"),
-            );
+            ));
         }
 
+        if let Some(stopped) = stopped_if_requested(cancel) {
+            return stopped;
+        }
         let reader = match std::fs::read_dir(&target) {
             Ok(reader) => reader,
-            Err(error) => return io_error(error.kind()),
+            Err(error) => return ToolInvokeEnd::Done(io_error(error.kind())),
         };
         let mut entries: Vec<(bool, String)> = Vec::new();
         for entry in reader {
+            if let Some(stopped) = stopped_if_requested(cancel) {
+                return stopped;
+            }
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Some(matcher) = &matcher
@@ -128,13 +137,19 @@ impl ListTool {
         let display = card("Listed", path, "none", "")
             .with_fact("entries_total", total.to_string())
             .with_fact("truncated", truncated.to_string());
-        RichToolResult::new(ToolResult::success(model_text)).with_display(display)
+        ToolInvokeEnd::Done(
+            RichToolResult::new(ToolResult::success(model_text)).with_display(display),
+        )
     }
 }
 
 impl ToolHandler for ListTool {
     fn call<'a>(&'a self, arguments: ToolArguments) -> ToolHandlerFuture<'a> {
-        Box::pin(async move { self.list(&arguments) })
+        Box::pin(async move {
+            self.list(&arguments, &ToolCancel::none())
+                .into_done()
+                .expect("list cannot stop without a requested cancel")
+        })
     }
 
     fn call_with_cx<'a>(
@@ -142,11 +157,6 @@ impl ToolHandler for ListTool {
         arguments: ToolArguments,
         cx: ToolInvokeCx,
     ) -> ToolHandlerEndFuture<'a> {
-        Box::pin(async move {
-            if let Some(stopped) = stopped_if_cancelled(&cx) {
-                return stopped;
-            }
-            ToolInvokeEnd::Done(self.list(&arguments))
-        })
+        Box::pin(async move { self.list(&arguments, cx.cancel()) })
     }
 }

@@ -9,12 +9,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use philo_agent_runtime::{
-    AgentRuntime, GenerationConfig, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
-    ToolArguments, ToolHandler, ToolRegistry, UserMessage,
+    AgentRuntime, ChannelBounds, GenerationConfig, OperationOutcome, OperationSpec, RuntimeConfig,
+    RuntimeDeps, SequentialIdSource, SessionId, ToolArguments, ToolHandler, ToolRegistry,
+    UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use philo_tools_std::ReadTool;
-use support::{StubResponse, StubTransport, adapter_over, sse, text_sse};
+use support::{
+    StubResponse, StubTransport, adapter_over, drain_until_settled, generation, sse, text_sse,
+};
 
 struct TempRoot {
     path: PathBuf,
@@ -51,7 +54,7 @@ fn tool_round_sse(response_id: &str, call_id: &str, path: &str) -> Vec<u8> {
 }
 
 /// The three-way ledger check: tool output = durable fact = next request.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn truncated_tool_output_is_the_single_source_of_truth() {
     let root = TempRoot::new();
     // Content that will truncate under a tight byte limit.
@@ -85,10 +88,9 @@ async fn truncated_tool_output_is_the_single_source_of_truth() {
         )
         .expect("register read tool")
         .build();
-    let runtime = AgentRuntime::with_tools(
+    let generation = generation(
         Arc::new(adapter_over(transport.clone())),
-        sessions.clone(),
-        Arc::new(SequentialIdSource::new()),
+        Arc::new(registry),
         RuntimeConfig {
             system_prompt: "sys".to_owned(),
             model_target: "stub-model".to_owned(),
@@ -104,21 +106,29 @@ async fn truncated_tool_output_is_the_single_source_of_truth() {
             tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
         },
-        Arc::new(registry),
     );
+    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+        sessions: sessions.clone(),
+        ids: Arc::new(SequentialIdSource::new()),
+        bounds: ChannelBounds::default(),
+    })
+    .expect("start runtime");
 
-    let mut handle = runtime
-        .prompt(SessionId::new("m10-001"), UserMessage::new("read big.txt"))
+    let accepted = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("m10-001"),
+            user_message: UserMessage::new("read big.txt"),
+            generation,
+            service_request_id: None,
+        })
         .await
-        .expect("prompt accepted");
-    assert!(matches!(
-        handle.wait().await,
-        OperationOutcome::Succeeded { .. }
-    ));
+        .expect("submit accepted");
+    let (events, outcome) = drain_until_settled(&mut sub, &accepted.operation_id).await;
+    assert!(matches!(outcome, OperationOutcome::Succeeded { .. }));
 
     // Ledger leg 1: the event carries the same text (same source).
     let mut event_text = None;
-    while let Some(event) = handle.next_event().await {
+    for event in events {
         if let philo_agent_runtime::AgentEvent::ToolExecutionCompleted { result, .. } = event {
             event_text = result.content().map(str::to_owned);
         }

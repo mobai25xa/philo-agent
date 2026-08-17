@@ -1,28 +1,32 @@
-//! Public store orchestration, cached session state, and durable commit.
+//! Public store handle over a dedicated JSONL actor thread.
 
-use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use philo_session::{
     SessionCommit, SessionContextView, SessionError, SessionFuture, SessionId, SessionProjection,
     SessionStore, SessionTransaction,
 };
+use tokio::sync::oneshot;
 
-use crate::artifact::{ARTIFACTS_DIR, store_artifact};
 use crate::error::{JsonlOpenError, io_error, io_error_text};
-use crate::schema::{PendingArtifact, SCHEMA_VERSION, TransactionRecord, encode_entry};
 
+mod actor;
 mod layout;
 mod recovery;
 
-use layout::{LOG_FILE, acquire_lock, decode_session_dir_name, fsync_dir, session_dir_name};
+use actor::{Reply, StoreActor, StoreCommand};
 pub use recovery::RecoveryReport;
 
-struct SessionState {
+/// Bounded store-command queue capacity. Full enqueue returns [`SessionError::StoreBusy`].
+pub const STORE_COMMAND_CAP: usize = 64;
+
+pub(super) struct SessionState {
     projection: SessionProjection,
     log: File,
     /// Held for the lifetime of the state; the OS releases the advisory lock
@@ -34,16 +38,54 @@ struct SessionState {
     poisoned: Option<String>,
 }
 
-/// Durable [`SessionStore`] over per-session append-only JSONL logs.
-pub struct JsonlSessionStore {
+struct CommandHandle {
     root: PathBuf,
-    sessions: Mutex<HashMap<SessionId, SessionState>>,
+    tx: SyncSender<StoreCommand>,
+    closed: AtomicBool,
+}
+
+impl Drop for CommandHandle {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        let (reply, _) = mpsc::channel();
+        let _ = self.tx.try_send(StoreCommand::Shutdown { reply });
+    }
+}
+
+struct ThreadSlot {
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for ThreadSlot {
+    fn drop(&mut self) {
+        if let Some(thread) = take_thread(&self.thread) {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn take_thread(thread: &Mutex<Option<JoinHandle<()>>>) -> Option<JoinHandle<()>> {
+    thread
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+/// Durable [`SessionStore`] over per-session append-only JSONL logs.
+///
+/// Cloneable handle to a dedicated OS thread (`philo-jsonl-store`) that owns
+/// session projections, file handles, and advisory locks. Async methods copy
+/// inputs, `try_send` on a bounded channel, and await a oneshot reply.
+#[derive(Clone)]
+pub struct JsonlSessionStore {
+    commands: Arc<CommandHandle>,
+    thread: Arc<ThreadSlot>,
 }
 
 impl fmt::Debug for JsonlSessionStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsonlSessionStore")
-            .field("root", &self.root)
+            .field("root", &self.commands.root)
             .finish()
     }
 }
@@ -54,9 +96,21 @@ impl JsonlSessionStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, JsonlOpenError> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|error| io_error("creating store root", &error))?;
+        let (tx, rx) = mpsc::sync_channel(STORE_COMMAND_CAP);
+        let actor_root = root.clone();
+        let thread = thread::Builder::new()
+            .name("philo-jsonl-store".to_owned())
+            .spawn(move || StoreActor::new(actor_root, rx).run())
+            .map_err(|error| io_error("spawning jsonl store actor", &error))?;
         Ok(Self {
-            root,
-            sessions: Mutex::new(HashMap::new()),
+            commands: Arc::new(CommandHandle {
+                root,
+                tx,
+                closed: AtomicBool::new(false),
+            }),
+            thread: Arc::new(ThreadSlot {
+                thread: Mutex::new(Some(thread)),
+            }),
         })
     }
 
@@ -69,55 +123,13 @@ impl JsonlSessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<RecoveryReport, JsonlOpenError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| io_error_text("store mutex poisoned"))?;
-        if let Some(state) = sessions.get(session_id) {
-            return Ok(state.report.clone());
-        }
-        if !self.session_dir(session_id).is_dir() {
-            return Ok(RecoveryReport {
-                transactions: 0,
-                truncated_tail_bytes: 0,
-                orphan_artifacts: Vec::new(),
-            });
-        }
-        let state = recovery::recover_locked(&self.session_dir(session_id))?;
-        let report = state.report.clone();
-        sessions.insert(session_id.clone(), state);
-        Ok(report)
-    }
-
-    fn session_dir(&self, session_id: &SessionId) -> PathBuf {
-        self.root.join(session_dir_name(session_id))
-    }
-
-    /// Creates the directory, lock, and empty log for a brand-new session.
-    fn create_session(&self, session_id: &SessionId) -> Result<SessionState, JsonlOpenError> {
-        let dir = self.session_dir(session_id);
-        fs::create_dir_all(&dir).map_err(|error| io_error("creating session dir", &error))?;
-        let lock = acquire_lock(&dir)?;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(LOG_FILE))
-            .map_err(|error| io_error("creating session log", &error))?;
-        // Make the directory entries themselves durable before the first
-        // commit reports success.
-        fsync_dir(&dir)?;
-        fsync_dir(&self.root)?;
-        Ok(SessionState {
-            projection: SessionProjection::empty(),
-            log,
-            _lock: lock,
-            report: RecoveryReport {
-                transactions: 0,
-                truncated_tail_bytes: 0,
-                orphan_artifacts: Vec::new(),
-            },
-            poisoned: None,
-        })
+        let (reply, rx) = mpsc::channel();
+        self.try_enqueue_open(StoreCommand::RecoverSession {
+            session_id: session_id.clone(),
+            reply,
+        })?;
+        rx.recv()
+            .map_err(|_| io_error_text("jsonl store actor stopped"))?
     }
 
     /// Enumerates the session ids present under the store root.
@@ -128,53 +140,99 @@ impl JsonlSessionStore {
     /// encodings (internal files, foreign directories) are skipped silently.
     /// Order is not specified; callers sort as needed.
     pub fn list_sessions(&self) -> Result<Vec<SessionId>, JsonlOpenError> {
-        let listing =
-            fs::read_dir(&self.root).map_err(|error| io_error("listing store root", &error))?;
-        let mut sessions = Vec::new();
-        for entry in listing {
-            let entry = entry.map_err(|error| io_error("listing store root", &error))?;
-            let is_directory = entry
-                .file_type()
-                .map(|file_type| file_type.is_dir())
-                .unwrap_or(false);
-            if !is_directory {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if let Some(session_id) = decode_session_dir_name(name) {
-                sessions.push(session_id);
-            }
-        }
-        Ok(sessions)
+        let (reply, rx) = mpsc::channel();
+        self.try_enqueue_open(StoreCommand::ListSessions {
+            reply: Reply::Sync(reply),
+        })?;
+        rx.recv()
+            .map_err(|_| io_error_text("jsonl store actor stopped"))?
     }
 
-    /// Returns the recovered state for a session, recovering or (optionally)
-    /// creating it on first touch. `None` means the session does not exist
-    /// and creation was not requested.
-    fn touch<'a>(
-        &self,
-        sessions: &'a mut HashMap<SessionId, SessionState>,
-        session_id: &SessionId,
-        create_missing: bool,
-    ) -> Result<Option<&'a mut SessionState>, JsonlOpenError> {
-        if !sessions.contains_key(session_id) {
-            let state = if self.session_dir(session_id).is_dir() {
-                recovery::recover_locked(&self.session_dir(session_id))?
-            } else if create_missing {
-                self.create_session(session_id)?
-            } else {
-                return Ok(None);
-            };
-            sessions.insert(session_id.clone(), state);
+    /// Drains already-queued commits, rejects new requests, fsyncs, releases
+    /// locks, and joins the actor thread.
+    pub fn shutdown(&self) -> Result<(), JsonlOpenError> {
+        self.commands.closed.store(true, Ordering::Release);
+        let (reply, rx) = mpsc::channel();
+        match self.commands.tx.send(StoreCommand::Shutdown { reply }) {
+            Ok(()) => {}
+            Err(_) => {
+                self.join_actor();
+                return Err(io_error_text("jsonl store actor is unavailable"));
+            }
         }
-        Ok(Some(
-            sessions
-                .get_mut(session_id)
-                .expect("state inserted or present"),
-        ))
+        let _ = rx.recv();
+        self.join_actor();
+        Ok(())
+    }
+
+    fn join_actor(&self) {
+        if let Some(thread) = take_thread(&self.thread.thread) {
+            let _ = thread.join();
+        }
+    }
+
+    fn try_enqueue(&self, command: StoreCommand) -> Result<(), SessionError> {
+        if self.commands.closed.load(Ordering::Acquire) {
+            return Err(SessionError::store_unavailable("jsonl store is shut down"));
+        }
+        match self.commands.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SessionError::store_busy(
+                "jsonl store command queue is full",
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(SessionError::store_unavailable(
+                "jsonl store actor is unavailable",
+            )),
+        }
+    }
+
+    fn try_enqueue_open(&self, command: StoreCommand) -> Result<(), JsonlOpenError> {
+        if self.commands.closed.load(Ordering::Acquire) {
+            return Err(io_error_text("jsonl store is shut down"));
+        }
+        match self.commands.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(io_error_text("jsonl store command queue is full")),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(io_error_text("jsonl store actor is unavailable"))
+            }
+        }
+    }
+
+    fn await_store<T: Send + 'static>(
+        &self,
+        command: StoreCommand,
+        rx: oneshot::Receiver<Result<T, SessionError>>,
+    ) -> SessionFuture<'_, Result<T, SessionError>> {
+        match self.try_enqueue(command) {
+            Ok(()) => Box::pin(async move {
+                rx.await
+                    .map_err(|_| SessionError::store_unavailable("jsonl store actor stopped"))?
+            }),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    #[cfg(test)]
+    fn block_actor_for_test(
+        &self,
+    ) -> (
+        oneshot::Receiver<()>,
+        mpsc::Sender<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .tx
+            .send(StoreCommand::Block {
+                started: started_tx,
+                release: release_rx,
+                reply: reply_tx,
+            })
+            .expect("enqueue block command");
+        (started_rx, release_tx, reply_rx)
     }
 }
 
@@ -183,95 +241,120 @@ impl SessionStore for JsonlSessionStore {
         &'a self,
         session_id: &'a SessionId,
     ) -> SessionFuture<'a, Result<SessionContextView, SessionError>> {
-        Box::pin(async move {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| SessionError::store_unavailable("jsonl store mutex poisoned"))?;
-            match self.touch(&mut sessions, session_id, false) {
-                Ok(Some(state)) => Ok(state.projection.context_view(session_id)),
-                Ok(None) => Ok(SessionProjection::empty().context_view(session_id)),
-                Err(error) => Err(SessionError::store_unavailable(error.to_string())),
-            }
-        })
+        let (reply, rx) = oneshot::channel();
+        self.await_store(
+            StoreCommand::ContextView {
+                session_id: session_id.clone(),
+                reply,
+            },
+            rx,
+        )
     }
 
     fn commit<'a>(
         &'a self,
         transaction: SessionTransaction,
     ) -> SessionFuture<'a, Result<SessionCommit, SessionError>> {
-        Box::pin(async move {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| SessionError::store_unavailable("jsonl store mutex poisoned"))?;
-            let state = self
-                .touch(&mut sessions, transaction.session_id(), true)
-                .map_err(|error| SessionError::store_unavailable(error.to_string()))?
-                .expect("commit always creates missing sessions");
-            if let Some(reason) = &state.poisoned {
-                return Err(SessionError::store_unavailable(format!(
-                    "session refused after write failure: {reason}"
-                )));
-            }
-            if transaction.expected_revision() != state.projection.revision() {
-                return Err(SessionError::RevisionConflict {
-                    expected: transaction.expected_revision(),
-                    actual: state.projection.revision(),
-                });
-            }
-            let applied = state.projection.apply(&transaction)?;
+        let (reply, rx) = oneshot::channel();
+        self.await_store(StoreCommand::Commit { transaction, reply }, rx)
+    }
 
-            let mut pending_artifacts: Vec<PendingArtifact> = Vec::new();
-            let record = TransactionRecord {
-                v: SCHEMA_VERSION,
-                revision: applied.projection().revision().get(),
-                entries: applied
-                    .entries()
-                    .iter()
-                    .map(|entry| encode_entry(entry, &mut pending_artifacts))
-                    .collect(),
-            };
-            // Barrier extension (ADR-0002): every artifact newly referenced
-            // by this transaction is durable before the log line appends, so
-            // a visible reference always points at a complete fsynced file.
-            // Content addressing makes re-submitting the same image a no-op.
-            if !pending_artifacts.is_empty() {
-                let artifacts_dir = self
-                    .session_dir(transaction.session_id())
-                    .join(ARTIFACTS_DIR);
-                for artifact in &pending_artifacts {
-                    if let Err(error) =
-                        store_artifact(&artifacts_dir, &artifact.hash, &artifact.bytes)
-                    {
-                        let reason = format!("artifact write or fsync failed ({:?})", error.kind());
-                        state.poisoned = Some(reason.clone());
-                        return Err(SessionError::store_unavailable(reason));
-                    }
+    fn list_sessions(&self) -> SessionFuture<'_, Result<Vec<SessionId>, SessionError>> {
+        let (reply, rx) = oneshot::channel();
+        match self.try_enqueue(StoreCommand::ListSessions {
+            reply: Reply::Async(reply),
+        }) {
+            Ok(()) => Box::pin(async move {
+                match rx.await {
+                    Ok(Ok(ids)) => Ok(ids),
+                    Ok(Err(error)) => Err(SessionError::store_unavailable(error.to_string())),
+                    Err(_) => Err(SessionError::store_unavailable("jsonl store actor stopped")),
                 }
-                if let Err(error) = fsync_dir(&artifacts_dir) {
-                    let reason = format!("artifact directory sync failed: {error}");
-                    state.poisoned = Some(reason.clone());
-                    return Err(SessionError::store_unavailable(reason));
-                }
-            }
-            let mut line = serde_json::to_vec(&record).map_err(|error| {
-                SessionError::store_unavailable(format!("envelope serialization failed: {error}"))
-            })?;
-            line.push(b'\n');
-            let written = state
-                .log
-                .write_all(&line)
-                .and_then(|()| state.log.sync_all());
-            if let Err(error) = written {
-                let reason = format!("append or fsync failed ({:?})", error.kind());
-                state.poisoned = Some(reason.clone());
-                return Err(SessionError::store_unavailable(reason));
-            }
+            }),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+}
 
-            let commit = applied.commit();
-            state.projection = applied.into_projection();
-            Ok(commit)
-        })
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use philo_session::{SessionError, SessionId, SessionStore};
+
+    use super::{JsonlSessionStore, STORE_COMMAND_CAP};
+
+    struct TempRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TempRoot {
+        fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "philo-session-jsonl-actor-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("create temp root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_command_queue_returns_store_busy() {
+        let root = TempRoot::new();
+        let store = JsonlSessionStore::open(&root.path).expect("open");
+        let (started, release, _done) = store.block_actor_for_test();
+        let _release = ReleaseOnDrop(Some(release.clone()));
+        started.await.expect("actor entered block");
+
+        let session_id = SessionId::new("busy");
+        let mut queued = Vec::with_capacity(STORE_COMMAND_CAP);
+        for _ in 0..STORE_COMMAND_CAP {
+            queued.push(SessionStore::context_view(&store, &session_id));
+        }
+        let error = SessionStore::context_view(&store, &session_id)
+            .await
+            .expect_err("queue full");
+        assert!(
+            matches!(error, SessionError::StoreBusy { .. }),
+            "expected StoreBusy, got {error:?}"
+        );
+
+        release.send(()).expect("release actor");
+        for future in queued {
+            future.await.expect("queued view completes");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_rejects_subsequent_requests() {
+        let root = TempRoot::new();
+        let store = JsonlSessionStore::open(&root.path).expect("open");
+        store.shutdown().expect("shutdown");
+        let error = SessionStore::context_view(&store, &SessionId::new("ghost"))
+            .await
+            .expect_err("shut down");
+        assert!(
+            matches!(error, SessionError::StoreUnavailable { .. }),
+            "expected StoreUnavailable, got {error:?}"
+        );
     }
 }

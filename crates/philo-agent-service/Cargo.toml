@@ -1,0 +1,15 @@
+[package]
+name = "philo-agent-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+philo-agent-runtime = { path = "../philo-agent-runtime" }
+philo-session = { path = "../philo-session" }
+philo-tools = { path = "../philo-tools" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+philo-session-jsonl = { path = "../philo-session-jsonl" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

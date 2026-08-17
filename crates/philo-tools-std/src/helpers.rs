@@ -1,7 +1,10 @@
-//! Shared error-construction helpers: every failure in this crate is a
-//! business error on the model channel, never a `ToolPortError`.
+//! Shared error-construction helpers.
+//!
+//! Tool business failures are always `ToolResult::Error` with a stable code.
+//! The only `ToolPortError` paths in this crate are blocking-pool saturation
+//! and a panicked `spawn_blocking` worker (see [`crate::BlockingPool`]).
 
-use philo_tools::{RichToolResult, ToolInvokeCx, ToolInvokeEnd};
+use philo_tools::{RichToolResult, ToolCancel, ToolInvokeCx, ToolInvokeEnd};
 
 use crate::args::FieldError;
 use crate::error_code;
@@ -9,7 +12,12 @@ use crate::path::PathError;
 
 /// Returns [`ToolInvokeEnd::Stopped`] when the invoke token is already requested.
 pub(crate) fn stopped_if_cancelled(cx: &ToolInvokeCx) -> Option<ToolInvokeEnd> {
-    if cx.cancel().is_requested() {
+    stopped_if_requested(cx.cancel())
+}
+
+/// Returns [`ToolInvokeEnd::Stopped`] when `cancel` has been requested.
+pub(crate) fn stopped_if_requested(cancel: &ToolCancel) -> Option<ToolInvokeEnd> {
+    if cancel.is_requested() {
         Some(ToolInvokeEnd::Stopped)
     } else {
         None

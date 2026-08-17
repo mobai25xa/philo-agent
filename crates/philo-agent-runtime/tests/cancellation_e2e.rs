@@ -7,38 +7,19 @@
 
 mod support;
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentRuntime, GenerationConfig, ModelAssistantBlock, ModelMessage, ModelToolResultOutcome,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    GenerationConfig, ModelAssistantBlock, ModelMessage, ModelToolResultOutcome, OperationOutcome,
+    RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, SessionStore, ToolResultOutcome};
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.as_mut().poll(&mut context)
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -76,19 +57,20 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds),
         tools,
     )
+    .await
 }
 
 /// Restarted-process ID source: keeps Operation/Turn IDs unique across
@@ -115,8 +97,8 @@ fn echo_definition() -> ToolDefinition {
 
 /// M6-001 on JSONL: a model-stream cancel discards the stream, persists the
 /// two terminal entries atomically, and the session stays usable on disk.
-#[test]
-fn stream_cancel_persists_terminal_facts_on_jsonl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cancel_persists_terminal_facts_on_jsonl() {
     let root = TempRoot::new();
     let session = SessionId::new("m6-001");
     {
@@ -127,27 +109,40 @@ fn stream_cancel_persists_terminal_facts_on_jsonl() {
             ModelScript::text_suspending(&[], &warmup_gate, &["done"]),
             ModelScript::text_suspending(&["par"], &victim_gate, &["tial"]),
         ]));
-        let agent = runtime(model, sessions, Arc::new(FakeTool::new([], [])), 1);
+        let agent = runtime(model, sessions, Arc::new(FakeTool::new([], [])), 1).await;
 
-        let warmup_handle =
-            block_on(agent.prompt(session.clone(), UserMessage::new("warmup"))).unwrap();
-        let mut warmup = Box::pin(async move { warmup_handle.wait().await });
-        assert!(poll_once(&mut warmup).is_pending());
-        let victim = block_on(agent.prompt(session.clone(), UserMessage::new("victim"))).unwrap();
+        let warmup_handle = agent
+            .prompt(session.clone(), UserMessage::new("warmup"))
+            .await;
+        warmup_handle.wait_until_busy().await;
+        let victim = agent
+            .prompt(session.clone(), UserMessage::new("victim"))
+            .await;
         warmup_gate.release();
         assert!(matches!(
-            block_on(&mut warmup),
+            warmup_handle.wait().await,
             OperationOutcome::Succeeded { .. }
         ));
 
-        let mut wait = Box::pin(victim.wait());
-        assert!(poll_once(&mut wait).is_pending(), "suspends mid-stream");
-        victim.cancel();
-        assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+        victim
+            .wait_until_phase(|phase| {
+                matches!(
+                    phase,
+                    philo_agent_runtime::OperationPhase::RunningModelCall(
+                        philo_agent_runtime::ModelCallPhase::Streaming
+                    )
+                )
+            })
+            .await;
+        victim.cancel().await;
+        assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
+        drop(warmup_handle);
+        drop(victim);
+        agent.stop().await;
         // Runtime, handles, and store drop here: the process "exits".
     }
 
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("re-open"));
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
     let report = reopened
         .recover_session(&philo_session::SessionId::new("m6-001"))
         .expect("recovery succeeds");
@@ -158,8 +153,10 @@ fn stream_cancel_persists_terminal_facts_on_jsonl() {
     );
     assert!(!report.tail_was_truncated());
 
-    let view =
-        block_on(reopened.context_view(&philo_session::SessionId::new("m6-001"))).expect("view");
+    let view = reopened
+        .context_view(&philo_session::SessionId::new("m6-001"))
+        .await
+        .expect("view");
     assert!(
         matches!(
             view.messages().last(),
@@ -171,7 +168,7 @@ fn stream_cancel_persists_terminal_facts_on_jsonl() {
 
     // The session continues normally after the cancelled turn (M6-008).
     let model = Arc::new(FakeModel::succeeds(&["next"]));
-    let restarted = AgentRuntime::with_tools(
+    let restarted = support::runtime::TestRuntime::with_tools(
         model,
         reopened,
         Arc::new(RestartIdSource {
@@ -179,10 +176,13 @@ fn stream_cancel_persists_terminal_facts_on_jsonl() {
         }),
         config(1),
         Arc::new(FakeTool::new([], [])),
-    );
-    let next = block_on(restarted.prompt(session, UserMessage::new("continue"))).unwrap();
+    )
+    .await;
+    let next = restarted
+        .prompt(session, UserMessage::new("continue"))
+        .await;
     assert!(matches!(
-        block_on(next.wait()),
+        next.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "next"
     ));
 }
@@ -191,8 +191,8 @@ fn stream_cancel_persists_terminal_facts_on_jsonl() {
 /// the Cancelled suffix atomically with the terminals; after a restart the
 /// next turn's model call replays the partial trajectory, cancelled mark
 /// included.
-#[test]
-fn mid_batch_cancel_survives_restart_and_replays() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_batch_cancel_survives_restart_and_replays() {
     let root = TempRoot::new();
     let session = SessionId::new("m6-002");
     {
@@ -207,25 +207,38 @@ fn mid_batch_cancel_survives_restart_and_replays() {
             [echo_definition()],
             [FakeToolResult::gated_success(&tool_gate, "one")],
         ));
-        let agent = runtime(model, sessions, tools.clone(), 1);
+        let agent = runtime(model, sessions, tools.clone(), 1).await;
 
-        let warmup_handle =
-            block_on(agent.prompt(session.clone(), UserMessage::new("warmup"))).unwrap();
-        let mut warmup = Box::pin(async move { warmup_handle.wait().await });
-        assert!(poll_once(&mut warmup).is_pending());
-        let victim = block_on(agent.prompt(session.clone(), UserMessage::new("victim"))).unwrap();
+        let warmup_handle = agent
+            .prompt(session.clone(), UserMessage::new("warmup"))
+            .await;
+        warmup_handle.wait_until_busy().await;
+        let victim = agent
+            .prompt(session.clone(), UserMessage::new("victim"))
+            .await;
         warmup_gate.release();
-        let _ = block_on(&mut warmup);
+        let _ = warmup_handle.wait().await;
 
-        let mut wait = Box::pin(victim.wait());
-        assert!(poll_once(&mut wait).is_pending(), "call-1 executing");
-        victim.cancel();
+        victim
+            .wait_until_phase(|phase| {
+                matches!(
+                    phase,
+                    philo_agent_runtime::OperationPhase::RunningToolBatch(
+                        philo_agent_runtime::RunningToolBatchPhase::Executing { .. }
+                    )
+                )
+            })
+            .await;
+        victim.cancel().await;
         tool_gate.release();
-        assert!(matches!(block_on(wait), OperationOutcome::Cancelled));
+        assert!(matches!(victim.wait().await, OperationOutcome::Cancelled));
         assert_eq!(tools.invocation_count(), 1, "call-2 never executed");
+        drop(warmup_handle);
+        drop(victim);
+        agent.stop().await;
     }
 
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("re-open"));
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
     let report = reopened
         .recover_session(&philo_session::SessionId::new("m6-002"))
         .expect("recovery succeeds");
@@ -236,8 +249,10 @@ fn mid_batch_cancel_survives_restart_and_replays() {
     );
 
     // Durable projection: real prefix, cancelled suffix.
-    let view =
-        block_on(reopened.context_view(&philo_session::SessionId::new("m6-002"))).expect("view");
+    let view = reopened
+        .context_view(&philo_session::SessionId::new("m6-002"))
+        .await
+        .expect("view");
     let outcomes: Vec<_> = view
         .messages()
         .iter()
@@ -261,7 +276,7 @@ fn mid_batch_cancel_survives_restart_and_replays() {
 
     // Restarted process: the next turn replays the partial tool trajectory.
     let model = Arc::new(FakeModel::succeeds(&["turn two"]));
-    let restarted = AgentRuntime::with_tools(
+    let restarted = support::runtime::TestRuntime::with_tools(
         model.clone(),
         reopened,
         Arc::new(RestartIdSource {
@@ -269,10 +284,13 @@ fn mid_batch_cancel_survives_restart_and_replays() {
         }),
         config(1),
         Arc::new(FakeTool::new([echo_definition()], [])),
-    );
-    let next = block_on(restarted.prompt(session, UserMessage::new("continue"))).unwrap();
+    )
+    .await;
+    let next = restarted
+        .prompt(session, UserMessage::new("continue"))
+        .await;
     assert!(matches!(
-        block_on(next.wait()),
+        next.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "turn two"
     ));
 
@@ -315,8 +333,8 @@ fn mid_batch_cancel_survives_restart_and_replays() {
 
 /// M6-003 + M6-005 on JSONL: a queued cancel leaves zero bytes behind, and a
 /// between-rounds cancel adds exactly one terminal-only transaction.
-#[test]
-fn queued_and_between_rounds_cancels_keep_the_log_minimal() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_and_between_rounds_cancels_keep_the_log_minimal() {
     let root = TempRoot::new();
     let session = SessionId::new("m6-003");
     {
@@ -327,27 +345,29 @@ fn queued_and_between_rounds_cancels_keep_the_log_minimal() {
             &warmup_gate,
             &["done"],
         )]));
-        let agent = runtime(model, sessions, Arc::new(FakeTool::new([], [])), 1);
+        let agent = runtime(model, sessions, Arc::new(FakeTool::new([], [])), 1).await;
 
-        let warmup_handle =
-            block_on(agent.prompt(session.clone(), UserMessage::new("warmup"))).unwrap();
-        let mut warmup = Box::pin(async move { warmup_handle.wait().await });
-        assert!(poll_once(&mut warmup).is_pending());
+        let warmup_handle = agent
+            .prompt(session.clone(), UserMessage::new("warmup"))
+            .await;
+        warmup_handle.wait_until_busy().await;
         // Cancelled while queued: never starts, never commits.
-        let queued = block_on(agent.prompt(session.clone(), UserMessage::new("queued"))).unwrap();
-        queued.cancel();
-        assert!(matches!(
-            block_on(queued.wait()),
-            OperationOutcome::Cancelled
-        ));
+        let queued = agent
+            .prompt(session.clone(), UserMessage::new("queued"))
+            .await;
+        queued.cancel().await;
+        assert!(matches!(queued.wait().await, OperationOutcome::Cancelled));
         warmup_gate.release();
         assert!(matches!(
-            block_on(&mut warmup),
+            warmup_handle.wait().await,
             OperationOutcome::Succeeded { .. }
         ));
+        drop(queued);
+        drop(warmup_handle);
+        agent.stop().await;
     }
 
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("re-open"));
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
     let report = reopened
         .recover_session(&philo_session::SessionId::new("m6-003"))
         .expect("recovery succeeds");

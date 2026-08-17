@@ -26,15 +26,17 @@ pub(super) async fn run<'a>(
     // The latest batch is already fully committed, so the cancellation
     // transaction is terminal-only.
     if cx.operation.is_cancel_requested() {
-        cx.operation.cancellation_observed();
+        cx.operation.cancellation_observed().await;
         cx.cancel(effect_id.clone(), Vec::new(), Vec::new()).await;
         return None;
     }
     cx.operation
         .set_phase(OperationPhase::RunningModelCall(ModelCallPhase::Starting));
-    cx.operation.push(AgentEvent::ModelCallStarted {
-        model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
-    });
+    cx.operation
+        .push(AgentEvent::ModelCallStarted {
+            model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
+        })
+        .await;
     let request = ModelCallSnapshot {
         session_id: turn.session_id.clone(),
         context_fingerprint: cx.current_leaf.as_str().to_owned(),
@@ -54,7 +56,7 @@ pub(super) async fn run<'a>(
         generation: turn.generation.clone(),
         max_parallel_tool_calls: turn.max_parallel_tool_calls,
     };
-    let started = cx.ctx.model.start(request).await;
+    let started = cx.ctx.model().start(request).await;
     let mut stream = match started {
         Ok(stream) => stream,
         Err(error) => {
@@ -81,7 +83,7 @@ pub(super) async fn run<'a>(
             // deltas stay transient facts.
             StreamStep::CancelObserved => {
                 drop(stream);
-                cx.operation.cancellation_observed();
+                cx.operation.cancellation_observed().await;
                 cx.cancel(effect_id.clone(), Vec::new(), Vec::new()).await;
                 return None;
             }
@@ -128,34 +130,40 @@ pub(super) async fn run<'a>(
                         return None;
                     }
                     response_started_seen = true;
-                    cx.operation.push(AgentEvent::ModelResponseStarted {
-                        model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
-                        response_model,
-                        response_id,
-                    });
+                    cx.operation
+                        .push(AgentEvent::ModelResponseStarted {
+                            model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
+                            response_model,
+                            response_id,
+                        })
+                        .await;
                 }
                 (false, ModelEvent::TextDelta(delta)) => {
                     cx.operation
                         .set_phase(OperationPhase::RunningModelCall(ModelCallPhase::Streaming));
                     assembler.text(&delta);
-                    cx.operation.push(AgentEvent::TextDelta { delta });
+                    cx.operation.push(AgentEvent::TextDelta { delta }).await;
                 }
                 // Transient observations: forwarded as-is, never part of
                 // the assembled output, never written to the Session.
                 (false, ModelEvent::ReasoningDelta { text }) => {
-                    cx.operation.push(AgentEvent::ReasoningDelta {
-                        model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
-                        text,
-                    });
+                    cx.operation
+                        .push(AgentEvent::ReasoningDelta {
+                            model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
+                            text,
+                        })
+                        .await;
                 }
                 (false, ModelEvent::UsageUpdated { usage }) => {
                     if let Some(input_tokens) = usage.input_tokens {
                         cx.ctx.record_input_tokens(&turn.session_id, input_tokens);
                     }
-                    cx.operation.push(AgentEvent::ModelUsageUpdated {
-                        model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
-                        usage,
-                    });
+                    cx.operation
+                        .push(AgentEvent::ModelUsageUpdated {
+                            model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
+                            usage,
+                        })
+                        .await;
                 }
                 (
                     false,

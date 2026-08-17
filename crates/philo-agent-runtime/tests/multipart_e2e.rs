@@ -4,31 +4,18 @@
 
 mod support;
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentRuntime, GenerationConfig, ModelMessage, OperationOutcome, RuntimeConfig,
-    SequentialIdSource, SessionId, ToolDefinition, UserMessage, UserPart,
+    GenerationConfig, ModelMessage, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
+    ToolDefinition, UserMessage, UserPart,
 };
 use philo_session::{ContextMessage, SessionStore, SessionUserPart};
 use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -66,19 +53,20 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds),
         tools,
     )
+    .await
 }
 
 /// Simulates the restarted process's unique-ID responsibility.
@@ -130,8 +118,8 @@ fn session_dir(root: &TempRoot, encoded: &str) -> PathBuf {
 /// M8-001 + M8-002 + M8-008(v=1): an image-bearing turn completes a tool loop
 /// on the JSONL backend; the artifact is durable and content-addressed, the
 /// log lines stay small references under envelope v2.
-#[test]
-fn image_turn_completes_a_tool_loop_on_jsonl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_turn_completes_a_tool_loop_on_jsonl() {
     let root = TempRoot::new();
     let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
     let model = Arc::new(FakeModel::new([
@@ -147,13 +135,12 @@ fn image_turn_completes_a_tool_loop_on_jsonl() {
         [FakeToolResult::success("ok")],
     ));
 
-    let handle = block_on(
-        runtime(model.clone(), sessions.clone(), tools, 1)
-            .prompt(SessionId::new("m8-001"), png_message()),
-    )
-    .unwrap();
+    let handle = runtime(model.clone(), sessions.clone(), tools, 1)
+        .await
+        .prompt(SessionId::new("m8-001"), png_message())
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "a cat"
     ));
 
@@ -186,28 +173,29 @@ fn image_turn_completes_a_tool_loop_on_jsonl() {
 
 /// M8-003: after a restart the image turn's context rebuilds byte-for-byte
 /// and the next turn's model call snapshot carries the image parts.
-#[test]
-fn restart_replays_image_context_into_the_next_snapshot() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_replays_image_context_into_the_next_snapshot() {
     let root = TempRoot::new();
     let session = SessionId::new("m8-003");
     {
         let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
         let model = Arc::new(FakeModel::succeeds(&["a cat"]));
-        let handle = block_on(
-            runtime(model, sessions, Arc::new(FakeTool::new([], [])), 0)
-                .prompt(session.clone(), png_message()),
-        )
-        .unwrap();
+        let agent = runtime(model, sessions, Arc::new(FakeTool::new([], [])), 0).await;
+        let handle = agent.prompt(session.clone(), png_message()).await;
         assert!(matches!(
-            block_on(handle.wait()),
+            handle.wait().await,
             OperationOutcome::Succeeded { .. }
         ));
+        drop(handle);
+        agent.stop().await;
         // The first "process" ends here; its store instance drops with it.
     }
 
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("re-open store"));
-    let view =
-        block_on(reopened.context_view(&philo_session::SessionId::new("m8-003"))).expect("view");
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
+    let view = reopened
+        .context_view(&philo_session::SessionId::new("m8-003"))
+        .await
+        .expect("view");
     assert_eq!(
         view.messages()[0],
         ContextMessage::User {
@@ -223,7 +211,7 @@ fn restart_replays_image_context_into_the_next_snapshot() {
     );
 
     let model = Arc::new(FakeModel::succeeds(&["still a cat"]));
-    let restarted = AgentRuntime::with_tools(
+    let restarted = support::runtime::TestRuntime::with_tools(
         model.clone(),
         reopened,
         Arc::new(RestartIdSource {
@@ -231,10 +219,13 @@ fn restart_replays_image_context_into_the_next_snapshot() {
         }),
         config(0),
         Arc::new(FakeTool::new([], [])),
-    );
-    let next = block_on(restarted.prompt(session, UserMessage::new("and now?"))).unwrap();
+    )
+    .await;
+    let next = restarted
+        .prompt(session, UserMessage::new("and now?"))
+        .await;
     assert!(matches!(
-        block_on(next.wait()),
+        next.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
@@ -257,22 +248,21 @@ fn restart_replays_image_context_into_the_next_snapshot() {
 
 /// M8-004 across modules: a missing referenced artifact surfaces through the
 /// runtime as a store failure on the next prompt — never silently skipped.
-#[test]
-fn missing_artifact_fails_the_next_prompt_as_store_unavailable() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_artifact_fails_the_next_prompt_as_store_unavailable() {
     let root = TempRoot::new();
     let session = SessionId::new("m8-004");
     {
         let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
         let model = Arc::new(FakeModel::succeeds(&["a cat"]));
-        let handle = block_on(
-            runtime(model, sessions, Arc::new(FakeTool::new([], [])), 0)
-                .prompt(session.clone(), png_message()),
-        )
-        .unwrap();
+        let agent = runtime(model, sessions, Arc::new(FakeTool::new([], [])), 0).await;
+        let handle = agent.prompt(session.clone(), png_message()).await;
         assert!(matches!(
-            block_on(handle.wait()),
+            handle.wait().await,
             OperationOutcome::Succeeded { .. }
         ));
+        drop(handle);
+        agent.stop().await;
     }
     // Crash-adjacent damage: the referenced artifact disappears.
     std::fs::remove_file(
@@ -282,9 +272,9 @@ fn missing_artifact_fails_the_next_prompt_as_store_unavailable() {
     )
     .expect("delete artifact");
 
-    let reopened = Arc::new(JsonlSessionStore::open(&root.path).expect("open store"));
+    let reopened = Arc::new(support::jsonl::reopen(&root.path).await);
     let model = Arc::new(FakeModel::succeeds(&["unused"]));
-    let restarted = AgentRuntime::with_tools(
+    let restarted = support::runtime::TestRuntime::with_tools(
         model.clone(),
         reopened,
         Arc::new(RestartIdSource {
@@ -292,9 +282,12 @@ fn missing_artifact_fails_the_next_prompt_as_store_unavailable() {
         }),
         config(0),
         Arc::new(FakeTool::new([], [])),
-    );
-    let handle = block_on(restarted.prompt(session, UserMessage::new("continue"))).unwrap();
-    let OperationOutcome::Failed { failure, .. } = block_on(handle.wait()) else {
+    )
+    .await;
+    let handle = restarted
+        .prompt(session, UserMessage::new("continue"))
+        .await;
+    let OperationOutcome::Failed { failure, .. } = handle.wait().await else {
         panic!("a corrupt session must fail the prompt");
     };
     assert_eq!(

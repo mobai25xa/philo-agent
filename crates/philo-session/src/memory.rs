@@ -66,4 +66,11 @@ impl SessionStore for MemorySessionStore {
             Ok(commit)
         })
     }
+
+    fn list_sessions(&self) -> SessionFuture<'_, Result<Vec<SessionId>, SessionError>> {
+        Box::pin(async move {
+            let sessions = self.sessions.lock().map_err(|_| unavailable())?;
+            Ok(sessions.keys().cloned().collect())
+        })
+    }
 }

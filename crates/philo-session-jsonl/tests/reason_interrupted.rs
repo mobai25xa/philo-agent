@@ -1,11 +1,8 @@
 //! JSONL-005: cancel-reason and `interrupted` serialization on schema v2,
 //! and the crash-remnant construction shape used by integration tests.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use philo_session::{
     CancelReason, MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock,
@@ -13,16 +10,6 @@ use philo_session::{
     SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -131,8 +118,8 @@ fn seal_transaction(revision: u64) -> SessionTransaction {
 
 // ---------------------------------------------------------------- golden 形态
 
-#[test]
-fn golden_seal_transaction_serializes_reason_and_interrupted_at_v2() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_seal_transaction_serializes_reason_and_interrupted_at_v2() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     for transaction in [
@@ -140,7 +127,7 @@ fn golden_seal_transaction_serializes_reason_and_interrupted_at_v2() {
         batch_transaction(1),
         seal_transaction(2),
     ] {
-        block_on(store.commit(transaction)).expect("commit");
+        store.commit(transaction).await.expect("commit");
     }
     drop(store);
 
@@ -157,8 +144,8 @@ fn golden_seal_transaction_serializes_reason_and_interrupted_at_v2() {
     );
 }
 
-#[test]
-fn golden_timeout_cancellation_serializes_its_reason() {
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_timeout_cancellation_serializes_its_reason() {
     let root = TempRoot::new();
     let store = JsonlSessionStore::open(&root.path).expect("open");
     let mut entries = vec![
@@ -171,7 +158,7 @@ fn golden_timeout_cancellation_serializes_its_reason() {
         batch_transaction(1),
         SessionTransaction::linear(session_id(), SessionRevision::new(2), entries),
     ] {
-        block_on(store.commit(transaction)).expect("commit");
+        store.commit(transaction).await.expect("commit");
     }
     drop(store);
 
@@ -183,8 +170,8 @@ fn golden_timeout_cancellation_serializes_its_reason() {
 
 // ---------------------------------------------------------------- v1 / missing reason
 
-#[test]
-fn schema_v1_cancelled_file_is_unsupported() {
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_v1_cancelled_file_is_unsupported() {
     let root = TempRoot::new();
     let dir = root.path.join("s-golden");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -207,8 +194,8 @@ fn schema_v1_cancelled_file_is_unsupported() {
     ));
 }
 
-#[test]
-fn cancelled_outcome_without_reason_is_corrupt() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_outcome_without_reason_is_corrupt() {
     let root = TempRoot::new();
     let dir = root.path.join("s-golden");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -235,8 +222,8 @@ fn cancelled_outcome_without_reason_is_corrupt() {
 
 // ---------------------------------------------------------------- 往返一致
 
-#[test]
-fn seal_roundtrips_across_a_restart_with_identical_projection() {
+#[tokio::test(flavor = "multi_thread")]
+async fn seal_roundtrips_across_a_restart_with_identical_projection() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
@@ -245,12 +232,12 @@ fn seal_roundtrips_across_a_restart_with_identical_projection() {
             batch_transaction(1),
             seal_transaction(2),
         ] {
-            block_on(store.commit(transaction)).expect("commit");
+            store.commit(transaction).await.expect("commit");
         }
     }
 
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
-    let disk_view = block_on(reopened.context_view(&session_id())).expect("view");
+    let disk_view = reopened.context_view(&session_id()).await.expect("view");
 
     let memory = MemorySessionStore::new();
     for transaction in [
@@ -258,9 +245,9 @@ fn seal_roundtrips_across_a_restart_with_identical_projection() {
         batch_transaction(1),
         seal_transaction(2),
     ] {
-        block_on(memory.commit(transaction)).expect("memory commit");
+        memory.commit(transaction).await.expect("memory commit");
     }
-    let memory_view = block_on(memory.context_view(&session_id())).expect("view");
+    let memory_view = memory.context_view(&session_id()).await.expect("view");
 
     assert_eq!(disk_view, memory_view, "replay equals in-memory projection");
     assert!(disk_view.open_turns().is_empty());
@@ -268,20 +255,20 @@ fn seal_roundtrips_across_a_restart_with_identical_projection() {
 
 // ---------------------------------------------------------------- 崩溃残留构造
 
-#[test]
-fn crash_remnant_log_reports_open_turns_after_reopen() {
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_remnant_log_reports_open_turns_after_reopen() {
     let root = TempRoot::new();
     // B_k durable, no results, no terminal facts: exactly what a crash
     // between Barrier B_k and C_k leaves behind. Built by committing the
     // first two transactions and never sealing.
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        block_on(store.commit(start_transaction(0))).expect("start");
-        block_on(store.commit(batch_transaction(1))).expect("batch");
+        store.commit(start_transaction(0)).await.expect("start");
+        store.commit(batch_transaction(1)).await.expect("batch");
     }
 
     let reopened = JsonlSessionStore::open(&root.path).expect("re-open");
-    let view = block_on(reopened.context_view(&session_id())).expect("view");
+    let view = reopened.context_view(&session_id()).await.expect("view");
     let open = view.open_turns();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].turn_id(), &TurnId::new("turn-1"));
@@ -294,7 +281,10 @@ fn crash_remnant_log_reports_open_turns_after_reopen() {
     );
 
     // The seal transaction the runtime would construct commits cleanly.
-    block_on(reopened.commit(seal_transaction(2))).expect("seal commits");
-    let sealed = block_on(reopened.context_view(&session_id())).expect("view");
+    reopened
+        .commit(seal_transaction(2))
+        .await
+        .expect("seal commits");
+    let sealed = reopened.context_view(&session_id()).await.expect("view");
     assert!(sealed.open_turns().is_empty());
 }

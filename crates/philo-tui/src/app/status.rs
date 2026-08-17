@@ -1,6 +1,6 @@
 //! Status bar projection: pure data to one summary line.
 
-use philo_agent_runtime::TokenUsage;
+use philo_agent_service::FrontendTokenUsage;
 
 use super::text;
 use super::transcript::InfoLevel;
@@ -16,12 +16,14 @@ pub struct StatusData {
     compaction_spinner: usize,
     /// Prompts accepted while another operation was active (M6 FIFO).
     pub queued: usize,
-    pub usage: Option<TokenUsage>,
+    pub usage: Option<FrontendTokenUsage>,
     /// Context-budget hint: the configured or capability-derived window.
     pub context_window: Option<u64>,
     pub level: InfoLevel,
     /// A parsed config change is waiting for Idle before Runtime apply.
     pub config_reload_pending: bool,
+    /// Input handle is waiting to rebuild. Shown once; not a transcript cell.
+    pub input_rebuilding: bool,
 }
 
 impl StatusData {
@@ -37,6 +39,7 @@ impl StatusData {
             context_window: None,
             level,
             config_reload_pending: false,
+            input_rebuilding: false,
         }
     }
 
@@ -106,6 +109,9 @@ impl StatusData {
         if self.config_reload_pending {
             fields.push((6, 0, "reload".to_owned()));
         }
+        if self.input_rebuilding {
+            fields.push((7, 0, "input".to_owned()));
+        }
 
         let mut admitted: Vec<(usize, String)> = Vec::new();
         fields.sort_by_key(|(_, priority, _)| *priority);
@@ -162,10 +168,10 @@ mod tests {
 
         status.busy = true;
         status.queued = 2;
-        status.usage = Some(TokenUsage {
+        status.usage = Some(FrontendTokenUsage {
             input_tokens: Some(1200),
             output_tokens: Some(340),
-            ..TokenUsage::default()
+            ..FrontendTokenUsage::default()
         });
         status.context_window = Some(128_000);
         status.level = InfoLevel::Verbose;
@@ -174,11 +180,11 @@ mod tests {
             "gpt-test  s-1  queued 2  1.2k/128.0k  verbose"
         );
 
-        status.usage = Some(TokenUsage {
+        status.usage = Some(FrontendTokenUsage {
             input_tokens: Some(1200),
             output_tokens: Some(340),
             cache_read_tokens: Some(900),
-            ..TokenUsage::default()
+            ..FrontendTokenUsage::default()
         });
         assert_eq!(
             status.line(),
@@ -203,5 +209,14 @@ mod tests {
         status.config_reload_pending = true;
         assert!(status.line().contains("reload"));
         assert!(status.line().contains("gpt-test"));
+    }
+
+    #[test]
+    fn input_rebuild_is_visible_once_on_the_status_line() {
+        let mut status = StatusData::new("gpt-test", "s-1", InfoLevel::Default);
+        status.input_rebuilding = true;
+        assert!(status.line().contains("input"));
+        status.input_rebuilding = false;
+        assert!(!status.line().contains("input"));
     }
 }

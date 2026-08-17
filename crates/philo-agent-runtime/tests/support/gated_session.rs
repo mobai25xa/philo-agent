@@ -100,4 +100,8 @@ impl SessionStore for GatedSessionStore {
             Ok(commit)
         })
     }
+
+    fn list_sessions(&self) -> SessionFuture<'_, Result<Vec<SessionId>, SessionError>> {
+        self.inner.list_sessions()
+    }
 }

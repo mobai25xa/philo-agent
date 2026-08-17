@@ -85,6 +85,7 @@ pub struct SessionContextView {
     pub(crate) current_leaf: Option<EntryId>,
     pub(crate) messages: Vec<ContextMessage>,
     pub(crate) open_turns: Vec<OpenTurnInfo>,
+    pub(crate) settled_turns: Vec<(OperationId, TurnId)>,
     pub(crate) settled_turn_boundaries: Vec<EntryId>,
     pub(crate) latest_compaction_boundary: Option<EntryId>,
 }
@@ -114,6 +115,12 @@ impl SessionContextView {
     /// Empty for sessions whose every turn terminated cleanly.
     pub fn open_turns(&self) -> &[OpenTurnInfo] {
         &self.open_turns
+    }
+
+    /// Returns `(operation_id, turn_id)` for operations with a durable
+    /// terminal outcome. Order is stable by operation id.
+    pub fn settled_turns(&self) -> &[(OperationId, TurnId)] {
+        &self.settled_turns
     }
 
     /// Returns every settled operation entry boundary in source order.

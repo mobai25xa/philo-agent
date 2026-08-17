@@ -1,13 +1,14 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 /// One-way latch used to suspend fake ports at deterministic points.
-///
-/// A gated future stays `Pending` until `release()`; the spin-polling test
-/// executor re-polls, so no waker plumbing is needed.
 #[derive(Clone, Debug, Default)]
-pub struct Gate(Arc<AtomicBool>);
+pub struct Gate {
+    released: Arc<AtomicBool>,
+    wakers: Arc<Mutex<Vec<Waker>>>,
+}
 
 impl Gate {
     pub fn new() -> Self {
@@ -15,15 +16,31 @@ impl Gate {
     }
 
     pub fn release(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.released.store(true, Ordering::SeqCst);
+        let wakers = self
+            .wakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
     pub fn is_released(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.released.load(Ordering::SeqCst)
     }
 
     pub async fn wait(&self) {
-        std::future::poll_fn(|_| {
+        std::future::poll_fn(|cx| {
+            if self.is_released() {
+                return Poll::Ready(());
+            }
+            self.wakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(cx.waker().clone());
             if self.is_released() {
                 Poll::Ready(())
             } else {

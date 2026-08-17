@@ -49,6 +49,7 @@ pub struct EffectiveSetting {
 }
 
 /// Everything one run needs.
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub deployment: Deployment,
     pub data_dir: PathBuf,
@@ -61,7 +62,7 @@ pub struct Settings {
     pub shell_timeout_secs: Option<u64>,
     pub verbosity: Verbosity,
     pub show_reasoning: bool,
-    /// Mapped screen for `TuiConfig`. `/config` shows the configured token
+    /// Mapped screen for `TuiLaunchConfig`. `/config` shows the configured token
     /// from `entries`, not this mapped value.
     pub screen: TuiScreen,
     pub entries: Vec<EffectiveSetting>,

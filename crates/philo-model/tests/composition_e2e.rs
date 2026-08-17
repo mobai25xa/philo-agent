@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, OperationHandle,
-    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
+    AgentEvent, AgentFailureKind, AgentRuntime, ChannelBounds, GenerationConfig, OperationOutcome,
+    OperationSpec, RuntimeConfig, RuntimeDeps, SequentialIdSource, SessionId, SettlementDurability,
     ToolRegistry, UserMessage,
 };
 use philo_session::{
@@ -20,7 +20,9 @@ use philo_session::{
     SessionTransaction, ToolResultOutcome, TurnOutcome,
 };
 use philo_tools_std::ReadTool;
-use support::{StubResponse, StubTransport, adapter_over, sse, text_sse};
+use support::{
+    StubResponse, StubTransport, adapter_over, drain_until_settled, generation, sse, text_sse,
+};
 
 struct TempRoot {
     path: PathBuf,
@@ -49,20 +51,18 @@ impl Drop for TempRoot {
     }
 }
 
-fn runtime(
+fn compose_generation(
     transport: StubTransport,
-    sessions: Arc<MemorySessionStore>,
     root: &TempRoot,
     max_tool_rounds: u32,
-) -> AgentRuntime {
+) -> Arc<philo_agent_runtime::RuntimeGeneration> {
     let registry = ToolRegistry::builder()
         .register(ReadTool::definition(), ReadTool::new(&root.path))
         .expect("register read tool")
         .build();
-    AgentRuntime::with_tools(
+    generation(
         Arc::new(adapter_over(transport)),
-        sessions,
-        Arc::new(SequentialIdSource::new()),
+        Arc::new(registry),
         RuntimeConfig {
             system_prompt: "You are the M4 integration assistant.".to_owned(),
             model_target: "stub-model".to_owned(),
@@ -78,7 +78,6 @@ fn runtime(
             tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
         },
-        Arc::new(registry),
     )
 }
 
@@ -98,14 +97,6 @@ fn tool_round_sse(response_id: &str, call_id: &str, path: &str) -> Vec<u8> {
     sse(&[&head, &start, &args_head, &args_tail, &finish, "[DONE]"])
 }
 
-async fn drain(handle: &mut OperationHandle) -> Vec<AgentEvent> {
-    let mut events = Vec::new();
-    while let Some(event) = handle.next_event().await {
-        events.push(event);
-    }
-    events
-}
-
 fn position(events: &[AgentEvent], matcher: impl Fn(&AgentEvent) -> bool, what: &str) -> usize {
     events
         .iter()
@@ -115,7 +106,7 @@ fn position(events: &[AgentEvent], matcher: impl Fn(&AgentEvent) -> bool, what: 
 
 /// M4-001 + M4-002: a real multi-round tool loop over the real adapter and
 /// registry persists 0.4-contract facts and publishes the passthrough events.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn multi_round_tool_loop_with_real_adapter_and_registry() {
     let root = TempRoot::new();
     root.file("hello.txt", "philo agent M4 content");
@@ -128,20 +119,31 @@ async fn multi_round_tool_loop_with_real_adapter_and_registry() {
         )),
     ]);
     let sessions = Arc::new(MemorySessionStore::new());
-    let runtime = runtime(transport.clone(), sessions.clone(), &root, 2);
+    let generation = compose_generation(transport.clone(), &root, 2);
+    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+        sessions: sessions.clone(),
+        ids: Arc::new(SequentialIdSource::new()),
+        bounds: ChannelBounds::default(),
+    })
+    .expect("start runtime");
 
-    let mut handle = runtime
-        .prompt(SessionId::new("m4-001"), UserMessage::new("read hello.txt"))
+    let accepted = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("m4-001"),
+            user_message: UserMessage::new("read hello.txt"),
+            generation,
+            service_request_id: None,
+        })
         .await
-        .expect("prompt accepted");
+        .expect("submit accepted");
+    let (events, outcome) = drain_until_settled(&mut sub, &accepted.operation_id).await;
     assert!(matches!(
-        handle.wait().await,
+        outcome,
         OperationOutcome::Succeeded { assistant }
             if assistant.content() == "The file says: philo"
     ));
 
     // Event order per the 0.4 contract plus the RUNTIME-004 passthrough.
-    let events = drain(&mut handle).await;
     let started = position(
         &events,
         |event| matches!(event, AgentEvent::OperationStarted { .. }),
@@ -261,18 +263,29 @@ async fn multi_round_tool_loop_with_real_adapter_and_registry() {
 
 /// M4-003: infrastructure failures normalize to ModelError and settle the
 /// operation through the existing confirmed failure path.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn transport_failure_settles_failed_with_durable_facts() {
     let root = TempRoot::new();
     let transport = StubTransport::new([StubResponse::ConnectError]);
     let sessions = Arc::new(MemorySessionStore::new());
-    let runtime = runtime(transport, sessions.clone(), &root, 2);
+    let generation = compose_generation(transport, &root, 2);
+    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+        sessions: sessions.clone(),
+        ids: Arc::new(SequentialIdSource::new()),
+        bounds: ChannelBounds::default(),
+    })
+    .expect("start runtime");
 
-    let mut handle = runtime
-        .prompt(SessionId::new("m4-003"), UserMessage::new("hello"))
+    let accepted = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("m4-003"),
+            user_message: UserMessage::new("hello"),
+            generation,
+            service_request_id: None,
+        })
         .await
-        .expect("prompt accepted");
-    let outcome = handle.wait().await;
+        .expect("submit accepted");
+    let (events, outcome) = drain_until_settled(&mut sub, &accepted.operation_id).await;
     let OperationOutcome::Failed {
         failure,
         durability,
@@ -288,7 +301,6 @@ async fn transport_failure_settles_failed_with_durable_facts() {
     );
     assert_eq!(durability, SettlementDurability::Confirmed);
 
-    let events = drain(&mut handle).await;
     assert!(
         events
             .iter()
@@ -306,7 +318,7 @@ async fn transport_failure_settles_failed_with_durable_facts() {
 
 /// M4-004: a turn whose durable history contains invalid raw arguments is
 /// replayed with the `{}` placeholder and the next call succeeds.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn history_with_invalid_raw_arguments_replays_degraded() {
     let root = TempRoot::new();
     let session_id = philo_session::SessionId::new("m4-004");
@@ -395,13 +407,25 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
 
     let transport =
         StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["fine"]))]);
-    let runtime = runtime(transport.clone(), sessions, &root, 2);
-    let handle = runtime
-        .prompt(SessionId::new("m4-004"), UserMessage::new("try again"))
+    let generation = compose_generation(transport.clone(), &root, 2);
+    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+        sessions,
+        ids: Arc::new(SequentialIdSource::new()),
+        bounds: ChannelBounds::default(),
+    })
+    .expect("start runtime");
+    let accepted = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("m4-004"),
+            user_message: UserMessage::new("try again"),
+            generation,
+            service_request_id: None,
+        })
         .await
-        .expect("prompt accepted");
+        .expect("submit accepted");
+    let (_events, outcome) = drain_until_settled(&mut sub, &accepted.operation_id).await;
     assert!(matches!(
-        handle.wait().await,
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "fine"
     ));
 
@@ -418,7 +442,7 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
 
 /// M4-005: `tools_allowed = false` maps to an empty tools list with
 /// `ToolChoice::None` (the wire omits both fields).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn zero_tool_rounds_requests_without_tools() {
     let root = TempRoot::new();
     root.file("hello.txt", "unused");
@@ -428,14 +452,26 @@ async fn zero_tool_rounds_requests_without_tools() {
         &["direct"],
     ))]);
     let sessions = Arc::new(MemorySessionStore::new());
-    let runtime = runtime(transport.clone(), sessions, &root, 0);
+    let generation = compose_generation(transport.clone(), &root, 0);
+    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+        sessions,
+        ids: Arc::new(SequentialIdSource::new()),
+        bounds: ChannelBounds::default(),
+    })
+    .expect("start runtime");
 
-    let handle = runtime
-        .prompt(SessionId::new("m4-005"), UserMessage::new("no tools"))
+    let accepted = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("m4-005"),
+            user_message: UserMessage::new("no tools"),
+            generation,
+            service_request_id: None,
+        })
         .await
-        .expect("prompt accepted");
+        .expect("submit accepted");
+    let (_events, outcome) = drain_until_settled(&mut sub, &accepted.operation_id).await;
     assert!(matches!(
-        handle.wait().await,
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "direct"
     ));
 
@@ -446,7 +482,7 @@ async fn zero_tool_rounds_requests_without_tools() {
 
 /// M4-006: read-tool business errors (missing file, escaping path) become
 /// durable `ToolResult::Error` facts and the loop continues to a final answer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn tool_business_errors_continue_the_loop() {
     let root = TempRoot::new();
     let transport = StubTransport::new([
@@ -455,14 +491,26 @@ async fn tool_business_errors_continue_the_loop() {
         StubResponse::Sse(text_sse("resp-3", "stub-gpt", &["both reads failed"])),
     ]);
     let sessions = Arc::new(MemorySessionStore::new());
-    let runtime = runtime(transport.clone(), sessions.clone(), &root, 2);
+    let generation = compose_generation(transport.clone(), &root, 2);
+    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+        sessions: sessions.clone(),
+        ids: Arc::new(SequentialIdSource::new()),
+        bounds: ChannelBounds::default(),
+    })
+    .expect("start runtime");
 
-    let handle = runtime
-        .prompt(SessionId::new("m4-006"), UserMessage::new("read stuff"))
+    let accepted = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("m4-006"),
+            user_message: UserMessage::new("read stuff"),
+            generation,
+            service_request_id: None,
+        })
         .await
-        .expect("prompt accepted");
+        .expect("submit accepted");
+    let (_events, outcome) = drain_until_settled(&mut sub, &accepted.operation_id).await;
     assert!(matches!(
-        handle.wait().await,
+        outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "both reads failed"
     ));
 

@@ -1813,6 +1813,18 @@ dependencies = [
  "philo-session",
  "philo-session-jsonl",
  "philo-tools",
+ "tokio",
+]
+
+[[package]]
+name = "philo-agent-service"
+version = "0.1.0"
+dependencies = [
+ "philo-agent-runtime",
+ "philo-session",
+ "philo-session-jsonl",
+ "philo-tools",
+ "tokio",
 ]
 
 [[package]]
@@ -1822,10 +1834,12 @@ dependencies = [
  "clap",
  "dirs",
  "philo-agent-runtime",
+ "philo-agent-service",
  "philo-coding-profile",
  "philo-model",
  "philo-session",
  "philo-session-jsonl",
+ "philo-tools-std",
  "philo-tui",
  "tokio",
  "toml",
@@ -1873,6 +1887,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -1898,8 +1913,7 @@ dependencies = [
  "futures-core",
  "insta",
  "philo-agent-runtime",
- "philo-session",
- "philo-tools",
+ "philo-agent-service",
  "png",
  "pulldown-cmark",
  "ratatui",

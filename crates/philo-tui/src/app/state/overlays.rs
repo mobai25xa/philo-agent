@@ -1,28 +1,23 @@
 //! Overlay key handling: approval answers and session-picker navigation.
 
-use philo_session::SessionId;
+use philo_agent_service::ConfirmationDecision;
 
 use super::App;
 use super::line;
-use crate::api::confirmation::{ConfirmationId, ConfirmationRequest, ConfirmationResponse};
 use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::overlay::{ConfirmPrompt, Preview, SessionPicker};
 use crate::app::transcript::LineKind;
 
 impl App {
-    /// Keeps the approval overlay in step with the channel: the front
-    /// request opens it, and a vanished one (answered, or auto-denied when
-    /// the operation settled) closes it.
-    pub fn sync_confirmation(
-        &mut self,
-        front: Option<(ConfirmationId, ConfirmationRequest)>,
-    ) -> bool {
+    /// Keeps the approval overlay in step with the front pending
+    /// confirmation. A vanished id (answered or auto-denied) closes it.
+    pub fn sync_confirmation(&mut self, front: Option<(u64, String, String)>) -> bool {
         let previous = self.confirm.as_ref().map(|prompt| prompt.id);
         match front {
-            Some((id, request)) => {
+            Some((id, title, body)) => {
                 if self.confirm.as_ref().is_none_or(|prompt| prompt.id != id) {
-                    self.confirm = Some(ConfirmPrompt::new(id, request));
+                    self.confirm = Some(ConfirmPrompt::new(id, title, body));
                 }
             }
             None => self.confirm = None,
@@ -30,15 +25,15 @@ impl App {
         previous != self.confirm.as_ref().map(|prompt| prompt.id)
     }
 
-    pub(crate) fn open_picker(&mut self, sessions: Vec<SessionId>) {
+    pub(crate) fn open_picker(&mut self, sessions: Vec<String>) {
         self.picker = Some(SessionPicker::new(sessions));
     }
 
-    pub(crate) fn claim_preview(&mut self) -> Option<SessionId> {
+    pub(crate) fn claim_preview(&mut self) -> Option<String> {
         self.picker.as_mut()?.claim_preview()
     }
 
-    pub(crate) fn set_preview(&mut self, session_id: &SessionId, preview: Preview) {
+    pub(crate) fn set_preview(&mut self, session_id: &str, preview: Preview) {
         if let Some(picker) = self.picker.as_mut() {
             picker.set_preview(session_id, preview);
         }
@@ -59,17 +54,17 @@ impl App {
     pub(super) fn on_confirm_action(&mut self, action: Action) -> Vec<Effect> {
         let prompt = self.confirm.as_ref().expect("approval overlay is open");
         let (id, title) = (prompt.id, prompt.title().to_owned());
-        let (response, verb) = match action {
-            Action::InsertChar('y' | 'Y') => (ConfirmationResponse::Allow, "allowed"),
+        let (decision, verb) = match action {
+            Action::InsertChar('y' | 'Y') => (ConfirmationDecision::Allow, "allowed"),
             Action::InsertChar('n' | 'N') | Action::Escape | Action::CtrlC => {
-                (ConfirmationResponse::Deny, "denied")
+                (ConfirmationDecision::Deny, "denied")
             }
             _ => return vec![],
         };
         self.confirm = None;
         vec![
             Effect::Append(vec![line(LineKind::Meta, format!("{verb}: {title}"))]),
-            Effect::Host(HostRequest::Respond(id, response)),
+            Effect::Host(HostRequest::Respond(id, decision)),
         ]
     }
 
@@ -98,8 +93,9 @@ impl App {
                          sessions",
                     )])];
                 }
-                let selected = picker.selected().clone();
+                let selected = picker.selected().to_owned();
                 self.picker = None;
+                self.session_load_intent = Some(SessionLoadIntent::Switch);
                 vec![Effect::Host(HostRequest::SwitchSession(selected))]
             }
             Action::Escape | Action::CtrlC => {
@@ -109,4 +105,12 @@ impl App {
             _ => vec![],
         }
     }
+}
+
+/// How the next `SessionLoaded` should be presented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionLoadIntent {
+    New,
+    Switch,
+    Snapshot,
 }

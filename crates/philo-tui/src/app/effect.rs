@@ -1,33 +1,30 @@
 //! Side-effect requests emitted by the pure app state machine.
 
-use philo_agent_runtime::ReasoningEffort;
-use philo_session::SessionId;
-
-use crate::api::confirmation::{ConfirmationId, ConfirmationResponse};
+use philo_agent_service::{ConfirmationDecision, FrontendReasoningEffort};
 
 use super::attachment::PendingAttachment;
 use super::transcript::TranscriptLine;
 
-/// One host-backed operation requested by a command or overlay.
+/// One service-backed operation requested by a command or overlay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostRequest {
     NewSession,
     OpenSessions,
-    LoadPreview(SessionId),
-    SwitchSession(SessionId),
+    LoadPreview(String),
+    SwitchSession(String),
     RebuildModel(String),
-    SetReasoning(ReasoningEffort),
+    SetReasoning(FrontendReasoningEffort),
     ShowConfig,
     ShowStatus,
-    Respond(ConfirmationId, ConfirmationResponse),
+    Respond(u64, ConfirmationDecision),
 }
 
 /// A side effect the driver must perform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Effect {
     Append(Vec<TranscriptLine>),
-    /// Send this message; the driver resolves the attachments into image
-    /// parts first and refuses the send when one cannot be read.
+    /// Send this message; the driver resolves path attachments into bytes
+    /// first and refuses the send when one cannot be read.
     Submit {
         text: String,
         attachments: Vec<PendingAttachment>,
@@ -37,11 +34,17 @@ pub(crate) enum Effect {
     /// Copy the TUI selection to the system clipboard.
     WriteClipboard(String),
     CancelActive,
-    /// Start a cancellable manual compaction in the driver's select loop.
+    /// Busy `Ctrl+C`: counts toward the supervisor two-strike force-exit.
+    /// Escape uses [`Effect::CancelActive`] and does not count.
+    InterruptCancel,
+    /// Ask the service to start manual compaction.
     StartCompaction,
-    /// Drop the active manual compaction future.
+    /// Ask the service to cancel the active maintenance task.
     CancelCompaction,
+    /// Idle user exit. Supervisor detaches after `TuiOutcome::UserExit`.
     Quit,
+    /// Busy `/quit` confirmation: `ShutdownRequested`.
+    RequestShutdown,
     /// Explicit terminal recovery (`Ctrl+L`), not ordinary invalidation.
     HardRedraw,
     Host(HostRequest),

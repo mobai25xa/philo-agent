@@ -4,18 +4,15 @@
 
 mod support;
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentRuntime, GenerationConfig, ModelMessage, ModelToolResultOutcome,
-    OperationHandle, OperationOutcome, OperationPhase, RunningToolBatchPhase, RuntimeConfig,
-    SequentialIdSource, SessionId, ToolDefinition, UserMessage,
+    AgentEvent, GenerationConfig, ModelMessage, ModelToolResultOutcome, OperationOutcome,
+    OperationPhase, RunningToolBatchPhase, RuntimeConfig, SequentialIdSource, SessionId,
+    ToolDefinition, UserMessage,
 };
 use philo_session::{
     SessionAssistantBlock, SessionEntryKind, SessionRevision, SessionStore, SessionToolCall,
@@ -25,22 +22,6 @@ use philo_session_jsonl::JsonlSessionStore;
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-fn poll_once<F: Future + ?Sized>(future: &mut Pin<Box<F>>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.as_mut().poll(&mut context)
-}
 
 struct TempRoot {
     path: PathBuf,
@@ -78,20 +59,21 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
     operation_timeout: Option<Duration>,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds, operation_timeout),
         tools,
     )
+    .await
 }
 
 fn sid() -> SessionId {
@@ -110,9 +92,9 @@ fn read_log(root: &TempRoot) -> String {
     std::fs::read_to_string(log_path(root)).expect("read session log")
 }
 
-fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
@@ -120,47 +102,51 @@ fn collect_events(mut handle: OperationHandle) -> Vec<AgentEvent> {
 
 /// Persists the crash window between B_k and C_k: start facts and a
 /// two-call batch, no results, no terminal facts.
-fn persist_crash_remnant(store: &JsonlSessionStore) {
-    block_on(store.commit(SessionTransaction::linear(
-        stored_sid(),
-        SessionRevision::new(0),
-        vec![
-            SessionEntryKind::OperationStarted {
-                operation_id: philo_session::OperationId::new("stale-op"),
-            },
-            SessionEntryKind::TurnStarted {
-                operation_id: philo_session::OperationId::new("stale-op"),
-                turn_id: philo_session::TurnId::new("stale-turn"),
-            },
-            SessionEntryKind::UserMessage {
-                turn_id: philo_session::TurnId::new("stale-turn"),
-                parts: SessionUserPart::text_parts("edit files"),
-            },
-        ],
-    )))
-    .expect("remnant start commits");
-    block_on(store.commit(SessionTransaction::linear(
-        stored_sid(),
-        SessionRevision::new(1),
-        vec![SessionEntryKind::AssistantToolCallBatch {
-            turn_id: philo_session::TurnId::new("stale-turn"),
-            model_call_id: "stale-model-call".to_owned(),
-            tool_batch_id: philo_session::ToolBatchId::new("stale-batch"),
-            blocks: vec![
-                SessionAssistantBlock::ToolCall(SessionToolCall::new(
-                    philo_session::ToolCallId::new("stale-call-1"),
-                    "write",
-                    r#"{"path":"a.txt"}"#,
-                )),
-                SessionAssistantBlock::ToolCall(SessionToolCall::new(
-                    philo_session::ToolCallId::new("stale-call-2"),
-                    "shell",
-                    r#"{"command":"cargo test"}"#,
-                )),
+async fn persist_crash_remnant(store: &JsonlSessionStore) {
+    store
+        .commit(SessionTransaction::linear(
+            stored_sid(),
+            SessionRevision::new(0),
+            vec![
+                SessionEntryKind::OperationStarted {
+                    operation_id: philo_session::OperationId::new("stale-op"),
+                },
+                SessionEntryKind::TurnStarted {
+                    operation_id: philo_session::OperationId::new("stale-op"),
+                    turn_id: philo_session::TurnId::new("stale-turn"),
+                },
+                SessionEntryKind::UserMessage {
+                    turn_id: philo_session::TurnId::new("stale-turn"),
+                    parts: SessionUserPart::text_parts("edit files"),
+                },
             ],
-        }],
-    )))
-    .expect("remnant batch commits");
+        ))
+        .await
+        .expect("remnant start commits");
+    store
+        .commit(SessionTransaction::linear(
+            stored_sid(),
+            SessionRevision::new(1),
+            vec![SessionEntryKind::AssistantToolCallBatch {
+                turn_id: philo_session::TurnId::new("stale-turn"),
+                model_call_id: "stale-model-call".to_owned(),
+                tool_batch_id: philo_session::ToolBatchId::new("stale-batch"),
+                blocks: vec![
+                    SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                        philo_session::ToolCallId::new("stale-call-1"),
+                        "write",
+                        r#"{"path":"a.txt"}"#,
+                    )),
+                    SessionAssistantBlock::ToolCall(SessionToolCall::new(
+                        philo_session::ToolCallId::new("stale-call-2"),
+                        "shell",
+                        r#"{"command":"cargo test"}"#,
+                    )),
+                ],
+            }],
+        ))
+        .await
+        .expect("remnant batch commits");
 }
 
 fn echo() -> ToolDefinition {
@@ -169,12 +155,12 @@ fn echo() -> ToolDefinition {
 
 // ------------------------------------------------- M11-001 崩溃残留端到端
 
-#[test]
-fn crash_remnant_seals_on_disk_and_the_session_continues() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_remnant_seals_on_disk_and_the_session_continues() {
     let root = TempRoot::new();
     {
         let store = JsonlSessionStore::open(&root.path).expect("open");
-        persist_crash_remnant(&store);
+        persist_crash_remnant(&store).await;
         // The "crash": the store drops with the batch unresolved.
     }
 
@@ -186,13 +172,14 @@ fn crash_remnant_seals_on_disk_and_the_session_continues() {
         Arc::new(FakeTool::new([], [])),
         0,
         None,
-    );
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    )
+    .await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "continuing"
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         events
             .iter()
@@ -233,35 +220,37 @@ fn crash_remnant_seals_on_disk_and_the_session_continues() {
 
 // ------------------------------------------------- M11-004 占位零改动
 
-#[test]
-fn placeholders_add_nothing_to_the_durable_log() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placeholders_add_nothing_to_the_durable_log() {
     let root = TempRoot::new();
     let store = Arc::new(JsonlSessionStore::open(&root.path).expect("open"));
-    persist_crash_remnant(store.as_ref());
+    persist_crash_remnant(store.as_ref()).await;
     // Terminate the stale turn the failure way: the batch stays dangling
     // but the turn is closed, so sealing never touches it.
-    block_on(store.commit(SessionTransaction::linear(
-        stored_sid(),
-        SessionRevision::new(2),
-        vec![
-            SessionEntryKind::TurnFailure {
-                turn_id: philo_session::TurnId::new("stale-turn"),
-                failure: philo_session::TurnFailure::new(
-                    philo_session::TurnFailureKind::ModelCall,
-                    "provider offline",
-                ),
-            },
-            SessionEntryKind::TurnTerminated {
-                turn_id: philo_session::TurnId::new("stale-turn"),
-                outcome: philo_session::TurnOutcome::Failed,
-            },
-            SessionEntryKind::OperationSettled {
-                operation_id: philo_session::OperationId::new("stale-op"),
-                outcome: philo_session::OperationOutcome::Failed,
-            },
-        ],
-    )))
-    .expect("failure transaction commits");
+    store
+        .commit(SessionTransaction::linear(
+            stored_sid(),
+            SessionRevision::new(2),
+            vec![
+                SessionEntryKind::TurnFailure {
+                    turn_id: philo_session::TurnId::new("stale-turn"),
+                    failure: philo_session::TurnFailure::new(
+                        philo_session::TurnFailureKind::ModelCall,
+                        "provider offline",
+                    ),
+                },
+                SessionEntryKind::TurnTerminated {
+                    turn_id: philo_session::TurnId::new("stale-turn"),
+                    outcome: philo_session::TurnOutcome::Failed,
+                },
+                SessionEntryKind::OperationSettled {
+                    operation_id: philo_session::OperationId::new("stale-op"),
+                    outcome: philo_session::OperationOutcome::Failed,
+                },
+            ],
+        ))
+        .await
+        .expect("failure transaction commits");
     let log_before = read_log(&root);
 
     let model = Arc::new(FakeModel::succeeds(&["ok"]));
@@ -271,13 +260,14 @@ fn placeholders_add_nothing_to_the_durable_log() {
         Arc::new(FakeTool::new([], [])),
         0,
         None,
-    );
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    )
+    .await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         !events
             .iter()
@@ -321,8 +311,8 @@ fn placeholders_add_nothing_to_the_durable_log() {
 
 // ------------------------------------------------- M11-005 超时 reason 落盘
 
-#[test]
-fn timeout_cancellation_lands_on_disk_with_its_reason() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_cancellation_lands_on_disk_with_its_reason() {
     let root = TempRoot::new();
     let store = Arc::new(JsonlSessionStore::open(&root.path).expect("open"));
     let gate = Gate::new();
@@ -339,25 +329,23 @@ fn timeout_cancellation_lands_on_disk_with_its_reason() {
     ));
     // Leave enough headroom for the JSONL tests running in parallel to reach
     // the gated tool before the timeout window starts testing cancellation.
-    let agent = runtime(model, store, tools, 2, Some(Duration::from_millis(250)));
+    let agent = runtime(model, store, tools, 2, Some(Duration::from_millis(250))).await;
 
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("go"))).unwrap();
-    let mut wait = Box::pin(handle.wait());
-    loop {
-        assert!(poll_once(&mut wait).is_pending());
-        if handle.phase()
-            == OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
-                in_flight: 1,
-                completed: 0,
-            })
-        {
-            break;
-        }
-    }
-    std::thread::sleep(Duration::from_millis(300));
+    let handle = agent.prompt(sid(), UserMessage::new("go")).await;
+    handle
+        .wait_until_phase(|phase| {
+            matches!(
+                phase,
+                OperationPhase::RunningToolBatch(RunningToolBatchPhase::Executing {
+                    in_flight: 1,
+                    completed: 0,
+                })
+            )
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     gate.release();
-    assert!(matches!(block_on(&mut wait), OperationOutcome::Cancelled));
-    drop(wait);
+    assert!(matches!(handle.wait().await, OperationOutcome::Cancelled));
     drop(handle);
 
     let log = read_log(&root);
@@ -369,8 +357,8 @@ fn timeout_cancellation_lands_on_disk_with_its_reason() {
 
 // ------------------------------------------------- M11-006 legacy 延续
 
-#[test]
-fn legacy_cancelled_session_continues_after_upgrade() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_cancelled_session_continues_after_upgrade() {
     let root = TempRoot::new();
     // A previously cancelled session on schema v2 (jsonl no longer opens v1).
     let dir = root.path.join("s-s");
@@ -388,13 +376,13 @@ fn legacy_cancelled_session_continues_after_upgrade() {
 
     let store = Arc::new(JsonlSessionStore::open(&root.path).expect("open"));
     let model = Arc::new(FakeModel::succeeds(&["hello again"]));
-    let agent = runtime(model, store, Arc::new(FakeTool::new([], [])), 0, None);
-    let handle = block_on(agent.prompt(sid(), UserMessage::new("continue"))).unwrap();
+    let agent = runtime(model, store, Arc::new(FakeTool::new([], [])), 0, None).await;
+    let handle = agent.prompt(sid(), UserMessage::new("continue")).await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "hello again"
     ));
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     assert!(
         !events
             .iter()

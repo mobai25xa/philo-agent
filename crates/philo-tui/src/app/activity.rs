@@ -1,6 +1,6 @@
 //! Ephemeral projection of the operation currently occupying the agent.
 
-use philo_agent_runtime::{AgentEvent, CancelReason};
+use philo_agent_service::FrontendOperationEvent;
 
 use super::text;
 use super::transcript::compact_args;
@@ -29,7 +29,7 @@ enum ActivityKind {
         total: usize,
     },
     Compacting,
-    Cancelling(CancelReason),
+    Cancelling(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,7 +171,7 @@ impl ActivityState {
             }
             ActivityKind::Compacting => ("compact".to_owned(), ActivityTone::Normal),
             ActivityKind::Cancelling(reason) => (
-                format!("cancel  {}", reason_text(*reason)),
+                format!("cancel  {}", reason_text(reason)),
                 ActivityTone::Warning,
             ),
         };
@@ -182,24 +182,24 @@ impl ActivityState {
         })
     }
 
-    pub(crate) fn on_event(&mut self, event: &AgentEvent) {
+    pub(crate) fn on_event(&mut self, event: &FrontendOperationEvent) {
         match event {
-            AgentEvent::OperationQueued { .. } => {
+            FrontendOperationEvent::OperationQueued { .. } => {
                 self.set(ActivityKind::Waiting("wait"));
             }
-            AgentEvent::OperationStarted { .. }
-            | AgentEvent::TurnStarted { .. }
-            | AgentEvent::ModelCallStarted { .. } => self.wait_for_model(),
-            AgentEvent::ModelResponseStarted { .. } => {
+            FrontendOperationEvent::OperationStarted { .. }
+            | FrontendOperationEvent::TurnStarted { .. }
+            | FrontendOperationEvent::ModelCallStarted { .. } => self.wait_for_model(),
+            FrontendOperationEvent::ModelResponseStarted { .. } => {
                 self.set(ActivityKind::Waiting("wait"));
             }
-            AgentEvent::ReasoningDelta { .. } => self.set(ActivityKind::Reasoning),
-            AgentEvent::TextDelta { .. } => self.set(ActivityKind::Responding),
-            AgentEvent::ToolBatchRequested { call_count, .. } => {
+            FrontendOperationEvent::ReasoningDelta { .. } => self.set(ActivityKind::Reasoning),
+            FrontendOperationEvent::TextDelta { .. } => self.set(ActivityKind::Responding),
+            FrontendOperationEvent::ToolBatchRequested { call_count, .. } => {
                 self.tool_batch_size = *call_count;
                 self.set(ActivityKind::Waiting("wait"));
             }
-            AgentEvent::ToolExecutionStarted {
+            FrontendOperationEvent::ToolExecutionStarted {
                 tool_name,
                 arguments,
                 index,
@@ -226,7 +226,7 @@ impl ActivityState {
                     total: self.tool_batch_size,
                 });
             }
-            AgentEvent::ToolExecutionProgress { index, tail, .. } => {
+            FrontendOperationEvent::ToolExecutionProgress { index, tail, .. } => {
                 if matches!(self.current, Some(ActivityKind::Cancelling(_))) {
                     return;
                 }
@@ -236,7 +236,7 @@ impl ActivityState {
                     }
                 }
             }
-            AgentEvent::ToolExecutionCompleted { index, .. } => {
+            FrontendOperationEvent::ToolExecutionCompleted { index, .. } => {
                 let next = match &self.current {
                     Some(ActivityKind::Tool { running, total }) => {
                         let running: Vec<_> = running
@@ -259,21 +259,22 @@ impl ActivityState {
                     self.replace(next);
                 }
             }
-            AgentEvent::ContextCompactionCompleted { .. }
-            | AgentEvent::ContextCompactionFailed { .. } => {
+            FrontendOperationEvent::ContextCompactionCompleted { .. }
+            | FrontendOperationEvent::ContextCompactionFailed { .. } => {
                 if matches!(self.current, Some(ActivityKind::Compacting)) {
                     self.replace(ActivityKind::Waiting("wait"));
                 }
             }
-            AgentEvent::ContextCompactionStarted => self.set(ActivityKind::Compacting),
-            AgentEvent::CancellationRequested { reason, .. }
-            | AgentEvent::TurnCancelled { reason, .. } => {
-                self.replace(ActivityKind::Cancelling(*reason));
+            FrontendOperationEvent::ContextCompactionStarted => self.set(ActivityKind::Compacting),
+            FrontendOperationEvent::CancellationRequested { reason, .. }
+            | FrontendOperationEvent::TurnCancelled { reason, .. } => {
+                self.replace(ActivityKind::Cancelling(reason.clone()));
             }
-            AgentEvent::AssistantMessageCompleted { .. } => {
+            FrontendOperationEvent::AssistantMessageCompleted { .. } => {
                 self.set(ActivityKind::Waiting("wait"));
             }
-            AgentEvent::TurnFailed { .. } | AgentEvent::OperationSettled { .. } => self.clear(),
+            FrontendOperationEvent::TurnFailed { .. }
+            | FrontendOperationEvent::OperationSettled { .. } => self.clear(),
             _ => {}
         }
     }
@@ -343,33 +344,44 @@ fn strip_controls(input: &str) -> String {
         .collect()
 }
 
-fn reason_text(reason: CancelReason) -> &'static str {
+fn reason_text(reason: &str) -> String {
     match reason {
-        CancelReason::User => "user",
-        CancelReason::Timeout => "timeout",
-        CancelReason::Abandoned => "abandoned",
+        "User" | "user" => "user".to_owned(),
+        "Timeout" | "timeout" => "timeout".to_owned(),
+        "Abandoned" | "abandoned" => "abandoned".to_owned(),
+        other => other.to_ascii_lowercase(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use philo_agent_runtime::{
-        OperationId, OperationStatus, SettlementDurability, ToolBatchId, ToolCallId,
-    };
-    use philo_tools::ToolResult;
+    use philo_agent_service::{FrontendOperationEvent, FrontendToolResult};
 
     use super::*;
+
+    fn completed(index: usize, name: &str, content: &str) -> FrontendOperationEvent {
+        FrontendOperationEvent::ToolExecutionCompleted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: format!("call-{index}"),
+            index,
+            tool_name: name.to_owned(),
+            result: FrontendToolResult::Success {
+                content: content.to_owned(),
+            },
+            display: None,
+        }
+    }
 
     #[test]
     fn tool_activity_is_ephemeral_and_terminal_events_clean_it_up() {
         let mut state = ActivityState::default();
-        state.on_event(&AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch"),
+        state.on_event(&FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch".to_owned(),
             call_count: 2,
         });
-        state.on_event(&AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
+        state.on_event(&FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call".to_owned(),
             index: 0,
             tool_name: "read_file".to_owned(),
             arguments: "{\"path\":\"src/很长的文件.rs\"}".to_owned(),
@@ -379,20 +391,13 @@ mod tests {
         assert!(text::width(&view.text) <= 36);
         assert_eq!(state.detail_rows(40, 2, 5), ["path: src/很长的文件.rs"]);
 
-        state.on_event(&AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
-            index: 0,
-            tool_name: "read_file".to_owned(),
-            result: ToolResult::success("ok"),
-            display: None,
-        });
+        state.on_event(&completed(0, "read_file", "ok"));
         assert!(state.view(80).expect("waiting").text.contains("wait"));
 
-        state.on_event(&AgentEvent::OperationSettled {
-            operation_id: OperationId::new("op"),
-            status: OperationStatus::Succeeded,
-            durability: SettlementDurability::Confirmed,
+        state.on_event(&FrontendOperationEvent::OperationSettled {
+            operation_id: "op".to_owned(),
+            status: "Succeeded".to_owned(),
+            durability: "Confirmed".to_owned(),
         });
         assert!(!state.is_active());
     }
@@ -400,20 +405,20 @@ mod tests {
     #[test]
     fn concurrent_tool_starts_stay_visible_together() {
         let mut state = ActivityState::default();
-        state.on_event(&AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch"),
+        state.on_event(&FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch".to_owned(),
             call_count: 3,
         });
-        state.on_event(&AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call-1"),
+        state.on_event(&FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call-1".to_owned(),
             index: 0,
             tool_name: "read_file".to_owned(),
             arguments: "{\"path\":\"a.rs\"}".to_owned(),
         });
-        state.on_event(&AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call-2"),
+        state.on_event(&FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call-2".to_owned(),
             index: 1,
             tool_name: "grep".to_owned(),
             arguments: "{\"pattern\":\"fn\"}".to_owned(),
@@ -421,14 +426,7 @@ mod tests {
         let view = state.view(80).expect("parallel activity");
         assert!(view.text.contains("tools  2/3"), "{view:?}");
 
-        state.on_event(&AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call-1"),
-            index: 0,
-            tool_name: "read_file".to_owned(),
-            result: ToolResult::success("ok"),
-            display: None,
-        });
+        state.on_event(&completed(0, "read_file", "ok"));
         let remaining = state.view(80).expect("one still running");
         assert!(remaining.text.contains("tool  grep"), "{remaining:?}");
     }
@@ -436,41 +434,34 @@ mod tests {
     #[test]
     fn cancellation_cannot_be_overwritten_by_late_text() {
         let mut state = ActivityState::default();
-        state.on_event(&AgentEvent::CancellationRequested {
-            operation_id: OperationId::new("op"),
-            reason: CancelReason::User,
+        state.on_event(&FrontendOperationEvent::CancellationRequested {
+            operation_id: "op".to_owned(),
+            reason: "User".to_owned(),
         });
-        state.on_event(&AgentEvent::TextDelta {
+        state.on_event(&FrontendOperationEvent::TextDelta {
             delta: "late".to_owned(),
         });
-        state.on_event(&AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
-            index: 0,
-            tool_name: "late_tool".to_owned(),
-            result: ToolResult::success("late"),
-            display: None,
-        });
+        state.on_event(&completed(0, "late_tool", "late"));
         assert!(state.view(80).expect("activity").text.contains("cancel"));
     }
 
     #[test]
     fn progress_updates_the_live_tail_and_cannot_outrank_cancel() {
         let mut state = ActivityState::default();
-        state.on_event(&AgentEvent::ToolBatchRequested {
-            tool_batch_id: ToolBatchId::new("batch"),
+        state.on_event(&FrontendOperationEvent::ToolBatchRequested {
+            tool_batch_id: "batch".to_owned(),
             call_count: 1,
         });
-        state.on_event(&AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
+        state.on_event(&FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call".to_owned(),
             index: 0,
             tool_name: "shell".to_owned(),
             arguments: "{\"command\":\"echo hi\"}".to_owned(),
         });
-        state.on_event(&AgentEvent::ToolExecutionProgress {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
+        state.on_event(&FrontendOperationEvent::ToolExecutionProgress {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call".to_owned(),
             index: 0,
             tail: "\u{1b}[32mhello\u{1b}[0m\rworld".to_owned(),
         });
@@ -486,13 +477,13 @@ mod tests {
             "{details:?}"
         );
 
-        state.on_event(&AgentEvent::CancellationRequested {
-            operation_id: OperationId::new("op"),
-            reason: CancelReason::User,
+        state.on_event(&FrontendOperationEvent::CancellationRequested {
+            operation_id: "op".to_owned(),
+            reason: "User".to_owned(),
         });
-        state.on_event(&AgentEvent::ToolExecutionProgress {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("call"),
+        state.on_event(&FrontendOperationEvent::ToolExecutionProgress {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "call".to_owned(),
             index: 0,
             tail: "late-progress".to_owned(),
         });

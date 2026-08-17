@@ -5,8 +5,10 @@
 //! final answer text; everything else goes to stderr. `Unconfirmed`
 //! settlement must never read like an ordinary completion.
 
-use philo_agent_runtime::{
-    AgentEvent, CancelReason, OperationStatus, SettlementDurability, TokenUsage,
+use philo_agent_runtime::{CancelReason, OperationStatus, SettlementDurability, TokenUsage};
+use philo_agent_service::{
+    FrontendOperationEvent, FrontendTokenUsage, FrontendToolDisplay, FrontendToolResult,
+    FrontendUpdateKind,
 };
 
 use crate::config::Verbosity;
@@ -101,7 +103,9 @@ impl Renderer {
     }
 
     /// Renders one event into channel writes, in order.
-    pub fn render(&mut self, event: &AgentEvent) -> Vec<Output> {
+    #[cfg(test)]
+    pub fn render(&mut self, event: &philo_agent_runtime::AgentEvent) -> Vec<Output> {
+        use philo_agent_runtime::AgentEvent;
         let mut outputs = Vec::new();
         match event {
             AgentEvent::TextDelta { delta } => {
@@ -346,6 +350,254 @@ impl Renderer {
         }
         outputs
     }
+
+    /// Renders a mapped frontend operation event through the same state machine.
+    pub fn render_frontend(&mut self, event: &FrontendOperationEvent) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        match event {
+            FrontendOperationEvent::TextDelta { delta } => {
+                self.close_reasoning(&mut outputs);
+                if !delta.is_empty() {
+                    self.stdout_open = !delta.ends_with('\n');
+                    outputs.push(out(delta.clone()));
+                }
+            }
+            FrontendOperationEvent::ReasoningDelta { text, .. } => {
+                if self.show_reasoning && !self.quiet() && !text.is_empty() {
+                    if !self.reasoning_open {
+                        outputs.push(err("[reasoning] "));
+                        self.reasoning_open = true;
+                    }
+                    outputs.push(err(text.clone()));
+                }
+            }
+            FrontendOperationEvent::ModelUsageUpdated { usage, .. } => {
+                self.last_usage = Some(token_usage_from_frontend(*usage));
+                if self.verbose() {
+                    outputs.push(err(format!(
+                        "usage update: {}\n",
+                        usage_line(&self.last_usage.expect("just set"))
+                    )));
+                }
+            }
+            FrontendOperationEvent::OperationQueued { operation_id } => {
+                if self.verbose() {
+                    outputs.push(err(format!("operation {operation_id} queued\n")));
+                }
+            }
+            FrontendOperationEvent::OperationStarted { operation_id } => {
+                if self.verbose() {
+                    outputs.push(err(format!("operation {operation_id} started\n")));
+                }
+            }
+            FrontendOperationEvent::TurnStarted { turn_id } => {
+                if self.verbose() {
+                    outputs.push(err(format!("turn {turn_id} started\n")));
+                }
+            }
+            FrontendOperationEvent::ModelCallStarted { model_call_id } => {
+                self.close_reasoning(&mut outputs);
+                if self.verbose() {
+                    outputs.push(err(format!("model call {model_call_id}\n")));
+                }
+            }
+            FrontendOperationEvent::ModelResponseStarted {
+                response_model,
+                response_id,
+                ..
+            } => {
+                if self.verbose() {
+                    outputs.push(err(format!(
+                        "model response: model={} id={}\n",
+                        response_model.as_deref().unwrap_or("-"),
+                        response_id.as_deref().unwrap_or("-"),
+                    )));
+                }
+            }
+            FrontendOperationEvent::ToolBatchRequested {
+                tool_batch_id,
+                call_count,
+            } => {
+                self.close_reasoning(&mut outputs);
+                self.tool_batch_size = *call_count;
+                if self.verbose() {
+                    outputs.push(err(format!(
+                        "tool batch {tool_batch_id}: {call_count} call(s)\n"
+                    )));
+                }
+            }
+            FrontendOperationEvent::ToolExecutionStarted {
+                tool_name,
+                arguments,
+                index,
+                ..
+            } => {
+                self.close_reasoning(&mut outputs);
+                if self.verbose() {
+                    outputs.push(err(format!(
+                        "tool {}/{} {tool_name} arguments: {arguments}\n",
+                        index + 1,
+                        self.tool_batch_size,
+                    )));
+                } else if !self.quiet() {
+                    outputs.push(err(format!(
+                        "tool {tool_name}({})\n",
+                        preview(arguments, 60)
+                    )));
+                }
+            }
+            FrontendOperationEvent::ToolExecutionProgress { tail, .. } => {
+                self.close_reasoning(&mut outputs);
+                if !self.quiet() {
+                    let line = progress_line(tail, if self.verbose() { 160 } else { 80 });
+                    if !line.is_empty() {
+                        outputs.push(err(format!("\r{line}")));
+                        self.progress_open = true;
+                    }
+                }
+            }
+            FrontendOperationEvent::ToolExecutionCompleted {
+                tool_name,
+                result,
+                display,
+                ..
+            } => {
+                self.close_reasoning(&mut outputs);
+                self.close_progress(&mut outputs);
+                let summary = match result {
+                    FrontendToolResult::Success { content } => {
+                        format!("ok: {}", preview(content, 80))
+                    }
+                    FrontendToolResult::Error { code, message } => {
+                        format!("error {code}: {}", preview(message, 80))
+                    }
+                };
+                if self.verbose() {
+                    let full = match result {
+                        FrontendToolResult::Success { content } => content.clone(),
+                        FrontendToolResult::Error { code, message } => {
+                            format!("[{code}] {message}")
+                        }
+                    };
+                    outputs.push(err(format!("tool {tool_name} result:\n{full}\n")));
+                    if let Some(display) = display {
+                        render_frontend_display(&mut outputs, display);
+                    }
+                } else if !self.quiet() {
+                    outputs.push(err(format!("  {tool_name} -> {summary}\n")));
+                }
+            }
+            FrontendOperationEvent::AssistantMessageCompleted { .. } => {
+                self.close_reasoning(&mut outputs);
+                if self.stdout_open {
+                    outputs.push(out("\n"));
+                    self.stdout_open = false;
+                }
+            }
+            FrontendOperationEvent::PriorTurnSealed { turn_id } => {
+                self.close_reasoning(&mut outputs);
+                if self.verbose() {
+                    outputs.push(err(format!(
+                        "notice: previous turn {turn_id} did not end cleanly and was sealed; \
+                         its tool calls may have executed without recorded results\n"
+                    )));
+                } else if !self.quiet() {
+                    outputs.push(err(
+                        "notice: a previous turn did not end cleanly and was sealed; \
+                         its tool calls may have executed without recorded results\n",
+                    ));
+                }
+            }
+            FrontendOperationEvent::ContextCompactionStarted => {
+                self.close_reasoning(&mut outputs);
+                if !self.quiet() {
+                    outputs.push(err("compacting context...\n"));
+                }
+            }
+            FrontendOperationEvent::ContextCompactionCompleted { covers_up_to } => {
+                self.close_reasoning(&mut outputs);
+                if self.verbose() {
+                    outputs.push(err(format!("context compacted through {covers_up_to}\n")));
+                } else if !self.quiet() {
+                    outputs.push(err("context compacted\n"));
+                }
+            }
+            FrontendOperationEvent::ContextCompactionFailed { message } => {
+                self.close_reasoning(&mut outputs);
+                outputs.push(err(format!(
+                    "warning: context compaction failed: {message}; continuing without \
+                     compaction\n"
+                )));
+            }
+            FrontendOperationEvent::CancellationRequested { reason, .. } => {
+                self.close_reasoning(&mut outputs);
+                self.cancel_reason = Some(parse_cancel_reason(reason));
+                outputs.push(err(format!(
+                    "cancelling ({})...\n",
+                    reason_text(self.cancel_reason.expect("just set"))
+                )));
+            }
+            FrontendOperationEvent::TurnCancelled { reason, .. } => {
+                self.close_reasoning(&mut outputs);
+                self.cancel_reason = Some(parse_cancel_reason(reason));
+                outputs.push(err(format!(
+                    "turn cancelled ({})\n",
+                    reason_text(self.cancel_reason.expect("just set"))
+                )));
+            }
+            FrontendOperationEvent::TurnFailed { kind, message, .. } => {
+                self.close_reasoning(&mut outputs);
+                outputs.push(err(format!("error: turn failed ({kind}): {message}\n")));
+            }
+            FrontendOperationEvent::OperationSettled {
+                status, durability, ..
+            } => {
+                self.close_reasoning(&mut outputs);
+                if self.stdout_open {
+                    outputs.push(out("\n"));
+                    self.stdout_open = false;
+                }
+                let parsed_status = parse_operation_status(status);
+                let unconfirmed = parse_durability(durability) == SettlementDurability::Unconfirmed;
+                let show_line = !self.quiet() || parsed_status != OperationStatus::Succeeded;
+                if show_line {
+                    let status_text = match (parsed_status, self.cancel_reason) {
+                        (OperationStatus::Succeeded, _) => "succeeded".to_owned(),
+                        (OperationStatus::Failed, _) => "failed".to_owned(),
+                        (OperationStatus::Cancelled, Some(reason)) => {
+                            format!("cancelled: {}", reason_text(reason))
+                        }
+                        (OperationStatus::Cancelled, None) => "cancelled".to_owned(),
+                    };
+                    outputs.push(err(format!("done ({status_text})\n")));
+                    if let Some(usage) = &self.last_usage
+                        && !self.quiet()
+                    {
+                        outputs.push(err(format!("{}\n", usage_line(usage))));
+                    }
+                }
+                if unconfirmed {
+                    outputs.push(err(
+                        "WARNING: settlement durability UNCONFIRMED - the session may not \
+                         have durably recorded this outcome\n",
+                    ));
+                }
+            }
+        }
+        outputs
+    }
+
+    /// Renders one frontend update. Non-operation updates that carry errors
+    /// are written to stderr; everything else is ignored.
+    pub fn render_update(&mut self, kind: &FrontendUpdateKind) -> Vec<Output> {
+        match kind {
+            FrontendUpdateKind::OperationEvent(event) => self.render_frontend(event),
+            FrontendUpdateKind::CommandRejected { reason } => {
+                vec![err(format!("error: {reason}\n"))]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// Human-readable cancellation reason (M11). Seals never reach the
@@ -355,6 +607,72 @@ fn reason_text(reason: CancelReason) -> &'static str {
         CancelReason::User => "user",
         CancelReason::Timeout => "timeout",
         CancelReason::Abandoned => "abandoned",
+    }
+}
+
+fn parse_cancel_reason(label: &str) -> CancelReason {
+    match label {
+        "Timeout" | "timeout" => CancelReason::Timeout,
+        "Abandoned" | "abandoned" => CancelReason::Abandoned,
+        _ => CancelReason::User,
+    }
+}
+
+fn parse_operation_status(label: &str) -> OperationStatus {
+    match label {
+        "Failed" | "failed" => OperationStatus::Failed,
+        "Cancelled" | "cancelled" => OperationStatus::Cancelled,
+        _ => OperationStatus::Succeeded,
+    }
+}
+
+fn parse_durability(label: &str) -> SettlementDurability {
+    match label {
+        "Unconfirmed" | "unconfirmed" => SettlementDurability::Unconfirmed,
+        _ => SettlementDurability::Confirmed,
+    }
+}
+
+fn token_usage_from_frontend(usage: FrontendTokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+    }
+}
+
+fn render_frontend_display(outputs: &mut Vec<Output>, display: &FrontendToolDisplay) {
+    if !display.detail.is_empty() {
+        outputs.push(err(format!("detail: {}\n", display.detail)));
+    }
+    if !display.facts.is_empty() {
+        let facts = display
+            .facts
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        outputs.push(err(format!("facts: {facts}\n")));
+    }
+}
+
+/// Writes renderer output with the stdout/stderr channel discipline.
+pub fn write_outputs(outputs: &[Output]) {
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    for output in outputs {
+        match output.channel {
+            Channel::Stdout => {
+                let _ = std::io::Write::write_all(&mut stdout, output.text.as_bytes());
+                let _ = std::io::Write::flush(&mut stdout);
+            }
+            Channel::Stderr => {
+                let _ = std::io::Write::write_all(&mut stderr, output.text.as_bytes());
+                let _ = std::io::Write::flush(&mut stderr);
+            }
+        }
     }
 }
 
@@ -402,7 +720,8 @@ fn usage_line(usage: &TokenUsage) -> String {
 mod tests {
     use super::*;
     use philo_agent_runtime::{
-        AgentFailure, AgentFailureKind, ModelCallId, OperationId, ToolBatchId, ToolCallId, TurnId,
+        AgentEvent, AgentFailure, AgentFailureKind, ModelCallId, OperationId, ToolBatchId,
+        ToolCallId, TurnId,
     };
 
     fn text(delta: &str) -> AgentEvent {
@@ -423,6 +742,7 @@ mod tests {
             operation_id: OperationId::new("op-1"),
             status,
             durability,
+            session_revision: None,
         }
     }
 
@@ -888,5 +1208,21 @@ mod tests {
             ..TokenUsage::default()
         };
         assert_eq!(usage_line(&usage), "tokens: input 10, output 20, cache 8");
+    }
+
+    #[test]
+    fn frontend_settled_matches_agent_event_rendering() {
+        let mut agent_renderer = Renderer::new(Verbosity::Default);
+        let mut frontend_renderer = Renderer::new(Verbosity::Default);
+        let agent = settled(OperationStatus::Succeeded, SettlementDurability::Confirmed);
+        let frontend = FrontendOperationEvent::OperationSettled {
+            operation_id: "op-1".to_owned(),
+            status: "Succeeded".to_owned(),
+            durability: "Confirmed".to_owned(),
+        };
+        assert_eq!(
+            agent_renderer.render(&agent),
+            frontend_renderer.render_frontend(&frontend)
+        );
     }
 }

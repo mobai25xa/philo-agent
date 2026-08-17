@@ -321,3 +321,12 @@ fn store_unavailable_carries_diagnostic_text() {
     };
     assert_eq!(reason, "disk on fire");
 }
+
+#[test]
+fn store_busy_carries_diagnostic_text() {
+    let error = SessionError::store_busy("queue full");
+    let SessionError::StoreBusy { reason } = &error else {
+        panic!("expected StoreBusy");
+    };
+    assert_eq!(reason, "queue full");
+}

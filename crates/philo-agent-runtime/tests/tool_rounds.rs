@@ -2,30 +2,17 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, GenerationConfig, ModelAssistantBlock,
-    ModelMessage, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
-    SettlementDurability, ToolDefinition, UserMessage,
+    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelMessage,
+    OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
+    ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
 use support::failing_session::{FailingSessionStore, FailurePlan};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 fn config(max_tool_rounds: u32) -> RuntimeConfig {
     RuntimeConfig {
@@ -40,24 +27,25 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     max_tool_rounds: u32,
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds),
         tools,
     )
+    .await
 }
 
-fn collect_events(mut handle: philo_agent_runtime::OperationHandle) -> Vec<AgentEvent> {
+async fn collect_events(handle: &support::runtime::TestOp) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    while let Some(event) = block_on(handle.next_event()) {
+    while let Some(event) = handle.next_event().await {
         events.push(event);
     }
     events
@@ -85,8 +73,8 @@ fn context_kinds(view: &philo_session::SessionContextView) -> Vec<&'static str> 
 }
 
 /// Commit sequence per round: A=1, then B_k = 2k, C_k = 2k+1, final = 2N+2.
-#[test]
-fn two_round_loop_follows_tools_allowed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_round_loop_follows_tools_allowed() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -100,13 +88,12 @@ fn two_round_loop_follows_tools_allowed() {
         ],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(2, model.clone(), sessions, tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), sessions, tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "final"
     ));
 
@@ -120,7 +107,7 @@ fn two_round_loop_follows_tools_allowed() {
     assert!(calls[2].tools.is_empty(), "budget exhausted on call 3");
     assert_eq!(tools.invocation_count(), 2);
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let batch_ids = events
         .iter()
         .filter_map(|event| match event {
@@ -132,17 +119,16 @@ fn two_round_loop_follows_tools_allowed() {
     assert_ne!(batch_ids[0], batch_ids[1]);
 }
 
-#[test]
-fn zero_rounds_never_exposes_tools() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_rounds_never_exposes_tools() {
     let model = Arc::new(FakeModel::succeeds(&["plain"]));
     let tools = Arc::new(FakeTool::new([echo_definition()], []));
-    let handle = block_on(
-        runtime(0, model.clone(), Arc::new(MemorySessionStore::new()), tools)
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(0, model.clone(), Arc::new(MemorySessionStore::new()), tools)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
     assert!(
@@ -151,25 +137,24 @@ fn zero_rounds_never_exposes_tools() {
     );
 }
 
-#[test]
-fn exhausted_call_with_tool_calls_fails_invalid_output() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_call_with_tool_calls_fails_invalid_output() {
     let model = Arc::new(FakeModel::new([tool_round("call-1"), tool_round("call-2")]));
     let tools = Arc::new(FakeTool::new(
         [echo_definition()],
         [FakeToolResult::success("one")],
     ));
-    let handle = block_on(
-        runtime(
-            1,
-            model.clone(),
-            Arc::new(MemorySessionStore::new()),
-            tools.clone(),
-        )
-        .prompt(SessionId::new("session"), UserMessage::new("hi")),
+    let handle = runtime(
+        1,
+        model.clone(),
+        Arc::new(MemorySessionStore::new()),
+        tools.clone(),
     )
-    .unwrap();
+    .await
+    .prompt(SessionId::new("session"), UserMessage::new("hi"))
+    .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
@@ -179,21 +164,20 @@ fn exhausted_call_with_tool_calls_fails_invalid_output() {
     assert_eq!(tools.invocation_count(), 1);
 }
 
-#[test]
-fn barrier_b2_failure_keeps_round_two_tools_unexecuted() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn barrier_b2_failure_keeps_round_two_tools_unexecuted() {
     let model = Arc::new(FakeModel::new([tool_round("call-1"), tool_round("call-2")]));
     let tools = Arc::new(FakeTool::new(
         [echo_definition()],
         [FakeToolResult::success("one")],
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(4)));
-    let handle = block_on(
-        runtime(2, model.clone(), store, tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), store, tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -205,15 +189,16 @@ fn barrier_b2_failure_keeps_round_two_tools_unexecuted() {
         1,
         "round two must not execute after its batch commit fails"
     );
-    let batch_events = collect_events(handle)
+    let batch_events = collect_events(&handle)
+        .await
         .iter()
         .filter(|event| matches!(event, AgentEvent::ToolBatchRequested { .. }))
         .count();
     assert_eq!(batch_events, 1);
 }
 
-#[test]
-fn barrier_c2_failure_prevents_third_model_call() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn barrier_c2_failure_prevents_third_model_call() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -227,13 +212,12 @@ fn barrier_c2_failure_prevents_third_model_call() {
         ],
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(5)));
-    let handle = block_on(
-        runtime(2, model.clone(), store, tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), store, tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -241,7 +225,8 @@ fn barrier_c2_failure_prevents_third_model_call() {
     ));
     assert_eq!(model.call_count(), 2, "no model call after C_2 failure");
     assert_eq!(tools.invocation_count(), 2, "no silent tool retry");
-    let completed_events = collect_events(handle)
+    let completed_events = collect_events(&handle)
+        .await
         .iter()
         .filter(|event| matches!(event, AgentEvent::ToolExecutionCompleted { .. }))
         .count();
@@ -251,8 +236,8 @@ fn barrier_c2_failure_prevents_third_model_call() {
     );
 }
 
-#[test]
-fn round_two_infrastructure_failure_settles_failed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn round_two_infrastructure_failure_settles_failed() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -265,18 +250,17 @@ fn round_two_infrastructure_failure_settles_failed() {
             FakeToolResult::infrastructure_error("worker down"),
         ],
     ));
-    let handle = block_on(
-        runtime(
-            2,
-            model.clone(),
-            Arc::new(MemorySessionStore::new()),
-            tools.clone(),
-        )
-        .prompt(SessionId::new("session"), UserMessage::new("hi")),
+    let handle = runtime(
+        2,
+        model.clone(),
+        Arc::new(MemorySessionStore::new()),
+        tools.clone(),
     )
-    .unwrap();
+    .await
+    .prompt(SessionId::new("session"), UserMessage::new("hi"))
+    .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
@@ -286,8 +270,8 @@ fn round_two_infrastructure_failure_settles_failed() {
     assert_eq!(tools.invocation_count(), 2);
 }
 
-#[test]
-fn persistent_failure_mid_loop_is_unconfirmed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_failure_mid_loop_is_unconfirmed() {
     let model = Arc::new(FakeModel::new([tool_round("call-1"), tool_round("call-2")]));
     let tools = Arc::new(FakeTool::new(
         [echo_definition()],
@@ -296,27 +280,28 @@ fn persistent_failure_mid_loop_is_unconfirmed() {
     let store = Arc::new(FailingSessionStore::memory(
         FailurePlan::persistent_commit_at(4),
     ));
-    let handle = block_on(
-        runtime(2, model, store, tools).prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model, store, tools)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Unconfirmed,
             ..
         }
     ));
     assert!(
-        !collect_events(handle)
+        !collect_events(&handle)
+            .await
             .iter()
             .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
         "unconfirmed settlement must not publish durable TurnFailed"
     );
 }
 
-#[test]
-fn two_round_loop_persists_all_facts_in_order() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_round_loop_persists_all_facts_in_order() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         ModelScript::tool_calls(&[(0, "call-2", "echo", "{}"), (1, "call-3", "echo", "{}")]),
@@ -331,13 +316,12 @@ fn two_round_loop_persists_all_facts_in_order() {
         ],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(2, model.clone(), sessions.clone(), tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), sessions.clone(), tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "final answer"
     ));
     assert_eq!(model.call_count(), 3);
@@ -351,7 +335,10 @@ fn two_round_loop_persists_all_facts_in_order() {
         ["call-1", "call-2", "call-3"]
     );
 
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     assert_eq!(
         context_kinds(&view),
         vec![
@@ -366,7 +353,7 @@ fn two_round_loop_persists_all_facts_in_order() {
     );
     assert_eq!(view.revision(), philo_session::SessionRevision::new(6));
 
-    let events = collect_events(handle);
+    let events = collect_events(&handle).await;
     let round_markers = events
         .iter()
         .filter_map(|event| match event {
@@ -387,8 +374,8 @@ fn two_round_loop_persists_all_facts_in_order() {
     assert_eq!(round_markers[4].1, "call-3");
 }
 
-#[test]
-fn exhausting_rounds_forces_tool_free_final_call() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausting_rounds_forces_tool_free_final_call() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -401,13 +388,12 @@ fn exhausting_rounds_forces_tool_free_final_call() {
             FakeToolResult::success("two"),
         ],
     ));
-    let handle = block_on(
-        runtime(2, model.clone(), Arc::new(MemorySessionStore::new()), tools)
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), Arc::new(MemorySessionStore::new()), tools)
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "forced final"
     ));
     let calls = model.calls();
@@ -419,21 +405,20 @@ fn exhausting_rounds_forces_tool_free_final_call() {
     );
 }
 
-#[test]
-fn tool_calls_after_exhaustion_fail_invalid_output() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_calls_after_exhaustion_fail_invalid_output() {
     let model = Arc::new(FakeModel::new([tool_round("call-1"), tool_round("call-2")]));
     let tools = Arc::new(FakeTool::new(
         [echo_definition()],
         [FakeToolResult::success("one")],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(1, model.clone(), sessions.clone(), tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(1, model.clone(), sessions.clone(), tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
@@ -441,7 +426,10 @@ fn tool_calls_after_exhaustion_fail_invalid_output() {
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     assert_eq!(
         context_kinds(&view),
         vec!["user", "calls", "result"],
@@ -449,8 +437,8 @@ fn tool_calls_after_exhaustion_fail_invalid_output() {
     );
 }
 
-#[test]
-fn mid_round_tool_error_keeps_later_rounds_available() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_round_tool_error_keeps_later_rounds_available() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -464,13 +452,12 @@ fn mid_round_tool_error_keeps_later_rounds_available() {
         ],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(2, model.clone(), sessions.clone(), tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), sessions.clone(), tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "recovered"
     ));
     assert!(
@@ -478,7 +465,10 @@ fn mid_round_tool_error_keeps_later_rounds_available() {
         "an error result does not disable tools early"
     );
     assert_eq!(tools.invocation_count(), 2);
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     let outcomes = view
         .messages()
         .iter()
@@ -491,21 +481,20 @@ fn mid_round_tool_error_keeps_later_rounds_available() {
     assert!(matches!(outcomes[1], ToolResultOutcome::Success { .. }));
 }
 
-#[test]
-fn round_two_batch_commit_failure_executes_no_tool() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn round_two_batch_commit_failure_executes_no_tool() {
     let model = Arc::new(FakeModel::new([tool_round("call-1"), tool_round("call-2")]));
     let tools = Arc::new(FakeTool::new(
         [echo_definition()],
         [FakeToolResult::success("one")],
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(4)));
-    let handle = block_on(
-        runtime(2, model.clone(), store, tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), store, tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -517,14 +506,15 @@ fn round_two_batch_commit_failure_executes_no_tool() {
         "barrier B_2 failure keeps round-two tool calls at zero"
     );
     assert!(
-        !collect_events(handle)
+        !collect_events(&handle)
+            .await
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolExecutionStarted { index: 1, .. })),
     );
 }
 
-#[test]
-fn round_two_results_commit_failure_stops_next_model_call() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn round_two_results_commit_failure_stops_next_model_call() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -538,13 +528,12 @@ fn round_two_results_commit_failure_stops_next_model_call() {
         ],
     ));
     let store = Arc::new(FailingSessionStore::memory(FailurePlan::commit_at(5)));
-    let handle = block_on(
-        runtime(2, model.clone(), store, tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(2, model.clone(), store, tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Failed {
             durability: SettlementDurability::Confirmed,
             ..
@@ -558,8 +547,8 @@ fn round_two_results_commit_failure_stops_next_model_call() {
     );
 }
 
-#[test]
-fn next_prompt_replays_all_rounds_in_source_order() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_prompt_replays_all_rounds_in_source_order() {
     let model = Arc::new(FakeModel::new([
         tool_round("call-1"),
         tool_round("call-2"),
@@ -574,16 +563,22 @@ fn next_prompt_replays_all_rounds_in_source_order() {
         ],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(2, model.clone(), sessions, tools);
+    let agent = runtime(2, model.clone(), sessions, tools).await;
     assert!(matches!(
-        block_on(agent.prompt(SessionId::new("session"), UserMessage::new("first")))
-            .map(|handle| block_on(handle.wait())),
-        Ok(OperationOutcome::Succeeded { .. })
+        agent
+            .prompt(SessionId::new("session"), UserMessage::new("first"))
+            .await
+            .wait()
+            .await,
+        OperationOutcome::Succeeded { .. }
     ));
     assert!(matches!(
-        block_on(agent.prompt(SessionId::new("session"), UserMessage::new("second")))
-            .map(|handle| block_on(handle.wait())),
-        Ok(OperationOutcome::Succeeded { .. })
+        agent
+            .prompt(SessionId::new("session"), UserMessage::new("second"))
+            .await
+            .wait()
+            .await,
+        OperationOutcome::Succeeded { .. }
     ));
 
     let second_turn_messages = &model.calls()[3].messages;
@@ -620,23 +615,22 @@ fn next_prompt_replays_all_rounds_in_source_order() {
     );
 }
 
-#[test]
-fn direct_answer_and_single_round_still_pass() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_answer_and_single_round_still_pass() {
     // Direct answer under the default-style budget: no tools requested.
     let direct_model = Arc::new(FakeModel::succeeds(&["hello"]));
     let direct_tools = Arc::new(FakeTool::new([], []));
-    let handle = block_on(
-        runtime(
-            8,
-            direct_model.clone(),
-            Arc::new(MemorySessionStore::new()),
-            direct_tools.clone(),
-        )
-        .prompt(SessionId::new("session"), UserMessage::new("hi")),
+    let handle = runtime(
+        8,
+        direct_model.clone(),
+        Arc::new(MemorySessionStore::new()),
+        direct_tools.clone(),
     )
-    .unwrap();
+    .await
+    .prompt(SessionId::new("session"), UserMessage::new("hi"))
+    .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "hello"
     ));
     assert_eq!(direct_model.call_count(), 1);
@@ -652,19 +646,21 @@ fn direct_answer_and_single_round_still_pass() {
         [FakeToolResult::success("ok")],
     ));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(1, loop_model.clone(), sessions.clone(), loop_tools.clone())
-            .prompt(SessionId::new("session"), UserMessage::new("hi")),
-    )
-    .unwrap();
+    let handle = runtime(1, loop_model.clone(), sessions.clone(), loop_tools.clone())
+        .await
+        .prompt(SessionId::new("session"), UserMessage::new("hi"))
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "done"
     ));
     assert_eq!(loop_model.call_count(), 2);
     assert!(loop_model.calls()[1].tools.is_empty());
     assert_eq!(loop_tools.invocation_count(), 1);
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("session"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("session"))
+        .await
+        .unwrap();
     assert_eq!(
         context_kinds(&view),
         vec!["user", "calls", "result", "assistant"]

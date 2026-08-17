@@ -5,10 +5,13 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::future::BoxFuture;
 use philo::api::stable as sdk;
 use philo_agent_runtime::{
     ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelMessage, ModelToolCall,
@@ -16,6 +19,7 @@ use philo_agent_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 const SIDECAR_DIR: &str = "model-replay";
 const LOCK_FILE: &str = "lock";
@@ -25,6 +29,9 @@ const GENERATION_SCHEMA_V2: u32 = 2;
 const DEFAULT_MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_ORPHAN_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Bounded replay-command queue capacity. Full enqueue returns [`ReplayStoreErrorCode::Busy`].
+pub const REPLAY_COMMAND_CAP: usize = 64;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -53,6 +60,8 @@ pub enum ReplayStoreErrorCode {
     Corrupted,
     QuotaExceeded,
     Conflict,
+    Busy,
+    Unavailable,
 }
 
 /// A redacted replay sidecar failure.
@@ -79,6 +88,8 @@ impl fmt::Display for ReplayStoreError {
             ReplayStoreErrorCode::Corrupted => "model replay sidecar is corrupted",
             ReplayStoreErrorCode::QuotaExceeded => "model replay sidecar quota exceeded",
             ReplayStoreErrorCode::Conflict => "model replay sidecar generation conflict",
+            ReplayStoreErrorCode::Busy => "model replay sidecar is busy",
+            ReplayStoreErrorCode::Unavailable => "model replay sidecar is unavailable",
         })
     }
 }
@@ -121,16 +132,31 @@ impl fmt::Debug for ReplayStoreBlob {
 }
 
 /// Narrow persistence seam for target-bound provider replay generations.
+///
+/// Mutation methods return object-safe boxed futures so file-backed stores can
+/// run directory walks, payload reads, rename, and fsync on a dedicated
+/// replay actor thread rather than the `ModelPort` / stream poll thread.
 pub trait ModelReplayStore: Send + Sync + fmt::Debug {
     fn policy(&self) -> ReplayStorePolicy;
 
-    fn load(&self, session_id: &str) -> Result<Vec<ReplayStoreBlob>, ReplayStoreError>;
+    fn load(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<Vec<ReplayStoreBlob>, ReplayStoreError>>;
 
-    fn commit(&self, session_id: &str, blob: ReplayStoreBlob) -> Result<(), ReplayStoreError>;
+    fn commit(
+        &self,
+        session_id: &str,
+        blob: ReplayStoreBlob,
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>>;
 
-    fn remove(&self, session_id: &str, generation_ids: &[String]) -> Result<(), ReplayStoreError>;
+    fn remove(
+        &self,
+        session_id: &str,
+        generation_ids: &[String],
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>>;
 
-    fn delete_session(&self, session_id: &str) -> Result<(), ReplayStoreError>;
+    fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), ReplayStoreError>>;
 }
 
 /// Process-local store used when callers do not configure durable replay.
@@ -145,6 +171,64 @@ impl MemoryModelReplayStore {
             policy,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn load_sync(&self, session_id: &str) -> Result<Vec<ReplayStoreBlob>, ReplayStoreError> {
+        Ok(self
+            .sessions
+            .lock()
+            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn commit_sync(&self, session_id: &str, blob: ReplayStoreBlob) -> Result<(), ReplayStoreError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?;
+        let records = sessions.entry(session_id.to_owned()).or_default();
+        if let Some(existing) = records.iter().find(|record| record.id == blob.id) {
+            return if existing.payload == blob.payload {
+                Ok(())
+            } else {
+                Err(ReplayStoreError::new(ReplayStoreErrorCode::Conflict))
+            };
+        }
+        let current = records.iter().fold(0_u64, |total, record| {
+            total.saturating_add(len_u64(record.payload.len()))
+        });
+        if current.saturating_add(len_u64(blob.payload.len())) > self.policy.max_session_bytes {
+            return Err(ReplayStoreError::new(ReplayStoreErrorCode::QuotaExceeded));
+        }
+        records.push(blob);
+        Ok(())
+    }
+
+    fn remove_sync(
+        &self,
+        session_id: &str,
+        generation_ids: &[String],
+    ) -> Result<(), ReplayStoreError> {
+        let remove = generation_ids.iter().collect::<HashSet<_>>();
+        if let Some(records) = self
+            .sessions
+            .lock()
+            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?
+            .get_mut(session_id)
+        {
+            records.retain(|record| !remove.contains(&record.id));
+        }
+        Ok(())
+    }
+
+    fn delete_session_sync(&self, session_id: &str) -> Result<(), ReplayStoreError> {
+        self.sessions
+            .lock()
+            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?
+            .remove(session_id);
+        Ok(())
     }
 }
 
@@ -169,64 +253,199 @@ impl ModelReplayStore for MemoryModelReplayStore {
         self.policy
     }
 
-    fn load(&self, session_id: &str) -> Result<Vec<ReplayStoreBlob>, ReplayStoreError> {
-        Ok(self
-            .sessions
-            .lock()
-            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default())
+    fn load(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<Vec<ReplayStoreBlob>, ReplayStoreError>> {
+        let result = self.load_sync(session_id);
+        Box::pin(async move { result })
     }
 
-    fn commit(&self, session_id: &str, blob: ReplayStoreBlob) -> Result<(), ReplayStoreError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?;
-        let records = sessions.entry(session_id.to_owned()).or_default();
-        if let Some(existing) = records.iter().find(|record| record.id == blob.id) {
-            return if existing.payload == blob.payload {
-                Ok(())
-            } else {
-                Err(ReplayStoreError::new(ReplayStoreErrorCode::Conflict))
-            };
-        }
-        let current = records.iter().fold(0_u64, |total, record| {
-            total.saturating_add(len_u64(record.payload.len()))
-        });
-        if current.saturating_add(len_u64(blob.payload.len())) > self.policy.max_session_bytes {
-            return Err(ReplayStoreError::new(ReplayStoreErrorCode::QuotaExceeded));
-        }
-        records.push(blob);
-        Ok(())
+    fn commit(
+        &self,
+        session_id: &str,
+        blob: ReplayStoreBlob,
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        let result = self.commit_sync(session_id, blob);
+        Box::pin(async move { result })
     }
 
-    fn remove(&self, session_id: &str, generation_ids: &[String]) -> Result<(), ReplayStoreError> {
-        let remove = generation_ids.iter().collect::<HashSet<_>>();
-        if let Some(records) = self
-            .sessions
-            .lock()
-            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?
-            .get_mut(session_id)
-        {
-            records.retain(|record| !remove.contains(&record.id));
-        }
-        Ok(())
+    fn remove(
+        &self,
+        session_id: &str,
+        generation_ids: &[String],
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        let result = self.remove_sync(session_id, generation_ids);
+        Box::pin(async move { result })
     }
 
-    fn delete_session(&self, session_id: &str) -> Result<(), ReplayStoreError> {
-        self.sessions
-            .lock()
-            .map_err(|_| ReplayStoreError::new(ReplayStoreErrorCode::Io))?
-            .remove(session_id);
-        Ok(())
+    fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        let result = self.delete_session_sync(session_id);
+        Box::pin(async move { result })
+    }
+}
+
+enum ReplayCommand {
+    Load {
+        session_id: String,
+        reply: oneshot::Sender<Result<Vec<ReplayStoreBlob>, ReplayStoreError>>,
+    },
+    Commit {
+        session_id: String,
+        blob: ReplayStoreBlob,
+        reply: oneshot::Sender<Result<(), ReplayStoreError>>,
+    },
+    Remove {
+        session_id: String,
+        generation_ids: Vec<String>,
+        reply: oneshot::Sender<Result<(), ReplayStoreError>>,
+    },
+    DeleteSession {
+        session_id: String,
+        reply: oneshot::Sender<Result<(), ReplayStoreError>>,
+    },
+    Shutdown {
+        reply: std::sync::mpsc::Sender<()>,
+    },
+    #[cfg(test)]
+    Block {
+        started: oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    Panic,
+}
+
+struct ReplayFs {
+    data_root: PathBuf,
+    policy: ReplayStorePolicy,
+}
+
+struct ReplayCommandHandle {
+    data_root: PathBuf,
+    tx: SyncSender<ReplayCommand>,
+    closed: AtomicBool,
+}
+
+impl Drop for ReplayCommandHandle {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        let (reply, _) = mpsc::channel();
+        let _ = self.tx.try_send(ReplayCommand::Shutdown { reply });
+    }
+}
+
+struct ReplayThreadSlot {
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for ReplayThreadSlot {
+    fn drop(&mut self) {
+        if let Some(thread) = take_replay_thread(&self.thread) {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn take_replay_thread(thread: &Mutex<Option<JoinHandle<()>>>) -> Option<JoinHandle<()>> {
+    thread
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+struct ReplayStoreActor {
+    fs: ReplayFs,
+    rx: Receiver<ReplayCommand>,
+}
+
+impl ReplayStoreActor {
+    fn run(mut self) {
+        loop {
+            match self.rx.recv() {
+                Ok(command) => {
+                    if self.dispatch(command) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn dispatch(&mut self, command: ReplayCommand) -> bool {
+        match command {
+            ReplayCommand::Load { session_id, reply } => {
+                let _ = reply.send(self.fs.load_blocking(&session_id));
+                false
+            }
+            ReplayCommand::Commit {
+                session_id,
+                blob,
+                reply,
+            } => {
+                let _ = reply.send(self.fs.commit_blocking(&session_id, blob));
+                false
+            }
+            ReplayCommand::Remove {
+                session_id,
+                generation_ids,
+                reply,
+            } => {
+                let _ = reply.send(self.fs.remove_blocking(&session_id, &generation_ids));
+                false
+            }
+            ReplayCommand::DeleteSession { session_id, reply } => {
+                let _ = reply.send(self.fs.delete_session_blocking(&session_id));
+                false
+            }
+            ReplayCommand::Shutdown { reply } => {
+                self.drain_accepted();
+                let _ = reply.send(());
+                true
+            }
+            #[cfg(test)]
+            ReplayCommand::Block {
+                started,
+                release,
+                reply,
+            } => {
+                let _ = started.send(());
+                let _ = release.recv();
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ReplayCommand::Panic => panic!("replay actor test panic"),
+        }
+    }
+
+    fn drain_accepted(&mut self) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(ReplayCommand::Shutdown { reply }) => {
+                    let _ = reply.send(());
+                }
+                Ok(command) => {
+                    let _ = self.dispatch(command);
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
     }
 }
 
 /// Atomic filesystem sidecar stored below each JSONL session directory.
+///
+/// Cloneable handle to a dedicated OS thread (`philo-replay-store`) that owns
+/// replay filesystem state. Async methods `try_send` on a bounded channel and
+/// await a oneshot reply. A full queue returns [`ReplayStoreErrorCode::Busy`].
+/// After the actor panics the handle stays permanently unavailable.
+#[derive(Clone)]
 pub struct FileModelReplayStore {
-    data_root: PathBuf,
+    commands: Arc<ReplayCommandHandle>,
+    thread: Arc<ReplayThreadSlot>,
     policy: ReplayStorePolicy,
 }
 
@@ -239,12 +458,120 @@ impl FileModelReplayStore {
         data_root: impl Into<PathBuf>,
         policy: ReplayStorePolicy,
     ) -> Result<Self, ReplayStoreError> {
+        Self::with_command_capacity(data_root, policy, REPLAY_COMMAND_CAP)
+    }
+
+    /// Opens a store with an explicit command-queue capacity. Production uses
+    /// [`REPLAY_COMMAND_CAP`]; tests inject `1` to saturate the actor.
+    pub fn with_command_capacity(
+        data_root: impl Into<PathBuf>,
+        policy: ReplayStorePolicy,
+        command_capacity: usize,
+    ) -> Result<Self, ReplayStoreError> {
         let data_root = data_root.into();
         fs::create_dir_all(&data_root).map_err(|_| store_io())?;
         restrict_directory(&data_root)?;
-        Ok(Self { data_root, policy })
+        let (tx, rx) = mpsc::sync_channel(command_capacity.max(1));
+        let actor_fs = ReplayFs {
+            data_root: data_root.clone(),
+            policy,
+        };
+        let thread = thread::Builder::new()
+            .name("philo-replay-store".to_owned())
+            .spawn(move || ReplayStoreActor { fs: actor_fs, rx }.run())
+            .map_err(|_| store_io())?;
+        Ok(Self {
+            commands: Arc::new(ReplayCommandHandle {
+                data_root,
+                tx,
+                closed: AtomicBool::new(false),
+            }),
+            thread: Arc::new(ReplayThreadSlot {
+                thread: Mutex::new(Some(thread)),
+            }),
+            policy,
+        })
     }
 
+    /// Drains already-accepted commands, rejects new requests, and joins the actor.
+    pub fn shutdown(&self) -> Result<(), ReplayStoreError> {
+        self.commands.closed.store(true, Ordering::Release);
+        let (reply, rx) = mpsc::channel();
+        match self.commands.tx.send(ReplayCommand::Shutdown { reply }) {
+            Ok(()) => {}
+            Err(_) => {
+                self.join_actor();
+                return Err(store_unavailable());
+            }
+        }
+        let _ = rx.recv();
+        self.join_actor();
+        Ok(())
+    }
+
+    fn join_actor(&self) {
+        if let Some(thread) = take_replay_thread(&self.thread.thread) {
+            let _ = thread.join();
+        }
+    }
+
+    fn try_enqueue(&self, command: ReplayCommand) -> Result<(), ReplayStoreError> {
+        if self.commands.closed.load(Ordering::Acquire) {
+            return Err(store_unavailable());
+        }
+        match self.commands.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(store_busy()),
+            Err(TrySendError::Disconnected(_)) => {
+                self.commands.closed.store(true, Ordering::Release);
+                Err(store_unavailable())
+            }
+        }
+    }
+
+    fn await_store<T: Send + 'static>(
+        &self,
+        command: ReplayCommand,
+        rx: oneshot::Receiver<Result<T, ReplayStoreError>>,
+    ) -> BoxFuture<'_, Result<T, ReplayStoreError>> {
+        match self.try_enqueue(command) {
+            Ok(()) => Box::pin(async move { rx.await.map_err(|_| store_unavailable())? }),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    #[cfg(test)]
+    fn block_actor_for_test(
+        &self,
+    ) -> (
+        oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .tx
+            .send(ReplayCommand::Block {
+                started: started_tx,
+                release: release_rx,
+                reply: reply_tx,
+            })
+            .expect("enqueue replay block command");
+        (started_rx, release_tx, reply_rx)
+    }
+
+    #[cfg(test)]
+    fn panic_actor_for_test(&self) {
+        self.commands
+            .tx
+            .send(ReplayCommand::Panic)
+            .expect("enqueue replay panic command");
+    }
+}
+
+impl ReplayFs {
     fn session_dir(&self, session_id: &str) -> PathBuf {
         self.data_root.join(session_dir_name(session_id))
     }
@@ -303,24 +630,8 @@ impl FileModelReplayStore {
         }
         Ok(())
     }
-}
 
-impl fmt::Debug for FileModelReplayStore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FileModelReplayStore")
-            .field("data_root", &self.data_root)
-            .field("policy", &self.policy)
-            .finish()
-    }
-}
-
-impl ModelReplayStore for FileModelReplayStore {
-    fn policy(&self) -> ReplayStorePolicy {
-        self.policy
-    }
-
-    fn load(&self, session_id: &str) -> Result<Vec<ReplayStoreBlob>, ReplayStoreError> {
+    fn load_blocking(&self, session_id: &str) -> Result<Vec<ReplayStoreBlob>, ReplayStoreError> {
         let replay_dir = self.replay_dir(session_id);
         if !replay_dir.is_dir() {
             return Ok(Vec::new());
@@ -351,7 +662,11 @@ impl ModelReplayStore for FileModelReplayStore {
         Ok(blobs)
     }
 
-    fn commit(&self, session_id: &str, blob: ReplayStoreBlob) -> Result<(), ReplayStoreError> {
+    fn commit_blocking(
+        &self,
+        session_id: &str,
+        blob: ReplayStoreBlob,
+    ) -> Result<(), ReplayStoreError> {
         if len_u64(blob.payload.len()) > self.policy.max_session_bytes {
             return Err(ReplayStoreError::new(ReplayStoreErrorCode::QuotaExceeded));
         }
@@ -399,7 +714,11 @@ impl ModelReplayStore for FileModelReplayStore {
         result
     }
 
-    fn remove(&self, session_id: &str, generation_ids: &[String]) -> Result<(), ReplayStoreError> {
+    fn remove_blocking(
+        &self,
+        session_id: &str,
+        generation_ids: &[String],
+    ) -> Result<(), ReplayStoreError> {
         let replay_dir = self.replay_dir(session_id);
         if !replay_dir.is_dir() || generation_ids.is_empty() {
             return Ok(());
@@ -416,7 +735,7 @@ impl ModelReplayStore for FileModelReplayStore {
         sync_directory(&replay_dir)
     }
 
-    fn delete_session(&self, session_id: &str) -> Result<(), ReplayStoreError> {
+    fn delete_session_blocking(&self, session_id: &str) -> Result<(), ReplayStoreError> {
         let replay_dir = self.replay_dir(session_id);
         if !replay_dir.exists() {
             return Ok(());
@@ -427,6 +746,79 @@ impl ModelReplayStore for FileModelReplayStore {
             fs::remove_file(path).map_err(|_| store_io())?;
         }
         sync_directory(&replay_dir)
+    }
+}
+
+impl fmt::Debug for FileModelReplayStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileModelReplayStore")
+            .field("data_root", &self.commands.data_root)
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+impl ModelReplayStore for FileModelReplayStore {
+    fn policy(&self) -> ReplayStorePolicy {
+        self.policy
+    }
+
+    fn load(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<Vec<ReplayStoreBlob>, ReplayStoreError>> {
+        let (reply, rx) = oneshot::channel();
+        self.await_store(
+            ReplayCommand::Load {
+                session_id: session_id.to_owned(),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    fn commit(
+        &self,
+        session_id: &str,
+        blob: ReplayStoreBlob,
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        let (reply, rx) = oneshot::channel();
+        self.await_store(
+            ReplayCommand::Commit {
+                session_id: session_id.to_owned(),
+                blob,
+                reply,
+            },
+            rx,
+        )
+    }
+
+    fn remove(
+        &self,
+        session_id: &str,
+        generation_ids: &[String],
+    ) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        let (reply, rx) = oneshot::channel();
+        self.await_store(
+            ReplayCommand::Remove {
+                session_id: session_id.to_owned(),
+                generation_ids: generation_ids.to_vec(),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), ReplayStoreError>> {
+        let (reply, rx) = oneshot::channel();
+        self.await_store(
+            ReplayCommand::DeleteSession {
+                session_id: session_id.to_owned(),
+                reply,
+            },
+            rx,
+        )
     }
 }
 
@@ -528,7 +920,7 @@ impl ReplayCoordinator {
         }
     }
 
-    pub fn load(
+    pub async fn load(
         &self,
         client: &sdk::PhiloClient,
         target: &sdk::CallTarget,
@@ -541,6 +933,7 @@ impl ReplayCoordinator {
         let blobs = self
             .store
             .load(request.session_id.as_str())
+            .await
             .map_err(store_model_error)?;
         let now = unix_seconds()?;
         let mut generations = Vec::new();
@@ -637,34 +1030,35 @@ impl ReplayCoordinator {
         // Some compatible Chat protocols expose visible reasoning but no
         // serializable SDK replay token. Preserve their prior same-process,
         // same-turn behavior without putting unsnapshotted state on disk.
-        let mut transient = self
-            .transient
-            .lock()
-            .map_err(|_| ModelError::new("transient model replay state is unavailable"))?;
-        transient.retain(|generation| {
-            generation.session_id != request.session_id.as_str()
-                || generation.turn_id == request.turn_id.as_str()
-        });
-        let mut transient_used = HashSet::new();
-        for (message_index, message) in request.messages.iter().enumerate() {
-            if by_message.contains_key(&message_index) {
-                continue;
-            }
-            let Some(generation) = transient.iter().find(|generation| {
-                generation.session_id == request.session_id.as_str()
-                    && generation.turn_id == request.turn_id.as_str()
-                    && generation.target_matches(target)
-                    && !transient_used.contains(&generation.generation_id)
-                    && generation.matches(message)
-            }) else {
-                continue;
-            };
-            transient_used.insert(generation.generation_id.clone());
-            if let Some(items) = generation.restore(client, target)? {
-                by_message.insert(message_index, items);
+        {
+            let mut transient = self
+                .transient
+                .lock()
+                .map_err(|_| ModelError::new("transient model replay state is unavailable"))?;
+            transient.retain(|generation| {
+                generation.session_id != request.session_id.as_str()
+                    || generation.turn_id == request.turn_id.as_str()
+            });
+            let mut transient_used = HashSet::new();
+            for (message_index, message) in request.messages.iter().enumerate() {
+                if by_message.contains_key(&message_index) {
+                    continue;
+                }
+                let Some(generation) = transient.iter().find(|generation| {
+                    generation.session_id == request.session_id.as_str()
+                        && generation.turn_id == request.turn_id.as_str()
+                        && generation.target_matches(target)
+                        && !transient_used.contains(&generation.generation_id)
+                        && generation.matches(message)
+                }) else {
+                    continue;
+                };
+                transient_used.insert(generation.generation_id.clone());
+                if let Some(items) = generation.restore(client, target)? {
+                    by_message.insert(message_index, items);
+                }
             }
         }
-        drop(transient);
 
         let grace = self.store.policy().orphan_grace.as_secs();
         for generation in &generations {
@@ -677,6 +1071,7 @@ impl ReplayCoordinator {
         if !remove.is_empty() {
             self.store
                 .remove(request.session_id.as_str(), &remove)
+                .await
                 .map_err(store_model_error)?;
         }
         Ok(ReplayHistory {
@@ -685,7 +1080,7 @@ impl ReplayCoordinator {
         })
     }
 
-    pub fn invalidate_continuation(&self, session_id: &str, history: &ReplayHistory) {
+    pub async fn invalidate_continuation(&self, session_id: &str, history: &ReplayHistory) {
         let Some(candidate) = &history.continuation else {
             return;
         };
@@ -698,6 +1093,7 @@ impl ReplayCoordinator {
             && let Err(error) = self
                 .store
                 .commit(session_id, candidate.invalidation.clone())
+                .await
         {
             tracing::warn!(
                 code = ?error.code(),
@@ -706,7 +1102,7 @@ impl ReplayCoordinator {
         }
     }
 
-    pub fn commit(
+    pub async fn commit(
         &self,
         client: &sdk::PhiloClient,
         target: &sdk::CallTarget,
@@ -788,10 +1184,14 @@ impl ReplayCoordinator {
         }
         let payload = serde_json::to_vec(&generation)
             .map_err(|_| ModelError::new("model replay snapshot serialization failed"))?;
-        match self.store.commit(
-            request.session_id.as_str(),
-            ReplayStoreBlob::new(generation_id, payload),
-        ) {
+        match self
+            .store
+            .commit(
+                request.session_id.as_str(),
+                ReplayStoreBlob::new(generation_id, payload),
+            )
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) if !has_required => {
                 tracing::warn!(
@@ -1224,6 +1624,14 @@ fn store_io() -> ReplayStoreError {
     ReplayStoreError::new(ReplayStoreErrorCode::Io)
 }
 
+fn store_busy() -> ReplayStoreError {
+    ReplayStoreError::new(ReplayStoreErrorCode::Busy)
+}
+
+fn store_unavailable() -> ReplayStoreError {
+    ReplayStoreError::new(ReplayStoreErrorCode::Unavailable)
+}
+
 fn len_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -1364,6 +1772,93 @@ mod tests {
         assert!(
             !generation.target_matches(&current_target),
             "old sidecar protocol IDs must not alias onto openai-responses/v2"
+        );
+    }
+
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "philo-replay-actor-{}-{}-{label}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("create temp root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_command_queue_returns_busy() {
+        let root = TempRoot::new("busy");
+        let store = FileModelReplayStore::with_command_capacity(
+            &root.path,
+            ReplayStorePolicy::default(),
+            1,
+        )
+        .expect("open");
+        let (started, release, _done) = store.block_actor_for_test();
+        let _release = ReleaseOnDrop(Some(release.clone()));
+        started.await.expect("actor entered block");
+
+        let queued = store.load("session");
+        let error = store.load("session").await.expect_err("queue full");
+        assert_eq!(error.code(), ReplayStoreErrorCode::Busy);
+
+        release.send(()).expect("release actor");
+        queued.await.expect("queued load completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_drains_accepted_work_then_rejects() {
+        let root = TempRoot::new("drain");
+        let store = FileModelReplayStore::open(&root.path).expect("open");
+        store
+            .commit("session", ReplayStoreBlob::new("one", b"abc".to_vec()))
+            .await
+            .expect("commit");
+        store.shutdown().expect("shutdown");
+        let error = store.load("session").await.expect_err("shut down");
+        assert_eq!(error.code(), ReplayStoreErrorCode::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn actor_panic_makes_the_handle_permanently_unavailable() {
+        let root = TempRoot::new("panic");
+        let store = FileModelReplayStore::open(&root.path).expect("open");
+        store.panic_actor_for_test();
+        let error = store
+            .load("session")
+            .await
+            .expect_err("unavailable after panic");
+        assert_eq!(error.code(), ReplayStoreErrorCode::Unavailable);
+        assert_eq!(
+            store
+                .commit("session", ReplayStoreBlob::new("late", b"x".to_vec()))
+                .await
+                .expect_err("still unavailable")
+                .code(),
+            ReplayStoreErrorCode::Unavailable
         );
     }
 }

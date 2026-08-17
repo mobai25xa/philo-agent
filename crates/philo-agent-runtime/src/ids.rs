@@ -27,6 +27,10 @@ string_id!(TurnId);
 string_id!(ModelCallId);
 string_id!(ToolBatchId);
 string_id!(ToolCallId);
+string_id!(GenerationId);
+string_id!(MaintenanceId);
+string_id!(RuntimeEpoch);
+string_id!(DiagnosticId);
 
 pub trait IdSource: Send + Sync {
     fn next_operation_id(&self) -> OperationId;

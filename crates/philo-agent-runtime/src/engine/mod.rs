@@ -18,10 +18,10 @@ use crate::mapping::failure::session_failure;
 use crate::mapping::messages::{context_messages, kernel_blocks_from_model};
 use crate::mapping::parts::kernel_user_parts;
 use crate::mapping::tool::kernel_result;
-use crate::operation::{OperationPublisher, OperationShared, QueueClaim, Scheduler};
+use crate::operation::{MaintenanceCancel, OperationPublisher, OperationShared};
 use crate::{
-    AgentEvent, AgentFailure, AssistantMessage, ModelPort, OperationPhase, RunningToolBatchPhase,
-    RuntimeConfig, SessionId, TurnSnapshot, UserMessage,
+    AgentEvent, AgentFailure, AssistantMessage, DriverExit, ModelPort, OperationPhase,
+    RunningToolBatchPhase, RuntimeConfig, RuntimeGeneration, SessionId, TurnSnapshot, UserMessage,
 };
 use philo_agent_kernel as kernel;
 use philo_session as session;
@@ -31,72 +31,70 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-/// Owned dependencies threaded into an operation engine so queued operations
-/// can be driven after `prompt()` has returned.
+/// Owned dependencies threaded into an operation or maintenance driver.
 pub(crate) struct EngineContext {
-    pub(crate) model: Arc<dyn ModelPort>,
+    pub(crate) generation: Arc<RuntimeGeneration>,
     pub(crate) sessions: Arc<dyn session::SessionStore>,
-    pub(crate) tools: Arc<dyn ToolPort>,
-    pub(crate) config: RuntimeConfig,
-    pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) last_input_tokens: Arc<Mutex<HashMap<SessionId, u64>>>,
+    pub(crate) maintenance_cancel: Option<Arc<MaintenanceCancel>>,
 }
 
 impl EngineContext {
+    pub(crate) fn model(&self) -> &Arc<dyn ModelPort> {
+        &self.generation.model
+    }
+
+    pub(crate) fn tools(&self) -> &Arc<dyn ToolPort> {
+        &self.generation.tools
+    }
+
+    pub(crate) fn config(&self) -> &RuntimeConfig {
+        &self.generation.runtime_config
+    }
+
+    pub(crate) fn maintenance_cancelled(&self) -> bool {
+        self.maintenance_cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_requested())
+    }
+
+    pub(crate) async fn wait_maintenance_cancel(&self) {
+        match &self.maintenance_cancel {
+            Some(cancel) => cancel.wait().await,
+            None => std::future::pending().await,
+        }
+    }
+
     pub(crate) fn record_input_tokens(&self, session_id: &SessionId, input_tokens: u64) {
-        self.last_input_tokens
-            .lock()
-            .expect("input usage mutex")
-            .insert(session_id.clone(), input_tokens);
+        if let Ok(mut map) = self.last_input_tokens.lock() {
+            map.insert(session_id.clone(), input_tokens);
+        }
     }
 
     pub(crate) fn last_input_tokens(&self, session_id: &SessionId) -> Option<u64> {
         self.last_input_tokens
             .lock()
-            .expect("input usage mutex")
-            .get(session_id)
-            .copied()
+            .ok()
+            .and_then(|map| map.get(session_id).copied())
     }
 }
 
-/// Drives a claimed operation to settlement and releases the active slot.
-pub(crate) async fn drive_claimed(
+/// Drives one admitted operation to settlement. Does not start the next
+/// queued operation; the coordinator owns that transition.
+pub(crate) async fn drive(
     ctx: EngineContext,
     shared: Arc<OperationShared>,
     session_id: SessionId,
     user_message: UserMessage,
-) {
-    let operation = OperationPublisher::begin(shared.clone(), ctx.config.operation_timeout);
-    drive(&ctx, operation, session_id, user_message).await;
-    ctx.scheduler.release(shared.operation_id());
-}
-
-/// Waits for the queue turn, then drives the operation. Completes without
-/// driving when the operation was cancelled while still queued.
-pub(crate) async fn run_queued(
-    ctx: EngineContext,
-    shared: Arc<OperationShared>,
-    session_id: SessionId,
-    user_message: UserMessage,
-) {
-    let claimed = std::future::poll_fn(|poll_context| {
-        match ctx
-            .scheduler
-            .try_claim_queued(&shared, poll_context.waker())
-        {
-            QueueClaim::Claimed => std::task::Poll::Ready(true),
-            QueueClaim::SettledInQueue => std::task::Poll::Ready(false),
-            QueueClaim::NotYet => std::task::Poll::Pending,
-        }
-    })
-    .await;
-    if claimed {
-        drive_claimed(ctx, shared, session_id, user_message).await;
-    }
+) -> DriverExit {
+    let timeout = ctx.config().operation_timeout;
+    let operation = OperationPublisher::begin(shared.clone(), timeout).await;
+    drive_turn(&ctx, operation, session_id, user_message).await;
+    shared.take_exit()
 }
 
 #[allow(clippy::too_many_lines)]
-async fn drive(
+async fn drive_turn(
     ctx: &EngineContext,
     operation: OperationPublisher,
     session_id: SessionId,
@@ -106,7 +104,9 @@ async fn drive(
     let context = match ctx.sessions.context_view(&stored_session_id).await {
         Ok(context) => context,
         Err(error) => {
-            operation.fail_unconfirmed(session_failure("reading session context", &error));
+            operation
+                .fail_unconfirmed(session_failure("reading session context", &error))
+                .await;
             return;
         }
     };
@@ -132,17 +132,17 @@ async fn drive(
         compaction::AutoCompactionOutcome::Ready(operation, context) => (operation, context),
         compaction::AutoCompactionOutcome::Settled => return,
     };
-    operation.turn_started();
+    operation.turn_started().await;
     let turn = TurnSnapshot {
         session_id: session_id.clone(),
         session_revision: context.revision(),
         context_messages: context_messages(&context),
-        system_prompt: ctx.config.system_prompt.clone(),
-        model_target: ctx.config.model_target.clone(),
-        generation: ctx.config.generation.clone(),
-        tools: ctx.tools.definitions(),
-        max_tool_rounds: ctx.config.max_tool_rounds,
-        max_parallel_tool_calls: ctx.config.max_parallel_tool_calls.max(1),
+        system_prompt: ctx.config().system_prompt.clone(),
+        model_target: ctx.config().model_target.clone(),
+        generation: ctx.config().generation.clone(),
+        tools: ctx.tools().definitions(),
+        max_tool_rounds: ctx.config().max_tool_rounds,
+        max_parallel_tool_calls: ctx.config().max_parallel_tool_calls.max(1),
     };
     // Explicit runtime -> kernel mapping; both layers enforce the same
     // structural rules, so a constructed UserMessage always converts.
@@ -150,9 +150,11 @@ async fn drive(
     {
         Ok(user) => user,
         Err(_) => {
-            operation.fail_unconfirmed(AgentFailure::runtime_driver(
-                "kernel rejected user message parts",
-            ));
+            operation
+                .fail_unconfirmed(AgentFailure::runtime_driver(
+                    "kernel rejected user message parts",
+                ))
+                .await;
             return;
         }
     };
@@ -167,7 +169,9 @@ async fn drive(
     ) {
         Ok(value) => value,
         Err(_) => {
-            operation.fail_unconfirmed(AgentFailure::runtime_driver("kernel rejected BeginTurn"));
+            operation
+                .fail_unconfirmed(AgentFailure::runtime_driver("kernel rejected BeginTurn"))
+                .await;
             return;
         }
     };
@@ -178,15 +182,15 @@ async fn drive(
     ) {
         Ok(entries) => entries,
         Err(failure) => {
-            operation.fail_unconfirmed(failure);
+            operation.fail_unconfirmed(failure).await;
             return;
         }
     };
     // Injection point: cancel before Barrier A persists ends with zero
     // persistent trace; no turn exists durably.
     if operation.is_cancel_requested() {
-        operation.cancellation_observed();
-        operation.cancel_zero_trace();
+        operation.cancellation_observed().await;
+        operation.cancel_zero_trace().await;
         return;
     }
     let start_commit = match ctx
@@ -200,7 +204,9 @@ async fn drive(
     {
         Ok(commit) => commit,
         Err(error) => {
-            operation.fail_unconfirmed(session_failure("committing turn start", &error));
+            operation
+                .fail_unconfirmed(session_failure("committing turn start", &error))
+                .await;
             return;
         }
     };
@@ -212,7 +218,18 @@ async fn drive(
         current_leaf: start_commit.current_leaf().clone(),
         state: started.next_state,
     };
-    let mut effect = started.effect.expect("BeginTurn always requests model");
+    let mut effect = match started.effect {
+        Some(effect) => effect,
+        None => {
+            cx.operation
+                .fail_unconfirmed(
+                    crate::DriverInvariantError::new("BeginTurn omitted model effect")
+                        .into_failure(),
+                )
+                .await;
+            return;
+        }
+    };
     let mut model_call_index: u32 = 0;
     loop {
         match effect {
@@ -321,10 +338,12 @@ async fn drive(
                 cx.revision = batch_commit.revision();
                 cx.current_leaf = batch_commit.current_leaf().clone();
                 cx.state = completed.next_state;
-                cx.operation.push(AgentEvent::ToolBatchRequested {
-                    tool_batch_id: crate::ToolBatchId::new(batch_id.as_str()),
-                    call_count: calls.len(),
-                });
+                cx.operation
+                    .push(AgentEvent::ToolBatchRequested {
+                        tool_batch_id: crate::ToolBatchId::new(batch_id.as_str()),
+                        call_count: calls.len(),
+                    })
+                    .await;
                 let step = tool_batch::run(
                     cx,
                     &tool_effect_id,
@@ -353,17 +372,33 @@ async fn drive(
                         cx.operation
                             .fail_unconfirmed(AgentFailure::invalid_model_output(
                                 "kernel rejected tool results",
-                            ));
+                            ))
+                            .await;
                         return;
                     }
                 };
                 cx.state = next.next_state;
-                effect = next.effect.expect("tool completion requests model");
+                effect = match next.effect {
+                    Some(effect) => effect,
+                    None => {
+                        cx.operation
+                            .fail_unconfirmed(
+                                crate::DriverInvariantError::new(
+                                    "tool completion omitted model effect",
+                                )
+                                .into_failure(),
+                            )
+                            .await;
+                        return;
+                    }
+                };
             }
             kernel::KernelEffect::ExecuteToolBatch { .. } => {
-                cx.operation.fail_unconfirmed(AgentFailure::runtime_driver(
-                    "runtime cannot execute uncommitted tool effect",
-                ));
+                cx.operation
+                    .fail_unconfirmed(AgentFailure::runtime_driver(
+                        "runtime cannot execute uncommitted tool effect",
+                    ))
+                    .await;
                 return;
             }
         }
@@ -400,13 +435,18 @@ async fn settle_success(
             final_entries,
         ))
         .await;
-    if let Err(error) = committed {
-        cx.fail(
-            effect_id,
-            session_failure("committing successful settlement", &error),
-        )
-        .await;
-        return;
+    match committed {
+        Ok(commit) => {
+            cx.operation
+                .succeed(AssistantMessage { content: text }, commit.revision().get())
+                .await;
+        }
+        Err(error) => {
+            cx.fail(
+                effect_id,
+                session_failure("committing successful settlement", &error),
+            )
+            .await;
+        }
     }
-    cx.operation.succeed(AssistantMessage { content: text });
 }

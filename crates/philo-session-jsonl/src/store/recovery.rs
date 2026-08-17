@@ -23,6 +23,14 @@ pub struct RecoveryReport {
 }
 
 impl RecoveryReport {
+    pub(crate) fn empty() -> Self {
+        Self {
+            transactions: 0,
+            truncated_tail_bytes: 0,
+            orphan_artifacts: Vec::new(),
+        }
+    }
+
     /// Number of complete transactions rebuilt from the log.
     pub fn transactions(&self) -> u64 {
         self.transactions

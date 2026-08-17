@@ -3,29 +3,15 @@
 
 mod support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use philo_agent_runtime::{
-    AgentRuntime, GenerationConfig, InvalidUserMessage, ModelMessage, OperationOutcome,
-    RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage, UserPart,
+    GenerationConfig, InvalidUserMessage, ModelMessage, OperationOutcome, RuntimeConfig,
+    SequentialIdSource, SessionId, ToolDefinition, UserMessage, UserPart,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, SessionUserPart};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut context = Context::from_waker(Waker::noop());
-    let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
 
 fn config(max_tool_rounds: u32) -> RuntimeConfig {
     RuntimeConfig {
@@ -40,19 +26,20 @@ fn config(max_tool_rounds: u32) -> RuntimeConfig {
     }
 }
 
-fn runtime(
+async fn runtime(
     model: Arc<FakeModel>,
     sessions: Arc<dyn SessionStore>,
     tools: Arc<FakeTool>,
     max_tool_rounds: u32,
-) -> AgentRuntime {
-    AgentRuntime::with_tools(
+) -> support::runtime::TestRuntime {
+    support::runtime::TestRuntime::with_tools(
         model,
         sessions,
         Arc::new(SequentialIdSource::new()),
         config(max_tool_rounds),
         tools,
     )
+    .await
 }
 
 fn png_bytes() -> Vec<u8> {
@@ -94,8 +81,8 @@ fn expected_session_parts() -> Vec<SessionUserPart> {
 
 // --- M8-001: full fidelity through a multi-round loop --------------------------
 
-#[test]
-fn multipart_prompt_completes_a_tool_loop_with_full_fidelity() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multipart_prompt_completes_a_tool_loop_with_full_fidelity() {
     let model = Arc::new(FakeModel::new([
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["a cat"]),
@@ -106,13 +93,12 @@ fn multipart_prompt_completes_a_tool_loop_with_full_fidelity() {
         FakeToolResult::success("ok"),
     ));
 
-    let handle = block_on(
-        runtime(model.clone(), sessions.clone(), tools, 1)
-            .prompt(SessionId::new("s"), mixed_message()),
-    )
-    .unwrap();
+    let handle = runtime(model.clone(), sessions.clone(), tools, 1)
+        .await
+        .prompt(SessionId::new("s"), mixed_message())
+        .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "a cat"
     ));
 
@@ -133,7 +119,10 @@ fn multipart_prompt_completes_a_tool_loop_with_full_fidelity() {
 
     // Barrier A persisted exactly the prompt's parts (runtime -> kernel ->
     // session mapping is lossless).
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(
         view.messages()[0],
         ContextMessage::User {
@@ -144,8 +133,8 @@ fn multipart_prompt_completes_a_tool_loop_with_full_fidelity() {
 
 // --- M8-007: image-only valid, structural rejects ------------------------------
 
-#[test]
-fn image_only_prompt_is_valid_and_persists() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_only_prompt_is_valid_and_persists() {
     let message = UserMessage::from_parts(vec![UserPart::Image {
         media_type: "image/jpeg".to_owned(),
         bytes: png_bytes(),
@@ -154,18 +143,17 @@ fn image_only_prompt_is_valid_and_persists() {
 
     let model = Arc::new(FakeModel::succeeds(&["a dog"]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let handle = block_on(
-        runtime(
-            model.clone(),
-            sessions.clone(),
-            Arc::new(FakeTool::new([], [])),
-            0,
-        )
-        .prompt(SessionId::new("s"), message),
+    let handle = runtime(
+        model.clone(),
+        sessions.clone(),
+        Arc::new(FakeTool::new([], [])),
+        0,
     )
-    .unwrap();
+    .await
+    .prompt(SessionId::new("s"), message)
+    .await;
     assert!(matches!(
-        block_on(handle.wait()),
+        handle.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 
@@ -178,7 +166,10 @@ fn image_only_prompt_is_valid_and_persists() {
             }]
         }
     );
-    let view = block_on(sessions.context_view(&philo_session::SessionId::new("s"))).unwrap();
+    let view = sessions
+        .context_view(&philo_session::SessionId::new("s"))
+        .await
+        .unwrap();
     assert_eq!(
         view.messages()[0],
         ContextMessage::User {
@@ -190,8 +181,8 @@ fn image_only_prompt_is_valid_and_persists() {
     );
 }
 
-#[test]
-fn empty_parts_and_empty_text_are_rejected_at_construction() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_parts_and_empty_text_are_rejected_at_construction() {
     assert_eq!(
         UserMessage::from_parts(Vec::new()),
         Err(InvalidUserMessage::EmptyParts)
@@ -204,23 +195,25 @@ fn empty_parts_and_empty_text_are_rejected_at_construction() {
 
 // --- Cross-turn context replay ---------------------------------------------------
 
-#[test]
-fn image_history_replays_into_the_next_turns_context() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_history_replays_into_the_next_turns_context() {
     let model = Arc::new(FakeModel::succeeds_sequence(vec![
         vec!["a cat"],
         vec!["still a cat"],
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let agent = runtime(model.clone(), sessions, Arc::new(FakeTool::new([], [])), 0);
+    let agent = runtime(model.clone(), sessions, Arc::new(FakeTool::new([], [])), 0).await;
 
-    let first = block_on(agent.prompt(SessionId::new("s"), mixed_message())).unwrap();
+    let first = agent.prompt(SessionId::new("s"), mixed_message()).await;
     assert!(matches!(
-        block_on(first.wait()),
+        first.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
-    let second = block_on(agent.prompt(SessionId::new("s"), UserMessage::new("and now?"))).unwrap();
+    let second = agent
+        .prompt(SessionId::new("s"), UserMessage::new("and now?"))
+        .await;
     assert!(matches!(
-        block_on(second.wait()),
+        second.wait().await,
         OperationOutcome::Succeeded { .. }
     ));
 

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use philo_agent_runtime::{AgentEvent, CancelReason, OperationStatus, SettlementDurability};
+use philo_agent_service::FrontendOperationEvent;
 
 use super::cells::TranscriptStore;
 use super::text;
@@ -102,16 +102,23 @@ impl Transcript {
 
     /// Projects one event into the ordered store. Resets per-op flags on
     /// settle; the App clears the store on session switch.
-    pub fn apply(&mut self, store: &mut TranscriptStore, event: &AgentEvent, level: InfoLevel) {
+    pub fn apply(
+        &mut self,
+        store: &mut TranscriptStore,
+        event: &FrontendOperationEvent,
+        level: InfoLevel,
+    ) {
         let verbose = level == InfoLevel::Verbose;
         match event {
-            AgentEvent::TextDelta { delta } => self.apply_text_delta(store, delta),
-            AgentEvent::ReasoningDelta { .. } if !self.show_reasoning => {}
-            AgentEvent::ReasoningDelta { text, .. } => self.apply_reasoning_delta(store, text),
-            AgentEvent::OperationQueued { .. } => {
+            FrontendOperationEvent::TextDelta { delta } => self.apply_text_delta(store, delta),
+            FrontendOperationEvent::ReasoningDelta { .. } if !self.show_reasoning => {}
+            FrontendOperationEvent::ReasoningDelta { text, .. } => {
+                self.apply_reasoning_delta(store, text)
+            }
+            FrontendOperationEvent::OperationQueued { .. } => {
                 store.push_closed([line(LineKind::Notice, "queued behind the active turn")]);
             }
-            AgentEvent::OperationStarted { operation_id } => {
+            FrontendOperationEvent::OperationStarted { operation_id } => {
                 if verbose {
                     store.push_closed([line(
                         LineKind::Meta,
@@ -119,12 +126,12 @@ impl Transcript {
                     )]);
                 }
             }
-            AgentEvent::TurnStarted { turn_id } => {
+            FrontendOperationEvent::TurnStarted { turn_id } => {
                 if verbose {
                     store.push_closed([line(LineKind::Meta, format!("turn {turn_id} started"))]);
                 }
             }
-            AgentEvent::ModelCallStarted { model_call_id } => {
+            FrontendOperationEvent::ModelCallStarted { model_call_id } => {
                 store.close_open();
                 self.wrote_answer_this_call = false;
                 self.think_header_written = false;
@@ -133,7 +140,7 @@ impl Transcript {
                         .push_closed([line(LineKind::Meta, format!("model call {model_call_id}"))]);
                 }
             }
-            AgentEvent::ModelResponseStarted {
+            FrontendOperationEvent::ModelResponseStarted {
                 response_model,
                 response_id,
                 ..
@@ -149,19 +156,19 @@ impl Transcript {
                     )]);
                 }
             }
-            AgentEvent::ModelUsageUpdated { .. } => {}
-            AgentEvent::ToolBatchRequested { call_count, .. } => {
+            FrontendOperationEvent::ModelUsageUpdated { .. } => {}
+            FrontendOperationEvent::ToolBatchRequested { call_count, .. } => {
                 store.close_open();
                 self.tool_batch_size = *call_count;
                 self.tool_args.clear();
             }
-            AgentEvent::ToolExecutionStarted {
+            FrontendOperationEvent::ToolExecutionStarted {
                 arguments, index, ..
             } => {
                 self.tool_args.insert(*index, arguments.clone());
             }
-            AgentEvent::ToolExecutionProgress { .. } => {}
-            AgentEvent::ToolExecutionCompleted {
+            FrontendOperationEvent::ToolExecutionProgress { .. } => {}
+            FrontendOperationEvent::ToolExecutionCompleted {
                 tool_name,
                 result,
                 display,
@@ -184,13 +191,13 @@ impl Transcript {
                 };
                 store.push_closed(card);
             }
-            AgentEvent::AssistantMessageCompleted { message, .. } => {
+            FrontendOperationEvent::AssistantMessageCompleted { content, .. } => {
                 store.close_open();
-                if !self.wrote_answer_this_call && !message.content().is_empty() {
-                    store.push_closed([line(LineKind::Answer, message.content())]);
+                if !self.wrote_answer_this_call && !content.is_empty() {
+                    store.push_closed([line(LineKind::Answer, content)]);
                 }
             }
-            AgentEvent::PriorTurnSealed { turn_id } => {
+            FrontendOperationEvent::PriorTurnSealed { turn_id } => {
                 if verbose {
                     store.push_closed([line(
                         LineKind::Notice,
@@ -207,12 +214,12 @@ impl Transcript {
                     )]);
                 }
             }
-            AgentEvent::ContextCompactionStarted => {
+            FrontendOperationEvent::ContextCompactionStarted => {
                 if verbose {
                     store.push_closed([line(LineKind::Notice, "compacting context...")]);
                 }
             }
-            AgentEvent::ContextCompactionCompleted { covers_up_to } => {
+            FrontendOperationEvent::ContextCompactionCompleted { covers_up_to } => {
                 let text = if verbose {
                     format!("context compacted through {covers_up_to}")
                 } else {
@@ -220,49 +227,45 @@ impl Transcript {
                 };
                 store.push_closed([line(LineKind::Meta, text)]);
             }
-            AgentEvent::ContextCompactionFailed { message } => {
+            FrontendOperationEvent::ContextCompactionFailed { message } => {
                 store.push_closed([line(
                     LineKind::Error,
                     format!("compaction failed: {message}; continuing without compaction"),
                 )]);
             }
-            AgentEvent::CancellationRequested { reason, .. } => {
+            FrontendOperationEvent::CancellationRequested { reason, .. } => {
                 store.close_open();
                 if verbose {
                     store.push_closed([line(
                         LineKind::Notice,
-                        format!("cancelling ({})...", reason_text(*reason)),
+                        format!("cancelling ({})...", reason_text(reason)),
                     )]);
                 }
             }
-            AgentEvent::TurnCancelled { reason, .. } => {
+            FrontendOperationEvent::TurnCancelled { reason, .. } => {
                 store.close_open();
                 store.push_closed([line(
                     LineKind::Notice,
-                    format!("turn cancelled ({})", reason_text(*reason)),
+                    format!("turn cancelled ({})", reason_text(reason)),
                 )]);
             }
-            AgentEvent::TurnFailed { failure, .. } => {
+            FrontendOperationEvent::TurnFailed { kind, message, .. } => {
                 store.close_open();
                 store.push_closed([line(
                     LineKind::Error,
-                    format!("turn failed ({:?}): {}", failure.kind(), failure.message()),
+                    format!("turn failed ({kind}): {message}"),
                 )]);
             }
-            AgentEvent::OperationSettled {
+            FrontendOperationEvent::OperationSettled {
                 status, durability, ..
             } => {
                 store.close_open();
-                match status {
-                    OperationStatus::Succeeded => {}
-                    OperationStatus::Failed => {
-                        store.push_closed([line(LineKind::Meta, "done (failed)")]);
-                    }
-                    OperationStatus::Cancelled => {
-                        store.push_closed([line(LineKind::Meta, "done (cancelled)")]);
-                    }
+                if status.eq_ignore_ascii_case("failed") {
+                    store.push_closed([line(LineKind::Meta, "done (failed)")]);
+                } else if status.eq_ignore_ascii_case("cancelled") {
+                    store.push_closed([line(LineKind::Meta, "done (cancelled)")]);
                 }
-                if *durability == SettlementDurability::Unconfirmed {
+                if durability.eq_ignore_ascii_case("unconfirmed") {
                     store.push_closed([line(
                         LineKind::Error,
                         "WARNING: settlement durability UNCONFIRMED - the session may not \
@@ -271,7 +274,6 @@ impl Transcript {
                 }
                 self.clear_ephemeral();
             }
-            _ => {}
         }
     }
 
@@ -323,11 +325,12 @@ impl Transcript {
     }
 }
 
-fn reason_text(reason: CancelReason) -> &'static str {
+fn reason_text(reason: &str) -> String {
     match reason {
-        CancelReason::User => "user",
-        CancelReason::Timeout => "timeout",
-        CancelReason::Abandoned => "abandoned",
+        "User" | "user" => "user".to_owned(),
+        "Timeout" | "timeout" => "timeout".to_owned(),
+        "Abandoned" | "abandoned" => "abandoned".to_owned(),
+        other => other.to_ascii_lowercase(),
     }
 }
 
@@ -353,14 +356,17 @@ pub(crate) fn compact_args(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use philo_agent_runtime::{
-        AgentEvent, ModelCallId, OperationId, OperationStatus, SettlementDurability, TokenUsage,
-        ToolBatchId, ToolCallId, TurnId,
+    use philo_agent_service::{
+        FrontendOperationEvent, FrontendTokenUsage, FrontendToolDisplay, FrontendToolResult,
     };
-    use philo_tools::{ToolDisplay, ToolResult};
 
-    fn apply_all(events: &[AgentEvent], level: InfoLevel, show_reasoning: bool) -> TranscriptStore {
+    use super::*;
+
+    fn apply_all(
+        events: &[FrontendOperationEvent],
+        level: InfoLevel,
+        show_reasoning: bool,
+    ) -> TranscriptStore {
         let mut transcript = Transcript::new(show_reasoning);
         let mut store = TranscriptStore::new();
         for event in events {
@@ -381,66 +387,71 @@ mod tests {
             .join("\n")
     }
 
-    fn event_sequence() -> Vec<AgentEvent> {
+    fn event_sequence() -> Vec<FrontendOperationEvent> {
         vec![
-            AgentEvent::OperationStarted {
-                operation_id: OperationId::new("op-1"),
+            FrontendOperationEvent::OperationStarted {
+                operation_id: "op-1".to_owned(),
             },
-            AgentEvent::PriorTurnSealed {
-                turn_id: TurnId::new("old-turn"),
+            FrontendOperationEvent::PriorTurnSealed {
+                turn_id: "old-turn".to_owned(),
             },
-            AgentEvent::TurnStarted {
-                turn_id: TurnId::new("turn-1"),
+            FrontendOperationEvent::TurnStarted {
+                turn_id: "turn-1".to_owned(),
             },
-            AgentEvent::ModelCallStarted {
-                model_call_id: ModelCallId::new("call-1"),
+            FrontendOperationEvent::ModelCallStarted {
+                model_call_id: "call-1".to_owned(),
             },
-            AgentEvent::ReasoningDelta {
-                model_call_id: ModelCallId::new("call-1"),
+            FrontendOperationEvent::ReasoningDelta {
+                model_call_id: "call-1".to_owned(),
                 text: "checking workspace\n".to_owned(),
             },
-            AgentEvent::TextDelta {
+            FrontendOperationEvent::TextDelta {
                 delta: "answer line\nfinal".to_owned(),
             },
-            AgentEvent::ModelUsageUpdated {
-                model_call_id: ModelCallId::new("call-1"),
-                usage: TokenUsage {
+            FrontendOperationEvent::ModelUsageUpdated {
+                model_call_id: "call-1".to_owned(),
+                usage: FrontendTokenUsage {
                     input_tokens: Some(12),
                     output_tokens: Some(7),
-                    ..TokenUsage::default()
+                    ..FrontendTokenUsage::default()
                 },
             },
-            AgentEvent::ToolBatchRequested {
-                tool_batch_id: ToolBatchId::new("batch-1"),
+            FrontendOperationEvent::ToolBatchRequested {
+                tool_batch_id: "batch-1".to_owned(),
                 call_count: 1,
             },
-            AgentEvent::ToolExecutionStarted {
-                tool_batch_id: ToolBatchId::new("batch-1"),
-                tool_call_id: ToolCallId::new("tool-1"),
+            FrontendOperationEvent::ToolExecutionStarted {
+                tool_batch_id: "batch-1".to_owned(),
+                tool_call_id: "tool-1".to_owned(),
                 index: 0,
                 tool_name: "read_file".to_owned(),
                 arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
             },
-            AgentEvent::ToolExecutionCompleted {
-                tool_batch_id: ToolBatchId::new("batch-1"),
-                tool_call_id: ToolCallId::new("tool-1"),
+            FrontendOperationEvent::ToolExecutionCompleted {
+                tool_batch_id: "batch-1".to_owned(),
+                tool_call_id: "tool-1".to_owned(),
                 index: 0,
                 tool_name: "read_file".to_owned(),
-                result: ToolResult::success("fn main() {}"),
-                display: Some(ToolDisplay::new("read 12 bytes").with_fact("bytes", "12")),
+                result: FrontendToolResult::Success {
+                    content: "fn main() {}".to_owned(),
+                },
+                display: Some(FrontendToolDisplay {
+                    detail: "read 12 bytes".to_owned(),
+                    facts: vec![("bytes".to_owned(), "12".to_owned())],
+                }),
             },
-            AgentEvent::CancellationRequested {
-                operation_id: OperationId::new("op-1"),
-                reason: CancelReason::Timeout,
+            FrontendOperationEvent::CancellationRequested {
+                operation_id: "op-1".to_owned(),
+                reason: "Timeout".to_owned(),
             },
-            AgentEvent::TurnCancelled {
-                turn_id: TurnId::new("turn-1"),
-                reason: CancelReason::Timeout,
+            FrontendOperationEvent::TurnCancelled {
+                turn_id: "turn-1".to_owned(),
+                reason: "Timeout".to_owned(),
             },
-            AgentEvent::OperationSettled {
-                operation_id: OperationId::new("op-1"),
-                status: OperationStatus::Cancelled,
-                durability: SettlementDurability::Confirmed,
+            FrontendOperationEvent::OperationSettled {
+                operation_id: "op-1".to_owned(),
+                status: "Cancelled".to_owned(),
+                durability: "Confirmed".to_owned(),
             },
         ]
     }
@@ -470,8 +481,8 @@ mod tests {
         let mut store = TranscriptStore::new();
         transcript.apply(
             &mut store,
-            &AgentEvent::ReasoningDelta {
-                model_call_id: ModelCallId::new("call-1"),
+            &FrontendOperationEvent::ReasoningDelta {
+                model_call_id: "call-1".to_owned(),
                 text: "hello".to_owned(),
             },
             InfoLevel::Default,
@@ -487,8 +498,8 @@ mod tests {
 
         transcript.apply(
             &mut store,
-            &AgentEvent::ReasoningDelta {
-                model_call_id: ModelCallId::new("call-1"),
+            &FrontendOperationEvent::ReasoningDelta {
+                model_call_id: "call-1".to_owned(),
                 text: " world\nmore".to_owned(),
             },
             InfoLevel::Default,
@@ -510,8 +521,8 @@ mod tests {
         let mut store = TranscriptStore::new();
         transcript.apply(
             &mut store,
-            &AgentEvent::ReasoningDelta {
-                model_call_id: ModelCallId::new("call-1"),
+            &FrontendOperationEvent::ReasoningDelta {
+                model_call_id: "call-1".to_owned(),
                 text: "thinking\n".to_owned(),
             },
             InfoLevel::Verbose,
@@ -524,9 +535,9 @@ mod tests {
     fn default_tool_started_is_transient_and_completion_is_bounded() {
         let mut transcript = Transcript::new(true);
         let mut store = TranscriptStore::new();
-        let started = AgentEvent::ToolExecutionStarted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("tool"),
+        let started = FrontendOperationEvent::ToolExecutionStarted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "tool".to_owned(),
             index: 0,
             tool_name: "读取文件".repeat(40),
             arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
@@ -537,12 +548,14 @@ mod tests {
             "started belongs only to Activity in default mode"
         );
 
-        let completed = AgentEvent::ToolExecutionCompleted {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("tool"),
+        let completed = FrontendOperationEvent::ToolExecutionCompleted {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "tool".to_owned(),
             index: 0,
             tool_name: "读取文件".repeat(40),
-            result: ToolResult::success("内容".repeat(100)),
+            result: FrontendToolResult::Success {
+                content: "内容".repeat(100),
+            },
             display: None,
         };
         transcript.apply(&mut store, &completed, InfoLevel::Default);
@@ -558,9 +571,9 @@ mod tests {
     fn tool_progress_never_writes_history() {
         let mut transcript = Transcript::new(true);
         let mut store = TranscriptStore::new();
-        let progress = AgentEvent::ToolExecutionProgress {
-            tool_batch_id: ToolBatchId::new("batch"),
-            tool_call_id: ToolCallId::new("tool"),
+        let progress = FrontendOperationEvent::ToolExecutionProgress {
+            tool_batch_id: "batch".to_owned(),
+            tool_call_id: "tool".to_owned(),
             index: 0,
             tail: "live output that must stay off scrollback".to_owned(),
         };
@@ -575,25 +588,27 @@ mod tests {
         let mut transcript = Transcript::new(true);
         let mut store = TranscriptStore::new();
         let events = [
-            AgentEvent::TextDelta {
+            FrontendOperationEvent::TextDelta {
                 delta: "I'll look".to_owned(),
             },
-            AgentEvent::ToolBatchRequested {
-                tool_batch_id: ToolBatchId::new("batch"),
+            FrontendOperationEvent::ToolBatchRequested {
+                tool_batch_id: "batch".to_owned(),
                 call_count: 1,
             },
-            AgentEvent::ToolExecutionCompleted {
-                tool_batch_id: ToolBatchId::new("batch"),
-                tool_call_id: ToolCallId::new("tool"),
+            FrontendOperationEvent::ToolExecutionCompleted {
+                tool_batch_id: "batch".to_owned(),
+                tool_call_id: "tool".to_owned(),
                 index: 0,
                 tool_name: "read".to_owned(),
-                result: ToolResult::success("ok"),
+                result: FrontendToolResult::Success {
+                    content: "ok".to_owned(),
+                },
                 display: None,
             },
-            AgentEvent::ModelCallStarted {
-                model_call_id: ModelCallId::new("call-2"),
+            FrontendOperationEvent::ModelCallStarted {
+                model_call_id: "call-2".to_owned(),
             },
-            AgentEvent::TextDelta {
+            FrontendOperationEvent::TextDelta {
                 delta: "done".to_owned(),
             },
         ];

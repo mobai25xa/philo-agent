@@ -11,6 +11,7 @@ pub(crate) mod cells;
 pub(crate) mod command;
 pub(crate) mod effect;
 pub(crate) mod input;
+pub(crate) mod listings;
 pub(crate) mod overlay;
 pub(crate) mod select;
 pub(crate) mod session;

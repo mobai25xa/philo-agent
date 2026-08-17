@@ -1,0 +1,481 @@
+//! Test doubles for the service crate. Not a production composition root.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use philo_agent_runtime::{
+    AdmissionError, AgentAvailability, CancelResult, CompactionSpec, GenerationDisplay,
+    GenerationId, MaintenanceAccepted, MaintenanceError, MaintenanceId, ModelCallSnapshot,
+    ModelError, ModelEventStream, ModelPort, OperationAccepted, OperationId, OperationSpec,
+    RuntimeConfig, RuntimeEpoch, RuntimeEvent, RuntimeFuture, RuntimeGeneration, RuntimeSnapshot,
+    ShutdownMode, ShutdownReport, ShutdownState, TryRecvError, TurnId,
+};
+use philo_session::{MemorySessionStore, SessionStore};
+use philo_tools::{ToolPort, ToolRegistry};
+use tokio::sync::{Notify, mpsc, watch};
+
+use crate::FrontendClient;
+use crate::bounds::RUNTIME_EVENT_CAP;
+use crate::generation::{AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler};
+use crate::runtime_api::{RuntimeEvents, RuntimePort};
+use crate::service::{AgentService, ServiceDeps};
+
+/// Model port that never starts a stream.
+#[derive(Debug, Default)]
+pub struct UnavailableModel;
+
+impl ModelPort for UnavailableModel {
+    fn start<'a>(
+        &'a self,
+        _request: ModelCallSnapshot,
+    ) -> RuntimeFuture<'a, Result<Box<dyn ModelEventStream>, ModelError>> {
+        Box::pin(async { Err(ModelError::new("unavailable test model")) })
+    }
+}
+
+/// Empty tool registry as a `ToolPort`.
+pub fn empty_tools() -> Arc<dyn ToolPort> {
+    Arc::new(ToolRegistry::empty())
+}
+
+/// Builds a generation that cannot execute model calls.
+pub fn test_generation(model_name: &str) -> Arc<RuntimeGeneration> {
+    Arc::new(RuntimeGeneration {
+        generation_id: GenerationId::new("generation-0"),
+        model: Arc::new(UnavailableModel),
+        tools: empty_tools(),
+        runtime_config: RuntimeConfig::default(),
+        display: GenerationDisplay {
+            model_name: model_name.to_owned(),
+        },
+    })
+}
+
+/// Releases runtime/assembler child calls previously parked by [`ChildHold`].
+pub struct ChildHold {
+    tx: watch::Sender<bool>,
+    rx: watch::Receiver<bool>,
+}
+
+impl ChildHold {
+    fn new() -> Self {
+        let (tx, rx) = watch::channel(false);
+        Self { tx, rx }
+    }
+
+    /// Additional receiver for a second fake that must wait on the same gate.
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.rx.clone()
+    }
+
+    /// Unblocks every waiter. Dropping without release also unblocks (channel closes).
+    pub fn release(self) {
+        let _ = self.tx.send(true);
+    }
+}
+
+async fn wait_hold(rx: Option<watch::Receiver<bool>>) {
+    let Some(mut rx) = rx else {
+        return;
+    };
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Assembler used by service tests. Can fail or delay selected names.
+#[derive(Clone)]
+pub struct FakeAssembler {
+    fail_names: Vec<String>,
+    delay_names: Vec<String>,
+    delay: Duration,
+    model: Arc<dyn ModelPort>,
+    tools: Arc<dyn ToolPort>,
+    config: RuntimeConfig,
+    hold: Option<watch::Receiver<bool>>,
+    started: Arc<AtomicU64>,
+    started_notify: Arc<Notify>,
+}
+
+impl FakeAssembler {
+    /// Succeeds immediately for every name.
+    pub fn new() -> Self {
+        Self {
+            fail_names: Vec::new(),
+            delay_names: Vec::new(),
+            delay: Duration::from_millis(0),
+            model: Arc::new(UnavailableModel),
+            tools: empty_tools(),
+            config: RuntimeConfig::default(),
+            hold: None,
+            started: Arc::new(AtomicU64::new(0)),
+            started_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Fails assembly for the given model names.
+    pub fn failing(names: &[&str]) -> Self {
+        let mut assembler = Self::new();
+        assembler.fail_names = names.iter().map(|name| (*name).to_owned()).collect();
+        assembler
+    }
+
+    /// Delays assembly for the given model names.
+    pub fn with_delay(mut self, names: &[&str], delay: Duration) -> Self {
+        self.delay_names = names.iter().map(|name| (*name).to_owned()).collect();
+        self.delay = delay;
+        self
+    }
+
+    /// Parks `assemble` until the matching [`ChildHold`] is released.
+    pub fn with_hold(mut self, hold: watch::Receiver<bool>) -> Self {
+        self.hold = Some(hold);
+        self
+    }
+
+    /// How many assemble calls have entered the child task.
+    pub fn started(&self) -> u64 {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    /// Waits until at least `count` assemble calls have started.
+    pub async fn wait_started(&self, count: u64) {
+        loop {
+            let notified = self.started_notify.notified();
+            if self.started() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Default for FakeAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GenerationAssembler for FakeAssembler {
+    fn assemble(
+        &self,
+        request: AssembleRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AssembledGeneration, AssembleError>> + Send + '_>> {
+        Box::pin(async move {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.started_notify.notify_waiters();
+            wait_hold(self.hold.clone()).await;
+            if self.delay_names.iter().any(|name| name == &request.name) {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.fail_names.iter().any(|name| name == &request.name) {
+                return Err(AssembleError::new(format!(
+                    "failed to assemble model {}",
+                    request.name
+                )));
+            }
+            Ok(AssembledGeneration {
+                model: self.model.clone(),
+                tools: self.tools.clone(),
+                runtime_config: self.config.clone(),
+                model_name: request.name,
+            })
+        })
+    }
+}
+
+struct FakeInner {
+    submitted: Vec<String>,
+    cancel_calls: Vec<OperationId>,
+    cancel_maintenance_calls: Vec<MaintenanceId>,
+    shutdown_calls: Vec<ShutdownMode>,
+    submit_error: Option<AdmissionError>,
+    next_op: u64,
+    snapshot: RuntimeSnapshot,
+    child_started: u64,
+    child_hold: Option<watch::Receiver<bool>>,
+}
+
+/// Cloneable fake [`RuntimePort`].
+#[derive(Clone)]
+pub struct FakeRuntimeHandle {
+    inner: Arc<Mutex<FakeInner>>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
+    consumed: Arc<AtomicU64>,
+    child_started_notify: Arc<Notify>,
+}
+
+/// Fake [`RuntimeEvents`] subscription.
+pub struct FakeRuntimeSubscription {
+    rx: mpsc::Receiver<RuntimeEvent>,
+    /// Keeps the event channel open even if the test drops every handle.
+    _keep_open: mpsc::Sender<RuntimeEvent>,
+    consumed: Arc<AtomicU64>,
+}
+
+impl FakeRuntimeHandle {
+    /// Creates a connected handle/subscription pair.
+    pub fn pair() -> (Self, FakeRuntimeSubscription) {
+        let (event_tx, rx) = mpsc::channel(RUNTIME_EVENT_CAP);
+        let consumed = Arc::new(AtomicU64::new(0));
+        let handle = Self {
+            inner: Arc::new(Mutex::new(FakeInner {
+                submitted: Vec::new(),
+                cancel_calls: Vec::new(),
+                cancel_maintenance_calls: Vec::new(),
+                shutdown_calls: Vec::new(),
+                submit_error: None,
+                next_op: 1,
+                snapshot: RuntimeSnapshot {
+                    epoch: RuntimeEpoch::new("epoch-1"),
+                    availability: AgentAvailability::Idle,
+                    queued: Vec::new(),
+                    active: None,
+                    maintenance: None,
+                    shutdown: ShutdownState::Running,
+                    last_settled: Vec::new(),
+                    runtime_revision: 0,
+                },
+                child_started: 0,
+                child_hold: None,
+            })),
+            event_tx: event_tx.clone(),
+            consumed: consumed.clone(),
+            child_started_notify: Arc::new(Notify::new()),
+        };
+        (
+            handle,
+            FakeRuntimeSubscription {
+                rx,
+                _keep_open: event_tx,
+                consumed,
+            },
+        )
+    }
+
+    /// Pushes a runtime event onto the subscription. Drops if the cap is full.
+    pub fn emit(&self, event: RuntimeEvent) {
+        let _ = self.event_tx.try_send(event);
+    }
+
+    /// Convenience for [`RuntimeEvent::Agent`].
+    pub fn emit_agent(&self, event: philo_agent_runtime::AgentEvent) {
+        self.emit(RuntimeEvent::Agent(event));
+    }
+
+    /// How many events the service has consumed from the subscription.
+    pub fn consumed(&self) -> u64 {
+        self.consumed.load(Ordering::SeqCst)
+    }
+
+    /// Recorded submit specs, in order.
+    pub fn submitted(&self) -> usize {
+        self.inner.lock().expect("fake runtime").submitted.len()
+    }
+
+    /// Last submitted generation id, if any.
+    pub fn last_submitted_generation(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("fake runtime")
+            .submitted
+            .last()
+            .cloned()
+    }
+
+    /// Recorded cancel calls.
+    pub fn cancel_calls(&self) -> usize {
+        self.inner.lock().expect("fake runtime").cancel_calls.len()
+    }
+
+    /// Forces the next submit to fail.
+    pub fn fail_next_submit(&self, error: AdmissionError) {
+        self.inner.lock().expect("fake runtime").submit_error = Some(error);
+    }
+
+    /// Parks subsequent runtime child calls until the returned hold is released.
+    pub fn hold_children(&self) -> ChildHold {
+        let hold = ChildHold::new();
+        self.inner.lock().expect("fake runtime").child_hold = Some(hold.subscribe());
+        hold
+    }
+
+    /// Replaces the snapshot returned by [`RuntimePort::snapshot`].
+    pub fn set_snapshot(&self, snapshot: RuntimeSnapshot) {
+        self.inner.lock().expect("fake runtime").snapshot = snapshot;
+    }
+
+    /// How many runtime child calls have entered before completing.
+    pub fn child_started(&self) -> u64 {
+        self.inner.lock().expect("fake runtime").child_started
+    }
+
+    /// Waits until at least `count` runtime child calls have started.
+    pub async fn wait_child_started(&self, count: u64) {
+        loop {
+            let notified = self.child_started_notify.notified();
+            if self.child_started() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Recorded shutdown calls.
+    pub fn shutdown_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("fake runtime")
+            .shutdown_calls
+            .len()
+    }
+}
+
+async fn park_runtime_child(inner: &Arc<Mutex<FakeInner>>, notify: &Notify) {
+    let hold = {
+        let mut guard = inner.lock().expect("fake runtime");
+        guard.child_started += 1;
+        guard.child_hold.clone()
+    };
+    notify.notify_waiters();
+    wait_hold(hold).await;
+}
+
+impl RuntimePort for FakeRuntimeHandle {
+    fn submit(
+        &self,
+        spec: OperationSpec,
+    ) -> impl Future<Output = Result<OperationAccepted, AdmissionError>> + Send {
+        let inner = self.inner.clone();
+        let notify = self.child_started_notify.clone();
+        async move {
+            park_runtime_child(&inner, &notify).await;
+            let mut inner = inner.lock().expect("fake runtime");
+            if let Some(error) = inner.submit_error.take() {
+                return Err(error);
+            }
+            let index = inner.next_op;
+            inner.next_op += 1;
+            inner
+                .submitted
+                .push(spec.generation.generation_id.to_string());
+            Ok(OperationAccepted {
+                operation_id: OperationId::new(format!("op-{index}")),
+                turn_id: TurnId::new(format!("turn-{index}")),
+            })
+        }
+    }
+
+    fn cancel(&self, operation_id: OperationId) -> impl Future<Output = CancelResult> + Send {
+        let inner = self.inner.clone();
+        let notify = self.child_started_notify.clone();
+        async move {
+            park_runtime_child(&inner, &notify).await;
+            inner
+                .lock()
+                .expect("fake runtime")
+                .cancel_calls
+                .push(operation_id);
+            CancelResult::Requested
+        }
+    }
+
+    fn start_compaction(
+        &self,
+        _spec: CompactionSpec,
+    ) -> impl Future<Output = Result<MaintenanceAccepted, MaintenanceError>> + Send {
+        let inner = self.inner.clone();
+        let notify = self.child_started_notify.clone();
+        async move {
+            park_runtime_child(&inner, &notify).await;
+            Ok(MaintenanceAccepted {
+                id: MaintenanceId::new("maint-1"),
+            })
+        }
+    }
+
+    fn cancel_maintenance(&self, id: MaintenanceId) -> impl Future<Output = CancelResult> + Send {
+        let inner = self.inner.clone();
+        let notify = self.child_started_notify.clone();
+        async move {
+            park_runtime_child(&inner, &notify).await;
+            inner
+                .lock()
+                .expect("fake runtime")
+                .cancel_maintenance_calls
+                .push(id);
+            CancelResult::Requested
+        }
+    }
+
+    fn snapshot(&self) -> impl Future<Output = RuntimeSnapshot> + Send {
+        let inner = self.inner.clone();
+        async move { inner.lock().expect("fake runtime").snapshot.clone() }
+    }
+
+    fn shutdown(&self, mode: ShutdownMode) -> impl Future<Output = ShutdownReport> + Send {
+        let inner = self.inner.clone();
+        let notify = self.child_started_notify.clone();
+        async move {
+            park_runtime_child(&inner, &notify).await;
+            let mut inner = inner.lock().expect("fake runtime");
+            inner.shutdown_calls.push(mode);
+            ShutdownReport {
+                epoch: inner.snapshot.epoch.clone(),
+                shutdown: ShutdownState::Stopped,
+                settlements: Vec::new(),
+            }
+        }
+    }
+}
+
+impl RuntimeEvents for FakeRuntimeSubscription {
+    async fn recv(&mut self) -> Option<RuntimeEvent> {
+        let event = self.rx.recv().await;
+        if event.is_some() {
+            self.consumed.fetch_add(1, Ordering::SeqCst);
+        }
+        event
+    }
+
+    fn try_recv(&mut self) -> Result<RuntimeEvent, TryRecvError> {
+        match self.rx.try_recv() {
+            Ok(event) => {
+                self.consumed.fetch_add(1, Ordering::SeqCst);
+                Ok(event)
+            }
+            Err(mpsc::error::TryRecvError::Empty) => Err(TryRecvError::Empty),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(TryRecvError::Closed),
+        }
+    }
+}
+
+/// Starts a service against [`FakeRuntimeHandle`] and [`MemorySessionStore`].
+pub fn start_test_service() -> (AgentService, FrontendClient, FakeRuntimeHandle) {
+    start_test_service_with(FakeAssembler::new(), MemorySessionStore::new())
+}
+
+/// Starts a service with an explicit assembler and store.
+pub fn start_test_service_with(
+    assembler: FakeAssembler,
+    sessions: impl SessionStore + 'static,
+) -> (AgentService, FrontendClient, FakeRuntimeHandle) {
+    let (runtime, subscription) = FakeRuntimeHandle::pair();
+    let handle = runtime.clone();
+    let (service, client) = crate::start(ServiceDeps {
+        runtime,
+        subscription,
+        sessions: Arc::new(sessions),
+        assembler: Arc::new(assembler),
+        initial_generation: test_generation("base"),
+    });
+    (service, client, handle)
+}

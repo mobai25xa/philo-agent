@@ -8,6 +8,7 @@ license.workspace = true
 philo-agent-kernel = { path = "../philo-agent-kernel" }
 philo-session = { path = "../philo-session" }
 philo-tools = { path = "../philo-tools" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [dev-dependencies]
 philo-session-jsonl = { path = "../philo-session-jsonl" }

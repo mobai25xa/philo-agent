@@ -2,69 +2,89 @@
 
 use crate::RuntimeEvent;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 /// Worst-case reliable events from one producer handler (admit, queued
 /// cancel, or driver-join settlement + fault).
 pub(crate) const PRODUCER_STAGING_RESERVE: usize = 2;
 
-/// FIFO of reliable events with a hard capacity from [`crate::ChannelBounds`].
-pub(crate) struct ReliableStaging {
+struct StagingInner {
     cap: usize,
     queue: VecDeque<RuntimeEvent>,
+}
+
+/// FIFO of reliable events with a hard capacity from [`crate::ChannelBounds`].
+///
+/// Shared between the coordinator and the epoch supervisor so a panic cannot
+/// drop events that already entered staging.
+#[derive(Clone)]
+pub(crate) struct ReliableStaging {
+    inner: Arc<Mutex<StagingInner>>,
 }
 
 impl ReliableStaging {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            cap,
-            queue: VecDeque::new(),
+            inner: Arc::new(Mutex::new(StagingInner {
+                cap,
+                queue: VecDeque::new(),
+            })),
         }
     }
 
     pub(crate) fn cap(&self) -> usize {
-        self.cap
+        lock(&self.inner).cap
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.queue.len()
+        lock(&self.inner).queue.len()
     }
 
     pub(crate) fn remaining(&self) -> usize {
-        self.cap.saturating_sub(self.queue.len())
+        let inner = lock(&self.inner);
+        inner.cap.saturating_sub(inner.queue.len())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        lock(&self.inner).queue.is_empty()
     }
 
     pub(crate) fn can_accept_producer(&self) -> bool {
         self.remaining() >= PRODUCER_STAGING_RESERVE
     }
 
-    pub(crate) fn push(&mut self, event: RuntimeEvent) -> Result<(), RuntimeEvent> {
-        if self.queue.len() >= self.cap {
+    pub(crate) fn push(&self, event: RuntimeEvent) -> Result<(), RuntimeEvent> {
+        let mut inner = lock(&self.inner);
+        if inner.queue.len() >= inner.cap {
             return Err(event);
         }
-        self.queue.push_back(event);
+        inner.queue.push_back(event);
         Ok(())
     }
 
-    pub(crate) fn pop_front(&mut self) -> Option<RuntimeEvent> {
-        self.queue.pop_front()
+    pub(crate) fn pop_front(&self) -> Option<RuntimeEvent> {
+        lock(&self.inner).queue.pop_front()
     }
 
-    pub(crate) fn push_front(&mut self, event: RuntimeEvent) {
-        debug_assert!(self.queue.len() < self.cap);
-        self.queue.push_front(event);
+    pub(crate) fn push_front(&self, event: RuntimeEvent) {
+        let mut inner = lock(&self.inner);
+        debug_assert!(inner.queue.len() < inner.cap);
+        inner.queue.push_front(event);
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.queue.clear();
+    pub(crate) fn clear(&self) {
+        lock(&self.inner).queue.clear();
     }
 
-    pub(crate) fn drain(&mut self) -> Vec<RuntimeEvent> {
-        self.queue.drain(..).collect()
+    pub(crate) fn drain(&self) -> Vec<RuntimeEvent> {
+        lock(&self.inner).queue.drain(..).collect()
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Test-visible occupancy of the two coordinator outbound buffers.
@@ -91,7 +111,7 @@ mod tests {
 
     #[test]
     fn push_rejects_when_full() {
-        let mut staging = ReliableStaging::new(1);
+        let staging = ReliableStaging::new(1);
         assert!(staging.push(availability()).is_ok());
         assert_eq!(staging.remaining(), 0);
         assert!(staging.push(availability()).is_err());
@@ -100,7 +120,7 @@ mod tests {
 
     #[test]
     fn fifo_and_clear() {
-        let mut staging = ReliableStaging::new(2);
+        let staging = ReliableStaging::new(2);
         let first = RuntimeEvent::AvailabilityChanged {
             availability: AgentAvailability::Idle,
             queued: 1,
@@ -122,9 +142,19 @@ mod tests {
 
     #[test]
     fn producer_reserve_requires_two_slots() {
-        let mut staging = ReliableStaging::new(2);
+        let staging = ReliableStaging::new(2);
         assert!(staging.can_accept_producer());
         assert!(staging.push(availability()).is_ok());
         assert!(!staging.can_accept_producer());
+    }
+
+    #[test]
+    fn clone_shares_the_same_queue() {
+        let staging = ReliableStaging::new(2);
+        let other = staging.clone();
+        assert!(staging.push(availability()).is_ok());
+        assert_eq!(other.len(), 1);
+        assert_eq!(other.drain().len(), 1);
+        assert!(staging.is_empty());
     }
 }

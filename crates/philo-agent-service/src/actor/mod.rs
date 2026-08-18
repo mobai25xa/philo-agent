@@ -122,6 +122,7 @@ pub(crate) struct AgentServiceActor<R, S> {
     snapshot_token: u64,
     applied_runtime_revision: u64,
     required_session_revision: HashMap<String, u64>,
+    operation_session: HashMap<String, String>,
     runtime_snapshot_inflight: bool,
     session_seq: u64,
     runtime_closed: bool,
@@ -166,6 +167,7 @@ where
             snapshot_token: 0,
             applied_runtime_revision: 0,
             required_session_revision: HashMap::new(),
+            operation_session: HashMap::new(),
             runtime_snapshot_inflight: false,
             session_seq: 0,
             runtime_closed: false,
@@ -473,10 +475,7 @@ where
                 report.final_state
             )),
             Err(philo_agent_runtime::ShutdownError::DeadlineExceeded { pending }) => {
-                let message = format!(
-                    "runtime shutdown deadline exceeded: {}",
-                    pending.join(",")
-                );
+                let message = format!("runtime shutdown deadline exceeded: {}", pending.join(","));
                 self.health = ServiceHealth::Degraded {
                     message: message.clone(),
                 };
@@ -562,6 +561,8 @@ where
                 session_id,
                 turn_id,
             } => {
+                self.operation_session
+                    .insert(operation_id.to_string(), session_id.to_string());
                 self.live.accept(operation_id.as_str(), turn_id.as_str());
                 self.emit(
                     None,
@@ -695,9 +696,20 @@ where
                     self.queued.remove(0);
                     self.live.mark_lagged();
                 }
+                let session_id = self
+                    .operation_session
+                    .get(operation_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.notice(format!(
+                            "queued operation {} has no accepted session",
+                            operation_id.as_str()
+                        ));
+                        String::new()
+                    });
                 self.queued.push(QueuedOperationSummary {
                     operation_id: operation_id.as_str().to_owned(),
-                    session_id: self.current_session.clone().unwrap_or_default(),
+                    session_id,
                 });
             }
             AgentEvent::OperationStarted { operation_id } => {
@@ -760,7 +772,15 @@ where
         if self.queued.is_empty() {
             self.availability = FrontendAvailability::Idle;
         }
-        self.on_operation_settled(durability, session_revision);
+        if let Some(owned) = self.operation_session.get(operation_id)
+            && owned != session_id
+        {
+            self.notice(format!(
+                "settlement session {session_id} does not match accepted session {owned}"
+            ));
+        }
+        self.on_operation_settled(session_id, durability, session_revision);
+        self.operation_session.remove(operation_id);
         self.emit(
             None,
             FrontendUpdateKind::OperationEvent(

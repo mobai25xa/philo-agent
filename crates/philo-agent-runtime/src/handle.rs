@@ -107,10 +107,7 @@ impl RuntimeHandle {
             return Err(ShutdownError::RuntimeGone);
         }
         self.shutdown_tx.send_modify(|slot| {
-            *slot = Some(merge_shutdown(
-                *slot,
-                ShutdownRequest { mode, deadline },
-            ));
+            *slot = Some(merge_shutdown(*slot, ShutdownRequest { mode, deadline }));
         });
         let mut completion_rx = self.completion_rx.clone();
         loop {

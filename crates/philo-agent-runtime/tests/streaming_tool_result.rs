@@ -158,21 +158,17 @@ async fn parallel_progress_tails_do_not_mix() {
         })
         .collect();
     assert!(
-        tails
-            .iter()
-            .any(|(id, tail)| id.contains("call-a") && tail.contains("AAA")),
-        "{tails:?}"
+        !tails.is_empty(),
+        "at least one tool progress must be visible: {tails:?}"
     );
+    // Driver slots stay per-call. The Service-facing coalescer is one
+    // ToolProgress slot per operation, so an unread outlet latest-wins.
+    // A surviving event must still carry its own call's tail.
     assert!(
-        tails
-            .iter()
-            .any(|(id, tail)| id.contains("call-b") && tail.contains("BBB")),
-        "{tails:?}"
-    );
-    assert!(
-        tails
-            .iter()
-            .all(|(id, tail)| !(id.contains("call-a") && tail.contains("BBB"))),
-        "{tails:?}"
+        tails.iter().all(|(id, tail)| {
+            !(id.contains("call-a") && tail.contains("BBB"))
+                && !(id.contains("call-b") && tail.contains("AAA"))
+        }),
+        "progress tail must belong to its tool_call_id: {tails:?}"
     );
 }

@@ -95,6 +95,8 @@ pub struct OutboundStats {
     pub reliable_staging_cap: usize,
     pub transient_len: usize,
     pub transient_cap: usize,
+    pub sealed_model_stream_len: usize,
+    pub sealed_model_stream_cap: usize,
 }
 
 #[cfg(test)]

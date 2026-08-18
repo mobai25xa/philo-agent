@@ -105,13 +105,9 @@ impl CtrlCPhase {
                     cancel_request: next_cancel_request,
                 }
             }
-            Self::CancelDispatching { .. } => {
-                // Still waiting for dispatch result: retry is not escalate.
-                // Second press while dispatching also does not force-exit.
-                CtrlCDecision::ForcedExit {
-                    code: FORCED_EXIT_CODE,
-                }
-            }
+            Self::CancelDispatching { cancel_request, .. } => CtrlCDecision::WaitForId {
+                cancel_request: *cancel_request,
+            },
             Self::Cancelling { .. } => CtrlCDecision::ForcedExit {
                 code: FORCED_EXIT_CODE,
             },
@@ -232,12 +228,14 @@ mod tests {
         let mut phase = CtrlCPhase::Idle;
         phase.observe_busy("op-1");
         let _ = phase.on_ctrl_c(3);
-        assert!(phase
-            .on_cancel_dispatch_finished(
-                3,
-                CancelDispatchResult::Enqueued(FrontendRequestId::new(9)),
-            )
-            .is_none());
+        assert!(
+            phase
+                .on_cancel_dispatch_finished(
+                    3,
+                    CancelDispatchResult::Enqueued(FrontendRequestId::new(9)),
+                )
+                .is_none()
+        );
         assert!(matches!(phase, CtrlCPhase::Cancelling { .. }));
         assert_eq!(
             phase.on_ctrl_c(4),
@@ -252,11 +250,60 @@ mod tests {
         let mut phase = CtrlCPhase::Idle;
         phase.observe_busy("op-1");
         let _ = phase.on_ctrl_c(1);
-        let _ = phase.on_cancel_dispatch_finished(
-            1,
-            CancelDispatchResult::Enqueued(FrontendRequestId::new(1)),
+        assert!(
+            phase
+                .on_cancel_dispatch_finished(
+                    1,
+                    CancelDispatchResult::Enqueued(FrontendRequestId::new(1)),
+                )
+                .is_none()
         );
         phase.observe_idle();
         assert_eq!(phase.on_ctrl_c(2), CtrlCDecision::UserExit);
+    }
+
+    #[test]
+    fn dispatching_second_ctrl_c_does_not_force() {
+        let mut phase = CtrlCPhase::Idle;
+        phase.observe_busy("op-1");
+        let first = phase.on_ctrl_c(1);
+        assert!(matches!(
+            first,
+            CtrlCDecision::Cancel {
+                cancel_request: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            phase.on_ctrl_c(2),
+            CtrlCDecision::WaitForId { cancel_request: 1 }
+        );
+        assert!(matches!(
+            phase,
+            CtrlCPhase::CancelDispatching {
+                operation_id: Some(ref id),
+                cancel_request: 1,
+            } if id == "op-1"
+        ));
+    }
+
+    #[test]
+    fn wait_for_id_second_ctrl_c_keeps_waiting() {
+        let mut phase = CtrlCPhase::Busy { operation_id: None };
+        assert_eq!(
+            phase.on_ctrl_c(5),
+            CtrlCDecision::WaitForId { cancel_request: 5 }
+        );
+        assert_eq!(
+            phase.on_ctrl_c(6),
+            CtrlCDecision::WaitForId { cancel_request: 5 }
+        );
+        assert!(matches!(
+            phase,
+            CtrlCPhase::CancelDispatching {
+                operation_id: None,
+                cancel_request: 5,
+            }
+        ));
     }
 }

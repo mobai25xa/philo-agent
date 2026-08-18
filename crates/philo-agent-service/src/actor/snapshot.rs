@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::CommandReject;
 use crate::frontend::snapshot::{
     DurableSessionView, FrontendAvailability, FrontendSnapshot, QueuedOperationSummary,
+    ServiceHealth,
 };
 use crate::frontend::update::FrontendUpdateKind;
 use crate::ids::{FrontendEpoch, FrontendRequestId};
@@ -14,6 +15,10 @@ use crate::runtime_api::{RuntimeEvents, RuntimePort};
 use philo_agent_runtime::{RuntimeSnapshot, SettlementDurability, SettlementRevision};
 
 use super::{AgentServiceActor, ServiceTaskResult, ViewKind};
+
+/// Same-session floor-insufficient reloads are bounded. Successful publish
+/// and a new `begin_pending_load` reset the counter.
+pub(crate) const SNAPSHOT_RELOAD_ATTEMPT_MAX: u32 = 8;
 
 /// Causal barrier captured when a session load or snapshot read starts.
 #[derive(Clone, Debug)]
@@ -42,6 +47,13 @@ struct PendingReload {
     request_id: Option<FrontendRequestId>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingLoad {
+    session_id: String,
+    #[allow(dead_code)]
+    generation: u64,
+}
+
 enum TokenDecision {
     Drop,
     Reload,
@@ -56,30 +68,73 @@ enum SettledApply {
 /// Session-scoped snapshot ownership, floors, and in-flight load tracking.
 pub(crate) struct SnapshotState {
     pub current_session: Option<String>,
+    pending_load: Option<PendingLoad>,
     operation_session: HashMap<String, String>,
     required_revision: HashMap<String, u64>,
     published_revision: HashMap<String, u64>,
     load_generation: u64,
     inflight: HashSet<String>,
     pending_reload: Option<PendingReload>,
+    reload_attempts: HashMap<String, u32>,
 }
 
 impl SnapshotState {
     pub(crate) fn new() -> Self {
         Self {
             current_session: None,
+            pending_load: None,
             operation_session: HashMap::new(),
             required_revision: HashMap::new(),
             published_revision: HashMap::new(),
             load_generation: 0,
             inflight: HashSet::new(),
             pending_reload: None,
+            reload_attempts: HashMap::new(),
         }
     }
 
-    pub(crate) fn switch_current(&mut self, session_id: String) -> u64 {
+    pub(crate) fn begin_pending_load(&mut self, session_id: String) -> u64 {
+        self.reset_reload_attempts(&session_id);
+        let generation = self.bump_generation();
+        self.pending_load = Some(PendingLoad {
+            session_id,
+            generation,
+        });
+        generation
+    }
+
+    pub(crate) fn commit_current(&mut self, session_id: String) {
+        if self
+            .pending_load
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            self.pending_load = None;
+        }
         self.current_session = Some(session_id);
-        self.bump_generation()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_pending_load(&self) -> bool {
+        self.pending_load.is_some()
+    }
+
+    pub(crate) fn pending_load_session(&self) -> Option<&str> {
+        self.pending_load
+            .as_ref()
+            .map(|pending| pending.session_id.as_str())
+    }
+
+    pub(crate) fn pending_load_is(&self, session_id: &str) -> bool {
+        self.pending_load
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+    }
+
+    pub(crate) fn clear_pending_load_if(&mut self, session_id: &str) {
+        if self.pending_load_is(session_id) {
+            self.pending_load = None;
+        }
     }
 
     pub(crate) fn bump_generation(&mut self) -> u64 {
@@ -90,6 +145,24 @@ impl SnapshotState {
     pub(crate) fn on_epoch_reset(&mut self) {
         self.bump_generation();
         self.pending_reload = None;
+        self.pending_load = None;
+        self.reload_attempts.clear();
+    }
+
+    fn reset_reload_attempts(&mut self, session_id: &str) {
+        self.reload_attempts.remove(session_id);
+    }
+
+    fn begin_reload_attempt(&mut self, session_id: &str) -> bool {
+        let count = self
+            .reload_attempts
+            .entry(session_id.to_owned())
+            .or_insert(0);
+        if *count >= SNAPSHOT_RELOAD_ATTEMPT_MAX {
+            return false;
+        }
+        *count = count.saturating_add(1);
+        true
     }
 
     pub(crate) fn required_for(&self, session_id: &str) -> u64 {
@@ -97,11 +170,19 @@ impl SnapshotState {
     }
 
     fn published_for(&self, session_id: &str) -> u64 {
-        self.published_revision.get(session_id).copied().unwrap_or(0)
+        self.published_revision
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn is_current_session(&self, session_id: &str) -> bool {
         self.current_session.as_deref() == Some(session_id)
+    }
+
+    #[cfg(test)]
+    fn load_gate_allows(&self, generation: u64, session_id: &str) -> bool {
+        generation == self.load_generation && self.pending_load_is(session_id)
     }
 
     pub(crate) fn note_accepted(&mut self, operation_id: String, session_id: String) {
@@ -110,6 +191,14 @@ impl SnapshotState {
 
     pub(crate) fn session_of(&self, operation_id: &str) -> Option<&str> {
         self.operation_session.get(operation_id).map(String::as_str)
+    }
+
+    /// Live belongs in the current session snapshot only when ownership matches.
+    pub(crate) fn live_belongs_to_current(&self, operation_id: Option<&str>) -> bool {
+        match (self.current_session.as_deref(), operation_id) {
+            (Some(current), Some(operation_id)) => self.session_of(operation_id) == Some(current),
+            _ => false,
+        }
     }
 
     fn apply_settled(
@@ -233,7 +322,7 @@ where
     }
 
     pub(super) fn start_session_load(&mut self, request_id: FrontendRequestId, session_id: String) {
-        self.snapshot.switch_current(session_id.clone());
+        self.snapshot.begin_pending_load(session_id.clone());
         self.spawn_tracked_view(Some(request_id), SessionViewKind::Load, session_id);
     }
 
@@ -287,6 +376,10 @@ where
                         reason: CommandReject::InvalidInput { reason },
                     },
                 );
+                if let ViewKind::Load(token) = &kind {
+                    self.snapshot.clear_pending_load_if(&token.session_id);
+                    return;
+                }
                 self.maybe_schedule_pending(pending);
                 return;
             }
@@ -321,20 +414,29 @@ where
         session_id: &str,
         durability: SettlementDurability,
         session_revision: SettlementRevision,
-    ) {
-        match self.snapshot.apply_settled(
-            operation_id,
-            session_id,
-            durability,
-            session_revision,
-        ) {
+    ) -> bool {
+        match self
+            .snapshot
+            .apply_settled(operation_id, session_id, durability, session_revision)
+        {
             SettledApply::Applied => {
                 if self.feed.is_resyncing() {
                     self.begin_fenced_snapshot(self.latest_snapshot);
                 }
+                true
             }
             SettledApply::ProtocolError { message } => {
-                self.notice(message);
+                self.notice(message.clone());
+                self.health = ServiceHealth::Degraded {
+                    message: message.clone(),
+                };
+                self.emit(
+                    None,
+                    FrontendUpdateKind::ServiceHealthChanged {
+                        health: self.health.clone(),
+                    },
+                );
+                false
             }
         }
     }
@@ -373,6 +475,7 @@ where
         self.latest_snapshot = request_id;
         match self.snapshot.current_session.clone() {
             Some(session_id) => {
+                self.snapshot.reset_reload_attempts(&session_id);
                 self.spawn_tracked_view(request_id, SessionViewKind::Snapshot, session_id);
             }
             None => {
@@ -399,6 +502,9 @@ where
         let spawn_id = request_id.unwrap_or(FrontendRequestId::INVALID);
         if !self.can_spawn_work() {
             self.snapshot.end_inflight(&session_id);
+            if kind == SessionViewKind::Load {
+                self.snapshot.clear_pending_load_if(&session_id);
+            }
             if let Some(id) = request_id {
                 self.reject_child_capacity(id);
             }
@@ -437,11 +543,21 @@ where
         match self.evaluate_token(&token, view.revision().get(), kind) {
             TokenDecision::Drop => self.maybe_schedule_pending(pending),
             TokenDecision::Reload => {
-                let reload = pending.unwrap_or(PendingReload {
-                    session_id: token.session_id,
-                    kind,
-                    request_id: token.request_id,
-                });
+                let reload = if kind == SessionViewKind::Load
+                    && self.snapshot.pending_load_is(&token.session_id)
+                {
+                    PendingReload {
+                        session_id: token.session_id,
+                        kind: SessionViewKind::Load,
+                        request_id: token.request_id,
+                    }
+                } else {
+                    pending.unwrap_or(PendingReload {
+                        session_id: token.session_id,
+                        kind,
+                        request_id: token.request_id,
+                    })
+                };
                 self.schedule_reload(reload);
             }
             TokenDecision::Publish => {
@@ -457,16 +573,28 @@ where
         view_revision: u64,
         kind: SessionViewKind,
     ) -> TokenDecision {
-        if token.generation != self.snapshot.load_generation
-            || token.frontend_epoch != self.epoch
-        {
+        if token.frontend_epoch != self.epoch {
             return TokenDecision::Drop;
         }
-        if !self.snapshot.is_current_session(&token.session_id) {
-            return TokenDecision::Drop;
-        }
-        if kind == SessionViewKind::Snapshot && self.latest_snapshot != token.request_id {
-            return TokenDecision::Drop;
+        match kind {
+            SessionViewKind::Load => {
+                if !self.snapshot.pending_load_is(&token.session_id) {
+                    return TokenDecision::Drop;
+                }
+                if token.generation != self.snapshot.load_generation {
+                    return TokenDecision::Reload;
+                }
+            }
+            SessionViewKind::Snapshot => {
+                if token.generation != self.snapshot.load_generation
+                    || !self.snapshot.is_current_session(&token.session_id)
+                {
+                    return TokenDecision::Drop;
+                }
+                if self.latest_snapshot != token.request_id {
+                    return TokenDecision::Drop;
+                }
+            }
         }
         let required = self.snapshot.required_for(&token.session_id);
         debug_assert!(
@@ -502,14 +630,19 @@ where
     ) {
         self.snapshot
             .note_published(&token.session_id, view.revision().get());
+        self.snapshot.reset_reload_attempts(&token.session_id);
         match kind {
-            SessionViewKind::Load => self.emit(
-                token.request_id,
-                FrontendUpdateKind::SessionLoaded {
-                    session_id: token.session_id,
-                    view: mapping::durable_session_view(&view),
-                },
-            ),
+            SessionViewKind::Load => {
+                self.snapshot.commit_current(token.session_id.clone());
+                self.drop_foreign_live();
+                self.emit(
+                    token.request_id,
+                    FrontendUpdateKind::SessionLoaded {
+                        session_id: token.session_id,
+                        view: mapping::durable_session_view(&view),
+                    },
+                );
+            }
             SessionViewKind::Snapshot => {
                 let durable = mapping::durable_session_view(&view);
                 let live = self.live_for_snapshot(&view);
@@ -530,7 +663,51 @@ where
         if !self.is_accepting_work() {
             return;
         }
-        if !self.snapshot.is_current_session(&pending.session_id) {
+        let allowed = match pending.kind {
+            SessionViewKind::Load => self.snapshot.pending_load_is(&pending.session_id),
+            SessionViewKind::Snapshot => self.snapshot.is_current_session(&pending.session_id),
+        };
+        if !allowed {
+            return;
+        }
+        if !self.snapshot.begin_reload_attempt(&pending.session_id) {
+            self.notice(format!(
+                "snapshot reload limit reached for session {}",
+                pending.session_id
+            ));
+            match pending.kind {
+                SessionViewKind::Load => {
+                    self.snapshot.clear_pending_load_if(&pending.session_id);
+                    if let Some(request_id) = pending.request_id {
+                        self.emit(
+                            Some(request_id),
+                            FrontendUpdateKind::CommandRejected {
+                                reason: CommandReject::InvalidInput {
+                                    reason: format!(
+                                        "session load reload limit reached for {}",
+                                        pending.session_id
+                                    ),
+                                },
+                            },
+                        );
+                    }
+                }
+                SessionViewKind::Snapshot => {
+                    if let Some(request_id) = pending.request_id {
+                        self.emit(
+                            Some(request_id),
+                            FrontendUpdateKind::CommandRejected {
+                                reason: CommandReject::InvalidInput {
+                                    reason: format!(
+                                        "snapshot reload limit reached for {}",
+                                        pending.session_id
+                                    ),
+                                },
+                            },
+                        );
+                    }
+                }
+            }
             return;
         }
         self.snapshot.bump_generation();
@@ -538,11 +715,36 @@ where
     }
 
     fn live_for_snapshot(&self, view: &philo_session::SessionContextView) -> LiveOperationSnapshot {
-        let mut live = self.live.clone();
+        let mut live = self.filter_live_for_current(self.live.clone());
         if mapping::session_view_covers_live(view, &live) {
             live.settle();
         }
         live
+    }
+
+    fn filter_live_for_current(&self, live: LiveOperationSnapshot) -> LiveOperationSnapshot {
+        if self
+            .snapshot
+            .live_belongs_to_current(live.operation_id.as_deref())
+        {
+            live
+        } else {
+            LiveOperationSnapshot::default()
+        }
+    }
+
+    fn drop_foreign_live(&mut self) {
+        if !self
+            .snapshot
+            .live_belongs_to_current(self.live.operation_id.as_deref())
+        {
+            self.live.clear();
+        }
+    }
+
+    pub(super) fn live_accepts_agent_events(&self) -> bool {
+        self.snapshot
+            .live_belongs_to_current(self.live.operation_id.as_deref())
     }
 
     pub(super) fn compose_snapshot(
@@ -550,6 +752,11 @@ where
         durable_session_view: Option<DurableSessionView>,
         live: LiveOperationSnapshot,
     ) -> FrontendSnapshot {
+        debug_assert!(
+            durable_session_view.is_some() || self.snapshot.current_session.is_none(),
+            "must not publish current_session_id: Some with durable_session_view: None"
+        );
+        let live = self.filter_live_for_current(live);
         FrontendSnapshot {
             epoch: self.epoch,
             revision: self.revision,
@@ -586,7 +793,7 @@ where
         self.runtime_snapshot_inflight = true;
         let runtime = self.runtime.clone();
         let epoch = self.epoch;
-        self.child_tasks.spawn(async move {
+        self.spawn_child(None, async move {
             let snapshot = runtime.snapshot().await;
             ServiceTaskResult::RuntimeSnapshot { epoch, snapshot }
         });
@@ -612,30 +819,82 @@ where
             }
         });
         if let Some(active) = snapshot.active {
-            self.live.start_operation(active.operation_id.as_str());
-            self.live.start_turn(active.turn_id.as_str());
+            if self.snapshot.is_current_session(active.session_id.as_str()) {
+                self.snapshot.note_accepted(
+                    active.operation_id.to_string(),
+                    active.session_id.to_string(),
+                );
+                self.live.start_operation(active.operation_id.as_str());
+                self.live.start_turn(active.turn_id.as_str());
+            }
         } else if let FrontendAvailability::Busy { operation_id } = &self.availability {
             let operation_id = operation_id.clone();
-            if self.live.operation_id.as_deref() != Some(operation_id.as_str()) {
+            if self
+                .snapshot
+                .live_belongs_to_current(Some(operation_id.as_str()))
+                && self.live.operation_id.as_deref() != Some(operation_id.as_str())
+            {
                 self.live.start_operation(operation_id);
             }
         }
+        self.drop_foreign_live();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::SNAPSHOT_RELOAD_ATTEMPT_MAX;
     use super::SnapshotState;
     use philo_agent_runtime::{SettlementDurability, SettlementRevision};
     use philo_session::SessionRevision;
 
     #[test]
-    fn switch_current_bumps_generation() {
+    fn begin_pending_load_does_not_change_current() {
         let mut state = SnapshotState::new();
-        let first = state.switch_current("sess-a".into());
-        let second = state.switch_current("sess-b".into());
+        state.commit_current("sess-a".into());
+        let first = state.begin_pending_load("sess-b".into());
+        let second = state.begin_pending_load("sess-c".into());
         assert!(second > first);
-        assert_eq!(state.current_session.as_deref(), Some("sess-b"));
+        assert_eq!(state.current_session.as_deref(), Some("sess-a"));
+        assert!(state.pending_load_is("sess-c"));
+        assert!(!state.pending_load_is("sess-b"));
+    }
+
+    #[test]
+    fn commit_current_clears_matching_pending() {
+        let mut state = SnapshotState::new();
+        let _ = state.begin_pending_load("sess-a".into());
+        state.commit_current("sess-a".into());
+        assert_eq!(state.current_session.as_deref(), Some("sess-a"));
+        assert!(!state.has_pending_load());
+
+        let _ = state.begin_pending_load("sess-b".into());
+        state.commit_current("sess-a".into());
+        assert_eq!(state.current_session.as_deref(), Some("sess-a"));
+        assert!(state.pending_load_is("sess-b"));
+    }
+
+    #[test]
+    fn load_gate_rejects_mismatched_generation_or_session() {
+        let mut state = SnapshotState::new();
+        let generation = state.begin_pending_load("sess-a".into());
+        assert!(state.load_gate_allows(generation, "sess-a"));
+        assert!(!state.load_gate_allows(generation.saturating_sub(1), "sess-a"));
+        assert!(!state.load_gate_allows(generation, "sess-b"));
+        state.commit_current("sess-a".into());
+        assert!(!state.load_gate_allows(generation, "sess-a"));
+    }
+
+    #[test]
+    fn reload_attempts_are_bounded_and_reset_on_new_load() {
+        let mut state = SnapshotState::new();
+        for _ in 0..SNAPSHOT_RELOAD_ATTEMPT_MAX {
+            assert!(state.begin_reload_attempt("sess-a"));
+        }
+        assert!(!state.begin_reload_attempt("sess-a"));
+        assert!(state.begin_reload_attempt("sess-b"));
+        let _ = state.begin_pending_load("sess-a".into());
+        assert!(state.begin_reload_attempt("sess-a"));
     }
 
     #[test]
@@ -678,6 +937,18 @@ mod tests {
     }
 
     #[test]
+    fn live_belongs_to_current_requires_matching_session() {
+        let mut state = SnapshotState::new();
+        state.commit_current("sess-b".into());
+        state.note_accepted("op-a".into(), "sess-a".into());
+        state.note_accepted("op-b".into(), "sess-b".into());
+        assert!(!state.live_belongs_to_current(Some("op-a")));
+        assert!(state.live_belongs_to_current(Some("op-b")));
+        assert!(!state.live_belongs_to_current(None));
+        assert!(!state.live_belongs_to_current(Some("op-missing")));
+    }
+
+    #[test]
     fn mismatch_and_missing_ownership_do_not_raise_floor() {
         let mut state = SnapshotState::new();
         state.note_accepted("op-a".into(), "sess-a".into());
@@ -687,7 +958,10 @@ mod tests {
             SettlementDurability::Confirmed,
             SettlementRevision::Committed(SessionRevision::new(7)),
         );
-        assert!(matches!(mismatch, super::SettledApply::ProtocolError { .. }));
+        assert!(matches!(
+            mismatch,
+            super::SettledApply::ProtocolError { .. }
+        ));
         assert_eq!(state.required_for("sess-a"), 0);
         assert_eq!(state.required_for("sess-b"), 0);
 

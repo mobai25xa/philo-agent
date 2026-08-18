@@ -71,6 +71,21 @@ pub(crate) fn user_block(rows: impl IntoIterator<Item = String>) -> Vec<Transcri
     lines
 }
 
+/// What the user sees when an attachment or stale media result stops the send.
+pub(crate) fn refusal_lines_for_restore(errors: &[String], restored: bool) -> Vec<TranscriptLine> {
+    let mut lines: Vec<TranscriptLine> = errors
+        .iter()
+        .map(|error| line(LineKind::Error, format!("error: {error}")))
+        .collect();
+    let outcome = if restored {
+        "the message was not sent; it is back in the input"
+    } else {
+        "the message was not sent; newer input was left unchanged"
+    };
+    lines.push(line(LineKind::Error, outcome));
+    lines
+}
+
 /// Streaming projection state for one operation's events.
 #[derive(Debug, Default)]
 pub struct Transcript {

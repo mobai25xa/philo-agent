@@ -271,6 +271,8 @@ pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
     );
     let staged = input.shared.staging.drain();
     let leftover = input.shared.ledger.take_all();
+    // Leftover forced settlements only cover ledger ops that never reached
+    // staging as OperationSettled. Already staged terminals are not repeated.
     let settled: HashSet<OperationId> = staged.iter().filter_map(settled_operation_id).collect();
     let forced: Vec<ForcedSettlement> = leftover
         .into_iter()

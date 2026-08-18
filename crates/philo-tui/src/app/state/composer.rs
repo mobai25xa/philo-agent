@@ -6,9 +6,7 @@ use super::App;
 use super::line;
 use crate::app::attachment::PendingAttachment;
 use crate::app::effect::Effect;
-use crate::app::submit::{
-    IntentId, PendingSubmission, SubmitDispatchResult, SubmitState,
-};
+use crate::app::submit::{IntentId, PendingSubmission, SubmitDispatchResult, SubmitState};
 use crate::app::transcript::LineKind;
 
 impl App {
@@ -146,11 +144,14 @@ impl App {
 
     pub(super) fn submit(&mut self) -> Vec<Effect> {
         self.clear_selection();
-        if self.input.is_empty() {
+        if self.input.is_empty() && self.attachments.is_empty() {
             return vec![];
         }
         // At most one pending submission.
-        if !matches!(self.submit_state, SubmitState::Editing | SubmitState::Accepted { .. }) {
+        if !matches!(
+            self.submit_state,
+            SubmitState::Editing | SubmitState::Accepted { .. }
+        ) {
             return vec![Effect::Append(vec![line(
                 LineKind::Notice,
                 "submit already in flight; wait for it to finish or fail",
@@ -160,10 +161,10 @@ impl App {
         let text = self.input.take_text();
         self.bump_draft_generation();
         self.completion = None;
-        self.history.push(text.clone());
 
         // A `/` prefix is a command: it never reaches the model.
         if text.starts_with('/') {
+            self.history.push(text.clone());
             return self.run_command(&text);
         }
         self.quit_armed = false;
@@ -213,20 +214,10 @@ impl App {
             return Vec::new();
         };
         let restored = self.restore_pending_contents(&pending, kept);
-        let mut lines: Vec<_> = errors
-            .iter()
-            .map(|error| line(LineKind::Error, format!("error: {error}")))
-            .collect();
-        lines.push(line(
-            LineKind::Error,
-            if restored {
-                "the message was not sent; it is back in the input"
-            } else {
-                "the message was not sent; newer input was left unchanged"
-            },
-        ));
         self.submit_state = SubmitState::Editing;
-        vec![Effect::Append(lines)]
+        vec![Effect::Append(
+            crate::app::transcript::refusal_lines_for_restore(&errors, restored),
+        )]
     }
 
     pub(super) fn on_submit_dispatch_finished(
@@ -244,13 +235,7 @@ impl App {
                 Vec::new()
             }
             SubmitDispatchResult::Backpressured => {
-                self.fail_pending_submit(
-                    intent_id,
-                    line(
-                        LineKind::Notice,
-                        "服务繁忙，提交未发送",
-                    ),
-                )
+                self.fail_pending_submit(intent_id, line(LineKind::Notice, "服务繁忙，提交未发送"))
             }
             SubmitDispatchResult::Disconnected { lane } => self.fail_pending_submit(
                 intent_id,
@@ -267,10 +252,7 @@ impl App {
         intent_id: IntentId,
         reason: CommandReject,
     ) -> Vec<Effect> {
-        self.fail_pending_submit(
-            intent_id,
-            line(LineKind::Error, format!("error: {reason}")),
-        )
+        self.fail_pending_submit(intent_id, line(LineKind::Error, format!("error: {reason}")))
     }
 
     pub(super) fn on_submit_accepted(
@@ -281,16 +263,32 @@ impl App {
         let Some(pending) = self.take_pending_if(intent_id) else {
             return Vec::new();
         };
-        let mut rows: Vec<String> = pending.draft.split('\n').map(str::to_owned).collect();
+        let mut rows: Vec<String> = Vec::new();
+        if !pending.draft.is_empty() {
+            rows.extend(pending.draft.split('\n').map(str::to_owned));
+        }
         for attachment in &pending.attachments {
             rows.push(format!("[attached {}]", attachment.label()));
         }
         let lines = crate::app::transcript::user_block(rows);
+        if !pending.draft.is_empty() {
+            self.history.push(pending.draft);
+        }
         self.submit_state = SubmitState::Accepted {
             intent_id,
             operation_id,
         };
         vec![Effect::Append(lines)]
+    }
+
+    pub(super) fn restore_pending_after_interrupt(
+        &mut self,
+        notice: crate::app::transcript::TranscriptLine,
+    ) -> Vec<Effect> {
+        let Some(intent_id) = self.submit_state.pending().map(|pending| pending.intent_id) else {
+            return Vec::new();
+        };
+        self.fail_pending_submit(intent_id, notice)
     }
 
     fn fail_pending_submit(
@@ -328,16 +326,22 @@ impl App {
     }
 
     /// Restores pending draft when the editor was not edited after dispatch began.
+    /// A newer generation skips text overwrite; empty editor attachments still
+    /// receive the pending attachments.
     fn restore_pending_contents(
         &mut self,
         pending: &PendingSubmission,
         attachments: Vec<PendingAttachment>,
     ) -> bool {
-        if self.draft_generation != pending.held_generation {
-            return false;
+        if self.draft_generation == pending.held_generation {
+            self.restore_draft(&pending.draft, attachments);
+            return true;
         }
-        self.restore_draft(&pending.draft, attachments);
-        true
+        if self.attachments.is_empty() && !attachments.is_empty() {
+            self.bump_draft_generation();
+            self.attachments.extend(attachments);
+        }
+        false
     }
 
     fn allocate_intent_id(&mut self) -> IntentId {

@@ -46,7 +46,7 @@ impl ChannelBounds {
             || self.event_cap == 0
             || self.queue_max == 0
             || self.driver_event_budget == 0
-            || self.reliable_staging_cap == 0
+            || self.reliable_staging_cap < crate::staging::PRODUCER_STAGING_RESERVE
         {
             return Err(super::StartError::InvalidBounds);
         }
@@ -75,6 +75,15 @@ mod tests {
         let mut bounds = ChannelBounds::default();
         bounds.reliable_staging_cap = 0;
         assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
+    }
+
+    #[test]
+    fn reliable_staging_cap_below_producer_reserve_is_rejected() {
+        let mut bounds = ChannelBounds::default();
+        bounds.reliable_staging_cap = crate::staging::PRODUCER_STAGING_RESERVE - 1;
+        assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
+        bounds.reliable_staging_cap = crate::staging::PRODUCER_STAGING_RESERVE;
+        assert_eq!(bounds.validate(), Ok(bounds));
     }
 
     #[test]

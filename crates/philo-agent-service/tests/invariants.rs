@@ -7,9 +7,9 @@ use philo_agent_runtime::{
 };
 use philo_agent_service::testing::{FakeAssembler, start_test_service, start_test_service_with};
 use philo_agent_service::{
-    AdmissionError, CommandDispatch, CommandReject, ConfirmationDecision, ConfirmationRequest,
-    FrontendCommand, FrontendGeneration, FrontendInstanceId, FrontendRevision, FrontendUpdate,
-    FrontendUpdateKind, LIVE_TEXT_CHARS_MAX, RecvOutcome, RuntimeEvent,
+    AdmissionError, CommandDispatch, CommandReject, FrontendCommand, FrontendGeneration,
+    FrontendRevision, FrontendUpdate, FrontendUpdateKind, LIVE_TEXT_CHARS_MAX, RecvOutcome,
+    RuntimeEvent,
 };
 use philo_session::{
     MemorySessionStore, OperationOutcome, SessionAssistantBlock, SessionEntryKind, SessionId,
@@ -451,85 +451,6 @@ async fn submit_assigns_request_identity_and_freezes_current_generation() {
     drop(service);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn attach_replacement_denies_pending_confirmations() {
-    let (service, client, _runtime) = start_test_service();
-    let _ = client.try_command(FrontendCommand::FrontendAttached {
-        frontend_instance_id: FrontendInstanceId::new("front-a"),
-    });
-    let gate = service.confirmation_gate();
-    let decision = tokio::spawn(async move {
-        gate.request(ConfirmationRequest {
-            title: "q".into(),
-            body: "b".into(),
-        })
-        .await
-    });
-    recv_matching(&client, |update| {
-        matches!(
-            update.kind,
-            FrontendUpdateKind::ConfirmationRequested { .. }
-        )
-    })
-    .await;
-
-    let _ = client.try_command(FrontendCommand::FrontendAttached {
-        frontend_instance_id: FrontendInstanceId::new("front-b"),
-    });
-    assert_eq!(decision.await.unwrap(), ConfirmationDecision::Deny);
-    recv_matching(&client, |update| {
-        matches!(
-            update.kind,
-            FrontendUpdateKind::ConfirmationResolved {
-                decision: ConfirmationDecision::Deny,
-                ..
-            }
-        )
-    })
-    .await;
-    drop(service);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn same_instance_reattach_keeps_pending_confirmation() {
-    let (service, client, _runtime) = start_test_service();
-    let instance = FrontendInstanceId::new("front-a");
-    let _ = client.try_command(FrontendCommand::FrontendAttached {
-        frontend_instance_id: instance.clone(),
-    });
-    let gate = service.confirmation_gate();
-    let decision = tokio::spawn(async move {
-        gate.request(ConfirmationRequest {
-            title: "q".into(),
-            body: "b".into(),
-        })
-        .await
-    });
-    let requested = recv_matching(&client, |update| {
-        matches!(
-            update.kind,
-            FrontendUpdateKind::ConfirmationRequested { .. }
-        )
-    })
-    .await;
-    let FrontendUpdateKind::ConfirmationRequested {
-        confirmation_id, ..
-    } = requested.kind
-    else {
-        unreachable!();
-    };
-
-    let _ = client.try_command(FrontendCommand::FrontendAttached {
-        frontend_instance_id: instance,
-    });
-    let _ = client.try_command(FrontendCommand::RespondConfirmation {
-        confirmation_id,
-        decision: ConfirmationDecision::Allow,
-    });
-    assert_eq!(decision.await.unwrap(), ConfirmationDecision::Allow);
-    drop(service);
-}
-
 #[test]
 fn frontend_generation_still_has_model_name() {
     let display = FrontendGeneration {
@@ -585,6 +506,15 @@ async fn agent_event_settlement_is_not_a_frontend_lifecycle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn runtime_event_settlement_is_the_public_frontend_terminal() {
     let (service, client, runtime) = start_test_service();
+    runtime.emit_operation_accepted(
+        OperationId::new("op-1"),
+        philo_agent_runtime::SessionId::new("sess-1"),
+        philo_agent_runtime::TurnId::new("turn-1"),
+    );
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+    })
+    .await;
     runtime.emit(RuntimeEvent::OperationSettled {
         operation_id: OperationId::new("op-1"),
         session_id: philo_agent_runtime::SessionId::new("sess-1"),
@@ -648,6 +578,10 @@ async fn runtime_event_settlement_is_the_public_frontend_terminal() {
     drop(service);
 }
 
+/// No successful current: Submit is `NoCurrentSession`. First pending load
+/// (no current yet) is covered by
+/// `snapshot::submit_during_first_pending_load_is_no_current_session`.
+/// Replacement load while current A exists submits to A.
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_without_current_session_is_rejected() {
     let (service, client, _runtime) = start_test_service();
@@ -784,9 +718,10 @@ async fn submit_admission_failure_is_rejected() {
 }
 
 #[test]
-fn lease_types_remain_public_without_fake_attach_api() {
+fn lease_types_remain_public_and_distinct_from_generation_display() {
     let _ = std::any::type_name::<philo_agent_service::FrontendLease>();
     let _ = std::any::type_name::<philo_agent_service::FrontendLeaseGeneration>();
+    let _ = std::any::type_name::<philo_agent_service::FrontendGeneration>();
     let _ = std::any::type_name::<philo_agent_service::SupervisorCommand>();
     let _ = std::any::type_name::<philo_agent_service::AttachError>();
     let _ = std::any::type_name::<philo_agent_service::DetachError>();

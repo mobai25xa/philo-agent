@@ -14,11 +14,11 @@ use crate::transient::TransientCoalescer;
 use crate::{
     ActiveOperationSnapshot, AdmissionError, AgentAvailability, AgentEvent, AgentFailure,
     CancelResult, ChannelBounds, CompactionSpec, DiagnosticId, DriverExit, EpochEndReason,
-    IdSource, MaintenanceAccepted, MaintenanceError, MaintenanceId,
-    MaintenanceResult, MaintenanceSnapshot, ModelCallId, OperationAccepted, OperationId,
-    OperationPhase, OperationSpec, OperationStatus, QueuedOperationSnapshot, RuntimeEpoch,
-    RuntimeEvent, RuntimeSnapshot, SessionId, SettledOperationSnapshot, SettlementDurability,
-    SettlementRevision, ShutdownMode, ShutdownState, TurnId,
+    IdSource, MaintenanceAccepted, MaintenanceError, MaintenanceId, MaintenanceResult,
+    MaintenanceSnapshot, ModelCallId, OperationAccepted, OperationId, OperationPhase,
+    OperationSpec, OperationStatus, QueuedOperationSnapshot, RuntimeEpoch, RuntimeEvent,
+    RuntimeSnapshot, SessionId, SettledOperationSnapshot, SettlementDurability, SettlementRevision,
+    ShutdownMode, ShutdownState, TurnId,
 };
 use philo_session::CancelReason;
 use std::collections::{HashMap, VecDeque};
@@ -194,6 +194,10 @@ impl Coordinator {
     async fn turn(&mut self) {
         if self.event_tx.is_closed() {
             self.on_event_sink_closed();
+        }
+        if self.driver_join.is_none() && self.driver_events.is_some() {
+            self.flush_staging_best_effort();
+            self.drain_driver_open_slots();
         }
         if self.can_poll_driver() {
             self.pull_caught_up_transients();
@@ -625,8 +629,53 @@ impl Coordinator {
         }
     }
 
-    fn on_driver_join(&mut self, join: Option<Result<DriverExit, tokio::task::JoinError>>) {
+    /// Drain while any staging slot is free. Join / epoch-end may use the
+    /// last reserved slot for the driver's own `OperationSettled`.
+    fn drain_driver_open_slots(&mut self) {
         self.drain_driver_events();
+        while self.reliable_staging.remaining() >= 1 {
+            match self
+                .driver_events
+                .as_mut()
+                .and_then(|rx| rx.try_recv().ok())
+            {
+                Some(event) => self.forward_driver_event(event),
+                None => break,
+            }
+        }
+        if !self.sink_closed && self.reliable_staging.remaining() >= 1 {
+            self.pull_caught_up_transients();
+        }
+        self.discard_driver_events_if_idle();
+    }
+
+    fn discard_driver_events_if_idle(&mut self) {
+        if self.driver_events_pending() {
+            return;
+        }
+        let Some(rx) = self.driver_events.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(event) => self.forward_driver_event(event),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => self.driver_events = None,
+        }
+    }
+
+    /// Free one staging slot by flushing to the public outlet. Does not
+    /// wait for a paused event consumer.
+    fn try_free_one_staging_slot(&mut self) -> bool {
+        if self.reliable_staging.remaining() >= 1 {
+            return true;
+        }
+        self.flush_staging_best_effort();
+        self.reliable_staging.remaining() >= 1
+    }
+
+    fn on_driver_join(&mut self, join: Option<Result<DriverExit, tokio::task::JoinError>>) {
+        let _ = self.try_free_one_staging_slot();
+        self.drain_driver_open_slots();
         let Some(join) = join else {
             return;
         };
@@ -640,12 +689,26 @@ impl Coordinator {
             },
         };
         let Some(active) = self.active.take() else {
-            self.driver_events = None;
             self.driver_join = None;
+            self.discard_driver_events_if_idle();
             return;
         };
-        self.driver_events = None;
         self.driver_join = None;
+        if !self.driver_events_pending() {
+            self.driver_events = None;
+        }
+        let committed = active.shared.has_committed_settlement();
+        if self.ledger.session_id(&active.operation_id).is_none() {
+            self.maybe_start_next();
+            return;
+        }
+        if committed {
+            // Driver already published a Committed settlement. Do not forge
+            // Unchanged over it; a later drain or epoch leftover must not
+            // replace that fact.
+            self.maybe_start_next();
+            return;
+        }
         let (status, durability, fault) = match &exit {
             DriverExit::Succeeded => (
                 OperationStatus::Succeeded,
@@ -813,6 +876,9 @@ impl Coordinator {
         if self.active.is_some() || self.maintenance.is_some() {
             return;
         }
+        if self.driver_events.is_some() || self.driver_join.is_some() {
+            return;
+        }
         if let Some(next) = self.queue.pop_front() {
             self.spawn_driver(next);
         }
@@ -820,13 +886,33 @@ impl Coordinator {
 
     async fn finish_epoch(&mut self) -> EpochExit {
         self.force_abort_children();
-        self.drain_driver_events();
+        self.drain_driver_open_slots();
         self.join_children_with_deadline().await;
-        self.drain_driver_events();
+        self.drain_driver_open_slots();
         let deadline = self
             .shutdown_deadline
             .unwrap_or_else(default_shutdown_deadline);
-        self.flush_reliable_until(deadline).await;
+        loop {
+            self.drain_driver_open_slots();
+            if !self.driver_events_pending() || Instant::now() >= deadline {
+                break;
+            }
+            let driver_before = self.driver_events_len();
+            let staging_before = self.reliable_staging.len();
+            self.flush_reliable_until(deadline).await;
+            self.drain_driver_open_slots();
+            if !self.driver_events_pending() || Instant::now() >= deadline {
+                break;
+            }
+            let flushed = self.reliable_staging.len() < staging_before;
+            let drained = self.driver_events_len() < driver_before;
+            if !flushed && !drained {
+                break;
+            }
+        }
+        if !self.driver_events_pending() {
+            self.driver_events = None;
+        }
         let maintenance = self
             .maintenance
             .take()
@@ -989,11 +1075,18 @@ impl Coordinator {
     }
 
     fn outbound_stats(&self) -> OutboundStats {
+        let (sealed_model_stream_len, sealed_model_stream_cap) = self
+            .active
+            .as_ref()
+            .map(|active| active.shared.sealed_model_stream_stats())
+            .unwrap_or((0, crate::transient::SEALED_MODEL_STREAM_CAP));
         OutboundStats {
             reliable_staging_len: self.reliable_staging.len(),
             reliable_staging_cap: self.reliable_staging.cap(),
             transient_len: self.transient_coalescer.len(),
             transient_cap: self.transient_coalescer.cap(),
+            sealed_model_stream_len,
+            sealed_model_stream_cap,
         }
     }
 
@@ -1094,6 +1187,10 @@ impl Coordinator {
 
     fn driver_events_pending(&self) -> bool {
         self.driver_events.as_ref().is_some_and(|rx| !rx.is_empty())
+    }
+
+    fn driver_events_len(&self) -> usize {
+        self.driver_events.as_ref().map(|rx| rx.len()).unwrap_or(0)
     }
 
     fn pull_caught_up_transients(&mut self) {

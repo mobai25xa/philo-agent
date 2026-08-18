@@ -22,10 +22,12 @@ pub const STORE_COMMAND_CAP: usize = 64;
 pub const BLOCKING_TOOL_QUEUE: usize = 32;
 /// Service → frontend update lane.
 pub const FRONTEND_UPDATE_CAP: usize = 64;
-/// Frontend command lane (submit, queries, install, attach).
+/// Frontend command lane (submit, queries, install).
 pub const FRONTEND_COMMAND_CAP: usize = 32;
-/// Frontend control lane (cancel, confirmation, shutdown, detach).
+/// Frontend control lane (cancel, confirmation, shutdown).
 pub const FRONTEND_CONTROL_CAP: usize = 16;
+/// Supervisor lifecycle lane (attach, detach). Independent of submit/list traffic.
+pub const FRONTEND_SUPERVISOR_CAP: usize = 4;
 /// Reserved snapshot-request lane so resync cannot be starved by submit.
 pub const FRONTEND_SNAPSHOT_CAP: usize = 1;
 /// Maximum live assistant text retained for the current operation.

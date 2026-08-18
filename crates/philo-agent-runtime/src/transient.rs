@@ -15,10 +15,37 @@ use tokio::sync::Notify;
 
 const TOOL_PROGRESS_SLOTS_MAX: usize = 32;
 
+/// One slot each for sealed text, reasoning, and usage. Reliable facts
+/// merge into these slots instead of appending an unbounded Vec.
+pub(crate) const SEALED_MODEL_STREAM_CAP: usize = 3;
+/// Parked sealed generations from earlier model calls in the same turn.
+/// Keeps the per-generation cap of three kinds without letting a later
+/// call overwrite an undrained earlier call.
+const SEALED_PENDING_GEN_MAX: usize = 8;
+
 /// Coalesced driver-side transients for one active operation.
 pub(crate) struct TransientDriverState {
     inner: Mutex<DriverSlots>,
     notify: Notify,
+}
+
+#[derive(Default)]
+struct ModelStreamSlots {
+    text: Option<String>,
+    reasoning: Option<(ModelCallId, String)>,
+    usage: Option<(ModelCallId, TokenUsage)>,
+}
+
+impl ModelStreamSlots {
+    fn is_empty(&self) -> bool {
+        self.text.is_none() && self.reasoning.is_none() && self.usage.is_none()
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.text.is_some())
+            + usize::from(self.reasoning.is_some())
+            + usize::from(self.usage.is_some())
+    }
 }
 
 #[derive(Default)]
@@ -28,7 +55,8 @@ struct DriverSlots {
     usage: Option<(ModelCallId, TokenUsage)>,
     tool_progress: HashMap<ToolCallId, AgentEvent>,
     phase: Option<OperationPhase>,
-    sealed_model_stream: Vec<AgentEvent>,
+    sealed: ModelStreamSlots,
+    sealed_pending: VecDeque<ModelStreamSlots>,
 }
 
 impl TransientDriverState {
@@ -42,25 +70,11 @@ impl TransientDriverState {
     pub(crate) fn publish_agent(&self, event: AgentEvent) {
         let mut slots = lock(&self.inner);
         match event {
-            AgentEvent::TextDelta { delta } => {
-                let text = slots.text.get_or_insert_with(String::new);
-                text.push_str(&delta);
-                if text.len() > crate::bounds::DELTA_MERGE_CHUNK_MAX {
-                    text.truncate(crate::bounds::DELTA_MERGE_CHUNK_MAX);
-                }
-            }
+            AgentEvent::TextDelta { delta } => merge_text(&mut slots.text, delta),
             AgentEvent::ReasoningDelta {
                 model_call_id,
                 text,
-            } => match &mut slots.reasoning {
-                Some((id, held)) if *id == model_call_id => {
-                    held.push_str(&text);
-                    if held.len() > crate::bounds::DELTA_MERGE_CHUNK_MAX {
-                        held.truncate(crate::bounds::DELTA_MERGE_CHUNK_MAX);
-                    }
-                }
-                _ => slots.reasoning = Some((model_call_id, text)),
-            },
+            } => merge_reasoning(&mut slots.reasoning, model_call_id, text),
             AgentEvent::ModelUsageUpdated {
                 model_call_id,
                 usage,
@@ -100,7 +114,22 @@ impl TransientDriverState {
             || slots.usage.is_some()
             || !slots.tool_progress.is_empty()
             || slots.phase.is_some()
-            || !slots.sealed_model_stream.is_empty()
+            || !slots.sealed.is_empty()
+            || !slots.sealed_pending.is_empty()
+    }
+
+    pub(crate) fn sealed_len(&self) -> usize {
+        let slots = lock(&self.inner);
+        slots.sealed.len()
+            + slots
+                .sealed_pending
+                .iter()
+                .map(ModelStreamSlots::len)
+                .sum::<usize>()
+    }
+
+    pub(crate) fn sealed_cap(&self) -> usize {
+        SEALED_MODEL_STREAM_CAP
     }
 
     /// Freezes the open model-stream slots so a later call cannot overwrite
@@ -111,7 +140,16 @@ impl TransientDriverState {
         if open.is_empty() {
             return;
         }
-        slots.sealed_model_stream.extend(open);
+        if slots.sealed.is_empty() || can_merge_stream_slots(&slots.sealed, &open) {
+            merge_stream_slots(&mut slots.sealed, open);
+        } else {
+            if slots.sealed_pending.len() >= SEALED_PENDING_GEN_MAX {
+                slots.sealed_pending.pop_front();
+            }
+            let previous = std::mem::take(&mut slots.sealed);
+            slots.sealed_pending.push_back(previous);
+            slots.sealed = open;
+        }
         drop(slots);
         self.wake();
     }
@@ -158,23 +196,86 @@ impl TransientDriverState {
 }
 
 fn drain_model_stream_from(slots: &mut DriverSlots) -> Vec<AgentEvent> {
-    let mut events = std::mem::take(&mut slots.sealed_model_stream);
-    events.extend(take_open_model_stream(slots));
+    let mut events = Vec::new();
+    for generation in slots.sealed_pending.drain(..) {
+        events.extend(model_stream_events(generation));
+    }
+    events.extend(model_stream_events(std::mem::take(&mut slots.sealed)));
+    events.extend(model_stream_events(take_open_model_stream(slots)));
     events
 }
 
-fn take_open_model_stream(slots: &mut DriverSlots) -> Vec<AgentEvent> {
+fn take_open_model_stream(slots: &mut DriverSlots) -> ModelStreamSlots {
+    ModelStreamSlots {
+        reasoning: slots.reasoning.take(),
+        text: slots.text.take(),
+        usage: slots.usage.take(),
+    }
+}
+
+fn merge_text(slot: &mut Option<String>, delta: String) {
+    let text = slot.get_or_insert_with(String::new);
+    text.push_str(&delta);
+    if text.len() > crate::bounds::DELTA_MERGE_CHUNK_MAX {
+        text.truncate(crate::bounds::DELTA_MERGE_CHUNK_MAX);
+    }
+}
+
+fn merge_reasoning(
+    slot: &mut Option<(ModelCallId, String)>,
+    model_call_id: ModelCallId,
+    text: String,
+) {
+    match slot {
+        Some((id, held)) if *id == model_call_id => {
+            held.push_str(&text);
+            if held.len() > crate::bounds::DELTA_MERGE_CHUNK_MAX {
+                held.truncate(crate::bounds::DELTA_MERGE_CHUNK_MAX);
+            }
+        }
+        _ => *slot = Some((model_call_id, text)),
+    }
+}
+
+fn stream_call_id(slots: &ModelStreamSlots) -> Option<&ModelCallId> {
+    slots
+        .reasoning
+        .as_ref()
+        .map(|(id, _)| id)
+        .or_else(|| slots.usage.as_ref().map(|(id, _)| id))
+}
+
+fn can_merge_stream_slots(held: &ModelStreamSlots, incoming: &ModelStreamSlots) -> bool {
+    match (stream_call_id(held), stream_call_id(incoming)) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn merge_stream_slots(target: &mut ModelStreamSlots, incoming: ModelStreamSlots) {
+    if let Some(delta) = incoming.text {
+        merge_text(&mut target.text, delta);
+    }
+    if let Some((model_call_id, text)) = incoming.reasoning {
+        merge_reasoning(&mut target.reasoning, model_call_id, text);
+    }
+    if let Some(usage) = incoming.usage {
+        target.usage = Some(usage);
+    }
+}
+
+fn model_stream_events(held: ModelStreamSlots) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    if let Some((model_call_id, text)) = slots.reasoning.take() {
+    if let Some((model_call_id, text)) = held.reasoning {
         events.push(AgentEvent::ReasoningDelta {
             model_call_id,
             text,
         });
     }
-    if let Some(delta) = slots.text.take() {
+    if let Some(delta) = held.text {
         events.push(AgentEvent::TextDelta { delta });
     }
-    if let Some((model_call_id, usage)) = slots.usage.take() {
+    if let Some((model_call_id, usage)) = held.usage {
         events.push(AgentEvent::ModelUsageUpdated {
             model_call_id,
             usage,
@@ -425,5 +526,72 @@ mod tests {
             coalescer.take_one(),
             Some(RuntimeEvent::AvailabilityChanged { .. })
         ));
+    }
+
+    #[test]
+    fn seal_merges_like_open_slots_and_never_grows_past_cap() {
+        let state = TransientDriverState::new();
+        for index in 0..32 {
+            state.publish_agent(AgentEvent::TextDelta {
+                delta: format!("t{index}"),
+            });
+            state.publish_agent(AgentEvent::ReasoningDelta {
+                model_call_id: ModelCallId::new("call"),
+                text: format!("r{index}"),
+            });
+            state.publish_agent(AgentEvent::ModelUsageUpdated {
+                model_call_id: ModelCallId::new("call"),
+                usage: TokenUsage {
+                    input_tokens: Some(index as u64),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            });
+            state.seal_model_stream();
+            assert!(
+                state.sealed_len() <= SEALED_MODEL_STREAM_CAP,
+                "sealed stream grew past cap after {} seals",
+                index + 1
+            );
+        }
+        let (_, events) = state.drain();
+        assert!(events.len() <= SEALED_MODEL_STREAM_CAP);
+        let text = events.iter().find_map(|event| match event {
+            AgentEvent::TextDelta { delta } => Some(delta.as_str()),
+            _ => None,
+        });
+        assert!(text.is_some_and(|delta| delta.contains("t0") && delta.contains("t31")));
+    }
+
+    #[test]
+    fn later_model_call_does_not_overwrite_undrained_sealed_reasoning() {
+        let state = TransientDriverState::new();
+        state.publish_agent(AgentEvent::ReasoningDelta {
+            model_call_id: ModelCallId::new("call-1"),
+            text: "planning the read".into(),
+        });
+        state.seal_model_stream();
+        state.publish_agent(AgentEvent::ReasoningDelta {
+            model_call_id: ModelCallId::new("call-2"),
+            text: "summarizing".into(),
+        });
+        state.seal_model_stream();
+        let (_, events) = state.drain();
+        let reasoning: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ReasoningDelta {
+                    model_call_id,
+                    text,
+                } => Some((model_call_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning,
+            vec![("call-1", "planning the read"), ("call-2", "summarizing")]
+        );
     }
 }

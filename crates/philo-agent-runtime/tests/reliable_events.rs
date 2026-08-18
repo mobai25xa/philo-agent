@@ -112,6 +112,10 @@ async fn alternating_transients_stay_within_coalescer_cap() {
             stats.reliable_staging_len <= stats.reliable_staging_cap,
             "reliable staging grew past cap: {stats:?}"
         );
+        assert!(
+            stats.sealed_model_stream_len <= stats.sealed_model_stream_cap,
+            "sealed model stream grew past cap: {stats:?}"
+        );
         if stats.reliable_staging_len >= stats.reliable_staging_cap.saturating_sub(1) {
             break;
         }
@@ -124,6 +128,11 @@ async fn alternating_transients_stay_within_coalescer_cap() {
     let stats = handle.outbound_stats().await;
     assert!(stats.transient_len <= stats.transient_cap);
     assert!(stats.reliable_staging_len <= stats.reliable_staging_cap);
+    assert!(stats.sealed_model_stream_len <= stats.sealed_model_stream_cap);
+    assert!(
+        stats.sealed_model_stream_cap > 0,
+        "sealed model stream must expose a hard cap: {stats:?}"
+    );
 
     let extra = handle
         .submit(philo_agent_runtime::OperationSpec {

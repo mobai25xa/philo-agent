@@ -376,14 +376,14 @@ fn animation_and_cancel_stay_live_without_runtime_handles() {
 
 #[tokio::test]
 async fn start_test_service_client_accepts_attach_and_load() {
-    let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
-    let accepted = client.try_command(philo_agent_service::FrontendCommand::FrontendAttached {
-        frontend_instance_id: philo_agent_service::FrontendInstanceId::new("tui-test"),
-    });
-    assert!(matches!(
-        accepted,
-        philo_agent_service::CommandDispatch::Enqueued(_)
-    ));
+    let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
+    let lease = service
+        .attach_frontend(
+            philo_agent_service::FrontendInstanceId::new("tui-test"),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("attach");
     let loaded = client.try_command(philo_agent_service::FrontendCommand::LoadSession {
         session_id: "s-1".to_owned(),
     });
@@ -391,4 +391,11 @@ async fn start_test_service_client_accepts_attach_and_load() {
         loaded,
         philo_agent_service::CommandDispatch::Enqueued(_)
     ));
+    service
+        .detach_frontend(
+            lease,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("detach");
 }

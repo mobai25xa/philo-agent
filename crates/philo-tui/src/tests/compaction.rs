@@ -9,6 +9,7 @@ use crate::app::action::Action;
 use crate::app::effect::Effect;
 use crate::app::state::App;
 use crate::app::status::StatusData;
+use crate::app::submit::CancelDispatchResult;
 use crate::app::transcript::{InfoLevel, TranscriptLine};
 use crate::tests::support::frontend_update;
 
@@ -138,6 +139,55 @@ fn spinner_rejection_and_escape_are_visible() {
             app.status.line(),
             appended(&refused_busy).join("\n"),
         )
+    );
+}
+
+#[test]
+fn compaction_escape_does_not_clear_before_dispatch() {
+    let mut app = test_app();
+    assert!(starts_compaction(&submit_command(&mut app, "/compact")));
+    let effects = app.on_action(Action::Escape);
+    assert_eq!(effects, vec![Effect::CancelCompaction]);
+    assert!(app.status.compacting);
+    assert!(
+        !appended(&effects)
+            .iter()
+            .any(|line| line.contains("cancelled"))
+    );
+}
+
+#[test]
+fn compaction_cancel_backpressured_stays_compacting() {
+    let mut app = test_app();
+    assert!(starts_compaction(&submit_command(&mut app, "/compact")));
+    let effects = app.on_action(Action::CompactionCancelDispatchFinished {
+        result: CancelDispatchResult::Backpressured,
+    });
+    assert!(app.status.compacting);
+    assert!(
+        appended(&effects)
+            .iter()
+            .any(|line| line.contains("取消请求未发送"))
+    );
+    assert!(
+        !appended(&effects)
+            .iter()
+            .any(|line| line.contains("cancelled"))
+    );
+}
+
+#[test]
+fn compaction_cancel_enqueued_then_clears() {
+    let mut app = test_app();
+    assert!(starts_compaction(&submit_command(&mut app, "/compact")));
+    let effects = app.on_action(Action::CompactionCancelDispatchFinished {
+        result: CancelDispatchResult::Enqueued(philo_agent_service::FrontendRequestId::new(3)),
+    });
+    assert!(!app.status.compacting);
+    assert!(
+        appended(&effects)
+            .iter()
+            .any(|line| line.contains("context compaction cancelled"))
     );
 }
 

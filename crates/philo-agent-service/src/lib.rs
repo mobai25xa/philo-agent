@@ -21,15 +21,15 @@ pub mod testing;
 pub use bounds::{
     BLOCKING_TOOL_QUEUE, CONFIRMATION_MAP_CAP, DELTA_MERGE_CHUNK_MAX, FRONTEND_COMMAND_CAP,
     FRONTEND_CONTROL_CAP, FRONTEND_RESTART_BUDGET, FRONTEND_RESTART_WINDOW_SECS,
-    FRONTEND_SNAPSHOT_CAP, FRONTEND_UPDATE_CAP, LIVE_REASONING_CHARS_MAX, LIVE_TEXT_CHARS_MAX,
-    LIVE_TOOL_PROGRESS_MAX, RUNTIME_COMMAND_CAP, RUNTIME_CONTROL_CAP, RUNTIME_DRIVER_EVENT_BUDGET,
-    RUNTIME_EVENT_CAP, RUNTIME_QUEUE_MAX, RUNTIME_RELIABLE_STAGING_CAP, STORE_COMMAND_CAP,
-    TRANSIENT_KIND_COUNT,
+    FRONTEND_SNAPSHOT_CAP, FRONTEND_SUPERVISOR_CAP, FRONTEND_UPDATE_CAP, LIVE_REASONING_CHARS_MAX,
+    LIVE_TEXT_CHARS_MAX, LIVE_TOOL_PROGRESS_MAX, RUNTIME_COMMAND_CAP, RUNTIME_CONTROL_CAP,
+    RUNTIME_DRIVER_EVENT_BUDGET, RUNTIME_EVENT_CAP, RUNTIME_QUEUE_MAX,
+    RUNTIME_RELIABLE_STAGING_CAP, STORE_COMMAND_CAP, TRANSIENT_KIND_COUNT,
 };
 pub use confirmation::{ConfirmationGate, ConfirmationRequest};
 pub use error::{CommandDispatch, CommandReject, RecvOutcome, ServiceError};
 pub use frontend::{
-    AttachError, ConfirmationDecision, DetachError, DetachReason, DetachReport, DurableSessionView,
+    AttachError, ConfirmationDecision, DetachError, DetachReport, DurableSessionView,
     FrontendAssistantBlock, FrontendAttachment, FrontendAvailability, FrontendClient,
     FrontendCommand, FrontendConfigEntry, FrontendContextMessage, FrontendGeneration,
     FrontendLease, FrontendLeaseGeneration, FrontendMaintenance, FrontendMaintenancePhase,

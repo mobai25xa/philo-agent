@@ -13,9 +13,9 @@ use philo_agent_runtime::{
 };
 use philo_agent_service::testing::{FakeAssembler, start_test_service};
 use philo_agent_service::{
-    AgentService, CommandDispatch, FrontendClient, FrontendCommand, FrontendMaintenancePhase,
-    FrontendOperationEvent, FrontendUpdate, FrontendUpdateKind, RecvOutcome, RuntimeHandle,
-    ServiceDeps, ServiceHealth, start,
+    AgentService, CommandDispatch, CommandReject, FrontendClient, FrontendCommand,
+    FrontendMaintenancePhase, FrontendOperationEvent, FrontendUpdate, FrontendUpdateKind,
+    RecvOutcome, RuntimeHandle, ServiceDeps, ServiceHealth, start,
 };
 use philo_session::MemorySessionStore;
 use tokio::sync::Notify;
@@ -337,6 +337,15 @@ async fn settled_only_from_runtime_event() {
         "submit reply must not settle: {extras:?}"
     );
 
+    runtime.emit_operation_accepted(
+        OperationId::new("op-1"),
+        SessionId::new("sess-1"),
+        philo_agent_runtime::TurnId::new("turn-1"),
+    );
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+    })
+    .await;
     runtime.emit_operation_settled(
         OperationId::new("op-1"),
         SessionId::new("sess-1"),
@@ -450,6 +459,15 @@ async fn epoch_diagnostic_emits_no_settlement() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fake_forwards_duplicate_settled_events() {
     let (service, client, runtime) = start_test_service();
+    runtime.emit_operation_accepted(
+        OperationId::new("op-dup"),
+        SessionId::new("sess-1"),
+        TurnId::new("turn-dup"),
+    );
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+    })
+    .await;
     for _ in 0..2 {
         runtime.emit_operation_settled(
             OperationId::new("op-dup"),
@@ -463,11 +481,16 @@ async fn fake_forwards_duplicate_settled_events() {
         !settled(std::slice::from_ref(update)).is_empty()
     })
     .await;
-    let second = recv_matching(&client, |update| {
-        !settled(std::slice::from_ref(update)).is_empty()
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::ServiceHealthChanged { .. })
     })
     .await;
-    assert_eq!(settled(&[first, second]).len(), 2);
+    let extras = drain_briefly(&client).await;
+    assert_eq!(settled(&[first]).len(), 1);
+    assert!(
+        settled(&extras).is_empty(),
+        "duplicate settled is a protocol error, not a second terminal: {extras:?}"
+    );
     drop(service);
 }
 
@@ -660,4 +683,60 @@ async fn real_coordinator_panic_one_forced_settled() {
     })
     .await
     .expect("real panic timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_epoch_mismatch_still_rejects_the_request() {
+    let (service, client, runtime) = start_test_service();
+    load_session(&client, "sess-1").await;
+    let hold = runtime.hold_children();
+    let request_id = submit(&client, "hello");
+    runtime.wait_child_started(1).await;
+    runtime.emit_epoch_ended(RuntimeEpoch::new("epoch-1"), EpochEndReason::Shutdown, 0);
+    recv_matching(&client, |update| {
+        matches!(
+            update.kind,
+            FrontendUpdateKind::ResyncRequired { .. }
+                | FrontendUpdateKind::ServiceHealthChanged {
+                    health: ServiceHealth::RuntimeEpochEnded { .. },
+                }
+        )
+    })
+    .await;
+    hold.release();
+    let rejected = recv_matching(&client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::CommandRejected { .. })
+    })
+    .await;
+    match &rejected.kind {
+        FrontendUpdateKind::CommandRejected {
+            reason: CommandReject::NotAccepting,
+        } => {}
+        other => panic!("expected CommandRejected for the request, got {other:?}"),
+    }
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_child_panic_rejects_the_request() {
+    let (service, client, runtime) = start_test_service();
+    load_session(&client, "sess-1").await;
+    let hold = runtime.hold_children();
+    let request_id = submit(&client, "hello");
+    runtime.wait_child_started(1).await;
+    runtime.panic_next_child();
+    hold.release();
+    let rejected = recv_matching(&client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::CommandRejected { .. })
+    })
+    .await;
+    match &rejected.kind {
+        FrontendUpdateKind::CommandRejected {
+            reason: CommandReject::AdmissionFailed { message },
+        } => assert!(message.contains("panicked"), "{message}"),
+        other => panic!("expected internal CommandRejected, got {other:?}"),
+    }
+    drop(service);
 }

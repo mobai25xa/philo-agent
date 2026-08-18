@@ -80,5 +80,9 @@ pub(crate) enum Action {
         request_id: u64,
         result: CancelDispatchResult,
     },
+    /// `try_command(CancelMaintenance)` finished.
+    CompactionCancelDispatchFinished {
+        result: CancelDispatchResult,
+    },
     None,
 }

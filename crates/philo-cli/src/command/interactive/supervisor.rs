@@ -7,10 +7,13 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use philo_agent_service::{
-    CommandDispatch, DetachReason, FRONTEND_RESTART_BUDGET, FRONTEND_RESTART_WINDOW_SECS,
-    FrontendCommand, FrontendInstanceId, FrontendRevision,
+    AgentService, AttachError, CommandDispatch, DetachError, DetachReport, FRONTEND_RESTART_BUDGET,
+    FRONTEND_RESTART_WINDOW_SECS, FrontendInstanceId, FrontendRevision,
 };
-use philo_tui::{RestoreReport, TuiLaunchConfig, TuiOutcome, TuiRunReport, run_async};
+use philo_tui::{
+    RestoreFailure, RestoreReport, TerminalCapability, TuiLaunchConfig, TuiOutcome, TuiRunReport,
+    run_async,
+};
 use tokio::sync::watch;
 
 use crate::assembly::{self, Bootstrap};
@@ -49,6 +52,56 @@ impl RestartBudget {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum RegisteredFrontend<T> {
+    AttachFailed(AttachError),
+    Finished {
+        output: Result<T, ()>,
+        detach: Result<DetachReport, DetachError>,
+    },
+}
+
+/// What the process supervisor may do after a detach attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetachFollowUp {
+    /// Lease is gone (`Ok` or `StaleLease`). TUI outcome may restart.
+    Continue,
+    /// Send succeeded or the lane was full; actor may still hold the lease.
+    /// Cleanup via supervisor shutdown; do not attach a new frontend id.
+    UncertainCleanup,
+    /// Host is already gone. Process shutdown, no TUI restart.
+    ServiceUnavailable,
+}
+
+fn detach_follow_up(detach: &Result<DetachReport, DetachError>) -> DetachFollowUp {
+    match detach {
+        Ok(_) | Err(DetachError::StaleLease) => DetachFollowUp::Continue,
+        Err(DetachError::DeadlineExceeded | DetachError::Backpressured) => {
+            DetachFollowUp::UncertainCleanup
+        }
+        Err(DetachError::ServiceGone | DetachError::Disconnected) => {
+            DetachFollowUp::ServiceUnavailable
+        }
+    }
+}
+
+fn run_registered_frontend<T>(
+    runtime: &tokio::runtime::Runtime,
+    service: &AgentService,
+    frontend_id: FrontendInstanceId,
+    deadline: Instant,
+    runner: impl FnOnce() -> T,
+) -> RegisteredFrontend<T> {
+    let lease = match runtime.block_on(service.attach_frontend(frontend_id, deadline)) {
+        Ok(lease) => lease,
+        Err(error) => return RegisteredFrontend::AttachFailed(error),
+    };
+    let output = catch_unwind(AssertUnwindSafe(runner)).map_err(|_| ());
+    let detach_deadline = Instant::now() + assembly::FRONTEND_REGISTRATION_GRACE;
+    let detach = runtime.block_on(service.detach_frontend(lease, detach_deadline));
+    RegisteredFrontend::Finished { output, detach }
+}
+
 pub(super) struct ProcessSupervisor {
     runtime: tokio::runtime::Runtime,
     bootstrap: Bootstrap,
@@ -77,33 +130,18 @@ impl ProcessSupervisor {
     }
 
     pub(super) fn run(mut self, session_id: String) -> Result<ExitCode, UsageError> {
-        let mut last_instance: Option<FrontendInstanceId> = None;
         loop {
             self.instance += 1;
             let instance_id = FrontendInstanceId::new(format!("cli-tui-{}", self.instance));
-            if let Some(previous) = last_instance.take() {
-                let _ = self
-                    .bootstrap
-                    .client
-                    .try_command(FrontendCommand::FrontendDetached {
-                        frontend_instance_id: previous,
-                        reason: DetachReason::Restart,
-                    });
-            }
-            let _ = self
-                .bootstrap
-                .client
-                .try_command(FrontendCommand::FrontendAttached {
-                    frontend_instance_id: instance_id.clone(),
-                });
             if self.instance > 1 {
                 match self
                     .bootstrap
                     .client
                     .request_snapshot(FrontendRevision::ZERO)
                 {
-                    CommandDispatch::Enqueued(_) | CommandDispatch::Backpressured => {}
-                    CommandDispatch::Disconnected { .. } => {}
+                    CommandDispatch::Enqueued(_)
+                    | CommandDispatch::Backpressured
+                    | CommandDispatch::Disconnected { .. } => {}
                 }
             }
 
@@ -113,61 +151,69 @@ impl ProcessSupervisor {
                 session_id.clone(),
                 self.interrupt_rx.clone(),
             );
-            let report = match catch_unwind(AssertUnwindSafe(|| {
-                self.runtime.block_on(run_async(client, config))
-            })) {
-                Ok(report) => report,
-                Err(_) => TuiRunReport {
-                    outcome: TuiOutcome::FrontendRestartRequested {
-                        fault: "frontend panicked".to_owned(),
-                    },
-                    restore: RestoreReport::default(),
-                },
-            };
-            // Restore is always reported before the exit/restart decision.
-            report_restore(&report.restore);
+            let session = run_registered_frontend(
+                &self.runtime,
+                &self.bootstrap.service,
+                instance_id,
+                Instant::now() + assembly::FRONTEND_REGISTRATION_GRACE,
+                || self.runtime.block_on(run_async(client, config)),
+            );
 
-            match report.outcome {
-                TuiOutcome::UserExit => {
-                    detach(&self.bootstrap, instance_id, DetachReason::UserExit);
-                    return Ok(self.shutdown(
-                        ExitCode::SUCCESS,
-                        Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE,
-                    ));
+            let report = match session {
+                RegisteredFrontend::AttachFailed(error) => {
+                    eprintln!("error: frontend attach failed: {error}");
+                    return Ok(self.shutdown(1, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE));
                 }
-                TuiOutcome::ProcessShutdownRequested => {
-                    detach(&self.bootstrap, instance_id, DetachReason::UserExit);
-                    return Ok(self.shutdown(
-                        ExitCode::SUCCESS,
-                        Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE,
-                    ));
+                RegisteredFrontend::Finished { output, detach } => {
+                    match detach_follow_up(&detach) {
+                        DetachFollowUp::UncertainCleanup => {
+                            if let Err(error) = &detach {
+                                eprintln!("error: frontend detach: {error}");
+                            }
+                            return Ok(self.cleanup_uncertain_detach());
+                        }
+                        DetachFollowUp::ServiceUnavailable => {
+                            if let Err(error) = &detach {
+                                eprintln!("error: frontend detach: {error}");
+                            }
+                            return Ok(
+                                self.shutdown(1, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE)
+                            );
+                        }
+                        DetachFollowUp::Continue => {
+                            if let Err(error) = detach {
+                                eprintln!("error: frontend detach: {error}");
+                            }
+                            match output {
+                                Ok(report) => report,
+                                Err(()) => TuiRunReport {
+                                    outcome: TuiOutcome::FrontendRestartRequested {
+                                        fault: "frontend panicked".to_owned(),
+                                    },
+                                    restore: uncertain_panic_restore(),
+                                },
+                            }
+                        }
+                    }
+                }
+            };
+
+            report_restore(&report.restore);
+            match report.outcome {
+                TuiOutcome::UserExit | TuiOutcome::ProcessShutdownRequested => {
+                    return Ok(self.shutdown(0, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE));
                 }
                 TuiOutcome::FrontendRestartRequested { fault: _ } => {
-                    last_instance = Some(instance_id);
                     if !self.budget.allow() {
                         return Ok(self.fallback("frontend restart budget exhausted", session_id));
                     }
                 }
                 TuiOutcome::FallbackRequested { fault } => {
-                    detach(
-                        &self.bootstrap,
-                        instance_id,
-                        DetachReason::Fault {
-                            message: fault.clone(),
-                        },
-                    );
                     return Ok(self.fallback(&fault, session_id));
                 }
                 TuiOutcome::ForcedExitRequested { code } => {
-                    detach(
-                        &self.bootstrap,
-                        instance_id,
-                        DetachReason::Fault {
-                            message: format!("forced exit {code}"),
-                        },
-                    );
                     report_forced_exit();
-                    return Ok(self.shutdown(ExitCode::from(code), Instant::now()));
+                    return Ok(self.shutdown(code, Instant::now()));
                 }
             }
         }
@@ -191,15 +237,29 @@ impl ProcessSupervisor {
             success_exit: 1,
             interrupt,
         }));
-        let code = ExitCode::from(report.code);
         if report.forced {
-            self.shutdown(code, Instant::now())
+            self.shutdown(report.code, Instant::now())
         } else {
-            self.shutdown(code, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE)
+            self.shutdown(
+                report.code,
+                Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE,
+            )
         }
     }
 
-    fn shutdown(self, code: ExitCode, deadline: Instant) -> ExitCode {
+    fn cleanup_uncertain_detach(self) -> ExitCode {
+        let deadline = Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE;
+        if let Err(error) = self.runtime.block_on(
+            self.bootstrap
+                .service
+                .shutdown_from_supervisor("uncertain frontend detach", deadline),
+        ) {
+            eprintln!("error: supervisor cleanup after uncertain detach: {error}");
+        }
+        self.shutdown(1, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE)
+    }
+
+    fn shutdown(self, code: u8, deadline: Instant) -> ExitCode {
         let Self {
             runtime,
             bootstrap,
@@ -207,7 +267,7 @@ impl ProcessSupervisor {
             mut interrupt_rx,
             ..
         } = self;
-        runtime.block_on(async {
+        let pending = runtime.block_on(async {
             let mut report =
                 assembly::shutdown_with_deadline(bootstrap, &mut interrupt_rx, deadline).await;
             assembly::join_watch_with_deadline(_watch, deadline, &mut report).await;
@@ -217,22 +277,27 @@ impl ProcessSupervisor {
             for diagnostic in &report.diagnostics {
                 eprintln!("error: {diagnostic}");
             }
+            report.pending
         });
-        code
+        ExitCode::from(assembly::shutdown_exit_code(code, &pending))
     }
-}
-
-fn detach(bootstrap: &Bootstrap, instance_id: FrontendInstanceId, reason: DetachReason) {
-    let _ = bootstrap
-        .client
-        .try_command(FrontendCommand::FrontendDetached {
-            frontend_instance_id: instance_id,
-            reason,
-        });
 }
 
 fn report_restore(restore: &RestoreReport) {
     render::write_outputs(&restore_line_outputs(restore));
+}
+
+fn uncertain_panic_restore() -> RestoreReport {
+    RestoreReport {
+        restored: false,
+        skipped_stale: false,
+        attempted: Vec::new(),
+        restored_caps: Vec::new(),
+        failures: vec![RestoreFailure {
+            capability: TerminalCapability::RawMode,
+            message: "uncertain ownership: frontend panicked before restore report".to_owned(),
+        }],
+    }
 }
 
 fn report_forced_exit() {
@@ -276,6 +341,7 @@ fn launch_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use philo_agent_service::testing::{abort_service_actor, start_test_service};
 
     #[test]
     fn restart_budget_allows_three_faults_then_denies() {
@@ -349,5 +415,239 @@ mod tests {
         ctrl_c::pulse(&tx);
         ctrl_c::pulse(&tx);
         assert_eq!(ctrl_c::take_pulses(&mut rx, &mut seen), 2);
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn attach_ack_precedes_runner() {
+        let runtime = test_runtime();
+        let _enter = runtime.enter();
+        let (service, _client, _handle) = start_test_service();
+        let mut started = false;
+        let session = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-1"),
+            Instant::now() + Duration::from_secs(2),
+            || {
+                started = true;
+                "ran"
+            },
+        );
+        assert!(started);
+        assert!(matches!(
+            session,
+            RegisteredFrontend::Finished {
+                output: Ok("ran"),
+                detach: Ok(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn attach_failure_does_not_start_runner() {
+        let runtime = test_runtime();
+        let _enter = runtime.enter();
+        let (service, _client, _handle) = start_test_service();
+        abort_service_actor(&service);
+        let mut started = false;
+        let session = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-1"),
+            Instant::now() + Duration::from_millis(200),
+            || {
+                started = true;
+                "ran"
+            },
+        );
+        assert!(!started);
+        assert!(matches!(session, RegisteredFrontend::AttachFailed(_)));
+    }
+
+    #[test]
+    fn detach_runs_after_normal_error_and_panic() {
+        let runtime = test_runtime();
+        let _enter = runtime.enter();
+        let (service, _client, _handle) = start_test_service();
+
+        let error_session = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-err"),
+            Instant::now() + Duration::from_secs(2),
+            || Err::<(), &str>("tui error"),
+        );
+        assert!(matches!(
+            error_session,
+            RegisteredFrontend::Finished {
+                output: Ok(Err("tui error")),
+                detach: Ok(_),
+            }
+        ));
+
+        let panic_session = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-panic"),
+            Instant::now() + Duration::from_secs(2),
+            || panic!("frontend panicked"),
+        );
+        assert!(matches!(
+            panic_session,
+            RegisteredFrontend::Finished {
+                output: Err(()),
+                detach: Ok(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn panic_restore_is_marked_uncertain() {
+        let restore = uncertain_panic_restore();
+        assert!(!restore.failures.is_empty());
+        let outputs = restore_line_outputs(&restore);
+        assert!(
+            outputs
+                .iter()
+                .any(|line| line.text.contains("uncertain") && line.channel == Channel::Stderr),
+            "{outputs:?}"
+        );
+    }
+
+    #[test]
+    fn runner_exceeding_attach_grace_still_detaches() {
+        let runtime = test_runtime();
+        let _enter = runtime.enter();
+        let (service, _client, _handle) = start_test_service();
+        let session = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-long"),
+            Instant::now() + Duration::from_millis(50),
+            || {
+                std::thread::sleep(Duration::from_millis(80));
+                "ran"
+            },
+        );
+        assert!(matches!(
+            session,
+            RegisteredFrontend::Finished {
+                output: Ok("ran"),
+                detach: Ok(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn only_confirmed_or_stale_detach_allows_restart() {
+        assert_eq!(
+            detach_follow_up(&Err(DetachError::StaleLease)),
+            DetachFollowUp::Continue
+        );
+        assert_eq!(
+            detach_follow_up(&Err(DetachError::DeadlineExceeded)),
+            DetachFollowUp::UncertainCleanup
+        );
+        assert_eq!(
+            detach_follow_up(&Err(DetachError::Backpressured)),
+            DetachFollowUp::UncertainCleanup
+        );
+        assert_eq!(
+            detach_follow_up(&Err(DetachError::ServiceGone)),
+            DetachFollowUp::ServiceUnavailable
+        );
+        assert_eq!(
+            detach_follow_up(&Err(DetachError::Disconnected)),
+            DetachFollowUp::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn uncertain_detach_must_not_attach_a_new_frontend_id() {
+        let runtime = test_runtime();
+        let _enter = runtime.enter();
+        let (service, _client, _handle) = start_test_service();
+        runtime
+            .block_on(service.attach_frontend(
+                FrontendInstanceId::new("cli-tui-1"),
+                Instant::now() + Duration::from_secs(2),
+            ))
+            .expect("attach");
+
+        // Caller saw DeadlineExceeded after send; actor still holds the lease.
+        let detach: Result<DetachReport, DetachError> = Err(DetachError::DeadlineExceeded);
+        assert_eq!(detach_follow_up(&detach), DetachFollowUp::UncertainCleanup);
+
+        let occupied = runtime.block_on(service.attach_frontend(
+            FrontendInstanceId::new("cli-tui-2"),
+            Instant::now() + Duration::from_secs(2),
+        ));
+        assert!(
+            matches!(occupied, Err(AttachError::FrontendOccupied { .. })),
+            "old restart path would Occupied-kill here: {occupied:?}"
+        );
+
+        runtime
+            .block_on(service.shutdown_from_supervisor(
+                "uncertain frontend detach",
+                Instant::now() + Duration::from_secs(2),
+            ))
+            .expect("supervisor cleanup");
+        let after = runtime.block_on(service.attach_frontend(
+            FrontendInstanceId::new("cli-tui-2"),
+            Instant::now() + Duration::from_secs(2),
+        ));
+        assert!(
+            matches!(
+                after,
+                Err(AttachError::Disconnected) | Err(AttachError::ServiceGone)
+            ),
+            "cleanup must not leave Occupied: {after:?}"
+        );
+        assert!(!matches!(after, Err(AttachError::FrontendOccupied { .. })));
+    }
+
+    #[test]
+    fn confirmed_detach_allows_a_new_frontend_id() {
+        let runtime = test_runtime();
+        let _enter = runtime.enter();
+        let (service, _client, _handle) = start_test_service();
+        let first = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-1"),
+            Instant::now() + Duration::from_secs(2),
+            || "first",
+        );
+        let detach = match first {
+            RegisteredFrontend::Finished {
+                detach: Ok(report),
+                output: Ok("first"),
+            } => Ok(report),
+            other => panic!("expected confirmed detach: {other:?}"),
+        };
+        assert_eq!(detach_follow_up(&detach), DetachFollowUp::Continue);
+
+        let second = run_registered_frontend(
+            &runtime,
+            &service,
+            FrontendInstanceId::new("cli-tui-2"),
+            Instant::now() + Duration::from_secs(2),
+            || "second",
+        );
+        assert!(matches!(
+            second,
+            RegisteredFrontend::Finished {
+                output: Ok("second"),
+                detach: Ok(_),
+            }
+        ));
     }
 }

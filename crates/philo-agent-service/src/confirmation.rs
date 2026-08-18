@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::bounds::CONFIRMATION_MAP_CAP;
 use crate::frontend::command::ConfirmationDecision;
+use crate::frontend::lease::FrontendLeaseGeneration;
 use crate::frontend::snapshot::PendingConfirmationView;
 
 /// One approval question shown to the frontend.
@@ -70,6 +71,7 @@ pub(crate) struct ConfirmationSubmit {
 struct PendingConfirmation {
     request: ConfirmationRequest,
     operation_id: Option<String>,
+    generation: FrontendLeaseGeneration,
     reply: oneshot::Sender<ConfirmationDecision>,
 }
 
@@ -90,7 +92,12 @@ impl ConfirmationMap {
     pub(crate) fn insert(
         &mut self,
         submit: ConfirmationSubmit,
+        generation: Option<FrontendLeaseGeneration>,
     ) -> Result<(u64, ConfirmationRequest), ConfirmationDecision> {
+        let Some(generation) = generation else {
+            let _ = submit.reply.send(ConfirmationDecision::Deny);
+            return Err(ConfirmationDecision::Deny);
+        };
         if self.pending.len() >= CONFIRMATION_MAP_CAP {
             let _ = submit.reply.send(ConfirmationDecision::Deny);
             return Err(ConfirmationDecision::Deny);
@@ -103,6 +110,7 @@ impl ConfirmationMap {
             PendingConfirmation {
                 request: submit.request,
                 operation_id: submit.operation_id,
+                generation,
                 reply: submit.reply,
             },
         );
@@ -113,7 +121,12 @@ impl ConfirmationMap {
         &mut self,
         id: u64,
         decision: ConfirmationDecision,
+        current: Option<FrontendLeaseGeneration>,
     ) -> Option<ConfirmationDecision> {
+        let pending = self.pending.get(&id)?;
+        if Some(pending.generation) != current {
+            return None;
+        }
         let pending = self.pending.remove(&id)?;
         let _ = pending.reply.send(decision);
         Some(decision)
@@ -124,6 +137,21 @@ impl ConfirmationMap {
             .pending
             .iter()
             .filter(|(_, pending)| pending.operation_id.as_deref() == Some(operation_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &ids {
+            if let Some(pending) = self.pending.remove(id) {
+                let _ = pending.reply.send(ConfirmationDecision::Deny);
+            }
+        }
+        ids
+    }
+
+    pub(crate) fn deny_for_generation(&mut self, generation: FrontendLeaseGeneration) -> Vec<u64> {
+        let ids: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.generation == generation)
             .map(|(id, _)| *id)
             .collect();
         for id in &ids {
@@ -183,25 +211,31 @@ mod tests {
         let mut map = ConfirmationMap::new();
         for index in 0..CONFIRMATION_MAP_CAP {
             let (tx, _rx) = oneshot::channel();
-            map.insert(ConfirmationSubmit {
+            map.insert(
+                ConfirmationSubmit {
+                    request: ConfirmationRequest {
+                        title: format!("q{index}"),
+                        body: String::new(),
+                    },
+                    operation_id: None,
+                    reply: tx,
+                },
+                Some(FrontendLeaseGeneration::new(1)),
+            )
+            .expect("fits");
+        }
+        let (tx, rx) = oneshot::channel();
+        let overflow = map.insert(
+            ConfirmationSubmit {
                 request: ConfirmationRequest {
-                    title: format!("q{index}"),
+                    title: "overflow".into(),
                     body: String::new(),
                 },
                 operation_id: None,
                 reply: tx,
-            })
-            .expect("fits");
-        }
-        let (tx, rx) = oneshot::channel();
-        let overflow = map.insert(ConfirmationSubmit {
-            request: ConfirmationRequest {
-                title: "overflow".into(),
-                body: String::new(),
             },
-            operation_id: None,
-            reply: tx,
-        });
+            Some(FrontendLeaseGeneration::new(1)),
+        );
         assert_eq!(overflow, Err(ConfirmationDecision::Deny));
         assert_eq!(map.views().len(), CONFIRMATION_MAP_CAP);
         assert_eq!(rx.blocking_recv(), Ok(ConfirmationDecision::Deny));
@@ -212,29 +246,55 @@ mod tests {
         let mut map = ConfirmationMap::new();
         let (tx_a, rx_a) = oneshot::channel();
         let (id_a, _) = map
-            .insert(ConfirmationSubmit {
-                request: ConfirmationRequest {
-                    title: "a".into(),
-                    body: String::new(),
+            .insert(
+                ConfirmationSubmit {
+                    request: ConfirmationRequest {
+                        title: "a".into(),
+                        body: String::new(),
+                    },
+                    operation_id: Some("op-1".into()),
+                    reply: tx_a,
                 },
-                operation_id: Some("op-1".into()),
-                reply: tx_a,
-            })
+                Some(FrontendLeaseGeneration::new(1)),
+            )
             .unwrap();
         let (tx_b, mut rx_b) = oneshot::channel();
-        map.insert(ConfirmationSubmit {
-            request: ConfirmationRequest {
-                title: "b".into(),
-                body: String::new(),
+        map.insert(
+            ConfirmationSubmit {
+                request: ConfirmationRequest {
+                    title: "b".into(),
+                    body: String::new(),
+                },
+                operation_id: Some("op-2".into()),
+                reply: tx_b,
             },
-            operation_id: Some("op-2".into()),
-            reply: tx_b,
-        })
+            Some(FrontendLeaseGeneration::new(1)),
+        )
         .unwrap();
         let denied = map.deny_for_operation("op-1");
         assert_eq!(denied, vec![id_a]);
         assert_eq!(rx_a.blocking_recv(), Ok(ConfirmationDecision::Deny));
         assert!(rx_b.try_recv().is_err());
         assert_eq!(map.views().len(), 1);
+    }
+
+    #[test]
+    fn insert_without_lease_auto_denies() {
+        let mut map = ConfirmationMap::new();
+        let (tx, rx) = oneshot::channel();
+        let result = map.insert(
+            ConfirmationSubmit {
+                request: ConfirmationRequest {
+                    title: "none".into(),
+                    body: String::new(),
+                },
+                operation_id: None,
+                reply: tx,
+            },
+            None,
+        );
+        assert_eq!(result, Err(ConfirmationDecision::Deny));
+        assert!(map.views().is_empty());
+        assert_eq!(rx.blocking_recv(), Ok(ConfirmationDecision::Deny));
     }
 }

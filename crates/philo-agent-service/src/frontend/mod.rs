@@ -5,12 +5,12 @@ pub(crate) mod command;
 pub(crate) mod feed;
 pub(crate) mod lease;
 pub(crate) mod snapshot;
+pub(crate) mod supervisor;
 pub(crate) mod update;
 
 pub use client::FrontendClient;
 pub use command::{
-    ConfirmationDecision, DetachReason, FrontendAttachment, FrontendCommand,
-    FrontendReasoningEffort,
+    ConfirmationDecision, FrontendAttachment, FrontendCommand, FrontendReasoningEffort,
 };
 pub use feed::ResyncRequired;
 pub use lease::{

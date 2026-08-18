@@ -209,12 +209,12 @@ enum TransientKey {
     },
     ToolProgress {
         operation_id: OperationId,
-        tool_call_id: ToolCallId,
     },
     Availability,
-    Maintenance { id: MaintenanceId },
+    Maintenance {
+        id: MaintenanceId,
+    },
 }
-
 
 fn transient_key(
     event: &RuntimeEvent,
@@ -222,12 +222,10 @@ fn transient_key(
     model_call_id: Option<&ModelCallId>,
 ) -> Option<TransientKey> {
     match event {
-        RuntimeEvent::Agent(AgentEvent::TextDelta { .. }) => {
-            Some(TransientKey::Text {
-                operation_id: operation_id.cloned()?,
-                model_call_id: model_call_id.cloned(),
-            })
-        }
+        RuntimeEvent::Agent(AgentEvent::TextDelta { .. }) => Some(TransientKey::Text {
+            operation_id: operation_id.cloned()?,
+            model_call_id: model_call_id.cloned(),
+        }),
         RuntimeEvent::Agent(AgentEvent::ReasoningDelta { model_call_id, .. }) => {
             Some(TransientKey::Reasoning {
                 operation_id: operation_id.cloned()?,
@@ -240,14 +238,15 @@ fn transient_key(
                 model_call_id: model_call_id.clone(),
             })
         }
-        RuntimeEvent::Agent(AgentEvent::ToolExecutionProgress { tool_call_id, .. }) => {
+        RuntimeEvent::Agent(AgentEvent::ToolExecutionProgress { .. }) => {
             Some(TransientKey::ToolProgress {
                 operation_id: operation_id.cloned()?,
-                tool_call_id: tool_call_id.clone(),
             })
         }
         RuntimeEvent::AvailabilityChanged { .. } => Some(TransientKey::Availability),
-        RuntimeEvent::MaintenanceProgress { id, .. } => Some(TransientKey::Maintenance { id: id.clone() }),
+        RuntimeEvent::MaintenanceProgress { id, .. } => {
+            Some(TransientKey::Maintenance { id: id.clone() })
+        }
         _ => None,
     }
 }
@@ -375,6 +374,37 @@ mod tests {
             None,
         );
         assert_eq!(coalescer.len(), 3);
+    }
+
+    fn tool_progress(tool_call_id: &str) -> RuntimeEvent {
+        RuntimeEvent::Agent(AgentEvent::ToolExecutionProgress {
+            tool_batch_id: crate::ToolBatchId::new("batch"),
+            tool_call_id: ToolCallId::new(tool_call_id),
+            index: 0,
+            tail: "tail".to_owned(),
+        })
+    }
+
+    #[test]
+    fn tool_progress_is_one_slot_per_operation() {
+        let op = OperationId::new("op-1");
+        let mut coalescer = TransientCoalescer::new(4);
+        coalescer.publish(text("keep"), Some(&op), None);
+        coalescer.publish(tool_progress("call-a"), Some(&op), None);
+        coalescer.publish(tool_progress("call-b"), Some(&op), None);
+        assert_eq!(coalescer.len(), 2);
+        let first = coalescer.take_one().unwrap();
+        assert!(matches!(
+            first,
+            RuntimeEvent::Agent(AgentEvent::TextDelta { .. })
+        ));
+        let second = coalescer.take_one().unwrap();
+        match second {
+            RuntimeEvent::Agent(AgentEvent::ToolExecutionProgress { tool_call_id, .. }) => {
+                assert_eq!(tool_call_id.as_str(), "call-b");
+            }
+            other => panic!("expected latest tool progress, got {other:?}"),
+        }
     }
 
     #[test]

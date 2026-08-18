@@ -1,13 +1,14 @@
 //! Epoch-root supervision: accepted ledger, child handoff, and panic recovery.
 
 use crate::shutdown::{ShutdownOutcome, ShutdownRequest, default_shutdown_deadline};
+use crate::staging::ReliableStaging;
 use crate::{
     AgentAvailability, DiagnosticId, EpochEndReason, ForcedSettlement, MaintenanceId,
     MaintenanceResult, OperationId, OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeSnapshot,
     SessionId, SettlementDurability, SettlementRevision, ShutdownDiagnostic, ShutdownError,
     ShutdownReport, ShutdownState, TurnId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,14 +21,16 @@ pub(crate) const EPOCH_CHILD_JOIN_DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub(crate) struct EpochShared {
     pub ledger: AcceptedLedger,
+    pub staging: ReliableStaging,
     pub children: EpochChildHandoff,
     pub epoch_ended: Arc<AtomicBool>,
 }
 
 impl EpochShared {
-    pub(crate) fn new(queue_max: usize) -> Self {
+    pub(crate) fn new(queue_max: usize, staging_cap: usize) -> Self {
         Self {
             ledger: AcceptedLedger::new(queue_max.saturating_add(1)),
+            staging: ReliableStaging::new(staging_cap),
             children: EpochChildHandoff::new(),
             epoch_ended: Arc::new(AtomicBool::new(false)),
         }
@@ -221,8 +224,6 @@ pub(crate) async fn join_epoch_children(children: EpochChildren) -> Vec<String> 
 
 pub(crate) struct EpochExit {
     pub reason: EpochEndReason,
-    pub pending_reliable: Vec<RuntimeEvent>,
-    pub forced_settlements: Vec<ForcedSettlement>,
     pub diagnostics: Vec<ShutdownDiagnostic>,
     pub maintenance: Option<(MaintenanceId, SessionId)>,
 }
@@ -244,8 +245,7 @@ pub(crate) struct SuperviseEpoch {
 pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
     let outcome = input.coordinator.await;
     let children = input.shared.children.take();
-    let leftover = input.shared.ledger.take_all();
-    let maintenance = match (
+    let children_maintenance = match (
         children.maintenance_id.clone(),
         children.maintenance_session_id.clone(),
     ) {
@@ -254,51 +254,40 @@ pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
     };
     let join_faults = join_epoch_children(children).await;
     let mut exit = match outcome {
-        Ok(CoordinatorExit::Finalized(mut exit)) => {
-            if exit.forced_settlements.is_empty() {
-                exit.forced_settlements
-                    .extend(leftover.into_iter().enumerate().map(|(index, entry)| {
-                        ForcedSettlement {
-                            operation_id: entry.operation_id,
-                            session_id: entry.session_id,
-                            status: OperationStatus::Failed,
-                            durability: SettlementDurability::Unconfirmed,
-                            diagnostic_id: DiagnosticId::new(format!(
-                                "epoch-{}-forced-{}",
-                                input.epoch.as_str(),
-                                index + 1
-                            )),
-                        }
-                    }));
-            }
-            exit
-        }
+        Ok(CoordinatorExit::Finalized(exit)) => exit,
         Err(_) => EpochExit {
             reason: EpochEndReason::CoordinatorFault,
-            pending_reliable: Vec::new(),
-            forced_settlements: leftover
-                .into_iter()
-                .enumerate()
-                .map(|(index, entry)| ForcedSettlement {
-                    operation_id: entry.operation_id,
-                    session_id: entry.session_id,
-                    status: OperationStatus::Failed,
-                    durability: SettlementDurability::Unconfirmed,
-                    diagnostic_id: DiagnosticId::new(format!(
-                        "epoch-{}-forced-{}",
-                        input.epoch.as_str(),
-                        index + 1
-                    )),
-                })
-                .collect(),
             diagnostics: Vec::new(),
-            maintenance,
+            maintenance: children_maintenance.clone(),
         },
     };
-    exit.diagnostics
-        .extend(join_faults.into_iter().map(|message| ShutdownDiagnostic {
-            message,
-        }));
+    if exit.maintenance.is_none() {
+        exit.maintenance = children_maintenance;
+    }
+    exit.diagnostics.extend(
+        join_faults
+            .into_iter()
+            .map(|message| ShutdownDiagnostic { message }),
+    );
+    let staged = input.shared.staging.drain();
+    let leftover = input.shared.ledger.take_all();
+    let settled: HashSet<OperationId> = staged.iter().filter_map(settled_operation_id).collect();
+    let forced: Vec<ForcedSettlement> = leftover
+        .into_iter()
+        .filter(|entry| !settled.contains(&entry.operation_id))
+        .enumerate()
+        .map(|(index, entry)| ForcedSettlement {
+            operation_id: entry.operation_id,
+            session_id: entry.session_id,
+            status: OperationStatus::Failed,
+            durability: SettlementDurability::Unconfirmed,
+            diagnostic_id: DiagnosticId::new(format!(
+                "epoch-{}-forced-{}",
+                input.epoch.as_str(),
+                index + 1
+            )),
+        })
+        .collect();
     let deadline = input
         .shutdown_rx
         .borrow()
@@ -310,10 +299,19 @@ pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
         input.snapshot_tx,
         input.epoch,
         exit,
+        staged,
+        forced,
         deadline,
     )
     .await;
     let _ = input.completion_tx.send(Some(result));
+}
+
+fn settled_operation_id(event: &RuntimeEvent) -> Option<OperationId> {
+    match event {
+        RuntimeEvent::OperationSettled { operation_id, .. } => Some(operation_id.clone()),
+        _ => None,
+    }
 }
 
 async fn apply_epoch_exit(
@@ -321,12 +319,14 @@ async fn apply_epoch_exit(
     snapshot_tx: tokio::sync::watch::Sender<RuntimeSnapshot>,
     epoch: RuntimeEpoch,
     exit: EpochExit,
+    staged: Vec<RuntimeEvent>,
+    forced: Vec<ForcedSettlement>,
     deadline: Instant,
 ) -> ShutdownOutcome {
     let sink_closed = event_tx.is_closed();
     let mut last_settled = snapshot_tx.borrow().last_settled.clone();
     let mut pending = Vec::new();
-    let mut events = exit.pending_reliable;
+    let mut events = staged;
     if let Some((id, session_id)) = exit.maintenance {
         events.push(RuntimeEvent::MaintenanceSettled {
             id,
@@ -334,7 +334,7 @@ async fn apply_epoch_exit(
             result: MaintenanceResult::Cancelled,
         });
     }
-    for settlement in &exit.forced_settlements {
+    for settlement in &forced {
         events.push(RuntimeEvent::OperationSettled {
             operation_id: settlement.operation_id.clone(),
             session_id: settlement.session_id.clone(),
@@ -365,7 +365,7 @@ async fn apply_epoch_exit(
             message: diagnostic.message.clone(),
         });
     }
-    let forced_count = exit.forced_settlements.len();
+    let forced_count = forced.len();
     events.push(RuntimeEvent::EpochEnded {
         epoch: epoch.clone(),
         reason: exit.reason,
@@ -414,7 +414,7 @@ async fn apply_epoch_exit(
         Ok(ShutdownReport {
             epoch,
             final_state: ShutdownState::Stopped,
-            settlements: exit.forced_settlements,
+            settlements: forced,
             diagnostics: exit.diagnostics,
         })
     } else {

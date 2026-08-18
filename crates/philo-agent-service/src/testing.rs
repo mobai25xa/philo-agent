@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
-    AdmissionError, AgentAvailability, CancelResult, CompactionSpec, GenerationDisplay,
-    GenerationId, MaintenanceAccepted, MaintenanceError, MaintenanceId, ModelCallSnapshot,
-    ModelError, ModelEventStream, ModelPort, OperationAccepted, OperationId, OperationSpec,
-    RuntimeConfig, RuntimeEpoch, RuntimeEvent, RuntimeFuture, RuntimeGeneration, RuntimeSnapshot,
-    ShutdownMode, ShutdownReport, ShutdownState, TryRecvError, TurnId,
+    AdmissionError, AgentAvailability, CancelResult, CompactionSpec, EpochEndReason,
+    GenerationDisplay, GenerationId, MaintenanceAccepted, MaintenanceError, MaintenanceId,
+    MaintenanceResult, ModelCallSnapshot, ModelError, ModelEventStream, ModelPort,
+    OperationAccepted, OperationId, OperationSpec, OperationStatus, RuntimeConfig, RuntimeEpoch,
+    RuntimeEvent, RuntimeFuture, RuntimeGeneration, RuntimeSnapshot, SessionId,
+    SettlementDurability, SettlementRevision, ShutdownMode, ShutdownReport, ShutdownState,
+    TryRecvError, TurnId,
 };
 use philo_session::{MemorySessionStore, SessionStore};
 use philo_tools::{ToolPort, ToolRegistry};
@@ -262,6 +264,9 @@ impl FakeRuntimeHandle {
     }
 
     /// Pushes a runtime event onto the subscription. Drops if the cap is full.
+    ///
+    /// Command replies never call this. Tests must emit lifecycle facts
+    /// explicitly so reply and event stay independently controllable.
     pub fn emit(&self, event: RuntimeEvent) {
         let _ = self.event_tx.try_send(event);
     }
@@ -269,6 +274,71 @@ impl FakeRuntimeHandle {
     /// Convenience for [`RuntimeEvent::Agent`].
     pub fn emit_agent(&self, event: philo_agent_runtime::AgentEvent) {
         self.emit(RuntimeEvent::Agent(event));
+    }
+
+    /// Publishes one admission fact. Does not complete a command reply.
+    pub fn emit_operation_accepted(
+        &self,
+        operation_id: OperationId,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) {
+        self.emit(RuntimeEvent::OperationAccepted {
+            operation_id,
+            session_id,
+            turn_id,
+        });
+    }
+
+    /// Publishes one terminal fact. Does not complete a command reply.
+    pub fn emit_operation_settled(
+        &self,
+        operation_id: OperationId,
+        session_id: SessionId,
+        status: OperationStatus,
+        durability: SettlementDurability,
+        session_revision: SettlementRevision,
+    ) {
+        self.emit(RuntimeEvent::OperationSettled {
+            operation_id,
+            session_id,
+            status,
+            durability,
+            session_revision,
+        });
+    }
+
+    /// Publishes one maintenance admission fact.
+    pub fn emit_maintenance_accepted(&self, id: MaintenanceId, session_id: SessionId) {
+        self.emit(RuntimeEvent::MaintenanceAccepted { id, session_id });
+    }
+
+    /// Publishes one maintenance terminal fact.
+    pub fn emit_maintenance_settled(
+        &self,
+        id: MaintenanceId,
+        session_id: SessionId,
+        result: MaintenanceResult,
+    ) {
+        self.emit(RuntimeEvent::MaintenanceSettled {
+            id,
+            session_id,
+            result,
+        });
+    }
+
+    /// Publishes an epoch diagnostic. Never carries settlements.
+    pub fn emit_epoch_ended(
+        &self,
+        epoch: RuntimeEpoch,
+        reason: EpochEndReason,
+        forced_count: usize,
+    ) {
+        self.emit(RuntimeEvent::EpochEnded {
+            epoch,
+            reason,
+            forced_count,
+        });
     }
 
     /// How many events the service has consumed from the subscription.
@@ -350,6 +420,7 @@ async fn park_runtime_child(inner: &Arc<Mutex<FakeInner>>, notify: &Notify) {
 }
 
 impl RuntimePort for FakeRuntimeHandle {
+    /// Completes the command reply only. Lifecycle facts must be emitted separately.
     fn submit(
         &self,
         spec: OperationSpec,

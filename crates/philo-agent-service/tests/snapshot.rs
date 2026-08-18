@@ -774,3 +774,136 @@ async fn subscription_lag_requests_runtime_snapshot() {
     assert_eq!(snapshot.queued[0].session_id, "sess-lag");
     drop(service);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settlement_updates_floor_of_event_session_not_current() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let inner = Arc::new(MemorySessionStore::new());
+        seed_session(&inner, "sess-a").await;
+        seed_session(&inner, "sess-b").await;
+        let mid = commit_turn(
+            inner.as_ref(),
+            "sess-a",
+            SessionRevision::new(1),
+            "op-a",
+            "turn-a",
+            "ask-a",
+            "answer-a",
+        )
+        .await;
+        let stale_a = inner
+            .context_view(&SessionId::new("sess-a"))
+            .await
+            .unwrap();
+        let final_a = commit_turn(
+            inner.as_ref(),
+            "sess-a",
+            mid.revision(),
+            "op-a-final",
+            "turn-a-final",
+            "ask-a-2",
+            "answer-a-final",
+        )
+        .await;
+        let store = ScriptedStore::new(inner);
+        let (service, client, runtime) =
+            start_test_service_with(FakeAssembler::new(), store.clone());
+        load_session(&client, "sess-b").await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-a"),
+            philo_agent_runtime::SessionId::new("sess-a"),
+            philo_agent_runtime::TurnId::new("turn-a"),
+        );
+        emit_settled(&runtime, "op-a", "sess-a", final_a.revision().get());
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.current_session_id.as_deref(), Some("sess-b"));
+        let durable = snapshot.durable_session_view.expect("b snapshot");
+        assert_eq!(durable.session_id, "sess-b");
+        assert_eq!(durable.revision, 1);
+
+        load_session(&client, "sess-a").await;
+        store.prepend(stale_a);
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        let durable = snapshot.durable_session_view.expect("a snapshot");
+        assert_eq!(durable.session_id, "sess-a");
+        assert!(durable.revision >= final_a.revision().get());
+        assert!(assistant_texts(&durable).contains(&"answer-a-final"));
+        drop(service);
+    })
+    .await
+    .expect("event-session floor test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_summary_uses_accepted_session() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let store = MemorySessionStore::new();
+        seed_session(&store, "sess-a").await;
+        seed_session(&store, "sess-b").await;
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
+        load_session(&client, "sess-b").await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-a"),
+            philo_agent_runtime::SessionId::new("sess-a"),
+            philo_agent_runtime::TurnId::new("turn-a"),
+        );
+        recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+        })
+        .await;
+        runtime.emit_agent(AgentEvent::OperationQueued {
+            operation_id: OperationId::new("op-a"),
+        });
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationQueued { .. }
+                )
+            )
+        })
+        .await;
+
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.queued.len(), 1);
+        assert_eq!(snapshot.queued[0].operation_id, "op-a");
+        assert_eq!(
+            snapshot.queued[0].session_id, "sess-a",
+            "queued summary must use accepted session, not current UI session"
+        );
+        drop(service);
+    })
+    .await
+    .expect("queued accepted-session test timed out");
+}

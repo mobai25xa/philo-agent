@@ -193,13 +193,19 @@ impl OperationShared {
         }
     }
 
-    pub(crate) fn settle(&self, outcome: OperationOutcome) {
+    /// Transitions to `Settled` once. A second call is a no-op and returns `false`.
+    pub(crate) fn settle(&self, outcome: OperationOutcome) -> bool {
+        let mut phase = lock(&self.phase);
+        if matches!(*phase, OperationPhase::Settled(_)) {
+            return false;
+        }
         let status = match &outcome {
             OperationOutcome::Succeeded { .. } => OperationStatus::Succeeded,
             OperationOutcome::Failed { .. } => OperationStatus::Failed,
             OperationOutcome::Cancelled => OperationStatus::Cancelled,
         };
-        *lock(&self.phase) = OperationPhase::Settled(status);
+        *phase = OperationPhase::Settled(status);
+        drop(phase);
         if let OperationOutcome::Failed { failure, .. } = &outcome {
             *lock(&self.failure) = Some(failure.clone());
         }
@@ -215,6 +221,7 @@ impl OperationShared {
             } => DriverExit::FailedUnconfirmed,
             OperationOutcome::Cancelled => DriverExit::CancelledConfirmed,
         });
+        true
     }
 
     pub(crate) fn failure(&self) -> Option<AgentFailure> {
@@ -232,4 +239,40 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AssistantMessage, OperationId, TurnId};
+
+    fn shared() -> OperationShared {
+        let (tx, _rx) = mpsc::channel(1);
+        OperationShared::new(
+            OperationId::new("op-1"),
+            TurnId::new("turn-1"),
+            tx,
+            OperationPhase::PreparingTurn,
+        )
+    }
+
+    #[test]
+    fn settle_is_idempotent() {
+        let shared = shared();
+        assert!(shared.settle(OperationOutcome::Cancelled));
+        assert_eq!(
+            shared.phase(),
+            OperationPhase::Settled(OperationStatus::Cancelled)
+        );
+        assert!(!shared.settle(OperationOutcome::Succeeded {
+            assistant: AssistantMessage {
+                content: "late".into(),
+            },
+        }));
+        assert_eq!(
+            shared.phase(),
+            OperationPhase::Settled(OperationStatus::Cancelled)
+        );
+        assert_eq!(shared.take_exit(), DriverExit::CancelledConfirmed);
+    }
 }

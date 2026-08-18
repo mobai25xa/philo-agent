@@ -137,18 +137,15 @@ where
 
     pub(super) fn on_operation_settled(
         &mut self,
+        session_id: &str,
         durability: SettlementDurability,
         session_revision: philo_agent_runtime::SettlementRevision,
     ) {
         if durability == SettlementDurability::Confirmed {
-            if let (
-                Some(session_id),
-                philo_agent_runtime::SettlementRevision::Committed(revision),
-            ) = (self.current_session.clone(), session_revision)
-            {
+            if let philo_agent_runtime::SettlementRevision::Committed(revision) = session_revision {
                 let required = self
                     .required_session_revision
-                    .entry(session_id)
+                    .entry(session_id.to_owned())
                     .or_insert(0);
                 *required = (*required).max(revision.get());
             }

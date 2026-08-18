@@ -62,8 +62,9 @@ impl AgentRuntime {
         let (event_tx, event_rx) = mpsc::channel(bounds.event_cap);
         let (snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot(epoch.clone()));
         let (shutdown_tx, shutdown_rx) = watch::channel(None::<ShutdownRequest>);
-        let (completion_tx, completion_rx) = watch::channel(None::<crate::shutdown::ShutdownOutcome>);
-        let shared = EpochShared::new(bounds.queue_max);
+        let (completion_tx, completion_rx) =
+            watch::channel(None::<crate::shutdown::ShutdownOutcome>);
+        let shared = EpochShared::new(bounds.queue_max, bounds.reliable_staging_cap);
         let join = Coordinator::spawn(
             epoch.clone(),
             deps.sessions,

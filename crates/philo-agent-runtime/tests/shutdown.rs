@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
-    AdmissionError, ChannelBounds, GenerationConfig, RuntimeConfig, RuntimeEvent, SequentialIdSource,
-    ShutdownError, ShutdownMode, ShutdownState,
+    AdmissionError, ChannelBounds, GenerationConfig, RuntimeConfig, RuntimeEvent,
+    SequentialIdSource, ShutdownError, ShutdownMode, ShutdownState,
 };
 use philo_session::MemorySessionStore;
 use support::fake_model::{FakeModel, ModelScript};
@@ -52,6 +52,21 @@ fn unread_event_bounds() -> ChannelBounds {
     }
 }
 
+/// Paused outlet with room for one completed operation's reliable prefix
+/// plus settlement. `can_poll_driver` / `can_reap_children` both require
+/// two free staging slots, so cap=4 plus `event_cap=1` stalls before
+/// `last_settled` is written.
+fn paused_outlet_bounds() -> ChannelBounds {
+    ChannelBounds {
+        command_cap: 4,
+        control_cap: 8,
+        event_cap: 1,
+        queue_max: 4,
+        driver_event_budget: 8,
+        reliable_staging_cap: 8,
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_observed_when_control_mailbox_full() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
@@ -79,7 +94,10 @@ async fn shutdown_observed_when_control_mailbox_full() {
 
     let report = tokio::time::timeout(
         Duration::from_secs(2),
-        handle.shutdown(ShutdownMode::Forced, Instant::now() + Duration::from_secs(1)),
+        handle.shutdown(
+            ShutdownMode::Forced,
+            Instant::now() + Duration::from_secs(1),
+        ),
     )
     .await
     .expect("shutdown must not hang behind a full control mailbox")
@@ -177,9 +195,12 @@ async fn dropping_event_receiver_still_finalizes() {
     .await;
     wait_until_busy(&handle, &accepted.operation_id).await;
     drop(sub);
-    tokio::time::timeout(Duration::from_secs(2), wait_until_shutdown_leaves_running(&handle))
-        .await
-        .expect("drop receiver must finalize");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_until_shutdown_leaves_running(&handle),
+    )
+    .await
+    .expect("drop receiver must finalize");
     let err = handle
         .submit(philo_agent_runtime::OperationSpec {
             session_id: philo_agent_runtime::SessionId::new("session"),
@@ -195,7 +216,9 @@ async fn dropping_event_receiver_still_finalizes() {
         .expect_err("admission must stop");
     assert!(matches!(
         err,
-        AdmissionError::ShuttingDown | AdmissionError::RuntimeStopped | AdmissionError::Backpressured
+        AdmissionError::ShuttingDown
+            | AdmissionError::RuntimeStopped
+            | AdmissionError::Backpressured
     ));
     gate.release();
 }
@@ -223,7 +246,10 @@ async fn coordinator_panic_one_forced_settlement_per_accepted() {
 
     let report = tokio::time::timeout(
         Duration::from_secs(3),
-        handle.shutdown(ShutdownMode::Forced, Instant::now() + Duration::from_secs(2)),
+        handle.shutdown(
+            ShutdownMode::Forced,
+            Instant::now() + Duration::from_secs(2),
+        ),
     )
     .await
     .expect("panic finalizer must not hang")
@@ -266,6 +292,164 @@ async fn coordinator_panic_one_forced_settlement_per_accepted() {
     gate.release();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_outlet_settled_then_coordinator_panic_still_publishes_one_settlement() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let model = Arc::new(FakeModel::succeeds(&["hello"]));
+        let sessions = Arc::new(MemorySessionStore::new());
+        let (handle, sub) = start_with_bounds(
+            sessions,
+            Arc::new(SequentialIdSource::new()),
+            paused_outlet_bounds(),
+        )
+        .await;
+        let probe = EventProbe::start_paused(sub);
+        let accepted = submit_prompt(
+            &handle,
+            generation(model, empty_tools(), config()),
+            "session-a",
+            "hi",
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot().await;
+            if snapshot
+                .last_settled
+                .iter()
+                .any(|settled| settled.operation_id == accepted.operation_id)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "settlement must enter staging while the outlet is paused"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.inject_coordinator_panic().await;
+        probe.resume();
+        let events = probe
+            .wait_for(
+                |events| {
+                    events
+                        .iter()
+                        .any(|event| matches!(event, RuntimeEvent::EpochEnded { .. }))
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        let settled: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::OperationSettled { operation_id, .. }
+                        if *operation_id == accepted.operation_id
+                )
+            })
+            .collect();
+        assert_eq!(
+            settled.len(),
+            1,
+            "staged settlement must survive coordinator panic: {events:?}"
+        );
+        match settled[0] {
+            RuntimeEvent::OperationSettled { session_id, .. } => {
+                assert_eq!(session_id.as_str(), "session-a");
+            }
+            other => panic!("{other:?}"),
+        }
+        let forced_count = events.iter().find_map(|event| match event {
+            RuntimeEvent::EpochEnded { forced_count, .. } => Some(*forced_count),
+            _ => None,
+        });
+        assert_eq!(
+            forced_count,
+            Some(0),
+            "already staged settlement is not a leftover forced fact"
+        );
+    })
+    .await
+    .expect("paused settle then panic timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_join_keeps_reserve_and_stages_settlement() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let model = Arc::new(FakeModel::panics("driver panic after start"));
+        let sessions = Arc::new(MemorySessionStore::new());
+        let (handle, sub) = start_with_bounds(
+            sessions,
+            Arc::new(SequentialIdSource::new()),
+            paused_outlet_bounds(),
+        )
+        .await;
+        let probe = EventProbe::start_paused(sub);
+        let accepted = submit_prompt(
+            &handle,
+            generation(model, empty_tools(), config()),
+            "session",
+            "hi",
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot().await;
+            if snapshot
+                .last_settled
+                .iter()
+                .any(|settled| settled.operation_id == accepted.operation_id)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "driver-join settlement must enter staging"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = handle.snapshot().await;
+        assert!(
+            snapshot
+                .last_settled
+                .iter()
+                .any(|settled| settled.operation_id == accepted.operation_id),
+            "settle_operation must record only after staging succeeds"
+        );
+
+        probe.resume();
+        let events = probe
+            .wait_for(
+                |events| {
+                    events.iter().any(|event| {
+                        matches!(
+                            event,
+                            RuntimeEvent::OperationSettled { operation_id, .. }
+                                if *operation_id == accepted.operation_id
+                        )
+                    })
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        let settled = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::OperationSettled { operation_id, .. }
+                        if *operation_id == accepted.operation_id
+                )
+            })
+            .count();
+        assert_eq!(settled, 1, "join settlement must appear once: {events:?}");
+    })
+    .await
+    .expect("driver-join reserve test timed out");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn repeated_shutdown_is_idempotent() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
@@ -285,10 +469,7 @@ async fn repeated_shutdown_is_idempotent() {
     .await;
     wait_until_idle(&handle).await;
     let first = handle
-        .shutdown(
-            ShutdownMode::Drain,
-            Instant::now() + Duration::from_secs(2),
-        )
+        .shutdown(ShutdownMode::Drain, Instant::now() + Duration::from_secs(2))
         .await
         .expect("first shutdown");
     let second = handle

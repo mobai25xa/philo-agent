@@ -100,10 +100,15 @@ impl OperationPublisher {
         assistant: AssistantMessage,
         session_revision: philo_session::SessionRevision,
     ) {
+        if !self.shared.settle(OperationOutcome::Succeeded {
+            assistant: assistant.clone(),
+        }) {
+            return;
+        }
         self.shared
             .publish(AgentEvent::AssistantMessageCompleted {
                 turn_id: self.shared.turn_id().clone(),
-                message: assistant.clone(),
+                message: assistant,
             })
             .await;
         self.publish_settled(
@@ -112,8 +117,6 @@ impl OperationPublisher {
             SettlementRevision::Committed(session_revision),
         )
         .await;
-        self.shared
-            .settle(OperationOutcome::Succeeded { assistant });
     }
 
     pub async fn fail_confirmed(
@@ -121,14 +124,20 @@ impl OperationPublisher {
         failure: AgentFailure,
         session_revision: philo_session::SessionRevision,
     ) {
+        if !self.shared.settle(OperationOutcome::Failed {
+            failure: failure.clone(),
+            durability: SettlementDurability::Confirmed,
+        }) {
+            return;
+        }
         self.shared
             .publish(AgentEvent::TurnFailed {
                 turn_id: self.shared.turn_id().clone(),
-                failure: failure.clone(),
+                failure,
             })
             .await;
-        self.fail(
-            failure,
+        self.publish_settled(
+            OperationStatus::Failed,
             SettlementDurability::Confirmed,
             SettlementRevision::Committed(session_revision),
         )
@@ -150,10 +159,12 @@ impl OperationPublisher {
         durability: SettlementDurability,
         session_revision: SettlementRevision,
     ) {
-        self.shared.settle(OperationOutcome::Failed {
+        if !self.shared.settle(OperationOutcome::Failed {
             failure,
             durability,
-        });
+        }) {
+            return;
+        }
         self.publish_settled(OperationStatus::Failed, durability, session_revision)
             .await;
     }
@@ -161,18 +172,23 @@ impl OperationPublisher {
     /// Settles as cancelled before any turn fact was persisted: no
     /// `TurnCancelled` because durably no turn exists.
     pub async fn cancel_zero_trace(self) {
+        if !self.shared.settle(OperationOutcome::Cancelled) {
+            return;
+        }
         self.publish_settled(
             OperationStatus::Cancelled,
             SettlementDurability::Confirmed,
             SettlementRevision::Unchanged,
         )
         .await;
-        self.shared.settle(OperationOutcome::Cancelled);
     }
 
     /// Settles as cancelled after the cancellation transaction committed:
     /// publishes `TurnCancelled` before the terminal event.
     pub async fn cancel_committed(self, session_revision: philo_session::SessionRevision) {
+        if !self.shared.settle(OperationOutcome::Cancelled) {
+            return;
+        }
         self.shared
             .publish(AgentEvent::TurnCancelled {
                 turn_id: self.shared.turn_id().clone(),
@@ -185,7 +201,6 @@ impl OperationPublisher {
             SettlementRevision::Committed(session_revision),
         )
         .await;
-        self.shared.settle(OperationOutcome::Cancelled);
     }
 
     /// Publishes the terminal settlement. `Committed` only after a Session

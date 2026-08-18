@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use philo_agent_runtime::{
     AdmissionError, AgentEvent, ChannelBounds, GenerationConfig, ModelEvent, RuntimeConfig,
-    RuntimeEvent, SequentialIdSource, SessionId, TokenUsage,
-    UserMessage,
+    RuntimeEvent, SequentialIdSource, SessionId, TokenUsage, UserMessage,
 };
 use philo_session::MemorySessionStore;
 use support::fake_model::{FakeModel, ModelScript};
@@ -91,12 +90,8 @@ async fn alternating_transients_stay_within_coalescer_cap() {
     let model = Arc::new(FakeModel::new([alternating_stream(200)]));
     let sessions = Arc::new(MemorySessionStore::new());
     let bounds = tiny_pipeline_bounds();
-    let (handle, sub) = start_with_bounds(
-        sessions,
-        Arc::new(SequentialIdSource::new()),
-        bounds,
-    )
-    .await;
+    let (handle, sub) =
+        start_with_bounds(sessions, Arc::new(SequentialIdSource::new()), bounds).await;
     let probe = EventProbe::start_paused(sub);
     submit_prompt(
         &handle,

@@ -6,20 +6,19 @@ use crate::epoch::{
     AcceptedLedger, CoordinatorExit, EPOCH_CHILD_JOIN_DEADLINE, EpochChildHandoff, EpochChildren,
     EpochExit, EpochShared, abort_and_join,
 };
-use crate::shutdown::{ShutdownRequest, default_shutdown_deadline};
 use crate::operation::{DriverEvent, MaintenanceCancel, OperationShared};
 use crate::runtime_event::is_mergeable;
+use crate::shutdown::{ShutdownRequest, default_shutdown_deadline};
 use crate::staging::{OutboundStats, ReliableStaging};
 use crate::transient::TransientCoalescer;
 use crate::{
     ActiveOperationSnapshot, AdmissionError, AgentAvailability, AgentEvent, AgentFailure,
     CancelResult, ChannelBounds, CompactionSpec, DiagnosticId, DriverExit, EpochEndReason,
-    ForcedSettlement, IdSource, MaintenanceAccepted, MaintenanceError, MaintenanceId,
+    IdSource, MaintenanceAccepted, MaintenanceError, MaintenanceId,
     MaintenanceResult, MaintenanceSnapshot, ModelCallId, OperationAccepted, OperationId,
     OperationPhase, OperationSpec, OperationStatus, QueuedOperationSnapshot, RuntimeEpoch,
-    RuntimeEvent,
-    RuntimeSnapshot, SessionId, SettledOperationSnapshot, SettlementDurability, SettlementRevision,
-    ShutdownMode, ShutdownState, TurnId,
+    RuntimeEvent, RuntimeSnapshot, SessionId, SettledOperationSnapshot, SettlementDurability,
+    SettlementRevision, ShutdownMode, ShutdownState, TurnId,
 };
 use philo_session::CancelReason;
 use std::collections::{HashMap, VecDeque};
@@ -71,7 +70,6 @@ struct ActiveMeta {
     shared: Arc<OperationShared>,
     phase: OperationPhase,
     started: bool,
-    settled_event_seen: bool,
     last_model_call_id: Option<ModelCallId>,
 }
 
@@ -148,7 +146,7 @@ impl Coordinator {
             maintenance_join: None,
             shutdown: ShutdownState::Running,
             shutdown_deadline: None,
-            reliable_staging: ReliableStaging::new(bounds.reliable_staging_cap),
+            reliable_staging: shared.staging.clone(),
             transient_coalescer: TransientCoalescer::new(bounds.transient_coalescer_cap()),
             sink_closed: false,
             last_settled: Vec::new(),
@@ -454,18 +452,12 @@ impl Coordinator {
                 operation_id: operation_id.clone(),
                 reason: CancelReason::User,
             }));
-            self.emit(RuntimeEvent::OperationSettled {
-                operation_id: operation_id.clone(),
-                session_id: queued.spec.session_id.clone(),
-                status: OperationStatus::Cancelled,
-                durability: SettlementDurability::Confirmed,
-                session_revision: SettlementRevision::Unchanged,
-            });
-            self.record_settled(
+            let _ = self.settle_operation(
                 operation_id,
                 queued.spec.session_id,
                 OperationStatus::Cancelled,
                 SettlementDurability::Confirmed,
+                SettlementRevision::Unchanged,
                 None,
             );
             return CancelResult::QueuedCancelled;
@@ -529,7 +521,6 @@ impl Coordinator {
             shared,
             phase: OperationPhase::PreparingTurn,
             started: false,
-            settled_event_seen: false,
             last_model_call_id: None,
         });
         self.driver_events = Some(event_rx);
@@ -581,9 +572,6 @@ impl Coordinator {
                     session_revision,
                 } = &agent
                 {
-                    if let Some(active) = &mut self.active {
-                        active.settled_event_seen = true;
-                    }
                     let session_id = self
                         .active
                         .as_ref()
@@ -594,21 +582,15 @@ impl Coordinator {
                         .active
                         .as_ref()
                         .and_then(|active| active.shared.failure());
-                    self.record_settled(
+                    self.release_transients_for(&agent);
+                    let _ = self.settle_operation(
                         operation_id.clone(),
-                        session_id.clone(),
+                        session_id,
                         *status,
                         *durability,
+                        *session_revision,
                         failure,
                     );
-                    self.release_transients_for(&agent);
-                    self.emit(RuntimeEvent::OperationSettled {
-                        operation_id: operation_id.clone(),
-                        session_id,
-                        status: *status,
-                        durability: *durability,
-                        session_revision: *session_revision,
-                    });
                     return;
                 }
                 if let AgentEvent::ModelCallStarted { model_call_id } = &agent {
@@ -628,7 +610,7 @@ impl Coordinator {
     }
 
     fn drain_driver_events(&mut self) {
-        while self.reliable_staging.remaining() > 0 {
+        while self.reliable_staging.can_accept_producer() {
             match self
                 .driver_events
                 .as_mut()
@@ -664,58 +646,50 @@ impl Coordinator {
         };
         self.driver_events = None;
         self.driver_join = None;
-        if !active.settled_event_seen {
-            let (status, durability, fault) = match &exit {
-                DriverExit::Succeeded => (
-                    OperationStatus::Succeeded,
-                    SettlementDurability::Confirmed,
-                    None,
-                ),
-                DriverExit::FailedConfirmed => (
-                    OperationStatus::Failed,
-                    SettlementDurability::Confirmed,
-                    None,
-                ),
-                DriverExit::FailedUnconfirmed
-                | DriverExit::Panicked { .. }
-                | DriverExit::Aborted { .. } => (
-                    OperationStatus::Failed,
-                    SettlementDurability::Unconfirmed,
-                    match &exit {
-                        DriverExit::Panicked { diagnostic_id }
-                        | DriverExit::Aborted { diagnostic_id } => Some((
-                            diagnostic_id.clone(),
-                            "operation driver ended without a confirmed settlement",
-                        )),
-                        _ => None,
-                    },
-                ),
-                DriverExit::CancelledConfirmed => (
-                    OperationStatus::Cancelled,
-                    SettlementDurability::Confirmed,
-                    None,
-                ),
-            };
-            self.emit(RuntimeEvent::OperationSettled {
-                operation_id: active.operation_id.clone(),
-                session_id: active.session_id.clone(),
-                status,
-                durability,
-                session_revision: SettlementRevision::Unchanged,
+        let (status, durability, fault) = match &exit {
+            DriverExit::Succeeded => (
+                OperationStatus::Succeeded,
+                SettlementDurability::Confirmed,
+                None,
+            ),
+            DriverExit::FailedConfirmed => (
+                OperationStatus::Failed,
+                SettlementDurability::Confirmed,
+                None,
+            ),
+            DriverExit::FailedUnconfirmed
+            | DriverExit::Panicked { .. }
+            | DriverExit::Aborted { .. } => (
+                OperationStatus::Failed,
+                SettlementDurability::Unconfirmed,
+                match &exit {
+                    DriverExit::Panicked { diagnostic_id }
+                    | DriverExit::Aborted { diagnostic_id } => Some((
+                        diagnostic_id.clone(),
+                        "operation driver ended without a confirmed settlement",
+                    )),
+                    _ => None,
+                },
+            ),
+            DriverExit::CancelledConfirmed => (
+                OperationStatus::Cancelled,
+                SettlementDurability::Confirmed,
+                None,
+            ),
+        };
+        let published = self.settle_operation(
+            active.operation_id.clone(),
+            active.session_id.clone(),
+            status,
+            durability,
+            SettlementRevision::Unchanged,
+            active.shared.failure(),
+        );
+        if published && let Some((diagnostic_id, message)) = fault {
+            self.emit(RuntimeEvent::RuntimeFault {
+                diagnostic_id,
+                message: message.to_owned(),
             });
-            self.record_settled(
-                active.operation_id.clone(),
-                active.session_id.clone(),
-                status,
-                durability,
-                active.shared.failure(),
-            );
-            if let Some((diagnostic_id, message)) = fault {
-                self.emit(RuntimeEvent::RuntimeFault {
-                    diagnostic_id,
-                    message: message.to_owned(),
-                });
-            }
         }
         let _ = active;
         self.maybe_start_next();
@@ -853,18 +827,6 @@ impl Coordinator {
             .shutdown_deadline
             .unwrap_or_else(default_shutdown_deadline);
         self.flush_reliable_until(deadline).await;
-        let leftover = self.ledger.take_all();
-        let mut settlements = Vec::new();
-        for entry in leftover {
-            let diagnostic_id = self.next_diagnostic();
-            settlements.push(ForcedSettlement {
-                operation_id: entry.operation_id,
-                session_id: entry.session_id,
-                status: OperationStatus::Failed,
-                durability: SettlementDurability::Unconfirmed,
-                diagnostic_id,
-            });
-        }
         let maintenance = self
             .maintenance
             .take()
@@ -878,8 +840,6 @@ impl Coordinator {
             } else {
                 EpochEndReason::Shutdown
             },
-            pending_reliable: self.reliable_staging.drain(),
-            forced_settlements: settlements,
             diagnostics: Vec::new(),
             maintenance,
         }
@@ -917,6 +877,32 @@ impl Coordinator {
         } else {
             AgentAvailability::Idle
         }
+    }
+
+    fn settle_operation(
+        &mut self,
+        operation_id: OperationId,
+        session_id: SessionId,
+        status: OperationStatus,
+        durability: SettlementDurability,
+        session_revision: SettlementRevision,
+        failure: Option<AgentFailure>,
+    ) -> bool {
+        if self.ledger.session_id(&operation_id).is_none() {
+            return false;
+        }
+        let event = RuntimeEvent::OperationSettled {
+            operation_id: operation_id.clone(),
+            session_id: session_id.clone(),
+            status,
+            durability,
+            session_revision,
+        };
+        if !self.stage_reliable(event) {
+            return false;
+        }
+        self.record_settled(operation_id, session_id, status, durability, failure);
+        true
     }
 
     fn record_settled(
@@ -1198,7 +1184,8 @@ impl Coordinator {
         const TRANSIENT_SEND_QUOTA: usize = 1;
         let mut reliable_since_transient = 0;
         loop {
-            if reliable_since_transient >= RELIABLE_BEFORE_TRANSIENT && self.has_sendable_transient()
+            if reliable_since_transient >= RELIABLE_BEFORE_TRANSIENT
+                && self.has_sendable_transient()
             {
                 if !self.try_send_one_transient() {
                     return;

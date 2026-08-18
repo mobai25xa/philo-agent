@@ -3,18 +3,27 @@
 use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
-    AgentEvent, ModelCallId, OperationId, OperationStatus, SettlementDurability,
+    AgentEvent, EpochEndReason, ModelCallId, OperationId, OperationStatus, SettlementDurability,
 };
 use philo_agent_service::testing::{FakeAssembler, start_test_service, start_test_service_with};
 use philo_agent_service::{
-    CommandSubmitResult, ConfirmationDecision, ConfirmationRequest, FrontendCommand,
-    FrontendInstanceId, FrontendRevision, FrontendUpdate, FrontendUpdateKind, LIVE_TEXT_CHARS_MAX,
-    RecvOutcome, RuntimeEvent,
+    AdmissionError, CommandDispatch, CommandReject, ConfirmationDecision, ConfirmationRequest,
+    FrontendCommand, FrontendGeneration, FrontendInstanceId, FrontendRevision, FrontendUpdate,
+    FrontendUpdateKind, LIVE_TEXT_CHARS_MAX, RecvOutcome, RuntimeEvent,
 };
 use philo_session::{
     MemorySessionStore, OperationOutcome, SessionAssistantBlock, SessionEntryKind, SessionId,
     SessionRevision, SessionStore, SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
 };
+
+fn accept_snapshot(
+    client: &philo_agent_service::FrontendClient,
+) -> philo_agent_service::FrontendRequestId {
+    match client.request_snapshot(FrontendRevision::ZERO) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("expected enqueued snapshot, got {other:?}"),
+    }
+}
 
 async fn recv_matching(
     client: &philo_agent_service::FrontendClient,
@@ -37,6 +46,34 @@ async fn recv_matching(
                 panic!("frontend disconnected while waiting; seen={seen:?}")
             }
         }
+    }
+}
+
+async fn drain_briefly(client: &philo_agent_service::FrontendClient) -> Vec<FrontendUpdateKind> {
+    let until = Instant::now() + Duration::from_millis(80);
+    let mut kinds = Vec::new();
+    while Instant::now() < until {
+        match client
+            .recv_until_async(Instant::now() + Duration::from_millis(20))
+            .await
+        {
+            RecvOutcome::Update(update) => kinds.push(update.kind),
+            RecvOutcome::Timeout => break,
+            RecvOutcome::Disconnected => panic!("disconnected"),
+        }
+    }
+    kinds
+}
+
+fn submit_hello(
+    client: &philo_agent_service::FrontendClient,
+) -> philo_agent_service::FrontendRequestId {
+    match client.try_command(FrontendCommand::Submit {
+        draft: "hello".into(),
+        attachments: Vec::new(),
+    }) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("submit enqueue {other:?}"),
     }
 }
 
@@ -162,7 +199,7 @@ async fn snapshot_is_session_view_plus_live_not_event_log() {
         client.try_command(FrontendCommand::LoadSession {
             session_id: "sess-snap".into(),
         }),
-        CommandSubmitResult::Accepted(_)
+        CommandDispatch::Enqueued(_)
     ));
     recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
@@ -171,6 +208,7 @@ async fn snapshot_is_session_view_plus_live_not_event_log() {
 
     runtime.emit(RuntimeEvent::OperationAccepted {
         operation_id: OperationId::new("op-live"),
+        session_id: philo_agent_runtime::SessionId::new("sess-snap"),
         turn_id: philo_agent_runtime::TurnId::new("turn-live"),
     });
     runtime.emit_agent(AgentEvent::OperationStarted {
@@ -190,8 +228,7 @@ async fn snapshot_is_session_view_plus_live_not_event_log() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let request_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(request_id.is_valid());
+    let _request_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -231,14 +268,14 @@ async fn stale_preview_and_epoch_results_are_discarded() {
         session_id: "sess-a".into(),
         request_generation: 1,
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("first preview {other:?}"),
     };
     let second = match client.try_command(FrontendCommand::PreviewSession {
         session_id: "sess-b".into(),
         request_generation: 2,
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("second preview {other:?}"),
     };
     assert!(second > first);
@@ -258,7 +295,8 @@ async fn stale_preview_and_epoch_results_are_discarded() {
 
     runtime.emit(RuntimeEvent::EpochEnded {
         epoch: philo_agent_runtime::RuntimeEpoch::new("1"),
-        settlements: Vec::new(),
+        reason: EpochEndReason::CoordinatorFault,
+        forced_count: 0,
     });
     let health = recv_matching(&client, |update| {
         matches!(
@@ -275,7 +313,7 @@ async fn stale_preview_and_epoch_results_are_discarded() {
         session_id: "sess-a".into(),
         request_generation: 1,
     });
-    assert!(matches!(late, CommandSubmitResult::Accepted(_)));
+    assert!(matches!(late, CommandDispatch::Enqueued(_)));
     let rejected_or_health = recv_matching(&client, |update| {
         matches!(
             update.kind,
@@ -303,7 +341,7 @@ async fn generation_install_failure_keeps_previous() {
     let request_id = match client.try_command(FrontendCommand::InstallModel {
         name: "broken".into(),
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("{other:?}"),
     };
     let failed = recv_matching(&client, |update| {
@@ -315,8 +353,7 @@ async fn generation_install_failure_keeps_previous() {
     .await;
     assert_eq!(failed.request_id, Some(request_id));
 
-    let snapshot_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(snapshot_id.is_valid());
+    let _snapshot_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -339,8 +376,8 @@ async fn stale_install_success_does_not_overwrite_newer_generation() {
     let fast = client.try_command(FrontendCommand::InstallModel {
         name: "fast".into(),
     });
-    assert!(matches!(slow, CommandSubmitResult::Accepted(_)));
-    assert!(matches!(fast, CommandSubmitResult::Accepted(_)));
+    assert!(matches!(slow, CommandDispatch::Enqueued(_)));
+    assert!(matches!(fast, CommandDispatch::Enqueued(_)));
 
     let installed = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::GenerationInstalled { .. })
@@ -352,8 +389,7 @@ async fn stale_install_success_does_not_overwrite_newer_generation() {
     assert_eq!(display.model_name, "fast");
 
     tokio::time::sleep(Duration::from_millis(120)).await;
-    let snapshot_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(snapshot_id.is_valid());
+    let _snapshot_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -371,20 +407,26 @@ async fn stale_install_success_does_not_overwrite_newer_generation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_assigns_request_identity_and_freezes_current_generation() {
     let (service, client, runtime) = start_test_service();
+    assert!(matches!(
+        client.try_command(FrontendCommand::LoadSession {
+            session_id: "sess-1".into(),
+        }),
+        CommandDispatch::Enqueued(_)
+    ));
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+    })
+    .await;
     let request_id = match client.try_command(FrontendCommand::Submit {
-        session_id: "sess-1".into(),
         draft: "hello".into(),
         attachments: Vec::new(),
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("{other:?}"),
     };
     let accepted = recv_matching(&client, |update| {
         update.request_id == Some(request_id)
-            && matches!(
-                update.kind,
-                FrontendUpdateKind::CommandAccepted | FrontendUpdateKind::OperationAccepted { .. }
-            )
+            && matches!(update.kind, FrontendUpdateKind::SubmitAccepted { .. })
     })
     .await;
     assert_eq!(accepted.request_id, Some(request_id));
@@ -399,11 +441,12 @@ async fn submit_assigns_request_identity_and_freezes_current_generation() {
         Some("generation-0")
     );
 
-    runtime.emit_agent(AgentEvent::OperationSettled {
+    runtime.emit(RuntimeEvent::OperationSettled {
         operation_id: OperationId::new("op-1"),
+        session_id: philo_agent_runtime::SessionId::new("sess-1"),
         status: OperationStatus::Succeeded,
         durability: SettlementDurability::Confirmed,
-        session_revision: None,
+        session_revision: philo_agent_runtime::SettlementRevision::Unchanged,
     });
     drop(service);
 }
@@ -485,4 +528,267 @@ async fn same_instance_reattach_keeps_pending_confirmation() {
     });
     assert_eq!(decision.await.unwrap(), ConfirmationDecision::Allow);
     drop(service);
+}
+
+#[test]
+fn frontend_generation_still_has_model_name() {
+    let display = FrontendGeneration {
+        generation_id: "g-1".into(),
+        model_name: "base".into(),
+        reasoning_effort: None,
+        tool_names: Vec::new(),
+    };
+    assert_eq!(display.model_name, "base");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_event_settlement_is_not_a_frontend_lifecycle() {
+    let (service, client, runtime) = start_test_service();
+    runtime.emit_agent(AgentEvent::OperationSettled {
+        operation_id: OperationId::new("op-agent"),
+        status: OperationStatus::Succeeded,
+        durability: SettlementDurability::Confirmed,
+        session_revision: philo_agent_runtime::SettlementRevision::Committed(SessionRevision::new(
+            7,
+        )),
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.consumed() == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(runtime.consumed() >= 1);
+
+    let drain_until = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < drain_until {
+        match client
+            .recv_until_async(Instant::now() + Duration::from_millis(40))
+            .await
+        {
+            RecvOutcome::Update(update) => {
+                assert!(
+                    !matches!(
+                        update.kind,
+                        FrontendUpdateKind::OperationEvent(
+                            philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                        )
+                    ),
+                    "AgentEvent::OperationSettled must not settle the frontend"
+                );
+            }
+            RecvOutcome::Timeout => break,
+            RecvOutcome::Disconnected => panic!("disconnected"),
+        }
+    }
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_event_settlement_is_the_public_frontend_terminal() {
+    let (service, client, runtime) = start_test_service();
+    runtime.emit(RuntimeEvent::OperationSettled {
+        operation_id: OperationId::new("op-1"),
+        session_id: philo_agent_runtime::SessionId::new("sess-1"),
+        status: OperationStatus::Succeeded,
+        durability: SettlementDurability::Confirmed,
+        session_revision: philo_agent_runtime::SettlementRevision::Committed(SessionRevision::new(
+            7,
+        )),
+    });
+    let update = recv_matching(&client, |update| {
+        matches!(
+            update.kind,
+            FrontendUpdateKind::OperationEvent(
+                philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+            )
+        )
+    })
+    .await;
+    let FrontendUpdateKind::OperationEvent(
+        philo_agent_service::FrontendOperationEvent::OperationSettled {
+            operation_id,
+            session_id,
+            status,
+            durability,
+            session_revision,
+        },
+    ) = update.kind
+    else {
+        unreachable!();
+    };
+    assert_eq!(operation_id, "op-1");
+    assert_eq!(session_id, "sess-1");
+    assert_eq!(status, "Succeeded");
+    assert_eq!(durability, "Confirmed");
+    assert_eq!(
+        session_revision,
+        philo_agent_runtime::SettlementRevision::Committed(SessionRevision::new(7))
+    );
+
+    let extra_until = Instant::now() + Duration::from_millis(80);
+    while Instant::now() < extra_until {
+        match client
+            .recv_until_async(Instant::now() + Duration::from_millis(30))
+            .await
+        {
+            RecvOutcome::Update(update) => {
+                assert!(
+                    !matches!(
+                        update.kind,
+                        FrontendUpdateKind::OperationEvent(
+                            philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                        )
+                    ),
+                    "exactly one frontend settled event"
+                );
+            }
+            RecvOutcome::Timeout => break,
+            RecvOutcome::Disconnected => panic!("disconnected"),
+        }
+    }
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_without_current_session_is_rejected() {
+    let (service, client, _runtime) = start_test_service();
+    let request_id = submit_hello(&client);
+    let rejected = recv_matching(&client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::CommandRejected { .. })
+    })
+    .await;
+    match &rejected.kind {
+        FrontendUpdateKind::CommandRejected {
+            reason: CommandReject::NoCurrentSession,
+        } => {}
+        other => panic!("expected NoCurrentSession, got {other:?}"),
+    }
+    let extras = drain_briefly(&client).await;
+    assert!(
+        extras.iter().all(|kind| {
+            !matches!(
+                kind,
+                FrontendUpdateKind::CommandAccepted | FrontendUpdateKind::SubmitAccepted { .. }
+            )
+        }),
+        "no-session submit must not accept: {extras:?}"
+    );
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_accepted_waits_for_runtime_and_keeps_lifecycle_separate() {
+    let (service, client, runtime) = start_test_service();
+    assert!(matches!(
+        client.try_command(FrontendCommand::LoadSession {
+            session_id: "sess-1".into(),
+        }),
+        CommandDispatch::Enqueued(_)
+    ));
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+    })
+    .await;
+
+    let hold = runtime.hold_children();
+    let request_id = submit_hello(&client);
+    runtime.wait_child_started(1).await;
+    let early = drain_briefly(&client).await;
+    assert!(
+        early.iter().all(|kind| {
+            !matches!(
+                kind,
+                FrontendUpdateKind::SubmitAccepted { .. }
+                    | FrontendUpdateKind::CommandAccepted
+                    | FrontendUpdateKind::OperationAccepted { .. }
+            )
+        }),
+        "runtime.submit must finish before SubmitAccepted: {early:?}"
+    );
+
+    hold.release();
+    let accepted = recv_matching(&client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::SubmitAccepted { .. })
+    })
+    .await;
+    match &accepted.kind {
+        FrontendUpdateKind::SubmitAccepted {
+            operation_id,
+            turn_id,
+        } => {
+            assert_eq!(operation_id, "op-1");
+            assert_eq!(turn_id, "turn-1");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let extras = drain_briefly(&client).await;
+    assert!(
+        extras
+            .iter()
+            .all(|kind| !matches!(kind, FrontendUpdateKind::SubmitAccepted { .. })),
+        "exactly one SubmitAccepted: {extras:?}"
+    );
+
+    runtime.emit(RuntimeEvent::OperationAccepted {
+        operation_id: OperationId::new("op-1"),
+        session_id: philo_agent_runtime::SessionId::new("sess-1"),
+        turn_id: philo_agent_runtime::TurnId::new("turn-1"),
+    });
+    let lifecycle = recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+    })
+    .await;
+    assert_eq!(lifecycle.request_id, None);
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_admission_failure_is_rejected() {
+    let (service, client, runtime) = start_test_service();
+    assert!(matches!(
+        client.try_command(FrontendCommand::LoadSession {
+            session_id: "sess-1".into(),
+        }),
+        CommandDispatch::Enqueued(_)
+    ));
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+    })
+    .await;
+
+    runtime.fail_next_submit(AdmissionError::QueueFull);
+    let request_id = submit_hello(&client);
+    let rejected = recv_matching(&client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::CommandRejected { .. })
+    })
+    .await;
+    match &rejected.kind {
+        FrontendUpdateKind::CommandRejected {
+            reason: CommandReject::AdmissionFailed { message },
+        } => {
+            assert!(message.contains("full"), "{message}");
+        }
+        other => panic!("expected AdmissionFailed, got {other:?}"),
+    }
+    let extras = drain_briefly(&client).await;
+    assert!(
+        extras
+            .iter()
+            .all(|kind| !matches!(kind, FrontendUpdateKind::SubmitAccepted { .. })),
+        "failed submit must not emit SubmitAccepted: {extras:?}"
+    );
+    drop(service);
+}
+
+#[test]
+fn lease_types_remain_public_without_fake_attach_api() {
+    let _ = std::any::type_name::<philo_agent_service::FrontendLease>();
+    let _ = std::any::type_name::<philo_agent_service::FrontendLeaseGeneration>();
+    let _ = std::any::type_name::<philo_agent_service::SupervisorCommand>();
+    let _ = std::any::type_name::<philo_agent_service::AttachError>();
+    let _ = std::any::type_name::<philo_agent_service::DetachError>();
+    let _ = std::any::type_name::<philo_agent_service::DetachReport>();
 }

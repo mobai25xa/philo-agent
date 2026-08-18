@@ -108,9 +108,24 @@ pub enum DriverExit {
 /// Forced terminal applied to one accepted operation when an epoch ends
 /// without a normal settlement.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EpochSettlement {
+pub struct ForcedSettlement {
     pub operation_id: OperationId,
+    pub session_id: crate::SessionId,
     pub status: OperationStatus,
     pub durability: SettlementDurability,
     pub diagnostic_id: DiagnosticId,
+}
+
+/// Why [`crate::RuntimeHandle::shutdown`] did not return a supervisor report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShutdownError {
+    RuntimeGone,
+    SupervisorPanicked,
+    DeadlineExceeded { pending: Vec<String> },
+}
+
+/// Diagnostic captured while an epoch is finalized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShutdownDiagnostic {
+    pub message: String,
 }

@@ -38,8 +38,8 @@ impl fmt::Display for FrontendRevision {
 pub struct FrontendRequestId(u64);
 
 impl FrontendRequestId {
-    /// Sentinel used when a convenience helper could not enqueue work.
-    pub const INVALID: Self = Self(0);
+    /// Internal spawn id when a snapshot has no caller request.
+    pub(crate) const INVALID: Self = Self(0);
 
     /// Creates a request id from its numeric representation.
     pub const fn new(value: u64) -> Self {

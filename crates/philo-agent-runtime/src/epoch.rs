@@ -1,9 +1,9 @@
 //! Epoch-root supervision: accepted ledger, child handoff, and panic recovery.
 
 use crate::{
-    AgentAvailability, AgentEvent, DiagnosticId, EpochSettlement, MaintenanceId, MaintenanceResult,
-    OperationId, OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeSnapshot,
-    SettlementDurability, ShutdownState, TurnId,
+    AgentAvailability, DiagnosticId, EpochEndReason, MaintenanceId, MaintenanceResult, OperationId,
+    OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeSnapshot, SessionId, SettlementDurability,
+    SettlementRevision, ShutdownState, TurnId,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,7 +48,15 @@ pub(crate) struct AcceptedLedger {
 struct LedgerInner {
     cap: usize,
     order: Vec<OperationId>,
-    states: HashMap<OperationId, TurnId>,
+    states: HashMap<OperationId, LedgerEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LedgerEntry {
+    pub operation_id: OperationId,
+    #[allow(dead_code)]
+    pub turn_id: TurnId,
+    pub session_id: SessionId,
 }
 
 impl AcceptedLedger {
@@ -62,7 +70,12 @@ impl AcceptedLedger {
         }
     }
 
-    pub(crate) fn insert(&self, operation_id: OperationId, turn_id: TurnId) -> Result<(), ()> {
+    pub(crate) fn insert(
+        &self,
+        operation_id: OperationId,
+        turn_id: TurnId,
+        session_id: SessionId,
+    ) -> Result<(), ()> {
         let mut inner = lock(&self.inner);
         if inner.states.contains_key(&operation_id) {
             return Ok(());
@@ -71,8 +84,22 @@ impl AcceptedLedger {
             return Err(());
         }
         inner.order.push(operation_id.clone());
-        inner.states.insert(operation_id, turn_id);
+        inner.states.insert(
+            operation_id.clone(),
+            LedgerEntry {
+                operation_id,
+                turn_id,
+                session_id,
+            },
+        );
         Ok(())
+    }
+
+    pub(crate) fn session_id(&self, operation_id: &OperationId) -> Option<SessionId> {
+        lock(&self.inner)
+            .states
+            .get(operation_id)
+            .map(|entry| entry.session_id.clone())
     }
 
     pub(crate) fn remove(&self, operation_id: &OperationId) -> bool {
@@ -84,21 +111,21 @@ impl AcceptedLedger {
         existed
     }
 
-    pub(crate) fn take_all(&self) -> Vec<(OperationId, TurnId)> {
+    pub(crate) fn take_all(&self) -> Vec<LedgerEntry> {
         let mut inner = lock(&self.inner);
         let order = std::mem::take(&mut inner.order);
         let mut states = std::mem::take(&mut inner.states);
         order
             .into_iter()
-            .filter_map(|id| states.remove(&id).map(|turn_id| (id, turn_id)))
+            .filter_map(|id| states.remove(&id))
             .collect()
     }
 
-    pub(crate) fn pop(&self) -> Option<(OperationId, TurnId)> {
+    pub(crate) fn pop(&self) -> Option<LedgerEntry> {
         let mut inner = lock(&self.inner);
         let id = inner.order.first().cloned()?;
         inner.order.remove(0);
-        inner.states.remove(&id).map(|turn_id| (id, turn_id))
+        inner.states.remove(&id)
     }
 }
 
@@ -113,6 +140,7 @@ pub(crate) struct EpochChildren {
     pub driver: Option<JoinHandle<crate::DriverExit>>,
     pub maintenance: Option<JoinHandle<Result<crate::CompactionReport, crate::CompactionError>>>,
     pub maintenance_id: Option<MaintenanceId>,
+    pub maintenance_session_id: Option<SessionId>,
 }
 
 impl EpochChildHandoff {
@@ -199,6 +227,7 @@ pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
     let children = input.shared.children.take();
     let maintenance_id = children.maintenance_id.clone();
     let leftover = input.shared.ledger.take_all();
+    let maintenance_session_id = children.maintenance_session_id.clone();
     let join_faults = join_epoch_children(children).await;
     let panicked = outcome.is_err();
     if input.shared.epoch_ended() {
@@ -212,6 +241,7 @@ pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
             input.epoch,
             leftover,
             maintenance_id.filter(|_| panicked),
+            maintenance_session_id.filter(|_| panicked),
             join_faults,
         )
         .await;
@@ -222,33 +252,35 @@ async fn publish_forced_end(
     event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
     snapshot_tx: tokio::sync::watch::Sender<RuntimeSnapshot>,
     epoch: RuntimeEpoch,
-    leftover: Vec<(OperationId, TurnId)>,
+    leftover: Vec<LedgerEntry>,
     maintenance_id: Option<MaintenanceId>,
+    maintenance_session_id: Option<SessionId>,
     join_faults: Vec<String>,
 ) {
-    let mut settlements = Vec::new();
     let mut last_settled = snapshot_tx.borrow().last_settled.clone();
-    if let Some(id) = maintenance_id {
+    if let (Some(id), Some(session_id)) = (maintenance_id, maintenance_session_id) {
         let _ = event_tx
             .send(RuntimeEvent::MaintenanceSettled {
                 id,
+                session_id,
                 result: MaintenanceResult::Cancelled,
             })
             .await;
     }
-    for (index, (operation_id, _)) in leftover.into_iter().enumerate() {
-        let diagnostic_id =
-            DiagnosticId::new(format!("epoch-{}-forced-{}", epoch.as_str(), index + 1));
+    let forced_count = leftover.len();
+    for entry in leftover {
         let _ = event_tx
-            .send(RuntimeEvent::Agent(AgentEvent::OperationSettled {
-                operation_id: operation_id.clone(),
+            .send(RuntimeEvent::OperationSettled {
+                operation_id: entry.operation_id.clone(),
+                session_id: entry.session_id.clone(),
                 status: OperationStatus::Failed,
                 durability: SettlementDurability::Unconfirmed,
-                session_revision: None,
-            }))
+                session_revision: SettlementRevision::Unchanged,
+            })
             .await;
         last_settled.push(crate::SettledOperationSnapshot {
-            operation_id: operation_id.clone(),
+            operation_id: entry.operation_id,
+            session_id: entry.session_id,
             status: OperationStatus::Failed,
             durability: SettlementDurability::Unconfirmed,
             failure: Some(crate::AgentFailure::runtime_driver(
@@ -258,12 +290,6 @@ async fn publish_forced_end(
         if last_settled.len() > 32 {
             last_settled.remove(0);
         }
-        settlements.push(EpochSettlement {
-            operation_id,
-            status: OperationStatus::Failed,
-            durability: SettlementDurability::Unconfirmed,
-            diagnostic_id,
-        });
     }
     for (index, message) in join_faults.into_iter().enumerate() {
         let _ = event_tx
@@ -280,7 +306,8 @@ async fn publish_forced_end(
     let _ = event_tx
         .send(RuntimeEvent::EpochEnded {
             epoch: epoch.clone(),
-            settlements,
+            reason: EpochEndReason::CoordinatorFault,
+            forced_count,
         })
         .await;
     let mut snapshot = snapshot_tx.borrow().clone();

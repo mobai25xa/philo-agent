@@ -5,7 +5,15 @@ pub const RUNTIME_CONTROL_CAP: usize = 16;
 pub const RUNTIME_EVENT_CAP: usize = 256;
 pub const RUNTIME_QUEUE_MAX: usize = 32;
 pub const RUNTIME_DRIVER_EVENT_BUDGET: usize = 32;
+pub const RUNTIME_RELIABLE_STAGING_CAP: usize = 64;
 pub const DELTA_MERGE_CHUNK_MAX: usize = 4096;
+
+/// Transient kinds that coalesce: Text, Reasoning, Usage, ToolProgress.
+///
+/// Theoretical transient ceiling is
+/// `(queue_max + 1) * TRANSIENT_KIND_COUNT + 2`, where the extra two slots
+/// are `AvailabilityChanged` and `MaintenanceProgress`.
+pub const TRANSIENT_KIND_COUNT: usize = 4;
 
 /// Channel and queue capacities frozen when the runtime starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +23,7 @@ pub struct ChannelBounds {
     pub event_cap: usize,
     pub queue_max: usize,
     pub driver_event_budget: usize,
+    pub reliable_staging_cap: usize,
 }
 
 impl Default for ChannelBounds {
@@ -25,6 +34,7 @@ impl Default for ChannelBounds {
             event_cap: RUNTIME_EVENT_CAP,
             queue_max: RUNTIME_QUEUE_MAX,
             driver_event_budget: RUNTIME_DRIVER_EVENT_BUDGET,
+            reliable_staging_cap: RUNTIME_RELIABLE_STAGING_CAP,
         }
     }
 }
@@ -34,10 +44,31 @@ impl ChannelBounds {
         if self.command_cap == 0
             || self.control_cap == 0
             || self.event_cap == 0
+            || self.queue_max == 0
             || self.driver_event_budget == 0
+            || self.reliable_staging_cap == 0
         {
             return Err(super::StartError::InvalidBounds);
         }
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_reliable_staging_cap_is_rejected() {
+        let mut bounds = ChannelBounds::default();
+        bounds.reliable_staging_cap = 0;
+        assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
+    }
+
+    #[test]
+    fn zero_queue_max_is_rejected() {
+        let mut bounds = ChannelBounds::default();
+        bounds.queue_max = 0;
+        assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
     }
 }

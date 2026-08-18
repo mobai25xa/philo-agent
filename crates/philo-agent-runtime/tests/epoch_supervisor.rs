@@ -4,12 +4,13 @@ mod support;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentEvent, CompactionConfig, CompactionSpec, EpochSettlement,
-    GenerationConfig, OperationAccepted, OperationId, OperationStatus, RuntimeConfig, RuntimeEvent,
-    SequentialIdSource, SessionId, SettlementDurability, ShutdownState,
+    AgentAvailability, AgentEvent, CompactionConfig, CompactionSpec, DiagnosticId,
+    ForcedSettlement, GenerationConfig, OperationAccepted, OperationId, OperationStatus,
+    RuntimeConfig, RuntimeEvent, RuntimeEventReceiver, SequentialIdSource, SessionId,
+    SettlementDurability, SettlementRevision, ShutdownState,
 };
 use philo_session::{MemorySessionStore, SessionEntryKind, SessionStore, SessionTransaction};
 use support::fake_model::{FakeModel, ModelScript};
@@ -43,21 +44,39 @@ fn compaction_config() -> RuntimeConfig {
 }
 
 async fn recv_until_epoch_ended(
-    sub: &mut philo_agent_runtime::RuntimeSubscription,
-) -> (Vec<RuntimeEvent>, Vec<EpochSettlement>) {
+    sub: &mut RuntimeEventReceiver,
+) -> (Vec<RuntimeEvent>, Vec<ForcedSettlement>) {
     let mut events = Vec::new();
+    let mut settled = Vec::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(5), sub.recv())
             .await
             .expect("timed out waiting for EpochEnded")
             .expect("subscription closed before EpochEnded");
-        let ended = match &event {
-            RuntimeEvent::EpochEnded { settlements, .. } => Some(settlements.clone()),
+        let forced_count = match &event {
+            RuntimeEvent::OperationSettled {
+                operation_id,
+                session_id,
+                status,
+                durability,
+                ..
+            } => {
+                settled.push(ForcedSettlement {
+                    operation_id: operation_id.clone(),
+                    session_id: session_id.clone(),
+                    status: *status,
+                    durability: *durability,
+                    diagnostic_id: DiagnosticId::new("from-operation-settled"),
+                });
+                None
+            }
+            RuntimeEvent::EpochEnded { forced_count, .. } => Some(*forced_count),
             _ => None,
         };
         events.push(event);
-        if let Some(settlements) = ended {
-            return (events, settlements);
+        if let Some(forced_count) = forced_count {
+            let start = settled.len().saturating_sub(forced_count);
+            return (events, settled.split_off(start));
         }
     }
 }
@@ -68,7 +87,13 @@ fn settled_ids(
     events
         .iter()
         .filter_map(|event| match event {
-            RuntimeEvent::Agent(AgentEvent::OperationSettled {
+            RuntimeEvent::OperationSettled {
+                operation_id,
+                status,
+                durability,
+                ..
+            }
+            | RuntimeEvent::Agent(AgentEvent::OperationSettled {
                 operation_id,
                 status,
                 durability,
@@ -82,7 +107,7 @@ fn settled_ids(
 fn assert_exactly_one_forced_terminal(
     accepted: &[OperationAccepted],
     events: &[RuntimeEvent],
-    settlements: &[EpochSettlement],
+    settlements: &[ForcedSettlement],
 ) {
     let accepted_ids: HashSet<_> = accepted
         .iter()
@@ -102,6 +127,26 @@ fn assert_exactly_one_forced_terminal(
         assert_eq!(matches[0].1, OperationStatus::Failed);
         assert_eq!(matches[0].2, SettlementDurability::Unconfirmed);
     }
+    let forced_events: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::OperationSettled {
+                operation_id,
+                session_id,
+                status: OperationStatus::Failed,
+                durability: SettlementDurability::Unconfirmed,
+                session_revision: SettlementRevision::Unchanged,
+            } if accepted_ids.contains(operation_id) => Some((operation_id, session_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(forced_events.len(), accepted_ids.len());
+    for (_, session_id) in &forced_events {
+        assert!(
+            !session_id.as_str().is_empty(),
+            "forced OperationSettled must carry session_id"
+        );
+    }
     let forced: HashSet<_> = settlements
         .iter()
         .map(|item| item.operation_id.clone())
@@ -110,7 +155,20 @@ fn assert_exactly_one_forced_terminal(
     for settlement in settlements {
         assert_eq!(settlement.status, OperationStatus::Failed);
         assert_eq!(settlement.durability, SettlementDurability::Unconfirmed);
+        assert!(
+            !settlement.session_id.as_str().is_empty(),
+            "forced settlement must carry session_id"
+        );
     }
+    let forced_count = events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::EpochEnded { forced_count, .. } => Some(*forced_count),
+            _ => None,
+        })
+        .expect("EpochEnded");
+    assert_eq!(forced_count, settlements.len());
+    assert_eq!(forced_count, forced_events.len());
 }
 
 async fn seed_turn(store: &dyn SessionStore, index: usize) {
@@ -221,6 +279,13 @@ async fn coordinator_panic_with_active_and_queued_operations() {
     wait_until_busy(&handle, &active.operation_id).await;
     let queued = submit_prompt(&handle, runtime_gen, "session", "second").await;
     wait_until_queued(&handle, &queued.operation_id).await;
+    let queued_snapshot = handle.snapshot().await;
+    assert_eq!(queued_snapshot.queued.len(), 1);
+    assert_eq!(queued_snapshot.queued[0].operation_id, queued.operation_id);
+    assert_eq!(
+        queued_snapshot.queued[0].session_id,
+        SessionId::new("session")
+    );
     handle.inject_coordinator_panic().await;
     let (events, settlements) = recv_until_epoch_ended(&mut sub).await;
     assert_exactly_one_forced_terminal(&[active, queued], &events, &settlements);
@@ -364,9 +429,13 @@ async fn graceful_shutdown_still_emits_epoch_ended() {
     .await;
     wait_until_idle(&handle).await;
     let report = handle
-        .shutdown(philo_agent_runtime::ShutdownMode::Drain)
-        .await;
-    assert_eq!(report.shutdown, ShutdownState::Stopped);
+        .shutdown(
+            philo_agent_runtime::ShutdownMode::Drain,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .expect("shutdown");
+    assert_eq!(report.final_state, ShutdownState::Stopped);
     assert!(report.settlements.is_empty());
     let (_, settlements) = recv_until_epoch_ended(&mut sub).await;
     assert!(settlements.is_empty());

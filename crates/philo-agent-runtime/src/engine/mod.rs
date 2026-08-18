@@ -438,7 +438,7 @@ async fn settle_success(
     match committed {
         Ok(commit) => {
             cx.operation
-                .succeed(AssistantMessage { content: text }, commit.revision().get())
+                .succeed(AssistantMessage { content: text }, commit.revision())
                 .await;
         }
         Err(error) => {

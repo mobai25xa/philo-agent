@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use philo_agent_service::testing::{FakeAssembler, start_test_service_with};
 use philo_agent_service::{
-    CommandSubmitResult, FrontendCommand, FrontendUpdate, FrontendUpdateKind, RecvOutcome,
+    CommandDispatch, FrontendCommand, FrontendUpdate, FrontendUpdateKind, RecvOutcome,
 };
 use philo_session::{
     MemorySessionStore, OperationOutcome, SessionAssistantBlock, SessionEntryKind, SessionError,
@@ -172,7 +172,7 @@ fn list_sessions(
     client: &philo_agent_service::FrontendClient,
 ) -> philo_agent_service::FrontendRequestId {
     match client.try_command(FrontendCommand::ListSessions) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("list sessions {other:?}"),
     }
 }
@@ -228,7 +228,7 @@ async fn uncommitted_current_session_appears_at_most_once() {
     let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
 
     let first = match client.try_command(FrontendCommand::CreateSession) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("{other:?}"),
     };
     let first_loaded = recv_matching(&client, |update| {
@@ -248,7 +248,7 @@ async fn uncommitted_current_session_appears_at_most_once() {
     assert_eq!(listed, ["sess-a", first_id.as_str(), "sess-z"]);
 
     let second = match client.try_command(FrontendCommand::CreateSession) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("{other:?}"),
     };
     let second_loaded = recv_matching(&client, |update| {
@@ -289,7 +289,7 @@ async fn store_busy_rejects_instead_of_empty_success() {
     .await;
     match &rejected.kind {
         FrontendUpdateKind::CommandRejected { reason } => {
-            assert!(reason.contains("busy"), "{reason}");
+            assert!(reason.to_string().contains("busy"), "{reason}");
         }
         other => panic!("{other:?}"),
     }
@@ -321,7 +321,7 @@ async fn store_unavailable_rejects_instead_of_empty_success() {
     .await;
     match &rejected.kind {
         FrontendUpdateKind::CommandRejected { reason } => {
-            assert!(reason.contains("unavailable"), "{reason}");
+            assert!(reason.to_string().contains("unavailable"), "{reason}");
         }
         other => panic!("{other:?}"),
     }

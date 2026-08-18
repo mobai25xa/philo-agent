@@ -1,9 +1,12 @@
 //! Cloneable control plane: send commands, never hold the engine.
 
+use std::time::Instant;
+
 use crate::coordinator::{ControlMessage, RuntimeCommand};
 use crate::{
     AdmissionError, CancelResult, CompactionSpec, MaintenanceAccepted, MaintenanceError,
-    OperationAccepted, OperationId, OperationSpec, RuntimeSnapshot, ShutdownMode, ShutdownReport,
+    OperationAccepted, OperationId, OperationSpec, RuntimeSnapshot, ShutdownError, ShutdownMode,
+    ShutdownReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -84,24 +87,25 @@ impl RuntimeHandle {
         self.snapshot_rx.borrow().clone()
     }
 
-    pub async fn shutdown(&self, mode: ShutdownMode) -> ShutdownReport {
+    pub async fn shutdown(
+        &self,
+        mode: ShutdownMode,
+        deadline: Instant,
+    ) -> Result<ShutdownReport, ShutdownError> {
+        if Instant::now() >= deadline {
+            return Err(ShutdownError::DeadlineExceeded {
+                pending: vec!["runtime".into()],
+            });
+        }
         let (reply, rx) = oneshot::channel();
         if self
             .control_tx
             .try_send(ControlMessage::Shutdown { mode, reply })
             .is_err()
         {
-            return ShutdownReport {
-                epoch: self.snapshot_rx.borrow().epoch.clone(),
-                shutdown: crate::ShutdownState::Stopped,
-                settlements: Vec::new(),
-            };
+            return Err(ShutdownError::RuntimeGone);
         }
-        rx.await.unwrap_or_else(|_| ShutdownReport {
-            epoch: self.snapshot_rx.borrow().epoch.clone(),
-            shutdown: crate::ShutdownState::Stopped,
-            settlements: Vec::new(),
-        })
+        rx.await.map_err(|_| ShutdownError::SupervisorPanicked)
     }
 
     /// Test hook: panic the coordinator actor on the next control turn.
@@ -111,5 +115,20 @@ impl RuntimeHandle {
             .control_tx
             .send(ControlMessage::InjectCoordinatorPanic)
             .await;
+    }
+
+    /// Test hook: force a coordinator turn that republishes the live snapshot.
+    #[doc(hidden)]
+    pub async fn publish_snapshot(&self) -> RuntimeSnapshot {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .control_tx
+            .try_send(ControlMessage::PublishSnapshot { reply })
+            .is_err()
+        {
+            return self.snapshot().await;
+        }
+        rx.await
+            .unwrap_or_else(|_| self.snapshot_rx.borrow().clone())
     }
 }

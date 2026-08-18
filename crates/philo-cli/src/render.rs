@@ -742,7 +742,7 @@ mod tests {
             operation_id: OperationId::new("op-1"),
             status,
             durability,
-            session_revision: None,
+            session_revision: philo_agent_runtime::SettlementRevision::Unchanged,
         }
     }
 
@@ -1217,8 +1217,10 @@ mod tests {
         let agent = settled(OperationStatus::Succeeded, SettlementDurability::Confirmed);
         let frontend = FrontendOperationEvent::OperationSettled {
             operation_id: "op-1".to_owned(),
+            session_id: "s-1".to_owned(),
             status: "Succeeded".to_owned(),
             durability: "Confirmed".to_owned(),
+            session_revision: philo_agent_runtime::SettlementRevision::Unchanged,
         };
         assert_eq!(
             agent_renderer.render(&agent),

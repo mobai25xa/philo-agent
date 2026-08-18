@@ -98,7 +98,9 @@ impl App {
     /// Applies one frontend update to the presentation projection.
     pub fn apply_update(&mut self, update: &FrontendUpdate) -> Vec<Effect> {
         match &update.kind {
-            Kind::CommandAccepted => Vec::new(),
+            Kind::CommandAccepted
+            | Kind::SubmitAccepted { .. }
+            | Kind::CompactionAccepted { .. } => Vec::new(),
             Kind::CommandRejected { reason } => self.apply_command_rejected(reason),
             Kind::OperationAccepted { .. } => Vec::new(),
             Kind::OperationEvent(event) => self.on_operation_event(event),
@@ -160,7 +162,10 @@ impl App {
         }
     }
 
-    fn apply_command_rejected(&mut self, reason: &str) -> Vec<Effect> {
+    fn apply_command_rejected(
+        &mut self,
+        reason: &philo_agent_service::CommandReject,
+    ) -> Vec<Effect> {
         if self.pending_model_switch {
             self.pending_model_switch = false;
             return self.ingest_appends(vec![Effect::Append(vec![line(

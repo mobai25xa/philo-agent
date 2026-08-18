@@ -130,9 +130,7 @@ pub enum AgentEvent {
         operation_id: OperationId,
         status: OperationStatus,
         durability: SettlementDurability,
-        /// Last successful Session commit revision for a Confirmed
-        /// settlement. `None` when Unconfirmed or when no durable commit
-        /// happened (queued / zero-trace cancel). Never forged.
-        session_revision: Option<u64>,
+        /// Durable Session revision when this settlement committed. Never forged.
+        session_revision: crate::SettlementRevision,
     },
 }

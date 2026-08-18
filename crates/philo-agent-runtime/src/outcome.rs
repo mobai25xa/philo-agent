@@ -49,6 +49,15 @@ pub enum SettlementDurability {
     Confirmed,
     Unconfirmed,
 }
+
+/// Session-store revision carried by a terminal settlement. Never forged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementRevision {
+    /// The settlement committed a Session transaction at this revision.
+    Committed(philo_session::SessionRevision),
+    /// No durable Session commit happened for this settlement.
+    Unchanged,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailureKind {
     ModelCall,

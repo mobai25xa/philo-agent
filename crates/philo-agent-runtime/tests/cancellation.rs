@@ -9,9 +9,11 @@ use philo_agent_runtime::{
     AgentAvailability, AgentEvent, AgentFailureKind, CancelReason, GenerationConfig, ModelCallId,
     ModelCallPhase, OperationId, OperationOutcome, OperationPhase, OperationStatus,
     RunningToolBatchPhase, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
-    ToolBatchId, ToolCallId, ToolDefinition, TurnId, UserMessage,
+    SettlementRevision, ToolBatchId, ToolCallId, ToolDefinition, TurnId, UserMessage,
 };
-use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
+use philo_session::{
+    ContextMessage, MemorySessionStore, SessionRevision, SessionStore, ToolResultOutcome,
+};
 use support::failing_session::{FailingSessionStore, FailurePlan};
 use support::fake_model::{FakeModel, ModelScript};
 use support::fake_tool::{FakeTool, FakeToolResult};
@@ -134,7 +136,7 @@ async fn queued_cancel_settles_immediately_with_zero_trace() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
-                session_revision: None,
+                session_revision: SettlementRevision::Unchanged,
             },
         ]
     );
@@ -196,7 +198,7 @@ async fn cancel_before_barrier_a_leaves_zero_trace() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
-                session_revision: None,
+                session_revision: SettlementRevision::Unchanged,
             },
         ],
         "no TurnCancelled: durably no turn ever existed"
@@ -279,7 +281,7 @@ async fn cancel_during_model_stream_discards_output_and_commits_terminal_facts()
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
-                session_revision: Some(4),
+                session_revision: SettlementRevision::Committed(SessionRevision::new(4)),
             },
         ]
     );
@@ -470,7 +472,7 @@ async fn cancel_mid_batch_completes_the_executing_call_and_marks_the_rest() {
                 operation_id: victim_id,
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
-                session_revision: Some(5),
+                session_revision: SettlementRevision::Committed(SessionRevision::new(5)),
             },
         ]
     );

@@ -180,6 +180,8 @@ pub struct FrontendUnfilledBatch {
 pub struct QueuedOperationSummary {
     /// Operation id.
     pub operation_id: String,
+    /// Session that owns the queued operation.
+    pub session_id: String,
 }
 
 /// Availability as a frontend DTO.
@@ -455,10 +457,14 @@ pub enum FrontendOperationEvent {
     OperationSettled {
         /// Operation id.
         operation_id: String,
+        /// Session that owns this operation.
+        session_id: String,
         /// Status label.
         status: String,
         /// Durability label.
         durability: String,
+        /// Durable Session revision when this settlement committed.
+        session_revision: philo_agent_runtime::SettlementRevision,
     },
 }
 

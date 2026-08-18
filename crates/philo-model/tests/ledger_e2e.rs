@@ -107,12 +107,14 @@ async fn truncated_tool_output_is_the_single_source_of_truth() {
             compaction: Default::default(),
         },
     );
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: sessions.clone(),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {

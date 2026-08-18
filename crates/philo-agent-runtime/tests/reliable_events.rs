@@ -38,28 +38,31 @@ fn echo() -> philo_agent_runtime::ToolDefinition {
     )
 }
 
+fn into_agent_event(event: RuntimeEvent) -> Option<AgentEvent> {
+    match event {
+        RuntimeEvent::Agent(agent) => Some(agent),
+        RuntimeEvent::OperationSettled {
+            operation_id,
+            status,
+            durability,
+            session_revision,
+            ..
+        } => Some(AgentEvent::OperationSettled {
+            operation_id,
+            status,
+            durability,
+            session_revision,
+        }),
+        _ => None,
+    }
+}
+
 async fn drain_after_idle(
     handle: &philo_agent_runtime::RuntimeHandle,
-    sub: &mut philo_agent_runtime::RuntimeSubscription,
+    sub: &mut philo_agent_runtime::RuntimeEventReceiver,
 ) -> Vec<AgentEvent> {
     wait_until_idle(handle).await;
-    let mut events = Vec::new();
-    let mut saw_settled = false;
-    loop {
-        match tokio::time::timeout(Duration::from_millis(250), sub.recv()).await {
-            Ok(Some(RuntimeEvent::Agent(agent))) => {
-                if matches!(agent, AgentEvent::OperationSettled { .. }) {
-                    saw_settled = true;
-                }
-                events.push(agent);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) if saw_settled => break,
-            Err(_) => panic!("timed out before reliable settlement arrived"),
-        }
-    }
-    events
+    drain_agent_events(sub, "timed out before reliable settlement arrived").await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -170,6 +173,7 @@ async fn pausing_the_consumer_does_not_drop_settlement() {
             event_cap: 2,
             queue_max: 8,
             driver_event_budget: 8,
+            reliable_staging_cap: 64,
         },
     )
     .await;
@@ -289,22 +293,34 @@ async fn gated_consumer_sees_ordered_facts_after_event_cap_one() {
 }
 
 async fn drain_after_idle_recv(
-    sub: &mut philo_agent_runtime::RuntimeSubscription,
+    sub: &mut philo_agent_runtime::RuntimeEventReceiver,
+) -> Vec<AgentEvent> {
+    drain_agent_events(
+        sub,
+        "gated consumer timed out before reliable settlement arrived",
+    )
+    .await
+}
+
+async fn drain_agent_events(
+    sub: &mut philo_agent_runtime::RuntimeEventReceiver,
+    timeout_message: &str,
 ) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     let mut saw_settled = false;
     loop {
         match tokio::time::timeout(Duration::from_millis(250), sub.recv()).await {
-            Ok(Some(RuntimeEvent::Agent(agent))) => {
-                if matches!(agent, AgentEvent::OperationSettled { .. }) {
-                    saw_settled = true;
+            Ok(Some(event)) => {
+                if let Some(agent) = into_agent_event(event) {
+                    if matches!(agent, AgentEvent::OperationSettled { .. }) {
+                        saw_settled = true;
+                    }
+                    events.push(agent);
                 }
-                events.push(agent);
             }
-            Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) if saw_settled => break,
-            Err(_) => panic!("gated consumer timed out before reliable settlement arrived"),
+            Err(_) => panic!("{timeout_message}"),
         }
     }
     events

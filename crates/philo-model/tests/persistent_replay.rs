@@ -9,7 +9,7 @@ mod support;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use philo_agent_runtime::{
@@ -778,7 +778,13 @@ async fn jsonl_session_and_private_replay_sidecar_continue_after_restart() {
         .await;
         let (_events, outcome) = drain_until_settled(&mut sub, &operation_id).await;
         assert!(matches!(outcome, OperationOutcome::Succeeded { .. }));
-        handle.shutdown(ShutdownMode::Drain).await;
+        handle
+            .shutdown(
+                ShutdownMode::Drain,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect("shutdown");
     }
 
     let sessions = Arc::new(JsonlSessionStore::open(&root.path).expect("reopen session store"));
@@ -799,7 +805,13 @@ async fn jsonl_session_and_private_replay_sidecar_continue_after_restart() {
         submit_prompt(&handle, session, UserMessage::new("continue"), generation).await;
     let (_events, outcome) = drain_until_settled(&mut sub, &operation_id).await;
     assert!(matches!(outcome, OperationOutcome::Succeeded { .. }));
-    handle.shutdown(ShutdownMode::Drain).await;
+    handle
+        .shutdown(
+            ShutdownMode::Drain,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .expect("shutdown");
 
     let bodies = transport.request_bodies();
     let input = bodies[0]["input"].as_array().expect("Responses input");

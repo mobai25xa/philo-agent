@@ -3,7 +3,7 @@
 use crate::coordinator::{Coordinator, empty_snapshot};
 use crate::epoch::{EpochShared, SuperviseEpoch, supervise_epoch};
 use crate::{
-    ChannelBounds, IdSource, RuntimeEpoch, RuntimeHandle, RuntimeSubscription, SequentialIdSource,
+    ChannelBounds, IdSource, RuntimeEpoch, RuntimeEventReceiver, RuntimeHandle, SequentialIdSource,
     StartError,
 };
 use philo_session as session;
@@ -12,8 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, watch};
 
 /// Construction-only type. After [`AgentRuntime::start`] the caller holds
-/// [`RuntimeHandle`] and [`RuntimeSubscription`].
+/// [`RuntimeParts`].
 pub struct AgentRuntime;
+
+/// One-shot runtime construction result. The event receiver can be taken once.
+pub struct RuntimeParts {
+    pub handle: RuntimeHandle,
+    pub events: RuntimeEventReceiver,
+}
 
 /// Dependencies frozen for one runtime epoch. Model/tools/config arrive
 /// per-submit on [`crate::OperationSpec::generation`].
@@ -37,8 +43,10 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 impl AgentRuntime {
     /// Starts a self-driven coordinator on the current Tokio runtime.
-    /// Operations progress after submit even if the subscription is idle.
-    pub fn start(deps: RuntimeDeps) -> Result<(RuntimeHandle, RuntimeSubscription), StartError> {
+    ///
+    /// The event receiver must be handed to AgentService immediately. Closing
+    /// it is a host failure, not an invitation to buffer events in memory.
+    pub fn start(deps: RuntimeDeps) -> Result<RuntimeParts, StartError> {
         let _runtime =
             tokio::runtime::Handle::try_current().map_err(|_| StartError::RuntimeUnavailable {
                 message: "AgentRuntime::start requires a Tokio runtime".to_owned(),
@@ -71,13 +79,13 @@ impl AgentRuntime {
             event_tx,
             snapshot_tx,
         }));
-        Ok((
-            RuntimeHandle {
+        Ok(RuntimeParts {
+            handle: RuntimeHandle {
                 command_tx,
                 control_tx,
                 snapshot_rx,
             },
-            RuntimeSubscription { events: event_rx },
-        ))
+            events: RuntimeEventReceiver { events: event_rx },
+        })
     }
 }

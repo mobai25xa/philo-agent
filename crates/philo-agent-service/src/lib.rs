@@ -23,29 +23,31 @@ pub use bounds::{
     FRONTEND_CONTROL_CAP, FRONTEND_RESTART_BUDGET, FRONTEND_RESTART_WINDOW_SECS,
     FRONTEND_SNAPSHOT_CAP, FRONTEND_UPDATE_CAP, LIVE_REASONING_CHARS_MAX, LIVE_TEXT_CHARS_MAX,
     LIVE_TOOL_PROGRESS_MAX, RUNTIME_COMMAND_CAP, RUNTIME_CONTROL_CAP, RUNTIME_DRIVER_EVENT_BUDGET,
-    RUNTIME_EVENT_CAP, RUNTIME_QUEUE_MAX, STORE_COMMAND_CAP,
+    RUNTIME_EVENT_CAP, RUNTIME_QUEUE_MAX, RUNTIME_RELIABLE_STAGING_CAP, STORE_COMMAND_CAP,
+    TRANSIENT_KIND_COUNT,
 };
 pub use confirmation::{ConfirmationGate, ConfirmationRequest};
-pub use error::{CommandSubmitResult, RecvOutcome, ServiceError};
+pub use error::{CommandDispatch, CommandReject, RecvOutcome, ServiceError};
 pub use frontend::{
-    ConfirmationDecision, DetachReason, DurableSessionView, FrontendAssistantBlock,
-    FrontendAttachment, FrontendAvailability, FrontendClient, FrontendCommand, FrontendConfigEntry,
-    FrontendContextMessage, FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase,
+    AttachError, ConfirmationDecision, DetachError, DetachReason, DetachReport, DurableSessionView,
+    FrontendAssistantBlock, FrontendAttachment, FrontendAvailability, FrontendClient,
+    FrontendCommand, FrontendConfigEntry, FrontendContextMessage, FrontendGeneration,
+    FrontendLease, FrontendLeaseGeneration, FrontendMaintenance, FrontendMaintenancePhase,
     FrontendOpenTurn, FrontendOperationEvent, FrontendReasoningEffort, FrontendSnapshot,
     FrontendStatus, FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing,
     FrontendToolResult, FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUpdate,
     FrontendUpdateKind, FrontendUserPart, PendingConfirmationView, QueuedOperationSummary,
-    ResyncRequired, ServiceHealth,
+    ResyncRequired, ServiceHealth, SupervisorCommand,
 };
 pub use generation::{AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler};
 pub use ids::{FrontendEpoch, FrontendInstanceId, FrontendRequestId, FrontendRevision};
 pub use live::{LiveOperationSnapshot, LiveToolProgress};
 pub use philo_agent_runtime::{
-    AdmissionError, CancelResult, ChannelBounds, CompactionSpec, EpochSettlement,
+    AdmissionError, CancelResult, ChannelBounds, CompactionSpec, ForcedSettlement,
     GenerationDisplay, GenerationId, MaintenanceAccepted, MaintenanceError, MaintenanceId,
-    MaintenanceResult, OperationAccepted, OperationSpec, RuntimeEvent, RuntimeGeneration,
-    RuntimeHandle, RuntimeSnapshot, RuntimeSubscription, ShutdownMode, ShutdownReport,
-    TryRecvError,
+    MaintenanceResult, OperationAccepted, OperationSpec, QueuedOperationSnapshot, RuntimeEvent,
+    RuntimeEventReceiver, RuntimeGeneration, RuntimeHandle, RuntimeParts, RuntimeSnapshot,
+    SettlementRevision, ShutdownError, ShutdownMode, ShutdownReport, TryRecvError,
 };
 pub use runtime_api::{RuntimeEvents, RuntimePort};
 pub use service::{AgentService, ServiceDeps, start};

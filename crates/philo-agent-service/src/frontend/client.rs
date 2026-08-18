@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use tokio::sync::{Mutex, mpsc};
 
-use crate::error::{CommandSubmitResult, RecvOutcome};
+use crate::error::{CommandDispatch, RecvOutcome};
 use crate::frontend::command::FrontendCommand;
 use crate::frontend::update::FrontendUpdate;
 use crate::ids::{FrontendRequestId, FrontendRevision, RequestIdSource};
@@ -42,45 +42,38 @@ impl FrontendClient {
     }
 
     /// Non-blocking command submit. Never waits for the service actor.
-    pub fn try_command(&self, command: FrontendCommand) -> CommandSubmitResult {
+    pub fn try_command(&self, command: FrontendCommand) -> CommandDispatch<FrontendRequestId> {
         let request_id = self.ids.next();
-        let tx = if command.is_snapshot() {
-            &self.snapshot_tx
+        let (tx, lane) = if command.is_snapshot() {
+            (&self.snapshot_tx, "frontend-snapshot")
         } else if command.is_control() {
-            &self.control_tx
+            (&self.control_tx, "frontend-control")
         } else {
-            &self.command_tx
+            (&self.command_tx, "frontend-command")
         };
         match tx.try_send(CommandEnvelope {
             request_id,
             command,
         }) {
-            Ok(()) => CommandSubmitResult::Accepted(request_id),
-            Err(mpsc::error::TrySendError::Full(_)) => CommandSubmitResult::Backpressured,
-            Err(mpsc::error::TrySendError::Closed(_)) => CommandSubmitResult::Disconnected,
+            Ok(()) => CommandDispatch::Enqueued(request_id),
+            Err(mpsc::error::TrySendError::Full(_)) => CommandDispatch::Backpressured,
+            Err(mpsc::error::TrySendError::Closed(_)) => CommandDispatch::Disconnected { lane },
         }
-    }
-
-    /// Async alias of [`Self::try_command`]. Same non-blocking semantics.
-    pub async fn try_command_async(&self, command: FrontendCommand) -> CommandSubmitResult {
-        self.try_command(command)
     }
 
     /// Requests a composed snapshot. Uses the reserved recovery lane.
-    pub fn request_snapshot(&self, known_revision: FrontendRevision) -> FrontendRequestId {
-        match self.try_command(FrontendCommand::RequestSnapshot { known_revision }) {
-            CommandSubmitResult::Accepted(request_id) => request_id,
-            CommandSubmitResult::Backpressured | CommandSubmitResult::Disconnected => {
-                FrontendRequestId::INVALID
-            }
-        }
+    pub fn request_snapshot(
+        &self,
+        known_revision: FrontendRevision,
+    ) -> CommandDispatch<FrontendRequestId> {
+        self.try_command(FrontendCommand::RequestSnapshot { known_revision })
     }
 
     /// Async alias of [`Self::request_snapshot`].
     pub async fn request_snapshot_async(
         &self,
         known_revision: FrontendRevision,
-    ) -> FrontendRequestId {
+    ) -> CommandDispatch<FrontendRequestId> {
         self.request_snapshot(known_revision)
     }
 
@@ -145,8 +138,9 @@ impl FrontendClient {
 mod tests {
     use super::*;
     use crate::bounds::FRONTEND_COMMAND_CAP;
-    use crate::error::CommandSubmitResult;
+    use crate::error::CommandDispatch;
     use crate::frontend::command::FrontendCommand;
+    use crate::ids::FrontendRevision;
 
     #[test]
     fn try_command_returns_backpressured_when_lane_is_full() {
@@ -155,16 +149,33 @@ mod tests {
         let (snapshot_tx, _snapshot_rx) = mpsc::channel(1);
         let (_update_tx, update_rx) = mpsc::channel(1);
         let client = FrontendClient::new(command_tx, control_tx, snapshot_tx, update_rx);
-        let mut accepted = 0;
+        let mut enqueued = 0;
         let mut backpressured = 0;
         for _ in 0..FRONTEND_COMMAND_CAP + 4 {
             match client.try_command(FrontendCommand::ListSessions) {
-                CommandSubmitResult::Accepted(_) => accepted += 1,
-                CommandSubmitResult::Backpressured => backpressured += 1,
-                CommandSubmitResult::Disconnected => panic!("disconnected"),
+                CommandDispatch::Enqueued(_) => enqueued += 1,
+                CommandDispatch::Backpressured => backpressured += 1,
+                CommandDispatch::Disconnected { lane } => panic!("disconnected: {lane}"),
             }
         }
-        assert_eq!(accepted, FRONTEND_COMMAND_CAP);
+        assert_eq!(enqueued, FRONTEND_COMMAND_CAP);
         assert!(backpressured > 0);
+    }
+
+    #[test]
+    fn request_snapshot_returns_backpressured_when_lane_is_full() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(1);
+        let (_update_tx, update_rx) = mpsc::channel(1);
+        let client = FrontendClient::new(command_tx, control_tx, snapshot_tx, update_rx);
+        assert!(matches!(
+            client.request_snapshot(FrontendRevision::ZERO),
+            CommandDispatch::Enqueued(_)
+        ));
+        assert!(matches!(
+            client.request_snapshot(FrontendRevision::ZERO),
+            CommandDispatch::Backpressured
+        ));
     }
 }

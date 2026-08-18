@@ -3,6 +3,7 @@
 pub(crate) mod client;
 pub(crate) mod command;
 pub(crate) mod feed;
+pub(crate) mod lease;
 pub(crate) mod snapshot;
 pub(crate) mod update;
 
@@ -12,6 +13,10 @@ pub use command::{
     FrontendReasoningEffort,
 };
 pub use feed::ResyncRequired;
+pub use lease::{
+    AttachError, DetachError, DetachReport, FrontendLease, FrontendLeaseGeneration,
+    SupervisorCommand,
+};
 pub use snapshot::{
     DurableSessionView, FrontendAssistantBlock, FrontendAvailability, FrontendConfigEntry,
     FrontendContextMessage, FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase,

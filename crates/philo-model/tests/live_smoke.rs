@@ -108,12 +108,14 @@ async fn live_direct_answer_settles_successfully() {
         empty_tools(),
         config(0, "You are a terse assistant."),
     );
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: Arc::new(MemorySessionStore::new()),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
     let accepted = handle
         .submit(OperationSpec {
             session_id: SessionId::new("live-direct"),
@@ -152,12 +154,14 @@ async fn live_tool_round_reads_a_real_file() {
             "You must use the read tool before answering questions about files.",
         ),
     );
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: Arc::new(MemorySessionStore::new()),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
     let accepted = handle
         .submit(OperationSpec {
             session_id: SessionId::new("live-tool"),
@@ -207,12 +211,14 @@ async fn live_reasoning_tool_round_streams_transient_reasoning() {
             "You must use the read tool before answering questions about files.",
         ),
     );
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: Arc::new(MemorySessionStore::new()),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
     let accepted = handle
         .submit(OperationSpec {
             session_id: SessionId::new("live-reasoning"),

@@ -19,8 +19,10 @@ mod operation;
 mod outcome;
 mod runtime;
 mod runtime_event;
+mod shutdown;
 mod snapshot;
 mod spec;
+mod staging;
 mod subscription;
 mod transient;
 
@@ -70,4 +72,5 @@ pub use snapshot::{
     TurnSnapshot,
 };
 pub use spec::{CompactionSpec, MaintenanceAccepted, OperationAccepted, OperationSpec};
+pub use staging::OutboundStats;
 pub use subscription::RuntimeEventReceiver;

@@ -37,7 +37,7 @@ use philo_agent_runtime::{
     AdmissionError, CancelResult, MaintenanceAccepted, MaintenanceError, MaintenanceResult,
     OperationAccepted, OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeGeneration,
     RuntimeSnapshot, SettlementDurability, SettlementRevision, ShutdownMode, ShutdownReport,
-    TryRecvError,
+    ShutdownState, TryRecvError,
 };
 
 /// Graceful shutdown phases. Forced deadlines belong to the process supervisor.
@@ -436,7 +436,7 @@ where
             ServiceTaskResult::CancelMaintenance { request_id, result } => {
                 self.emit_cancel(request_id, result);
             }
-            ServiceTaskResult::Shutdown(_) => self.on_runtime_shutdown_finished(),
+            ServiceTaskResult::Shutdown(result) => self.on_runtime_shutdown_finished(result),
             ServiceTaskResult::RuntimeSnapshot { epoch, snapshot } => {
                 self.handle_runtime_snapshot(epoch, snapshot)
             }
@@ -455,12 +455,41 @@ where
             self.shutdown,
             ServiceShutdownState::StopAccepting | ServiceShutdownState::RuntimeDraining
         ) {
-            self.on_runtime_shutdown_finished();
+            self.on_runtime_shutdown_finished(Err(
+                philo_agent_runtime::ShutdownError::SupervisorPanicked,
+            ));
         }
         self.finish_if_children_idle();
     }
 
-    fn on_runtime_shutdown_finished(&mut self) {
+    fn on_runtime_shutdown_finished(
+        &mut self,
+        result: Result<ShutdownReport, philo_agent_runtime::ShutdownError>,
+    ) {
+        match result {
+            Ok(report) if report.final_state == ShutdownState::Stopped => {}
+            Ok(report) => self.notice(format!(
+                "runtime shutdown ended in {:?}",
+                report.final_state
+            )),
+            Err(philo_agent_runtime::ShutdownError::DeadlineExceeded { pending }) => {
+                let message = format!(
+                    "runtime shutdown deadline exceeded: {}",
+                    pending.join(",")
+                );
+                self.health = ServiceHealth::Degraded {
+                    message: message.clone(),
+                };
+                self.notice(message);
+            }
+            Err(error) => {
+                let message = format!("runtime shutdown failed: {error:?}");
+                self.health = ServiceHealth::Degraded {
+                    message: message.clone(),
+                };
+                self.notice(message);
+            }
+        }
         if matches!(
             self.shutdown,
             ServiceShutdownState::StopAccepting | ServiceShutdownState::RuntimeDraining

@@ -41,6 +41,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
     let show_reasoning = bootstrap.settings.show_reasoning;
     let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(0u64);
     tokio::spawn(crate::command::ctrl_c::forward_os_ctrl_c(interrupt_tx));
+    let mut shutdown_interrupt = interrupt_rx.clone();
     let report = drive::run(drive::Request {
         client: bootstrap.client.clone(),
         sessions: Some(bootstrap.sessions.clone()),
@@ -53,11 +54,19 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
         interrupt: interrupt_rx,
     })
     .await;
-    if report.forced {
-        drop(bootstrap);
-        Ok(report.exit_code())
+    let deadline = if report.forced {
+        std::time::Instant::now()
     } else {
-        assembly::shutdown(bootstrap).await;
-        Ok(report.exit_code())
+        std::time::Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE
+    };
+    let shutdown = assembly::shutdown_with_deadline(
+        bootstrap,
+        &mut shutdown_interrupt,
+        deadline,
+    )
+    .await;
+    for name in &shutdown.pending {
+        eprintln!("error: shutdown deadline exceeded: {name}");
     }
+    Ok(report.exit_code())
 }

@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentEvent, CancelResult, GenerationConfig, ModelCallSnapshot, ModelError,
-    ModelEventStream, ModelPort, OperationOutcome, OperationSpec, OperationStatus, RuntimeConfig,
-    RuntimeFuture, SessionId, SettlementDurability, SettlementRevision, UserMessage,
+    AdmissionError, AgentAvailability, AgentEvent, CancelResult, GenerationConfig,
+    ModelCallSnapshot, ModelError, ModelEventStream, ModelPort, OperationOutcome, OperationSpec,
+    OperationStatus, RuntimeConfig, RuntimeFuture, SessionId, SettlementDurability,
+    SettlementRevision, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore};
 use support::fake_model::{FakeModel, ModelScript};
@@ -16,7 +17,7 @@ use support::fake_tool::{FakeTool, FakeToolResult};
 use support::gate::Gate;
 use support::runtime::{
     EventCursor, Harness, drain_until_settled, empty_tools, generation, start, submit_prompt,
-    wait_until_busy, wait_until_idle, wait_until_queued,
+    wait_until_busy, wait_until_queued, wait_until_shutdown_leaves_running,
 };
 
 fn config() -> RuntimeConfig {
@@ -33,43 +34,35 @@ fn config() -> RuntimeConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn submit_settles_without_consuming_subscription() {
+async fn dropping_subscription_shuts_runtime_and_rejects_submit() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let (handle, _sub) = start(model.clone(), sessions.clone(), empty_tools(), config()).await;
+    let (handle, sub) = start(model.clone(), sessions.clone(), empty_tools(), config()).await;
     let runtime_gen = generation(model.clone(), empty_tools(), config());
-    let accepted = submit_prompt(&handle, runtime_gen, "session", "hi").await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = handle.snapshot().await;
-        if snapshot
-            .last_settled
-            .iter()
-            .any(|settled| settled.operation_id == accepted.operation_id)
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "operation did not settle without a consumer"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    wait_until_idle(&handle).await;
-    let view = sessions
-        .context_view(&philo_session::SessionId::new("session"))
-        .await
-        .unwrap();
+    let _accepted = submit_prompt(&handle, runtime_gen, "session", "hi").await;
+    drop(sub);
+    wait_until_shutdown_leaves_running(&handle).await;
+    let rejected = handle
+        .submit(OperationSpec {
+            session_id: SessionId::new("session"),
+            user_message: UserMessage::new("again"),
+            generation: generation(model, empty_tools(), config()),
+            service_request_id: None,
+        })
+        .await;
     assert!(
-        view.messages()
-            .iter()
-            .any(|message| matches!(message, ContextMessage::Assistant { .. })),
-        "operation must persist without a subscription consumer"
+        matches!(
+            rejected,
+            Err(AdmissionError::ShuttingDown
+                | AdmissionError::RuntimeStopped
+                | AdmissionError::Backpressured)
+        ),
+        "submit after sink close must be rejected, got {rejected:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ignoring_subscription_does_not_change_progress() {
+async fn live_consumer_still_persists_assistant_message() {
     let model = Arc::new(FakeModel::succeeds(&["hello"]));
     let sessions = Arc::new(MemorySessionStore::new());
     let runtime_gen = generation(model.clone(), empty_tools(), config());
@@ -89,34 +82,16 @@ async fn ignoring_subscription_does_not_change_progress() {
         outcome,
         OperationOutcome::Succeeded { assistant } if assistant.content() == "hello"
     ));
-    let consumed_view = sessions
+    let view = sessions
         .context_view(&philo_session::SessionId::new("session"))
         .await
         .unwrap();
-
-    let model = Arc::new(FakeModel::succeeds(&["hello"]));
-    let sessions = Arc::new(MemorySessionStore::new());
-    let runtime_gen = generation(model.clone(), empty_tools(), config());
-    let (handle, _ignored) = start(model, sessions.clone(), empty_tools(), config()).await;
-    let accepted = submit_prompt(&handle, runtime_gen, "session", "hi").await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = handle.snapshot().await;
-        if snapshot
-            .last_settled
+    assert!(
+        view.messages()
             .iter()
-            .any(|settled| settled.operation_id == accepted.operation_id)
-        {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let ignored_view = sessions
-        .context_view(&philo_session::SessionId::new("session"))
-        .await
-        .unwrap();
-    assert_eq!(consumed_view.messages(), ignored_view.messages());
+            .any(|message| matches!(message, ContextMessage::Assistant { .. })),
+        "live drain must still persist the assistant message"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

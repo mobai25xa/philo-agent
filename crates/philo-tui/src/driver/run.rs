@@ -13,7 +13,7 @@ use ratatui::backend::Backend;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::api::types::{RestoreReport, TuiLaunchConfig, TuiOutcome, TuiRunReport, TuiScreen};
+use crate::api::types::{TuiLaunchConfig, TuiOutcome, TuiRunReport, TuiScreen};
 use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::overlay::Preview;
@@ -47,9 +47,9 @@ pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRu
         Err(error) => {
             return TuiRunReport {
                 outcome: TuiOutcome::FallbackRequested {
-                    fault: error.to_string(),
+                    fault: error.fault.to_string(),
                 },
-                restore: RestoreReport::default(),
+                restore: error.restore,
             };
         }
     };
@@ -64,7 +64,7 @@ pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRu
         screen,
     )
     .await;
-    let restore = session.restore();
+    let restore = session.finish();
     TuiRunReport { outcome, restore }
 }
 

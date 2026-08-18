@@ -52,6 +52,18 @@ impl ChannelBounds {
         }
         Ok(self)
     }
+
+    /// Hard cap for the outbound transient coalescer.
+    ///
+    /// `(queue_max + 1) * TRANSIENT_KIND_COUNT + 2` covers one slot per
+    /// kind for every admitted operation plus Availability and
+    /// MaintenanceProgress.
+    pub fn transient_coalescer_cap(self) -> usize {
+        self.queue_max
+            .saturating_add(1)
+            .saturating_mul(TRANSIENT_KIND_COUNT)
+            .saturating_add(2)
+    }
 }
 
 #[cfg(test)]

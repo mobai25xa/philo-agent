@@ -2,6 +2,7 @@
 
 use crate::coordinator::{Coordinator, empty_snapshot};
 use crate::epoch::{EpochShared, SuperviseEpoch, supervise_epoch};
+use crate::shutdown::ShutdownRequest;
 use crate::{
     ChannelBounds, IdSource, RuntimeEpoch, RuntimeEventReceiver, RuntimeHandle, SequentialIdSource,
     StartError,
@@ -60,6 +61,8 @@ impl AgentRuntime {
         let (control_tx, control_rx) = mpsc::channel(bounds.control_cap);
         let (event_tx, event_rx) = mpsc::channel(bounds.event_cap);
         let (snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot(epoch.clone()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(None::<ShutdownRequest>);
+        let (completion_tx, completion_rx) = watch::channel(None::<crate::shutdown::ShutdownOutcome>);
         let shared = EpochShared::new(bounds.queue_max);
         let join = Coordinator::spawn(
             epoch.clone(),
@@ -70,6 +73,7 @@ impl AgentRuntime {
             control_rx,
             event_tx.clone(),
             snapshot_tx.clone(),
+            shutdown_rx.clone(),
             shared.clone(),
         );
         tokio::spawn(supervise_epoch(SuperviseEpoch {
@@ -78,12 +82,16 @@ impl AgentRuntime {
             shared,
             event_tx,
             snapshot_tx,
+            shutdown_rx,
+            completion_tx,
         }));
         Ok(RuntimeParts {
             handle: RuntimeHandle {
                 command_tx,
                 control_tx,
                 snapshot_rx,
+                shutdown_tx,
+                completion_rx,
             },
             events: RuntimeEventReceiver { events: event_rx },
         })

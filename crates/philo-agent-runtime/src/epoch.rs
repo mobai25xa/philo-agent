@@ -1,14 +1,17 @@
 //! Epoch-root supervision: accepted ledger, child handoff, and panic recovery.
 
+use crate::shutdown::{ShutdownOutcome, ShutdownRequest, default_shutdown_deadline};
 use crate::{
-    AgentAvailability, DiagnosticId, EpochEndReason, MaintenanceId, MaintenanceResult, OperationId,
-    OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeSnapshot, SessionId, SettlementDurability,
-    SettlementRevision, ShutdownState, TurnId,
+    AgentAvailability, DiagnosticId, EpochEndReason, ForcedSettlement, MaintenanceId,
+    MaintenanceResult, OperationId, OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeSnapshot,
+    SessionId, SettlementDurability, SettlementRevision, ShutdownDiagnostic, ShutdownError,
+    ShutdownReport, ShutdownState, TurnId,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 pub(crate) const EPOCH_CHILD_JOIN_DEADLINE: Duration = Duration::from_secs(5);
@@ -34,6 +37,7 @@ impl EpochShared {
         self.epoch_ended.store(true, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn epoch_ended(&self) -> bool {
         self.epoch_ended.load(Ordering::SeqCst)
     }
@@ -121,6 +125,7 @@ impl AcceptedLedger {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pop(&self) -> Option<LedgerEntry> {
         let mut inner = lock(&self.inner);
         let id = inner.order.first().cloned()?;
@@ -214,75 +219,134 @@ pub(crate) async fn join_epoch_children(children: EpochChildren) -> Vec<String> 
     forced
 }
 
+pub(crate) struct EpochExit {
+    pub reason: EpochEndReason,
+    pub pending_reliable: Vec<RuntimeEvent>,
+    pub forced_settlements: Vec<ForcedSettlement>,
+    pub diagnostics: Vec<ShutdownDiagnostic>,
+    pub maintenance: Option<(MaintenanceId, SessionId)>,
+}
+
+pub(crate) enum CoordinatorExit {
+    Finalized(EpochExit),
+}
+
 pub(crate) struct SuperviseEpoch {
     pub epoch: RuntimeEpoch,
-    pub coordinator: JoinHandle<()>,
+    pub coordinator: JoinHandle<CoordinatorExit>,
     pub shared: EpochShared,
     pub event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
     pub snapshot_tx: tokio::sync::watch::Sender<RuntimeSnapshot>,
+    pub shutdown_rx: watch::Receiver<Option<ShutdownRequest>>,
+    pub completion_tx: watch::Sender<Option<ShutdownOutcome>>,
 }
 
 pub(crate) async fn supervise_epoch(input: SuperviseEpoch) {
     let outcome = input.coordinator.await;
     let children = input.shared.children.take();
-    let maintenance_id = children.maintenance_id.clone();
     let leftover = input.shared.ledger.take_all();
-    let maintenance_session_id = children.maintenance_session_id.clone();
+    let maintenance = match (
+        children.maintenance_id.clone(),
+        children.maintenance_session_id.clone(),
+    ) {
+        (Some(id), Some(session_id)) => Some((id, session_id)),
+        _ => None,
+    };
     let join_faults = join_epoch_children(children).await;
-    let panicked = outcome.is_err();
-    if input.shared.epoch_ended() {
-        return;
-    }
-    if panicked || !leftover.is_empty() {
-        input.shared.mark_epoch_ended();
-        publish_forced_end(
-            input.event_tx,
-            input.snapshot_tx,
-            input.epoch,
-            leftover,
-            maintenance_id.filter(|_| panicked),
-            maintenance_session_id.filter(|_| panicked),
-            join_faults,
-        )
-        .await;
-    }
+    let mut exit = match outcome {
+        Ok(CoordinatorExit::Finalized(mut exit)) => {
+            if exit.forced_settlements.is_empty() {
+                exit.forced_settlements
+                    .extend(leftover.into_iter().enumerate().map(|(index, entry)| {
+                        ForcedSettlement {
+                            operation_id: entry.operation_id,
+                            session_id: entry.session_id,
+                            status: OperationStatus::Failed,
+                            durability: SettlementDurability::Unconfirmed,
+                            diagnostic_id: DiagnosticId::new(format!(
+                                "epoch-{}-forced-{}",
+                                input.epoch.as_str(),
+                                index + 1
+                            )),
+                        }
+                    }));
+            }
+            exit
+        }
+        Err(_) => EpochExit {
+            reason: EpochEndReason::CoordinatorFault,
+            pending_reliable: Vec::new(),
+            forced_settlements: leftover
+                .into_iter()
+                .enumerate()
+                .map(|(index, entry)| ForcedSettlement {
+                    operation_id: entry.operation_id,
+                    session_id: entry.session_id,
+                    status: OperationStatus::Failed,
+                    durability: SettlementDurability::Unconfirmed,
+                    diagnostic_id: DiagnosticId::new(format!(
+                        "epoch-{}-forced-{}",
+                        input.epoch.as_str(),
+                        index + 1
+                    )),
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+            maintenance,
+        },
+    };
+    exit.diagnostics
+        .extend(join_faults.into_iter().map(|message| ShutdownDiagnostic {
+            message,
+        }));
+    let deadline = input
+        .shutdown_rx
+        .borrow()
+        .map(|request| request.deadline)
+        .unwrap_or_else(default_shutdown_deadline);
+    input.shared.mark_epoch_ended();
+    let result = apply_epoch_exit(
+        input.event_tx,
+        input.snapshot_tx,
+        input.epoch,
+        exit,
+        deadline,
+    )
+    .await;
+    let _ = input.completion_tx.send(Some(result));
 }
 
-async fn publish_forced_end(
+async fn apply_epoch_exit(
     event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
     snapshot_tx: tokio::sync::watch::Sender<RuntimeSnapshot>,
     epoch: RuntimeEpoch,
-    leftover: Vec<LedgerEntry>,
-    maintenance_id: Option<MaintenanceId>,
-    maintenance_session_id: Option<SessionId>,
-    join_faults: Vec<String>,
-) {
+    exit: EpochExit,
+    deadline: Instant,
+) -> ShutdownOutcome {
+    let sink_closed = event_tx.is_closed();
     let mut last_settled = snapshot_tx.borrow().last_settled.clone();
-    if let (Some(id), Some(session_id)) = (maintenance_id, maintenance_session_id) {
-        let _ = event_tx
-            .send(RuntimeEvent::MaintenanceSettled {
-                id,
-                session_id,
-                result: MaintenanceResult::Cancelled,
-            })
-            .await;
+    let mut pending = Vec::new();
+    let mut events = exit.pending_reliable;
+    if let Some((id, session_id)) = exit.maintenance {
+        events.push(RuntimeEvent::MaintenanceSettled {
+            id,
+            session_id,
+            result: MaintenanceResult::Cancelled,
+        });
     }
-    let forced_count = leftover.len();
-    for entry in leftover {
-        let _ = event_tx
-            .send(RuntimeEvent::OperationSettled {
-                operation_id: entry.operation_id.clone(),
-                session_id: entry.session_id.clone(),
-                status: OperationStatus::Failed,
-                durability: SettlementDurability::Unconfirmed,
-                session_revision: SettlementRevision::Unchanged,
-            })
-            .await;
+    for settlement in &exit.forced_settlements {
+        events.push(RuntimeEvent::OperationSettled {
+            operation_id: settlement.operation_id.clone(),
+            session_id: settlement.session_id.clone(),
+            status: settlement.status,
+            durability: settlement.durability,
+            session_revision: SettlementRevision::Unchanged,
+        });
         last_settled.push(crate::SettledOperationSnapshot {
-            operation_id: entry.operation_id,
-            session_id: entry.session_id,
-            status: OperationStatus::Failed,
-            durability: SettlementDurability::Unconfirmed,
+            operation_id: settlement.operation_id.clone(),
+            session_id: settlement.session_id.clone(),
+            status: settlement.status,
+            durability: settlement.durability,
             failure: Some(crate::AgentFailure::runtime_driver(
                 "runtime epoch ended before the operation settled",
             )),
@@ -291,35 +355,95 @@ async fn publish_forced_end(
             last_settled.remove(0);
         }
     }
-    for (index, message) in join_faults.into_iter().enumerate() {
-        let _ = event_tx
-            .send(RuntimeEvent::RuntimeFault {
-                diagnostic_id: DiagnosticId::new(format!(
-                    "epoch-{}-child-{}",
-                    epoch.as_str(),
-                    index + 1
-                )),
-                message,
-            })
-            .await;
+    for (index, diagnostic) in exit.diagnostics.iter().enumerate() {
+        events.push(RuntimeEvent::RuntimeFault {
+            diagnostic_id: DiagnosticId::new(format!(
+                "epoch-{}-child-{}",
+                epoch.as_str(),
+                index + 1
+            )),
+            message: diagnostic.message.clone(),
+        });
     }
-    let _ = event_tx
-        .send(RuntimeEvent::EpochEnded {
-            epoch: epoch.clone(),
-            reason: EpochEndReason::CoordinatorFault,
-            forced_count,
-        })
-        .await;
+    let forced_count = exit.forced_settlements.len();
+    events.push(RuntimeEvent::EpochEnded {
+        epoch: epoch.clone(),
+        reason: exit.reason,
+        forced_count,
+    });
+
+    let mut published_epoch_ended = sink_closed;
+    if !sink_closed {
+        for event in events {
+            let is_epoch_ended = matches!(event, RuntimeEvent::EpochEnded { .. });
+            match send_terminal(&event_tx, event, deadline).await {
+                Ok(()) => {
+                    if is_epoch_ended {
+                        published_epoch_ended = true;
+                    }
+                }
+                Err(TerminalSendError::Closed) => {
+                    published_epoch_ended = true;
+                    break;
+                }
+                Err(TerminalSendError::Timeout) => {
+                    pending.push("runtime-event-outlet".to_owned());
+                    break;
+                }
+            }
+        }
+    }
+
+    let complete = published_epoch_ended || sink_closed;
     let mut snapshot = snapshot_tx.borrow().clone();
-    snapshot.epoch = epoch;
+    snapshot.epoch = epoch.clone();
     snapshot.availability = AgentAvailability::Idle;
     snapshot.queued.clear();
     snapshot.active = None;
     snapshot.maintenance = None;
-    snapshot.shutdown = ShutdownState::Stopped;
+    snapshot.shutdown = if complete {
+        ShutdownState::Stopped
+    } else {
+        ShutdownState::Forced
+    };
     snapshot.last_settled = last_settled;
     snapshot.runtime_revision = snapshot.runtime_revision.saturating_add(1);
     let _ = snapshot_tx.send(snapshot);
+
+    if complete {
+        Ok(ShutdownReport {
+            epoch,
+            final_state: ShutdownState::Stopped,
+            settlements: exit.forced_settlements,
+            diagnostics: exit.diagnostics,
+        })
+    } else {
+        Err(ShutdownError::DeadlineExceeded { pending })
+    }
+}
+
+enum TerminalSendError {
+    Closed,
+    Timeout,
+}
+
+async fn send_terminal(
+    tx: &tokio::sync::mpsc::Sender<RuntimeEvent>,
+    event: RuntimeEvent,
+    deadline: Instant,
+) -> Result<(), TerminalSendError> {
+    if tx.is_closed() {
+        return Err(TerminalSendError::Closed);
+    }
+    if Instant::now() >= deadline {
+        return Err(TerminalSendError::Timeout);
+    }
+    tokio::select! {
+        result = tx.send(event) => result.map_err(|_| TerminalSendError::Closed),
+        _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => {
+            Err(TerminalSendError::Timeout)
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

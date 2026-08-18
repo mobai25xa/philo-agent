@@ -130,11 +130,17 @@ impl ProcessSupervisor {
             match report.outcome {
                 TuiOutcome::UserExit => {
                     detach(&self.bootstrap, instance_id, DetachReason::UserExit);
-                    return Ok(self.shutdown(ExitCode::SUCCESS));
+                    return Ok(self.shutdown(
+                        ExitCode::SUCCESS,
+                        Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE,
+                    ));
                 }
                 TuiOutcome::ProcessShutdownRequested => {
                     detach(&self.bootstrap, instance_id, DetachReason::UserExit);
-                    return Ok(self.shutdown(ExitCode::SUCCESS));
+                    return Ok(self.shutdown(
+                        ExitCode::SUCCESS,
+                        Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE,
+                    ));
                 }
                 TuiOutcome::FrontendRestartRequested { fault: _ } => {
                     last_instance = Some(instance_id);
@@ -161,7 +167,7 @@ impl ProcessSupervisor {
                         },
                     );
                     report_forced_exit();
-                    return Ok(self.abandon(ExitCode::from(code)));
+                    return Ok(self.shutdown(ExitCode::from(code), Instant::now()));
                 }
             }
         }
@@ -187,27 +193,31 @@ impl ProcessSupervisor {
         }));
         let code = ExitCode::from(report.code);
         if report.forced {
-            self.abandon(code)
+            self.shutdown(code, Instant::now())
         } else {
-            self.shutdown(code)
+            self.shutdown(code, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE)
         }
     }
 
-    fn shutdown(self, code: ExitCode) -> ExitCode {
+    fn shutdown(self, code: ExitCode, deadline: Instant) -> ExitCode {
         let Self {
-            runtime, bootstrap, ..
+            runtime,
+            bootstrap,
+            _watch,
+            mut interrupt_rx,
+            ..
         } = self;
-        runtime.block_on(assembly::shutdown(bootstrap));
-        code
-    }
-
-    /// Forced path: restore already happened. Do not wait for actor drain.
-    fn abandon(self, code: ExitCode) -> ExitCode {
-        let Self {
-            runtime, bootstrap, ..
-        } = self;
-        drop(bootstrap);
-        drop(runtime);
+        runtime.block_on(async {
+            let mut report =
+                assembly::shutdown_with_deadline(bootstrap, &mut interrupt_rx, deadline).await;
+            assembly::join_watch_with_deadline(_watch, deadline, &mut report).await;
+            for name in &report.pending {
+                eprintln!("error: shutdown deadline exceeded: {name}");
+            }
+            for diagnostic in &report.diagnostics {
+                eprintln!("error: {diagnostic}");
+            }
+        });
         code
     }
 }
@@ -296,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_exit_outcome_does_not_use_graceful_drain() {
+    fn forced_exit_outcome_still_reports_restore_first() {
         assert!(matches!(
             TuiOutcome::ForcedExitRequested { code: 130 },
             TuiOutcome::ForcedExitRequested { .. }

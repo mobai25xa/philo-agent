@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use philo_agent_runtime::{
@@ -10,11 +11,11 @@ use philo_agent_runtime::{
     MaintenanceAccepted, MaintenanceError, MaintenanceId, MaintenanceResult, OperationAccepted,
     OperationId, OperationOutcome, OperationPhase, OperationSpec, OperationStatus, RuntimeConfig,
     RuntimeDeps, RuntimeEvent, RuntimeEventReceiver, RuntimeGeneration, RuntimeHandle,
-    RuntimeSnapshot, SequentialIdSource, SessionId, SettlementDurability, ShutdownMode, ToolCallId,
-    ToolPort, ToolRegistry, UserMessage,
+    RuntimeSnapshot, SequentialIdSource, SessionId, SettlementDurability, ShutdownMode,
+    ShutdownState, ToolCallId, ToolPort, ToolRegistry, UserMessage,
 };
 use philo_session::SessionStore;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Polling budget for snapshot/phase waits. Long enough for a loaded
 /// Windows `cargo test --workspace` without turning tests into sleep-luck.
@@ -77,6 +78,115 @@ pub fn event_cap_bounds(event_cap: usize) -> ChannelBounds {
         queue_max: 32,
         driver_event_budget: 32,
         reliable_staging_cap: 64,
+    }
+}
+
+pub fn tiny_pipeline_bounds() -> ChannelBounds {
+    ChannelBounds {
+        command_cap: 4,
+        control_cap: 8,
+        event_cap: 1,
+        queue_max: 2,
+        driver_event_budget: 8,
+        reliable_staging_cap: 4,
+    }
+}
+
+/// Continuous drain of the one-shot event receiver. Pause stops `recv` so
+/// backpressure can be observed without dropping the outlet.
+pub struct EventProbe {
+    events: Arc<Mutex<VecDeque<RuntimeEvent>>>,
+    paused: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+    _join: tokio::task::JoinHandle<()>,
+}
+
+impl EventProbe {
+    pub fn start(sub: RuntimeEventReceiver) -> Self {
+        Self::start_with(sub, 256, false)
+    }
+
+    pub fn start_paused(sub: RuntimeEventReceiver) -> Self {
+        Self::start_with(sub, 256, true)
+    }
+
+    fn start_with(mut sub: RuntimeEventReceiver, cap: usize, paused: bool) -> Self {
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let paused_flag = Arc::new(AtomicBool::new(paused));
+        let wake = Arc::new(Notify::new());
+        let join = {
+            let events = events.clone();
+            let paused_flag = paused_flag.clone();
+            let wake = wake.clone();
+            tokio::spawn(async move {
+                loop {
+                    while paused_flag.load(Ordering::SeqCst) {
+                        wake.notified().await;
+                    }
+                    match sub.recv().await {
+                        Some(event) => {
+                            let mut held = events.lock().await;
+                            if held.len() >= cap {
+                                held.pop_front();
+                            }
+                            held.push_back(event);
+                        }
+                        None => break,
+                    }
+                }
+            })
+        };
+        Self {
+            events,
+            paused: paused_flag,
+            wake,
+            _join: join,
+        }
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    pub async fn snapshot(&self) -> Vec<RuntimeEvent> {
+        self.events.lock().await.iter().cloned().collect()
+    }
+
+    pub async fn wait_for(
+        &self,
+        predicate: impl Fn(&[RuntimeEvent]) -> bool,
+        timeout: Duration,
+    ) -> Vec<RuntimeEvent> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let events = self.snapshot().await;
+            if predicate(&events) {
+                return events;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("event probe timed out; held {} events", events.len());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+pub async fn wait_until_shutdown_leaves_running(handle: &RuntimeHandle) {
+    let deadline = tokio::time::Instant::now() + WAIT_DEADLINE;
+    loop {
+        let snapshot = handle.snapshot().await;
+        if snapshot.shutdown != ShutdownState::Running {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for runtime to leave Running");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

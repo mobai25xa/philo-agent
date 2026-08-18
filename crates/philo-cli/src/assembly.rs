@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use philo_agent_runtime::{
     AgentRuntime, GenerationDisplay, GenerationId, IdSource, ModelPort, ReasoningEffort,
@@ -28,9 +29,19 @@ use philo_session_jsonl::JsonlSessionStore;
 use philo_tools_std::BlockingToolExecutor;
 
 use crate::args::Cli;
-use crate::config::{ResolveFlags, Settings};
+use crate::config::{ResolveFlags, Settings, WatchTask};
 use crate::error::UsageError;
 use crate::ids::ProcessIdSource;
+
+/// Default process-level grace used by interactive and oneshot drain.
+pub(crate) const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Components that missed the process shutdown deadline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProcessShutdownReport {
+    pub pending: Vec<String>,
+    pub diagnostics: Vec<String>,
+}
 
 /// Running AgentService plus the stores the composition root still owns.
 pub(crate) struct Bootstrap {
@@ -376,8 +387,14 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
     })
 }
 
-/// Graceful service + store shutdown. Does not cancel in-flight work beyond Drain.
-pub(crate) async fn shutdown(bootstrap: Bootstrap) {
+/// Graceful service + store shutdown with a process-wide deadline.
+///
+/// `interrupt` stays live so a later Ctrl+C can shorten `deadline` to now.
+pub(crate) async fn shutdown_with_deadline(
+    bootstrap: Bootstrap,
+    interrupt: &mut watch::Receiver<u64>,
+    mut deadline: Instant,
+) -> ProcessShutdownReport {
     let Bootstrap {
         service,
         client,
@@ -385,15 +402,134 @@ pub(crate) async fn shutdown(bootstrap: Bootstrap) {
         assembler,
         ..
     } = bootstrap;
-    match client.try_command(FrontendCommand::ShutdownRequested) {
-        philo_agent_service::CommandDispatch::Enqueued(_) => {}
-        _ => {
-            let _ = service.request_shutdown();
+    let mut seen = skip_past_pulses(interrupt);
+    let mut report = ProcessShutdownReport::default();
+    deadline = shorten_deadline(interrupt, &mut seen, deadline);
+
+    if let Some(pending) =
+        request_service_shutdown(&client, &service, interrupt, &mut seen, &mut deadline).await
+    {
+        report.pending.push(pending);
+    }
+
+    match timeout_at(deadline, service.join()).await {
+        Ok(()) => {}
+        Err(_) => report.pending.push("service".to_owned()),
+    }
+    deadline = shorten_deadline(interrupt, &mut seen, deadline);
+
+    match timeout_at(deadline, tokio::task::spawn_blocking(move || assembler.shutdown())).await {
+        Ok(_) => {}
+        Err(_) => report.pending.push("generation-build-pool".to_owned()),
+    }
+    deadline = shorten_deadline(interrupt, &mut seen, deadline);
+
+    match timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            let _ = sessions.shutdown();
+        }),
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(_) => report.pending.push("session-store".to_owned()),
+    }
+    report
+}
+
+/// Drops a config watch under the same process deadline.
+pub(crate) async fn join_watch_with_deadline(
+    watch: WatchTask,
+    deadline: Instant,
+    report: &mut ProcessShutdownReport,
+) {
+    match timeout_at(deadline, tokio::task::spawn_blocking(move || drop(watch))).await {
+        Ok(_) => {}
+        Err(_) => report.pending.push("config-watch".to_owned()),
+    }
+}
+
+pub(crate) fn shorten_deadline(
+    interrupt: &mut watch::Receiver<u64>,
+    seen: &mut u64,
+    deadline: Instant,
+) -> Instant {
+    if take_pulses(interrupt, seen) > 0 {
+        Instant::now()
+    } else {
+        deadline
+    }
+}
+
+fn take_pulses(rx: &mut watch::Receiver<u64>, seen: &mut u64) -> u64 {
+    let now = *rx.borrow_and_update();
+    let delta = now.saturating_sub(*seen);
+    *seen = now;
+    delta
+}
+
+fn skip_past_pulses(rx: &mut watch::Receiver<u64>) -> u64 {
+    *rx.borrow_and_update()
+}
+
+async fn request_service_shutdown(
+    client: &FrontendClient,
+    service: &philo_agent_service::AgentService,
+    interrupt: &mut watch::Receiver<u64>,
+    seen: &mut u64,
+    deadline: &mut Instant,
+) -> Option<String> {
+    loop {
+        *deadline = shorten_deadline(interrupt, seen, *deadline);
+        match client.try_command(FrontendCommand::ShutdownRequested) {
+            philo_agent_service::CommandDispatch::Enqueued(_) => return None,
+            philo_agent_service::CommandDispatch::Disconnected { .. } => {
+                return match service.request_shutdown() {
+                    philo_agent_service::CommandDispatch::Backpressured => {
+                        wait_for_control_capacity(deadline, interrupt, seen).await
+                    }
+                    _ => None,
+                };
+            }
+            philo_agent_service::CommandDispatch::Backpressured => {
+                match service.request_shutdown() {
+                    philo_agent_service::CommandDispatch::Enqueued(_)
+                    | philo_agent_service::CommandDispatch::Disconnected { .. } => return None,
+                    philo_agent_service::CommandDispatch::Backpressured => {
+                        if let Some(pending) =
+                            wait_for_control_capacity(deadline, interrupt, seen).await
+                        {
+                            return Some(pending);
+                        }
+                    }
+                }
+            }
         }
     }
-    service.join().await;
-    assembler.shutdown();
-    let _ = sessions.shutdown();
+}
+
+async fn wait_for_control_capacity(
+    deadline: &mut Instant,
+    interrupt: &mut watch::Receiver<u64>,
+    seen: &mut u64,
+) -> Option<String> {
+    if Instant::now() >= *deadline {
+        return Some("service-control".to_owned());
+    }
+    tokio::select! {
+        _ = interrupt.changed() => {
+            *deadline = shorten_deadline(interrupt, seen, *deadline);
+            None
+        }
+        _ = tokio::time::sleep(Duration::from_millis(10)) => None,
+    }
+}
+
+async fn timeout_at<T>(deadline: Instant, future: impl Future<Output = T>) -> Result<T, ()> {
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future)
+        .await
+        .map_err(|_| ())
 }
 
 /// Applies a watched TOML reload: update assembler state, then InstallModel
@@ -794,5 +930,21 @@ mod tests {
             "assemble_sync must not run inside the async wrapper"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_at_names_a_component_that_does_not_exit() {
+        let result = timeout_at(Instant::now(), std::future::pending::<()>()).await;
+        assert_eq!(result, Err(()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctrl_c_pulse_shortens_deadline_to_now() {
+        let (tx, mut rx) = watch::channel(0u64);
+        let mut seen = skip_past_pulses(&mut rx);
+        let later = Instant::now() + Duration::from_secs(30);
+        tx.send_modify(|n| *n = n.saturating_add(1));
+        let shortened = shorten_deadline(&mut rx, &mut seen, later);
+        assert!(shortened <= Instant::now() + Duration::from_millis(20));
     }
 }

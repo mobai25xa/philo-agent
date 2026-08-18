@@ -5,8 +5,11 @@
 //! reliable FIFO.
 
 use crate::runtime_event::{is_mergeable, merge_events};
-use crate::{AgentEvent, ModelCallId, OperationPhase, RuntimeEvent, TokenUsage, ToolCallId};
-use std::collections::HashMap;
+use crate::{
+    AgentEvent, MaintenanceId, ModelCallId, OperationId, OperationPhase, RuntimeEvent, TokenUsage,
+    ToolCallId,
+};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use tokio::sync::Notify;
 
@@ -190,42 +193,125 @@ pub(crate) fn is_transient_agent(event: &AgentEvent) -> bool {
     )
 }
 
-/// Single-slot mergeable hold for the service-facing subscription.
-#[derive(Default)]
-pub(crate) struct TransientOutbound {
-    held: Option<RuntimeEvent>,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TransientKey {
+    Text {
+        operation_id: OperationId,
+        model_call_id: Option<ModelCallId>,
+    },
+    Reasoning {
+        operation_id: OperationId,
+        model_call_id: ModelCallId,
+    },
+    Usage {
+        operation_id: OperationId,
+        model_call_id: ModelCallId,
+    },
+    ToolProgress {
+        operation_id: OperationId,
+        tool_call_id: ToolCallId,
+    },
+    Availability,
+    Maintenance { id: MaintenanceId },
 }
 
-impl TransientOutbound {
-    /// Merges `event` into the hold. Returns a displaced previous value when
-    /// the identities do not merge, so the caller can send it without dropping.
-    pub(crate) fn publish(&mut self, event: RuntimeEvent) -> Option<RuntimeEvent> {
-        debug_assert!(is_mergeable(&event));
-        match self.held.take() {
-            Some(held) => {
-                if let Some(merged) = merge_events(held.clone(), event.clone()) {
-                    self.held = Some(merged);
-                    None
-                } else {
-                    self.held = Some(event);
-                    Some(held)
-                }
-            }
-            None => {
-                self.held = Some(event);
-                None
-            }
+
+fn transient_key(
+    event: &RuntimeEvent,
+    operation_id: Option<&OperationId>,
+    model_call_id: Option<&ModelCallId>,
+) -> Option<TransientKey> {
+    match event {
+        RuntimeEvent::Agent(AgentEvent::TextDelta { .. }) => {
+            Some(TransientKey::Text {
+                operation_id: operation_id.cloned()?,
+                model_call_id: model_call_id.cloned(),
+            })
+        }
+        RuntimeEvent::Agent(AgentEvent::ReasoningDelta { model_call_id, .. }) => {
+            Some(TransientKey::Reasoning {
+                operation_id: operation_id.cloned()?,
+                model_call_id: model_call_id.clone(),
+            })
+        }
+        RuntimeEvent::Agent(AgentEvent::ModelUsageUpdated { model_call_id, .. }) => {
+            Some(TransientKey::Usage {
+                operation_id: operation_id.cloned()?,
+                model_call_id: model_call_id.clone(),
+            })
+        }
+        RuntimeEvent::Agent(AgentEvent::ToolExecutionProgress { tool_call_id, .. }) => {
+            Some(TransientKey::ToolProgress {
+                operation_id: operation_id.cloned()?,
+                tool_call_id: tool_call_id.clone(),
+            })
+        }
+        RuntimeEvent::AvailabilityChanged { .. } => Some(TransientKey::Availability),
+        RuntimeEvent::MaintenanceProgress { id, .. } => Some(TransientKey::Maintenance { id: id.clone() }),
+        _ => None,
+    }
+}
+
+/// Keyed latest-wins store for service-facing transients. Never spills into
+/// reliable staging.
+pub(crate) struct TransientCoalescer {
+    cap: usize,
+    slots: HashMap<TransientKey, RuntimeEvent>,
+    order: VecDeque<TransientKey>,
+}
+
+impl TransientCoalescer {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            slots: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
-    pub(crate) fn take(&mut self) -> Option<RuntimeEvent> {
-        self.held.take()
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
     }
 
-    pub(crate) fn restore(&mut self, event: RuntimeEvent) {
-        let displaced = self.publish(event);
-        debug_assert!(displaced.is_none());
-        let _ = displaced;
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        event: RuntimeEvent,
+        operation_id: Option<&OperationId>,
+        model_call_id: Option<&ModelCallId>,
+    ) {
+        debug_assert!(is_mergeable(&event));
+        let Some(key) = transient_key(&event, operation_id, model_call_id) else {
+            return;
+        };
+        if let Some(held) = self.slots.get_mut(&key) {
+            *held = merge_events(held.clone(), event.clone()).unwrap_or(event);
+            return;
+        }
+        if self.slots.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.slots.remove(&oldest);
+            }
+        }
+        self.slots.insert(key.clone(), event);
+        self.order.push_back(key);
+    }
+
+    pub(crate) fn take_one(&mut self) -> Option<RuntimeEvent> {
+        let key = self.order.pop_front()?;
+        self.slots.remove(&key)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+        self.order.clear();
     }
 }
 
@@ -233,4 +319,81 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentAvailability, TokenUsage};
+
+    fn text(delta: &str) -> RuntimeEvent {
+        RuntimeEvent::Agent(AgentEvent::TextDelta {
+            delta: delta.to_owned(),
+        })
+    }
+
+    fn reasoning(id: &str, text: &str) -> RuntimeEvent {
+        RuntimeEvent::Agent(AgentEvent::ReasoningDelta {
+            model_call_id: ModelCallId::new(id),
+            text: text.to_owned(),
+        })
+    }
+
+    #[test]
+    fn same_key_merges_and_never_grows() {
+        let op = OperationId::new("op-1");
+        let mut coalescer = TransientCoalescer::new(4);
+        coalescer.publish(text("a"), Some(&op), None);
+        coalescer.publish(text("b"), Some(&op), None);
+        assert_eq!(coalescer.len(), 1);
+        let RuntimeEvent::Agent(AgentEvent::TextDelta { delta }) = coalescer.take_one().unwrap()
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(delta, "ab");
+        assert!(coalescer.is_empty());
+    }
+
+    #[test]
+    fn different_keys_do_not_displace_into_a_queue() {
+        let op = OperationId::new("op-1");
+        let mut coalescer = TransientCoalescer::new(4);
+        coalescer.publish(text("a"), Some(&op), None);
+        coalescer.publish(reasoning("call", "r"), Some(&op), None);
+        coalescer.publish(
+            RuntimeEvent::Agent(AgentEvent::ModelUsageUpdated {
+                model_call_id: ModelCallId::new("call"),
+                usage: TokenUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(2),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            }),
+            Some(&op),
+            None,
+        );
+        assert_eq!(coalescer.len(), 3);
+    }
+
+    #[test]
+    fn over_cap_evicts_oldest_transient() {
+        let op = OperationId::new("op-1");
+        let mut coalescer = TransientCoalescer::new(1);
+        coalescer.publish(text("keep-me-not"), Some(&op), None);
+        coalescer.publish(
+            RuntimeEvent::AvailabilityChanged {
+                availability: AgentAvailability::Idle,
+                queued: 0,
+            },
+            None,
+            None,
+        );
+        assert_eq!(coalescer.len(), 1);
+        assert!(matches!(
+            coalescer.take_one(),
+            Some(RuntimeEvent::AvailabilityChanged { .. })
+        ));
+    }
 }

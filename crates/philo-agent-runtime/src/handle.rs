@@ -3,10 +3,11 @@
 use std::time::Instant;
 
 use crate::coordinator::{ControlMessage, RuntimeCommand};
+use crate::shutdown::{ShutdownOutcome, ShutdownRequest, merge_shutdown};
 use crate::{
     AdmissionError, CancelResult, CompactionSpec, MaintenanceAccepted, MaintenanceError,
-    OperationAccepted, OperationId, OperationSpec, RuntimeSnapshot, ShutdownError, ShutdownMode,
-    ShutdownReport,
+    OperationAccepted, OperationId, OperationSpec, OutboundStats, RuntimeSnapshot, ShutdownError,
+    ShutdownMode, ShutdownReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -16,6 +17,8 @@ pub struct RuntimeHandle {
     pub(crate) command_tx: mpsc::Sender<RuntimeCommand>,
     pub(crate) control_tx: mpsc::Sender<ControlMessage>,
     pub(crate) snapshot_rx: watch::Receiver<RuntimeSnapshot>,
+    pub(crate) shutdown_tx: watch::Sender<Option<ShutdownRequest>>,
+    pub(crate) completion_rx: watch::Receiver<Option<ShutdownOutcome>>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -97,15 +100,48 @@ impl RuntimeHandle {
                 pending: vec!["runtime".into()],
             });
         }
-        let (reply, rx) = oneshot::channel();
-        if self
-            .control_tx
-            .try_send(ControlMessage::Shutdown { mode, reply })
-            .is_err()
-        {
+        if let Some(outcome) = self.completion_rx.borrow().clone() {
+            return outcome;
+        }
+        if self.shutdown_tx.receiver_count() == 0 {
             return Err(ShutdownError::RuntimeGone);
         }
-        rx.await.map_err(|_| ShutdownError::SupervisorPanicked)
+        self.shutdown_tx.send_modify(|slot| {
+            *slot = Some(merge_shutdown(
+                *slot,
+                ShutdownRequest { mode, deadline },
+            ));
+        });
+        let mut completion_rx = self.completion_rx.clone();
+        loop {
+            if let Some(outcome) = completion_rx.borrow().clone() {
+                return outcome;
+            }
+            tokio::select! {
+                changed = completion_rx.changed() => {
+                    if changed.is_err() {
+                        return match completion_rx.borrow().clone() {
+                            Some(outcome) => outcome,
+                            None => Err(ShutdownError::SupervisorPanicked),
+                        };
+                    }
+                }
+                _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => {
+                    return Err(ShutdownError::DeadlineExceeded {
+                        pending: vec!["runtime".into()],
+                    });
+                }
+            }
+        }
+    }
+
+    /// Test hook: occupy one control-mailbox slot without requesting shutdown.
+    #[doc(hidden)]
+    pub fn try_send_control_probe(&self) -> bool {
+        let (reply, _rx) = oneshot::channel();
+        self.control_tx
+            .try_send(ControlMessage::PublishOutboundStats { reply })
+            .is_ok()
     }
 
     /// Test hook: panic the coordinator actor on the next control turn.
@@ -130,5 +166,29 @@ impl RuntimeHandle {
         }
         rx.await
             .unwrap_or_else(|_| self.snapshot_rx.borrow().clone())
+    }
+
+    /// Test hook: occupancy of reliable staging and the transient coalescer.
+    #[doc(hidden)]
+    pub async fn outbound_stats(&self) -> OutboundStats {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .control_tx
+            .try_send(ControlMessage::PublishOutboundStats { reply })
+            .is_err()
+        {
+            return OutboundStats {
+                reliable_staging_len: 0,
+                reliable_staging_cap: 0,
+                transient_len: 0,
+                transient_cap: 0,
+            };
+        }
+        rx.await.unwrap_or(OutboundStats {
+            reliable_staging_len: 0,
+            reliable_staging_cap: 0,
+            transient_len: 0,
+            transient_cap: 0,
+        })
     }
 }

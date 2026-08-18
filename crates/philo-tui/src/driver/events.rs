@@ -117,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_wait_prefers_frontend_update_over_closed_input() {
         let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
-        let _ = client.try_command(philo_agent_service::FrontendCommand::ReadStatus);
+        let _dispatch = client.try_command(philo_agent_service::FrontendCommand::ReadStatus);
         let mut input = FakeInputSource::new([]);
         let mut tasks = PendingTasks::new();
         let rebuild = Instant::now() + Duration::from_secs(60);

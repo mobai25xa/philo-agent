@@ -1,5 +1,10 @@
 //! Semantic input actions consumed by the pure app state machine.
 
+use philo_agent_service::CommandReject;
+
+use super::attachment::PendingAttachment;
+use super::submit::{CancelDispatchResult, IntentId, SubmitDispatchResult};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     InsertChar(char),
@@ -49,5 +54,31 @@ pub(crate) enum Action {
     /// `Ctrl+V` reached the app: the terminal did not turn it into a
     /// bracketed paste, so the clipboard has to be read directly.
     Paste,
+    /// Media decode refused a pending submit intent.
+    SubmitMediaRefused {
+        intent_id: IntentId,
+        kept: Vec<PendingAttachment>,
+        errors: Vec<String>,
+    },
+    /// `try_command(Submit)` finished for a pending intent.
+    SubmitDispatchFinished {
+        intent_id: IntentId,
+        result: SubmitDispatchResult,
+    },
+    /// Service refused a dequeued submit that still has a local pending intent.
+    SubmitCommandRejected {
+        intent_id: IntentId,
+        reason: CommandReject,
+    },
+    /// Runtime admitted submit; commit local pending state.
+    SubmitAccepted {
+        intent_id: IntentId,
+        operation_id: String,
+    },
+    /// `try_command(Cancel*)` finished.
+    CancelDispatchFinished {
+        request_id: u64,
+        result: CancelDispatchResult,
+    },
     None,
 }

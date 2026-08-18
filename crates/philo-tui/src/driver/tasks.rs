@@ -48,9 +48,9 @@ impl Drop for PendingTask {
 
 struct MediaRequest {
     id: u64,
+    intent_id: u64,
     text: String,
     attachments: Vec<PendingAttachment>,
-    draft_generation: u64,
 }
 
 /// One task completion selected by the fair driver event pump.
@@ -66,14 +66,14 @@ pub(crate) enum TaskCompletion {
 #[derive(Debug)]
 pub(crate) enum MediaResult {
     Ready {
+        intent_id: u64,
         draft: String,
         attachments: Vec<FrontendAttachment>,
     },
     Refused {
-        text: String,
+        intent_id: u64,
         kept: Vec<PendingAttachment>,
         errors: Vec<String>,
-        draft_generation: u64,
     },
 }
 
@@ -99,17 +99,17 @@ impl PendingTasks {
 
     pub(crate) fn enqueue_media(
         &mut self,
+        intent_id: u64,
         text: String,
         attachments: Vec<PendingAttachment>,
-        draft_generation: u64,
     ) {
         let id = self.next_media_id;
         self.next_media_id = self.next_media_id.wrapping_add(1).max(1);
         self.media.push_back(MediaRequest {
             id,
+            intent_id,
             text,
             attachments,
-            draft_generation,
         });
         self.start_next_media();
     }
@@ -193,21 +193,21 @@ impl PendingTasks {
 
 fn run_media(request: MediaRequest) -> TaskCompletion {
     let MediaRequest {
+        intent_id,
         text,
         attachments,
-        draft_generation,
         ..
     } = request;
     let resolved = media::resolve(attachments);
     if !resolved.errors.is_empty() {
         return TaskCompletion::Media(MediaResult::Refused {
-            text,
+            intent_id,
             kept: resolved.kept,
             errors: resolved.errors,
-            draft_generation,
         });
     }
     TaskCompletion::Media(MediaResult::Ready {
+        intent_id,
         draft: text,
         attachments: resolved.attachments,
     })
@@ -245,31 +245,43 @@ mod tests {
         let effects = app.on_action(Action::Submit);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Append(_), Effect::Submit { .. }]
+            [Effect::PrepareSubmit { .. }]
+                | [Effect::Append(_), Effect::PrepareSubmit { .. }]
         ));
-        let submitted_generation = app.draft_generation();
+        let intent_id = app.submit_state().intent_id().expect("pending intent");
         app.on_action(Action::InsertChar('n'));
 
-        assert!(!app.restore_draft_if_current(submitted_generation, "a", Vec::new()));
+        let effects = app.on_action(Action::SubmitMediaRefused {
+            intent_id,
+            kept: Vec::new(),
+            errors: vec!["missing".to_owned()],
+        });
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::Append(_))));
         assert_eq!(app.input.text(), "n");
     }
 
     #[tokio::test]
     async fn media_queue_decodes_in_order() {
         let mut tasks = PendingTasks::new();
-        tasks.enqueue_media("first".to_owned(), Vec::new(), 1);
-        tasks.enqueue_media("second".to_owned(), Vec::new(), 2);
+        tasks.enqueue_media(1, "first".to_owned(), Vec::new());
+        tasks.enqueue_media(2, "second".to_owned(), Vec::new());
         let first = tasks.next_completion().await;
         let second = tasks.next_completion().await;
         match first {
-            TaskCompletion::Media(MediaResult::Ready { draft, .. }) => {
+            TaskCompletion::Media(MediaResult::Ready {
+                draft, intent_id, ..
+            }) => {
                 assert_eq!(draft, "first");
+                assert_eq!(intent_id, 1);
             }
             other => panic!("unexpected {other:?}"),
         }
         match second {
-            TaskCompletion::Media(MediaResult::Ready { draft, .. }) => {
+            TaskCompletion::Media(MediaResult::Ready {
+                draft, intent_id, ..
+            }) => {
                 assert_eq!(draft, "second");
+                assert_eq!(intent_id, 2);
             }
             other => panic!("unexpected {other:?}"),
         }

@@ -49,7 +49,12 @@ fn attachment_echo_snapshot() {
 
     let effects = submit(&mut app, "compare these two");
     rendered.extend(appended(&effects));
-    let Effect::Submit { text, attachments } = effects[1].clone() else {
+    let Effect::PrepareSubmit {
+        intent_id,
+        text,
+        attachments,
+    } = effects[0].clone()
+    else {
         panic!("the message carries its attachments");
     };
 
@@ -61,7 +66,13 @@ fn attachment_echo_snapshot() {
             .into_iter()
             .map(|line| line.text),
     );
-    app.restore_draft(&text, resolved.kept);
+    let _ = app.on_action(Action::SubmitMediaRefused {
+        intent_id,
+        kept: resolved.kept,
+        errors: resolved.errors,
+    });
+    // Commit path is not taken; after refuse the draft is restored.
+    assert_eq!(text, "compare these two");
     rendered.push(format!("[input] {}", app.input.text()));
     rendered.push(format!(
         "[hint row] {}",

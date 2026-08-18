@@ -29,6 +29,15 @@ fn run(app: &mut App, text: &str) -> Vec<Effect> {
     app.on_action(Action::Submit)
 }
 
+/// Completes a pending submit so another draft can be sent.
+fn accept_pending(app: &mut App) -> Vec<Effect> {
+    let intent_id = app.submit_state().intent_id().expect("pending intent");
+    app.on_action(Action::SubmitAccepted {
+        intent_id,
+        operation_id: format!("op-{intent_id}"),
+    })
+}
+
 /// The transcript lines of the first Append effect.
 fn appended(effects: &[Effect]) -> Vec<TranscriptLine> {
     effects
@@ -59,32 +68,118 @@ fn request(title: &str) -> (String, String) {
 }
 
 #[test]
-fn submit_echoes_the_message_and_requests_a_prompt() {
+fn submit_holds_pending_intent_without_transcript_commit() {
     let mut app = app();
     let effects = run(&mut app, "hello");
     assert_eq!(
         effects,
-        vec![
-            Effect::Append(vec![
-                TranscriptLine {
-                    kind: LineKind::User,
-                    text: String::new(),
-                },
-                TranscriptLine {
-                    kind: LineKind::User,
-                    text: "› hello".to_owned(),
-                },
-                TranscriptLine {
-                    kind: LineKind::User,
-                    text: String::new(),
-                },
-            ]),
-            Effect::Submit {
-                text: "hello".to_owned(),
-                attachments: Vec::new(),
-            },
-        ]
+        vec![Effect::PrepareSubmit {
+            intent_id: 1,
+            text: "hello".to_owned(),
+            attachments: Vec::new(),
+        },]
     );
+    assert!(app.input.is_empty());
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Dispatching(_)
+    ));
+
+    let committed = app.on_action(Action::SubmitAccepted {
+        intent_id: 1,
+        operation_id: "op-1".to_owned(),
+    });
+    assert_eq!(
+        texts(&appended(&committed)),
+        ["", "› hello", ""]
+    );
+}
+
+#[test]
+fn backpressured_submit_restores_draft_and_attachments() {
+    use crate::app::submit::SubmitDispatchResult;
+
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    type_text(&mut app, "keep me");
+    let effects = app.on_action(Action::Submit);
+    let Effect::PrepareSubmit {
+        intent_id,
+        attachments,
+        ..
+    } = &effects[0]
+    else {
+        panic!("expected PrepareSubmit");
+    };
+    assert_eq!(attachments.len(), 1);
+    let intent_id = *intent_id;
+
+    let restored = app.on_action(Action::SubmitDispatchFinished {
+        intent_id,
+        result: SubmitDispatchResult::Backpressured,
+    });
+    assert!(
+        texts(&appended(&restored))
+            .iter()
+            .any(|line| line.contains("服务繁忙，提交未发送"))
+    );
+    assert_eq!(app.input.text(), "keep me");
+    assert_eq!(app.attachments().len(), 1);
+    assert_eq!(app.attachments().labels(), vec!["shots/a.png".to_owned()]);
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Editing
+    ));
+}
+
+#[test]
+fn rejected_submit_restores_without_committing_transcript() {
+    use crate::app::submit::SubmitDispatchResult;
+    use philo_agent_service::CommandReject;
+
+    let mut app = app();
+    run(&mut app, "draft");
+    let intent_id = app.submit_state().intent_id().unwrap();
+    let _ = app.on_action(Action::SubmitDispatchFinished {
+        intent_id,
+        result: SubmitDispatchResult::Enqueued(philo_agent_service::FrontendRequestId::new(42)),
+    });
+    let effects = app.on_action(Action::SubmitCommandRejected {
+        intent_id,
+        reason: CommandReject::NoCurrentSession,
+    });
+    assert!(texts(&appended(&effects))
+        .iter()
+        .any(|line| line.contains("no current session")));
+    assert_eq!(app.input.text(), "draft");
+    assert!(
+        app.cells
+            .cells()
+            .iter()
+            .all(|line| line.kind != LineKind::User),
+        "rejected submit must not commit a user transcript block"
+    );
+}
+
+#[test]
+fn late_submit_accepted_after_new_draft_is_ignored() {
+    let mut app = app();
+    run(&mut app, "old");
+    let old_intent = app.submit_state().intent_id().unwrap();
+    let _ = app.on_action(Action::SubmitDispatchFinished {
+        intent_id: old_intent,
+        result: crate::app::submit::SubmitDispatchResult::Backpressured,
+    });
+    run(&mut app, "new");
+    let new_intent = app.submit_state().intent_id().unwrap();
+    assert_ne!(old_intent, new_intent);
+
+    let late = app.on_action(Action::SubmitAccepted {
+        intent_id: old_intent,
+        operation_id: "op-stale".to_owned(),
+    });
+    assert!(late.is_empty());
+    assert_eq!(app.submit_state().intent_id(), Some(new_intent));
     assert!(app.input.is_empty());
 }
 
@@ -103,7 +198,8 @@ fn busy_submit_notes_the_queueing() {
     assert!(lines.iter().any(|line| line.text.contains("queued")));
     assert_eq!(
         effects[1],
-        Effect::Submit {
+        Effect::PrepareSubmit {
+            intent_id: 1,
             text: "next".to_owned(),
             attachments: Vec::new(),
         }
@@ -230,8 +326,18 @@ fn a_clipboard_image_joins_the_queue_and_rides_the_next_message() {
     );
 
     let effects = run(&mut app, "what is this?");
+    let Effect::PrepareSubmit { attachments, .. } = &effects[0] else {
+        panic!("the message carries its attachments");
+    };
+    assert_eq!(attachments.len(), 2);
+    assert!(app.attachments().is_empty(), "the queue drains on send");
+
+    let committed = app.on_action(Action::SubmitAccepted {
+        intent_id: 1,
+        operation_id: "op-1".to_owned(),
+    });
     assert_eq!(
-        texts(&appended(&effects)),
+        texts(&appended(&committed)),
         [
             "",
             "› what is this?",
@@ -240,11 +346,6 @@ fn a_clipboard_image_joins_the_queue_and_rides_the_next_message() {
             "",
         ]
     );
-    let Effect::Submit { attachments, .. } = &effects[1] else {
-        panic!("the message carries its attachments");
-    };
-    assert_eq!(attachments.len(), 2);
-    assert!(app.attachments().is_empty(), "the queue drains on send");
 }
 
 #[test]
@@ -252,13 +353,22 @@ fn a_refused_message_returns_to_the_input_with_its_survivors() {
     let mut app = app();
     run(&mut app, "/image missing.png");
     let effects = run(&mut app, "look");
-    let Effect::Submit { text, attachments } = effects[1].clone() else {
+    let Effect::PrepareSubmit {
+        intent_id,
+        text,
+        attachments,
+    } = effects[0].clone()
+    else {
         panic!("submit carries the draft");
     };
+    assert_eq!(text, "look");
     // The driver could not read one of them and hands back the rest.
-    app.restore_draft(&text, attachments[1..].to_vec());
+    let _ = app.on_action(Action::SubmitMediaRefused {
+        intent_id,
+        kept: attachments[1..].to_vec(),
+        errors: vec!["missing.png: not found".to_owned()],
+    });
     assert_eq!(app.input.text(), "look");
-    assert!(app.attachments().is_empty());
 }
 
 #[test]
@@ -580,7 +690,9 @@ fn ctrl_d_quits_only_on_empty_input() {
 fn input_history_recalls_previous_submissions() {
     let mut app = app();
     run(&mut app, "first");
+    accept_pending(&mut app);
     run(&mut app, "second");
+    accept_pending(&mut app);
 
     type_text(&mut app, "dra");
     app.on_action(Action::MoveUp);
@@ -597,6 +709,7 @@ fn input_history_recalls_previous_submissions() {
 fn multiline_draft_moves_within_lines_before_history() {
     let mut app = app();
     run(&mut app, "top");
+    accept_pending(&mut app);
     type_text(&mut app, "a");
     app.on_action(Action::InsertNewline);
     type_text(&mut app, "b");
@@ -713,7 +826,8 @@ fn concatenated_appends(effects: &[Effect]) -> Vec<TranscriptLine> {
 #[test]
 fn submit_ingests_append_payloads_into_cells() {
     let mut app = app();
-    let effects = run(&mut app, "hello");
+    run(&mut app, "hello");
+    let effects = accept_pending(&mut app);
     let expected = concatenated_appends(&effects);
     assert_eq!(
         expected,
@@ -800,6 +914,7 @@ fn page_up_unfollows_after_layout_is_noted() {
 fn redraw_returns_hard_redraw_and_does_not_clear_cells() {
     let mut app = app();
     run(&mut app, "hello");
+    accept_pending(&mut app);
     let before = app.cells.cells().to_vec();
     assert!(!before.is_empty());
     let effects = app.on_action(Action::Redraw);

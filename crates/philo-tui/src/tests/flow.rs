@@ -138,11 +138,31 @@ fn frontend_complete_interaction_snapshot() {
             collect(lines, &mut output);
         }
     }
+    if let Some(intent_id) = app.submit_state().intent_id() {
+        for effect in app.on_action(Action::SubmitAccepted {
+            intent_id,
+            operation_id: "op-1".to_owned(),
+        }) {
+            if let Effect::Append(lines) = effect {
+                collect(lines, &mut output);
+            }
+        }
+    }
     app.set_busy(true, 0);
     type_text(&mut app, "queued follow-up");
     for effect in app.on_action(Action::Submit) {
         if let Effect::Append(lines) = effect {
             collect(lines, &mut output);
+        }
+    }
+    if let Some(intent_id) = app.submit_state().intent_id() {
+        for effect in app.on_action(Action::SubmitAccepted {
+            intent_id,
+            operation_id: "op-2".to_owned(),
+        }) {
+            if let Effect::Append(lines) = effect {
+                collect(lines, &mut output);
+            }
         }
     }
 

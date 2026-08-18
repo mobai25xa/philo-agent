@@ -98,9 +98,11 @@ impl App {
     /// Applies one frontend update to the presentation projection.
     pub fn apply_update(&mut self, update: &FrontendUpdate) -> Vec<Effect> {
         match &update.kind {
-            Kind::CommandAccepted
-            | Kind::SubmitAccepted { .. }
-            | Kind::CompactionAccepted { .. } => Vec::new(),
+            Kind::CommandAccepted | Kind::CompactionAccepted { .. } => Vec::new(),
+            Kind::SubmitAccepted { .. } => {
+                // Commit path is driven by the driver with intent correlation.
+                Vec::new()
+            }
             Kind::CommandRejected { reason } => self.apply_command_rejected(reason),
             Kind::OperationAccepted { .. } => Vec::new(),
             Kind::OperationEvent(event) => self.on_operation_event(event),

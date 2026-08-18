@@ -22,6 +22,7 @@ use super::input::{InputEditor, InputHistory};
 use super::overlay::{ConfirmPrompt, OverlayFrame, SessionPicker};
 use super::select::{BandLayout, Selection};
 use super::status::StatusData;
+use super::submit::SubmitState;
 use super::transcript::{InfoLevel, LineKind, Transcript, TranscriptLine};
 
 use commands::CompletionMenu;
@@ -51,6 +52,10 @@ pub(crate) struct App {
     /// Changes whenever draft contents are consumed or edited. Background
     /// media failures may restore only the exact draft generation they left.
     draft_generation: u64,
+    /// Next submit intent id (monotonic).
+    next_intent_id: crate::app::submit::IntentId,
+    /// Local submit commit protocol (pending until `SubmitAccepted`).
+    submit_state: SubmitState,
     /// `[ui].show_reasoning`, carried across session switches.
     show_reasoning: bool,
     /// How the next `SessionLoaded` should be presented.
@@ -90,6 +95,8 @@ impl App {
             completion: None,
             attachments: Attachments::default(),
             draft_generation: 0,
+            next_intent_id: 1,
+            submit_state: SubmitState::Editing,
             show_reasoning,
             session_load_intent: None,
             expect_config_listing: false,
@@ -308,8 +315,32 @@ impl App {
             Action::SelectEnd { x, y } => self.select_end(x, y),
             Action::Complete => self.complete(),
             Action::Paste => vec![Effect::ReadClipboard],
+            Action::SubmitMediaRefused {
+                intent_id,
+                kept,
+                errors,
+            } => self.on_submit_media_refused(intent_id, kept, errors),
+            Action::SubmitDispatchFinished { intent_id, result } => {
+                self.on_submit_dispatch_finished(intent_id, result)
+            }
+            Action::SubmitCommandRejected { intent_id, reason } => {
+                self.on_submit_command_rejected(intent_id, reason)
+            }
+            Action::SubmitAccepted {
+                intent_id,
+                operation_id,
+            } => self.on_submit_accepted(intent_id, operation_id),
+            Action::CancelDispatchFinished { .. } => {
+                // Interrupt FSM lives in the driver; reducer only shows copy
+                // when the driver feeds Append effects alongside this action.
+                vec![]
+            }
             Action::None => vec![],
         }
+    }
+
+    pub(crate) fn submit_state(&self) -> &SubmitState {
+        &self.submit_state
     }
 
     fn has_activity(&self) -> bool {

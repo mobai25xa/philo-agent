@@ -1,4 +1,4 @@
-//! Wave 2F SnapshotFence: settlement/view races, supersession, revision retry, resync.
+//! Session-scoped snapshot fence: settlement floors, load tokens, supersession, resync.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -601,6 +601,15 @@ async fn confirmed_settlement_retries_until_required_revision() {
     let store = ScriptedStore::new(inner);
     let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store.clone());
     load_session(&client, "sess-rev").await;
+    runtime.emit_operation_accepted(
+        OperationId::new("op-live"),
+        philo_agent_runtime::SessionId::new("sess-rev"),
+        philo_agent_runtime::TurnId::new("turn-live"),
+    );
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+    })
+    .await;
     emit_settled(
         &runtime,
         "op-live",
@@ -906,4 +915,443 @@ async fn queued_summary_uses_accepted_session() {
     })
     .await
     .expect("queued accepted-session test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn switch_back_rejects_stale_load_and_reloads() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let inner = Arc::new(MemorySessionStore::new());
+        seed_session(&inner, "sess-a").await;
+        seed_session(&inner, "sess-b").await;
+        let mid = commit_turn(
+            inner.as_ref(),
+            "sess-a",
+            SessionRevision::new(1),
+            "op-a",
+            "turn-a",
+            "ask-a",
+            "answer-a",
+        )
+        .await;
+        let stale_a = inner
+            .context_view(&SessionId::new("sess-a"))
+            .await
+            .unwrap();
+        let final_a = commit_turn(
+            inner.as_ref(),
+            "sess-a",
+            mid.revision(),
+            "op-a-final",
+            "turn-a-final",
+            "ask-a-2",
+            "answer-a-final",
+        )
+        .await;
+        let store = ScriptedStore::new(inner);
+        let (service, client, runtime) =
+            start_test_service_with(FakeAssembler::new(), store.clone());
+        load_session(&client, "sess-b").await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-a"),
+            philo_agent_runtime::SessionId::new("sess-a"),
+            philo_agent_runtime::TurnId::new("turn-a"),
+        );
+        emit_settled(&runtime, "op-a", "sess-a", final_a.revision().get());
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+
+        store.prepend(stale_a);
+        assert!(matches!(
+            client.try_command(FrontendCommand::LoadSession {
+                session_id: "sess-a".into(),
+            }),
+            CommandDispatch::Enqueued(_)
+        ));
+        let loaded = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+        })
+        .await;
+        let FrontendUpdateKind::SessionLoaded { session_id, view } = loaded.kind else {
+            unreachable!();
+        };
+        assert_eq!(session_id, "sess-a");
+        assert!(view.revision >= final_a.revision().get());
+        assert!(assistant_texts(&view).contains(&"answer-a-final"));
+        drop(service);
+    })
+    .await
+    .expect("switch-back stale load test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_load_of_a_does_not_publish_onto_b() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let inner = Arc::new(MemorySessionStore::new());
+        seed_session(&inner, "sess-a").await;
+        seed_session(&inner, "sess-b").await;
+        let (store, hold) = AfterReadStore::gate_after(inner, 1);
+        let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
+        assert!(matches!(
+            client.try_command(FrontendCommand::LoadSession {
+                session_id: "sess-a".into(),
+            }),
+            CommandDispatch::Enqueued(_)
+        ));
+        hold.wait_held().await;
+        assert!(matches!(
+            client.try_command(FrontendCommand::LoadSession {
+                session_id: "sess-b".into(),
+            }),
+            CommandDispatch::Enqueued(_)
+        ));
+        recv_matching(&client, |update| match &update.kind {
+            FrontendUpdateKind::SessionLoaded { session_id, .. } => session_id == "sess-b",
+            _ => false,
+        })
+        .await;
+
+        hold.release();
+        let late_deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < late_deadline {
+            match client
+                .recv_until_async(Instant::now() + Duration::from_millis(50))
+                .await
+            {
+                RecvOutcome::Update(update) => {
+                    if let FrontendUpdateKind::SessionLoaded { session_id, .. } = update.kind {
+                        assert_ne!(session_id, "sess-a", "late load of A must not publish onto B");
+                    }
+                }
+                RecvOutcome::Timeout => break,
+                RecvOutcome::Disconnected => panic!("disconnected"),
+            }
+        }
+        drop(service);
+    })
+    .await
+    .expect("late load A onto B test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn floor_is_monotonic_across_settlements() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let inner = Arc::new(MemorySessionStore::new());
+        seed_session(&inner, "sess-mono").await;
+        let first = commit_turn(
+            inner.as_ref(),
+            "sess-mono",
+            SessionRevision::new(1),
+            "op-1",
+            "turn-1",
+            "ask-1",
+            "answer-1",
+        )
+        .await;
+        let mid_view = inner
+            .context_view(&SessionId::new("sess-mono"))
+            .await
+            .unwrap();
+        let second = commit_turn(
+            inner.as_ref(),
+            "sess-mono",
+            first.revision(),
+            "op-2",
+            "turn-2",
+            "ask-2",
+            "answer-2",
+        )
+        .await;
+        let store = ScriptedStore::new(inner);
+        let (service, client, runtime) =
+            start_test_service_with(FakeAssembler::new(), store.clone());
+        load_session(&client, "sess-mono").await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-1"),
+            philo_agent_runtime::SessionId::new("sess-mono"),
+            philo_agent_runtime::TurnId::new("turn-1"),
+        );
+        emit_settled(&runtime, "op-1", "sess-mono", first.revision().get());
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-2"),
+            philo_agent_runtime::SessionId::new("sess-mono"),
+            philo_agent_runtime::TurnId::new("turn-2"),
+        );
+        emit_settled(&runtime, "op-2", "sess-mono", second.revision().get());
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+
+        store.prepend(mid_view);
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        let durable = snapshot.durable_session_view.expect("mono snapshot");
+        assert!(durable.revision >= second.revision().get());
+        assert!(assistant_texts(&durable).contains(&"answer-2"));
+        drop(service);
+    })
+    .await
+    .expect("monotonic floor test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settled_session_mismatch_is_protocol_error() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let store = MemorySessionStore::new();
+        seed_session(&store, "sess-a").await;
+        seed_session(&store, "sess-b").await;
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
+        load_session(&client, "sess-a").await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-a"),
+            philo_agent_runtime::SessionId::new("sess-a"),
+            philo_agent_runtime::TurnId::new("turn-a"),
+        );
+        recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+        })
+        .await;
+        runtime.emit_operation_settled(
+            OperationId::new("op-a"),
+            philo_agent_runtime::SessionId::new("sess-b"),
+            OperationStatus::Succeeded,
+            SettlementDurability::Confirmed,
+            philo_agent_runtime::SettlementRevision::Committed(SessionRevision::new(7)),
+        );
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert!(
+            snapshot
+                .config_notices
+                .iter()
+                .any(|notice| notice.contains("protocol error")),
+            "mismatch must be visible: {:?}",
+            snapshot.config_notices
+        );
+        assert_eq!(
+            snapshot.durable_session_view.as_ref().unwrap().revision,
+            1,
+            "A floor must not rise from a B settlement"
+        );
+
+        load_session(&client, "sess-b").await;
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert_eq!(
+            snapshot.durable_session_view.as_ref().unwrap().revision,
+            1,
+            "B floor must not rise from a mismatched settlement"
+        );
+        drop(service);
+    })
+    .await
+    .expect("mismatch protocol-error test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settled_without_accepted_is_protocol_error() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let store = MemorySessionStore::new();
+        seed_session(&store, "sess-a").await;
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
+        load_session(&client, "sess-a").await;
+        emit_settled(&runtime, "op-ghost", "sess-a", 9);
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert!(
+            snapshot
+                .config_notices
+                .iter()
+                .any(|notice| notice.contains("protocol error")),
+            "missing ownership must be visible: {:?}",
+            snapshot.config_notices
+        );
+        assert_eq!(
+            snapshot.durable_session_view.as_ref().unwrap().revision,
+            1,
+            "floor must stay 0 so the seeded revision can publish"
+        );
+        drop(service);
+    })
+    .await
+    .expect("missing-ownership protocol-error test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unchanged_settlement_does_not_raise_floor() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let inner = Arc::new(MemorySessionStore::new());
+        seed_session(&inner, "sess-u").await;
+        let stale = inner
+            .context_view(&SessionId::new("sess-u"))
+            .await
+            .unwrap();
+        let store = ScriptedStore::new(inner);
+        let (service, client, runtime) =
+            start_test_service_with(FakeAssembler::new(), store.clone());
+        load_session(&client, "sess-u").await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-u"),
+            philo_agent_runtime::SessionId::new("sess-u"),
+            philo_agent_runtime::TurnId::new("turn-u"),
+        );
+        runtime.emit_operation_settled(
+            OperationId::new("op-u"),
+            philo_agent_runtime::SessionId::new("sess-u"),
+            OperationStatus::Cancelled,
+            SettlementDurability::Confirmed,
+            philo_agent_runtime::SettlementRevision::Unchanged,
+        );
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled { .. }
+                )
+            )
+        })
+        .await;
+
+        store.prepend(stale);
+        let _ = accept_snapshot(&client);
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert_eq!(
+            snapshot.durable_session_view.as_ref().unwrap().revision,
+            1,
+            "Unchanged must not force a higher store revision"
+        );
+        drop(service);
+    })
+    .await
+    .expect("unchanged settlement test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_revision_is_not_session_floor() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let store = MemorySessionStore::new();
+        seed_session(&store, "sess-rt").await;
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
+        load_session(&client, "sess-rt").await;
+        runtime.set_snapshot(RuntimeSnapshot {
+            epoch: RuntimeEpoch::new("epoch-1"),
+            availability: AgentAvailability::Idle,
+            queued: Vec::new(),
+            active: None,
+            maintenance: None,
+            shutdown: ShutdownState::Running,
+            last_settled: Vec::new(),
+            runtime_revision: 99,
+        });
+        runtime.emit(RuntimeEvent::SubscriptionLagged { dropped: 1 });
+        let update = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        let durable = snapshot.durable_session_view.expect("session snapshot");
+        assert_eq!(durable.session_id, "sess-rt");
+        assert_eq!(
+            durable.revision, 1,
+            "runtime_revision must not become the session floor"
+        );
+        drop(service);
+    })
+    .await
+    .expect("runtime revision floor test timed out");
+}
+
+#[test]
+fn frontend_submit_has_no_session_id() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/frontend/command.rs"
+    ));
+    let start = source
+        .find("    Submit {")
+        .expect("FrontendCommand::Submit");
+    let rest = &source[start..];
+    let end = rest.find("    CancelOperation").expect("next variant");
+    let submit = &rest[..end];
+    assert!(
+        !submit.contains("session_id"),
+        "frontend Submit must not carry session_id:\n{submit}"
+    );
+    assert!(
+        !source.contains("service_state_revision"),
+        "service_state_revision must stay deleted"
+    );
 }

@@ -46,7 +46,8 @@ where
         }
         match result {
             Ok(durable) => {
-                let session_ids = compose_session_catalog(durable, self.current_session.as_deref());
+                let session_ids =
+                    compose_session_catalog(durable, self.snapshot.current_session.as_deref());
                 self.emit(
                     Some(request_id),
                     FrontendUpdateKind::SessionListLoaded { session_ids },
@@ -76,8 +77,7 @@ where
             self.reject_child_capacity(request_id);
             return;
         }
-        self.current_session = Some(session_id.clone());
-        self.spawn_view(request_id, super::ViewKind::Load, session_id);
+        self.start_session_load(request_id, session_id);
     }
 
     pub(super) fn handle_create_session(&mut self, request_id: FrontendRequestId) {
@@ -91,8 +91,7 @@ where
         }
         self.session_seq += 1;
         let session_id = format!("sess-service-{}", self.session_seq);
-        self.current_session = Some(session_id.clone());
-        self.spawn_view(request_id, super::ViewKind::Load, session_id);
+        self.start_session_load(request_id, session_id);
     }
 }
 

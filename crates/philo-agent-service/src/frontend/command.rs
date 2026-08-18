@@ -175,12 +175,17 @@ mod tests {
             }
             .is_snapshot()
         );
-        assert!(
-            !FrontendCommand::Submit {
-                draft: "hi".into(),
-                attachments: Vec::new(),
-            }
-            .is_control()
-        );
+        let submit = FrontendCommand::Submit {
+            draft: "hi".into(),
+            attachments: Vec::new(),
+        };
+        assert!(!submit.is_control());
+        let FrontendCommand::Submit {
+            draft: _,
+            attachments: _,
+        } = submit
+        else {
+            panic!("Submit must stay a two-field command without session_id");
+        };
     }
 }

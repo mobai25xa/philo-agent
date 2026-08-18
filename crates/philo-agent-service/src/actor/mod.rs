@@ -4,9 +4,8 @@ mod catalog;
 mod commands;
 mod snapshot;
 
-use snapshot::SnapshotFence;
+use snapshot::{SnapshotLoadToken, SnapshotState};
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,8 +50,8 @@ pub(crate) enum ServiceShutdownState {
 }
 
 pub(crate) enum ViewKind {
-    Snapshot(SnapshotFence),
-    Load,
+    Snapshot(SnapshotLoadToken),
+    Load(SnapshotLoadToken),
     Preview { request_generation: u64 },
 }
 
@@ -113,16 +112,14 @@ pub(crate) struct AgentServiceActor<R, S> {
     feed: FrontendFeed,
     epoch: FrontendEpoch,
     revision: FrontendRevision,
-    current_session: Option<String>,
+    snapshot: SnapshotState,
     attached: Option<FrontendInstanceId>,
     health: ServiceHealth,
     notices: Vec<String>,
     latest_snapshot: Option<FrontendRequestId>,
     latest_preview: Option<(FrontendRequestId, u64)>,
-    snapshot_token: u64,
+    /// Runtime snapshot cursor. Never used as a JSONL session floor.
     applied_runtime_revision: u64,
-    required_session_revision: HashMap<String, u64>,
-    operation_session: HashMap<String, String>,
     runtime_snapshot_inflight: bool,
     session_seq: u64,
     runtime_closed: bool,
@@ -158,16 +155,13 @@ where
             feed,
             epoch: FrontendEpoch::INITIAL,
             revision: FrontendRevision::ZERO,
-            current_session: None,
+            snapshot: SnapshotState::new(),
             attached: None,
             health: ServiceHealth::Ok,
             notices: Vec::new(),
             latest_snapshot: None,
             latest_preview: None,
-            snapshot_token: 0,
             applied_runtime_revision: 0,
-            required_session_revision: HashMap::new(),
-            operation_session: HashMap::new(),
             runtime_snapshot_inflight: false,
             session_seq: 0,
             runtime_closed: false,
@@ -561,8 +555,8 @@ where
                 session_id,
                 turn_id,
             } => {
-                self.operation_session
-                    .insert(operation_id.to_string(), session_id.to_string());
+                self.snapshot
+                    .note_accepted(operation_id.to_string(), session_id.to_string());
                 self.live.accept(operation_id.as_str(), turn_id.as_str());
                 self.emit(
                     None,
@@ -697,9 +691,9 @@ where
                     self.live.mark_lagged();
                 }
                 let session_id = self
-                    .operation_session
-                    .get(operation_id.as_str())
-                    .cloned()
+                    .snapshot
+                    .session_of(operation_id.as_str())
+                    .map(str::to_owned)
                     .unwrap_or_else(|| {
                         self.notice(format!(
                             "queued operation {} has no accepted session",
@@ -772,15 +766,7 @@ where
         if self.queued.is_empty() {
             self.availability = FrontendAvailability::Idle;
         }
-        if let Some(owned) = self.operation_session.get(operation_id)
-            && owned != session_id
-        {
-            self.notice(format!(
-                "settlement session {session_id} does not match accepted session {owned}"
-            ));
-        }
-        self.on_operation_settled(session_id, durability, session_revision);
-        self.operation_session.remove(operation_id);
+        self.apply_operation_settled(operation_id, session_id, durability, session_revision);
         self.emit(
             None,
             FrontendUpdateKind::OperationEvent(
@@ -798,7 +784,7 @@ where
     fn on_epoch_ended(&mut self, _runtime_epoch: &RuntimeEpoch, forced_count: usize) {
         self.epoch.bump();
         self.runtime_closed = true;
-        self.snapshot_token = self.snapshot_token.saturating_add(1);
+        self.snapshot.on_epoch_reset();
         self.live.clear();
         self.queued.clear();
         self.maintenance = None;

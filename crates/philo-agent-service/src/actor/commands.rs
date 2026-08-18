@@ -32,7 +32,7 @@ where
             self.reject_child_capacity(request_id);
             return;
         }
-        let Some(session_id) = self.current_session.clone() else {
+        let Some(session_id) = self.snapshot.current_session.clone() else {
             self.emit(
                 Some(request_id),
                 FrontendUpdateKind::CommandRejected {

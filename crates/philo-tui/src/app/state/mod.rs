@@ -335,6 +335,9 @@ impl App {
                 // when the driver feeds Append effects alongside this action.
                 vec![]
             }
+            Action::CompactionCancelDispatchFinished { result } => {
+                self.on_compaction_cancel_dispatch_finished(result)
+            }
             Action::None => vec![],
         }
     }

@@ -1,8 +1,9 @@
 //! Read-only durable session fixtures.
 
 use philo_agent_service::{
-    DurableSessionView, FrontendAssistantBlock, FrontendContextMessage, FrontendToolResultOutcome,
-    FrontendUserPart,
+    DurableSessionView, FrontendAssistantBlock, FrontendAvailability, FrontendContextMessage,
+    FrontendEpoch, FrontendGeneration, FrontendRevision, FrontendSnapshot,
+    FrontendToolResultOutcome, FrontendUserPart, LiveOperationSnapshot, ServiceHealth,
 };
 
 pub(crate) fn session_view(id: &str) -> DurableSessionView {
@@ -67,4 +68,40 @@ pub(crate) fn empty_session_view(id: &str) -> DurableSessionView {
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
     }
+}
+
+fn test_generation() -> FrontendGeneration {
+    FrontendGeneration {
+        generation_id: "g-1".to_owned(),
+        model_name: "m".to_owned(),
+        reasoning_effort: None,
+        tool_names: Vec::new(),
+    }
+}
+
+pub(crate) fn idle_snapshot(session_id: &str) -> FrontendSnapshot {
+    FrontendSnapshot {
+        epoch: FrontendEpoch::INITIAL,
+        revision: FrontendRevision::new(1),
+        current_session_id: Some(session_id.to_owned()),
+        durable_session_view: Some(empty_session_view(session_id)),
+        live: LiveOperationSnapshot::default(),
+        queued: Vec::new(),
+        maintenance: None,
+        availability: FrontendAvailability::Idle,
+        generation: test_generation(),
+        usage: None,
+        pending_confirmations: Vec::new(),
+        config_notices: Vec::new(),
+        health: ServiceHealth::Ok,
+    }
+}
+
+pub(crate) fn busy_snapshot(session_id: &str, operation_id: &str) -> FrontendSnapshot {
+    let mut snapshot = idle_snapshot(session_id);
+    snapshot.availability = FrontendAvailability::Busy {
+        operation_id: operation_id.to_owned(),
+    };
+    snapshot.live.operation_id = Some(operation_id.to_owned());
+    snapshot
 }

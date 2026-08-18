@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
-    AdmissionError, ChannelBounds, GenerationConfig, RuntimeConfig, RuntimeEvent,
-    SequentialIdSource, ShutdownError, ShutdownMode, ShutdownState,
+    AdmissionError, ChannelBounds, GenerationConfig, OperationPhase, OperationStatus,
+    RuntimeConfig, RuntimeEvent, SequentialIdSource, SettlementRevision, ShutdownError,
+    ShutdownMode, ShutdownState,
 };
 use philo_session::MemorySessionStore;
 use support::fake_model::{FakeModel, ModelScript};
@@ -448,6 +449,155 @@ async fn driver_join_keeps_reserve_and_stages_settlement() {
     })
     .await
     .expect("driver-join reserve test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_staging_deadline_keeps_driver_committed_settlement() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let model = Arc::new(FakeModel::succeeds(&["hello"]));
+        let sessions = Arc::new(MemorySessionStore::new());
+        let (handle, sub) = start_with_bounds(
+            sessions,
+            Arc::new(SequentialIdSource::new()),
+            ChannelBounds {
+                command_cap: 4,
+                control_cap: 8,
+                event_cap: 2,
+                queue_max: 4,
+                driver_event_budget: 8,
+                reliable_staging_cap: 4,
+            },
+        )
+        .await;
+        let probe = EventProbe::start_paused(sub);
+        let accepted = submit_prompt(
+            &handle,
+            generation(model, empty_tools(), config()),
+            "session",
+            "hi",
+        )
+        .await;
+
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot().await;
+            let stats = handle.outbound_stats().await;
+            let not_yet_recorded = snapshot
+                .last_settled
+                .iter()
+                .all(|settled| settled.operation_id != accepted.operation_id);
+            let staging_full_for_producer =
+                stats.reliable_staging_len + 1 >= stats.reliable_staging_cap;
+            let driver_settled = snapshot.active.as_ref().is_some_and(|active| {
+                matches!(
+                    active.phase,
+                    OperationPhase::Settled(OperationStatus::Succeeded)
+                )
+            });
+            if not_yet_recorded && staging_full_for_producer && driver_settled {
+                break;
+            }
+            if !not_yet_recorded {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < wait_deadline,
+                "timed out waiting for staging pressure with a driver settlement still unpublished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let shutdown = handle.shutdown(
+            ShutdownMode::Forced,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let resume = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            probe.resume();
+        };
+        let (result, _) = tokio::join!(shutdown, resume);
+        let report = result.expect("shutdown must complete");
+        assert!(
+            report.settlements.is_empty(),
+            "Committed driver settlement must not become leftover Forced Failed: {report:?}"
+        );
+
+        let events = probe
+            .wait_for(
+                |events| {
+                    events
+                        .iter()
+                        .any(|event| matches!(event, RuntimeEvent::EpochEnded { .. }))
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        let settled: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::OperationSettled { operation_id, .. }
+                        if *operation_id == accepted.operation_id
+                )
+            })
+            .collect();
+        assert_eq!(
+            settled.len(),
+            1,
+            "public stream must carry exactly one Committed settlement: {events:?}"
+        );
+        match settled[0] {
+            RuntimeEvent::OperationSettled {
+                status: OperationStatus::Succeeded,
+                session_revision: SettlementRevision::Committed(_),
+                ..
+            } => {}
+            other => panic!("expected Committed success, got {other:?}"),
+        }
+        let forced_count = events.iter().find_map(|event| match event {
+            RuntimeEvent::EpochEnded { forced_count, .. } => Some(*forced_count),
+            _ => None,
+        });
+        assert_eq!(forced_count, Some(0));
+    })
+    .await
+    .expect("full-staging committed settlement test timed out");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_returns_existing_completion_when_deadline_already_expired() {
+    let model = Arc::new(FakeModel::succeeds(&["hello"]));
+    let sessions = Arc::new(MemorySessionStore::new());
+    let (handle, _sub) = start_with_bounds(
+        sessions,
+        Arc::new(SequentialIdSource::new()),
+        control_cap_bounds(8),
+    )
+    .await;
+    submit_prompt(
+        &handle,
+        generation(model, empty_tools(), config()),
+        "session",
+        "hi",
+    )
+    .await;
+    wait_until_idle(&handle).await;
+    let first = handle
+        .shutdown(ShutdownMode::Drain, Instant::now() + Duration::from_secs(2))
+        .await
+        .expect("first shutdown");
+    assert_eq!(first.final_state, ShutdownState::Stopped);
+    let second = handle
+        .shutdown(
+            ShutdownMode::Forced,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .expect("already-stopped shutdown must ignore an expired deadline");
+    assert_eq!(first.epoch, second.epoch);
+    assert_eq!(second.final_state, ShutdownState::Stopped);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -608,9 +608,10 @@ async fn mixed_text_and_tool_call_continues_the_tool_loop() {
     assert_eq!(tools.invocation_count(), 1);
     let events = collect_events(&handle).await;
     assert!(
-        events.iter().any(
-            |event| matches!(event, AgentEvent::TextDelta { delta } if delta == "calling echo")
-        )
+        events.iter().any(|event| {
+            matches!(event, AgentEvent::TextDelta { delta } if delta.contains("calling echo"))
+        }),
+        "mixed-turn text must remain visible after sealed-stream merge: {events:?}"
     );
     assert!(
         events

@@ -19,8 +19,8 @@ use philo_agent_runtime::{
     RuntimeConfig, RuntimeDeps, RuntimeGeneration, ToolPort,
 };
 use philo_agent_service::{
-    AssembleError, AssembleRequest, AssembledGeneration, FrontendClient, FrontendCommand,
-    FrontendReasoningEffort, GenerationAssembler, ServiceDeps,
+    AssembleError, AssembleRequest, AssembledGeneration, CommandDispatch, FrontendClient,
+    FrontendCommand, FrontendReasoningEffort, GenerationAssembler, ServiceDeps,
 };
 use philo_coding_profile::CodingProfile;
 use philo_model::{AdapterBuildError, FileModelReplayStore, ModelReplayStore, PhiloModelAdapter};
@@ -35,6 +35,8 @@ use crate::ids::ProcessIdSource;
 
 /// Default process-level grace used by interactive and oneshot drain.
 pub(crate) const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Attach/detach handshake deadline owned by the interactive supervisor.
+pub(crate) const FRONTEND_REGISTRATION_GRACE: Duration = Duration::from_secs(5);
 
 /// Components that missed the process shutdown deadline.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -298,6 +300,18 @@ impl CliGenerationAssembler {
         *self.state.reload_fault.lock().expect("reload fault lock") = Some(message.into());
     }
 
+    fn note_reload_dispatch_failure(&self, reason: &str) {
+        let mut fault = self.state.reload_fault.lock().expect("reload fault lock");
+        if fault.is_none() {
+            *fault = Some(format!("config not applied: {reason}"));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_reload_fault(&self) -> Option<String> {
+        self.state.take_reload_fault()
+    }
+
     fn assemble_sync(
         &self,
         request: AssembleRequest,
@@ -389,7 +403,9 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
 
 /// Graceful service + store shutdown with a process-wide deadline.
 ///
-/// `interrupt` stays live so a later Ctrl+C can shorten `deadline` to now.
+/// Shutdown is sent on the supervisor lane, never the ordinary control mailbox.
+/// `interrupt` stays live so a later Ctrl+C upgrades Drain to Forced and
+/// shortens `deadline` to now.
 pub(crate) async fn shutdown_with_deadline(
     bootstrap: Bootstrap,
     interrupt: &mut watch::Receiver<u64>,
@@ -397,7 +413,6 @@ pub(crate) async fn shutdown_with_deadline(
 ) -> ProcessShutdownReport {
     let Bootstrap {
         service,
-        client,
         sessions,
         assembler,
         ..
@@ -406,19 +421,16 @@ pub(crate) async fn shutdown_with_deadline(
     let mut report = ProcessShutdownReport::default();
     deadline = shorten_deadline(interrupt, &mut seen, deadline);
 
-    if let Some(pending) =
-        request_service_shutdown(&client, &service, interrupt, &mut seen, &mut deadline).await
-    {
-        report.pending.push(pending);
-    }
+    drain_service(&service, interrupt, &mut seen, &mut deadline, &mut report).await;
 
-    match timeout_at(deadline, service.join()).await {
-        Ok(()) => {}
-        Err(_) => report.pending.push("service".to_owned()),
-    }
     deadline = shorten_deadline(interrupt, &mut seen, deadline);
 
-    match timeout_at(deadline, tokio::task::spawn_blocking(move || assembler.shutdown())).await {
+    match timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || assembler.shutdown()),
+    )
+    .await
+    {
         Ok(_) => {}
         Err(_) => report.pending.push("generation-build-pool".to_owned()),
     }
@@ -436,6 +448,16 @@ pub(crate) async fn shutdown_with_deadline(
         Err(_) => report.pending.push("session-store".to_owned()),
     }
     report
+}
+
+/// Maps a requested process exit onto the shutdown report. UserExit with
+/// leftover pending components is not success.
+pub(crate) fn shutdown_exit_code(requested: u8, pending: &[String]) -> u8 {
+    if !pending.is_empty() && requested == 0 {
+        1
+    } else {
+        requested
+    }
 }
 
 /// Drops a config watch under the same process deadline.
@@ -473,56 +495,58 @@ fn skip_past_pulses(rx: &mut watch::Receiver<u64>) -> u64 {
     *rx.borrow_and_update()
 }
 
-async fn request_service_shutdown(
-    client: &FrontendClient,
+async fn drain_service(
     service: &philo_agent_service::AgentService,
     interrupt: &mut watch::Receiver<u64>,
     seen: &mut u64,
     deadline: &mut Instant,
-) -> Option<String> {
+    report: &mut ProcessShutdownReport,
+) {
+    *deadline = shorten_deadline(interrupt, seen, *deadline);
+    let reason = if Instant::now() >= *deadline {
+        "process forced exit"
+    } else {
+        "process shutdown"
+    };
+    if let Err(error) = service.shutdown_from_supervisor(reason, *deadline).await {
+        report
+            .diagnostics
+            .push(format!("supervisor shutdown: {error}"));
+    }
+
+    let wait = service.wait_stopped();
+    tokio::pin!(wait);
     loop {
         *deadline = shorten_deadline(interrupt, seen, *deadline);
-        match client.try_command(FrontendCommand::ShutdownRequested) {
-            philo_agent_service::CommandDispatch::Enqueued(_) => return None,
-            philo_agent_service::CommandDispatch::Disconnected { .. } => {
-                return match service.request_shutdown() {
-                    philo_agent_service::CommandDispatch::Backpressured => {
-                        wait_for_control_capacity(deadline, interrupt, seen).await
-                    }
-                    _ => None,
-                };
-            }
-            philo_agent_service::CommandDispatch::Backpressured => {
-                match service.request_shutdown() {
-                    philo_agent_service::CommandDispatch::Enqueued(_)
-                    | philo_agent_service::CommandDispatch::Disconnected { .. } => return None,
-                    philo_agent_service::CommandDispatch::Backpressured => {
-                        if let Some(pending) =
-                            wait_for_control_capacity(deadline, interrupt, seen).await
-                        {
-                            return Some(pending);
-                        }
-                    }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::select! {
+            biased;
+            _ = &mut wait => break,
+            _ = interrupt.changed() => {
+                *deadline = Instant::now();
+                if let Err(error) = service
+                    .shutdown_from_supervisor("process interrupt", *deadline)
+                    .await
+                {
+                    report
+                        .diagnostics
+                        .push(format!("supervisor forced shutdown: {error}"));
                 }
             }
+            _ = tokio::time::sleep(remaining) => {
+                if let Err(error) = service
+                    .shutdown_from_supervisor("process deadline", Instant::now())
+                    .await
+                {
+                    report
+                        .diagnostics
+                        .push(format!("supervisor deadline shutdown: {error}"));
+                }
+                service.abort_actor();
+                report.pending.push("service".to_owned());
+                break;
+            }
         }
-    }
-}
-
-async fn wait_for_control_capacity(
-    deadline: &mut Instant,
-    interrupt: &mut watch::Receiver<u64>,
-    seen: &mut u64,
-) -> Option<String> {
-    if Instant::now() >= *deadline {
-        return Some("service-control".to_owned());
-    }
-    tokio::select! {
-        _ = interrupt.changed() => {
-            *deadline = shorten_deadline(interrupt, seen, *deadline);
-            None
-        }
-        _ = tokio::time::sleep(Duration::from_millis(10)) => None,
     }
 }
 
@@ -544,7 +568,7 @@ pub(crate) fn apply_config_reload(
         Err(error) => {
             assembler.set_reload_fault(format!("config not reloaded: {}", error.0));
             let name = assembler.current_settings().deployment.model;
-            let _ = client.try_command(FrontendCommand::InstallModel { name });
+            enqueue_generation_command(client, assembler, FrontendCommand::InstallModel { name });
         }
         Ok((settings, _warnings)) => {
             if settings.data_dir != *assembler.data_dir() {
@@ -552,7 +576,11 @@ pub(crate) fn apply_config_reload(
                     "config not reloaded: data_dir cannot be changed without restarting",
                 );
                 let name = assembler.current_settings().deployment.model;
-                let _ = client.try_command(FrontendCommand::InstallModel { name });
+                enqueue_generation_command(
+                    client,
+                    assembler,
+                    FrontendCommand::InstallModel { name },
+                );
                 return;
             }
             let previous = assembler.current_settings();
@@ -563,14 +591,38 @@ pub(crate) fn apply_config_reload(
             if only_reasoning_changed(&previous, &settings)
                 && let Some(effort) = settings.reasoning_effort
             {
-                let _ = client.try_command(FrontendCommand::SetReasoning {
-                    effort: frontend_effort(effort),
-                });
+                enqueue_generation_command(
+                    client,
+                    assembler,
+                    FrontendCommand::SetReasoning {
+                        effort: frontend_effort(effort),
+                    },
+                );
                 return;
             }
-            let _ = client.try_command(FrontendCommand::InstallModel {
-                name: settings.deployment.model,
-            });
+            enqueue_generation_command(
+                client,
+                assembler,
+                FrontendCommand::InstallModel {
+                    name: settings.deployment.model,
+                },
+            );
+        }
+    }
+}
+
+fn enqueue_generation_command(
+    client: &FrontendClient,
+    assembler: &CliGenerationAssembler,
+    command: FrontendCommand,
+) {
+    match client.try_command(command) {
+        CommandDispatch::Enqueued(_) => {}
+        CommandDispatch::Backpressured => {
+            assembler.note_reload_dispatch_failure("command lane full");
+        }
+        CommandDispatch::Disconnected { lane } => {
+            assembler.note_reload_dispatch_failure(&format!("{lane} disconnected"));
         }
     }
 }
@@ -857,6 +909,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_keeps_parse_fault_when_install_cannot_enqueue() {
+        let dir = temp_dir("reload-disconnected");
+        let assembler = assembler(&dir, "https://example.test/v1/chat/completions");
+        let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        philo_agent_service::testing::abort_service_actor(&service);
+        apply_config_reload(&client, &assembler, Err(UsageError::new("invalid TOML")));
+        assert_eq!(
+            assembler.take_reload_fault().as_deref(),
+            Some("config not reloaded: invalid TOML")
+        );
+        drop(service);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_records_dispatch_failure_when_generation_command_is_dropped() {
+        let dir = temp_dir("reload-backpressure");
+        let assembler = assembler(&dir, "https://example.test/v1/chat/completions");
+        let (service, client, _runtime, _hold) =
+            philo_agent_service::testing::start_test_service_with_command_hold();
+        for _ in 0..philo_agent_service::FRONTEND_COMMAND_CAP + 4 {
+            match client.try_command(FrontendCommand::ReadStatus) {
+                CommandDispatch::Enqueued(_) | CommandDispatch::Backpressured => {}
+                CommandDispatch::Disconnected { lane } => panic!("disconnected: {lane}"),
+            }
+        }
+        let mut next = assembler.current_settings();
+        next.deployment.model = "model-b".to_owned();
+        apply_config_reload(&client, &assembler, Ok((next, Vec::new())));
+        let fault = assembler.take_reload_fault().expect("dispatch failure");
+        assert!(
+            fault.contains("command lane full"),
+            "expected a visible dispatch failure, got {fault}"
+        );
+        drop(service);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn production_tool_port_wraps_filesystem_tools_and_leaves_shell_named() {
         let dir = temp_dir("tools");
@@ -946,5 +1037,30 @@ mod tests {
         tx.send_modify(|n| *n = n.saturating_add(1));
         let shortened = shorten_deadline(&mut rx, &mut seen, later);
         assert!(shortened <= Instant::now() + Duration::from_millis(20));
+    }
+
+    #[test]
+    fn pending_components_turn_success_into_failure() {
+        assert_eq!(shutdown_exit_code(0, &[]), 0);
+        assert_eq!(shutdown_exit_code(0, &["service".into()]), 1);
+        assert_eq!(shutdown_exit_code(130, &["service".into()]), 130);
+        assert_eq!(shutdown_exit_code(1, &["generation-build-pool".into()]), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn elapsed_deadline_records_named_service_pending() {
+        let (service, _client, runtime) = philo_agent_service::testing::start_test_service();
+        let hold = runtime.hold_children();
+        let (_tx, mut rx) = watch::channel(0u64);
+        let mut seen = skip_past_pulses(&mut rx);
+        let mut deadline = Instant::now();
+        let mut report = ProcessShutdownReport::default();
+        drain_service(&service, &mut rx, &mut seen, &mut deadline, &mut report).await;
+        assert!(
+            report.pending.iter().any(|name| name == "service"),
+            "deadline must name the component: {report:?}"
+        );
+        assert_eq!(shutdown_exit_code(0, &report.pending), 1);
+        drop(hold);
     }
 }

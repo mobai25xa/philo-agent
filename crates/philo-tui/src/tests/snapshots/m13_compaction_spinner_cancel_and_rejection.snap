@@ -13,8 +13,8 @@ Meta: /compact
 Error: error: context compaction is already running; press Esc to cancel it
 
 ESC
-Notice: context compaction cancelled
-STATUS model-a  s-1
+
+STATUS model-a  s-1  compact /
 
 BUSY
 Meta: /compact

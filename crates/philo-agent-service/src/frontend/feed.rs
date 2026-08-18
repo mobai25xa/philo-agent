@@ -68,22 +68,30 @@ impl FrontendFeed {
     }
 
     /// Attempts to emit `update`. Never waits for the frontend.
+    ///
+    /// Command replies (`request_id` set) still go through during resync so a
+    /// submit/cancel cannot hang without a terminal result.
     pub(crate) fn push(&mut self, update: FrontendUpdate) -> FeedPush {
         if self.disconnected {
             return FeedPush::Disconnected;
         }
-        if self.awaiting_snapshot {
+        let is_command_reply = update.request_id.is_some();
+        if self.awaiting_snapshot && !is_command_reply {
             return FeedPush::Dropped;
         }
-        if self.needs_resync {
+        if self.needs_resync && !is_command_reply {
             self.try_resync(update.epoch, update.revision);
             return FeedPush::Dropped;
         }
         match self.tx.try_send(update) {
             Ok(()) => FeedPush::Sent,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.needs_resync = true;
-                FeedPush::Dropped
+                if is_command_reply {
+                    FeedPush::Dropped
+                } else {
+                    self.needs_resync = true;
+                    FeedPush::Dropped
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.disconnected = true;

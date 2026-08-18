@@ -1,23 +1,7 @@
 //! Frontend → service commands. Control-lane commands are never mixed with
 //! submit/query traffic.
 
-use crate::ids::{FrontendInstanceId, FrontendRevision};
-
-/// Why a frontend instance detached.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DetachReason {
-    /// User quit or idle Ctrl+C.
-    UserExit,
-    /// Terminal or frontend fault. Must not cancel Runtime work.
-    Fault {
-        /// Stable diagnostic text.
-        message: String,
-    },
-    /// Supervisor is restarting the frontend.
-    Restart,
-    /// A newer frontend instance replaced this one. Pending confirmations deny.
-    Replaced,
-}
+use crate::ids::FrontendRevision;
 
 /// User answer to a pending confirmation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,18 +105,6 @@ pub enum FrontendCommand {
         /// Last revision the frontend applied.
         known_revision: FrontendRevision,
     },
-    /// A frontend instance is attached.
-    FrontendAttached {
-        /// Instance identity.
-        frontend_instance_id: FrontendInstanceId,
-    },
-    /// A frontend instance detached. Control lane. Does not cancel operations.
-    FrontendDetached {
-        /// Instance identity.
-        frontend_instance_id: FrontendInstanceId,
-        /// Why it detached.
-        reason: DetachReason,
-    },
     /// Request service/runtime shutdown. Control lane.
     ShutdownRequested,
 }
@@ -145,7 +117,6 @@ impl FrontendCommand {
             Self::CancelOperation { .. }
                 | Self::CancelMaintenance { .. }
                 | Self::RespondConfirmation { .. }
-                | Self::FrontendDetached { .. }
                 | Self::ShutdownRequested
         )
     }

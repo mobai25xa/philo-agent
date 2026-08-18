@@ -245,8 +245,7 @@ mod tests {
         let effects = app.on_action(Action::Submit);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::PrepareSubmit { .. }]
-                | [Effect::Append(_), Effect::PrepareSubmit { .. }]
+            [Effect::PrepareSubmit { .. }] | [Effect::Append(_), Effect::PrepareSubmit { .. }]
         ));
         let intent_id = app.submit_state().intent_id().expect("pending intent");
         app.on_action(Action::InsertChar('n'));
@@ -256,7 +255,11 @@ mod tests {
             kept: Vec::new(),
             errors: vec!["missing".to_owned()],
         });
-        assert!(effects.iter().any(|effect| matches!(effect, Effect::Append(_))));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Append(_)))
+        );
         assert_eq!(app.input.text(), "n");
     }
 

@@ -1,7 +1,6 @@
 //! Frontend attach/detach lease types. Distinct from [`super::snapshot::FrontendGeneration`].
-//!
-//! Track 07 implements attach/detach ack. This closeout freezes the types and
-//! does not issue a lease from `try_send`.
+
+use std::fmt;
 
 use crate::ids::FrontendInstanceId;
 
@@ -10,7 +9,6 @@ use crate::ids::FrontendInstanceId;
 pub struct FrontendLeaseGeneration(u64);
 
 impl FrontendLeaseGeneration {
-    #[allow(dead_code)]
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
@@ -21,16 +19,14 @@ impl FrontendLeaseGeneration {
     }
 }
 
-/// Opaque lease issued after a confirmed attach. Construction stays crate-private
-/// until Track 07 implements actor ack.
-#[derive(Debug)]
+/// Opaque lease issued after a confirmed attach. Construction stays crate-private.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontendLease {
     frontend_id: FrontendInstanceId,
     generation: FrontendLeaseGeneration,
 }
 
 impl FrontendLease {
-    #[allow(dead_code)]
     pub(crate) fn issue(
         frontend_id: FrontendInstanceId,
         generation: FrontendLeaseGeneration,
@@ -51,13 +47,12 @@ impl FrontendLease {
         self.generation
     }
 
-    #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> (FrontendInstanceId, FrontendLeaseGeneration) {
         (self.frontend_id, self.generation)
     }
 }
 
-/// Supervisor lifecycle commands. Wired onto a dedicated lane in Track 07.
+/// Supervisor lifecycle commands. Reply handles stay on the private envelope.
 #[derive(Debug)]
 pub enum SupervisorCommand {
     /// Register one frontend instance.
@@ -83,12 +78,15 @@ pub enum AttachError {
     /// This process already holds a live lease.
     AlreadyAttached,
     /// Another frontend instance is attached.
-    FrontendOccupied { current: FrontendInstanceId },
-    /// The command lane is full.
+    FrontendOccupied {
+        /// Instance that currently holds the lease.
+        current: FrontendInstanceId,
+    },
+    /// The supervisor lane is full and the caller deadline has already elapsed.
     Backpressured,
-    /// The command lane closed.
+    /// The supervisor lane closed.
     Disconnected,
-    /// The caller deadline elapsed before send.
+    /// The caller deadline elapsed before send or reply.
     DeadlineExceeded,
     /// The service actor is gone.
     ServiceGone,
@@ -99,11 +97,11 @@ pub enum AttachError {
 pub enum DetachError {
     /// The lease generation is no longer current.
     StaleLease,
-    /// The control lane is full.
+    /// The supervisor lane is full and the caller deadline has already elapsed.
     Backpressured,
-    /// The control lane closed.
+    /// The supervisor lane closed.
     Disconnected,
-    /// The caller deadline elapsed before send.
+    /// The caller deadline elapsed before send or reply.
     DeadlineExceeded,
     /// The service actor is gone.
     ServiceGone,
@@ -118,4 +116,31 @@ pub struct DetachReport {
     pub generation: FrontendLeaseGeneration,
     /// Confirmations denied while detaching.
     pub denied_confirmations: usize,
+}
+
+impl fmt::Display for AttachError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyAttached => write!(f, "frontend already attached"),
+            Self::FrontendOccupied { current } => {
+                write!(f, "frontend occupied by {current}")
+            }
+            Self::Backpressured => write!(f, "frontend attach backpressured"),
+            Self::Disconnected => write!(f, "frontend attach disconnected"),
+            Self::DeadlineExceeded => write!(f, "frontend attach deadline exceeded"),
+            Self::ServiceGone => write!(f, "service gone during attach"),
+        }
+    }
+}
+
+impl fmt::Display for DetachError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleLease => write!(f, "stale frontend lease"),
+            Self::Backpressured => write!(f, "frontend detach backpressured"),
+            Self::Disconnected => write!(f, "frontend detach disconnected"),
+            Self::DeadlineExceeded => write!(f, "frontend detach deadline exceeded"),
+            Self::ServiceGone => write!(f, "service gone during detach"),
+        }
+    }
 }

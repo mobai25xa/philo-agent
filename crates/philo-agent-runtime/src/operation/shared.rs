@@ -4,7 +4,7 @@ use crate::error::DriverExit;
 use crate::transient::{TransientDriverState, is_transient_agent};
 use crate::{
     AgentEvent, AgentFailure, DiagnosticId, OperationId, OperationOutcome, OperationPhase,
-    OperationStatus, TurnId,
+    OperationStatus, SettlementRevision, TurnId,
 };
 use philo_session::CancelReason;
 use philo_tools::ToolCancel;
@@ -67,6 +67,7 @@ pub(crate) struct OperationShared {
     failure: Mutex<Option<AgentFailure>>,
     events: mpsc::Sender<DriverEvent>,
     transient: TransientDriverState,
+    settlement_revision: Mutex<Option<SettlementRevision>>,
 }
 
 impl OperationShared {
@@ -89,6 +90,7 @@ impl OperationShared {
             failure: Mutex::new(None),
             events,
             transient: TransientDriverState::new(),
+            settlement_revision: Mutex::new(None),
         }
     }
 
@@ -103,6 +105,12 @@ impl OperationShared {
         if is_transient_agent(&event) {
             self.transient.publish_agent(event);
             return;
+        }
+        if let AgentEvent::OperationSettled {
+            session_revision, ..
+        } = &event
+        {
+            *lock(&self.settlement_revision) = Some(*session_revision);
         }
         self.transient.seal_model_stream();
         let _ = self.events.send(DriverEvent::Agent(event)).await;
@@ -228,6 +236,22 @@ impl OperationShared {
         lock(&self.failure).clone()
     }
 
+    pub(crate) fn settlement_revision(&self) -> Option<SettlementRevision> {
+        *lock(&self.settlement_revision)
+    }
+
+    pub(crate) fn has_committed_settlement(&self) -> bool {
+        matches!(self.phase(), OperationPhase::Settled(_))
+            && matches!(
+                self.settlement_revision(),
+                Some(SettlementRevision::Committed(_))
+            )
+    }
+
+    pub(crate) fn sealed_model_stream_stats(&self) -> (usize, usize) {
+        (self.transient.sealed_len(), self.transient.sealed_cap())
+    }
+
     pub(crate) fn take_exit(&self) -> DriverExit {
         lock(&self.exit).take().unwrap_or(DriverExit::Aborted {
             diagnostic_id: DiagnosticId::new("driver-missing-exit"),
@@ -274,5 +298,33 @@ mod tests {
             OperationPhase::Settled(OperationStatus::Cancelled)
         );
         assert_eq!(shared.take_exit(), DriverExit::CancelledConfirmed);
+    }
+
+    #[tokio::test]
+    async fn publish_records_committed_settlement_revision() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let shared = OperationShared::new(
+            OperationId::new("op-1"),
+            TurnId::new("turn-1"),
+            tx,
+            OperationPhase::PreparingTurn,
+        );
+        assert!(shared.settle(OperationOutcome::Cancelled));
+        shared
+            .publish(AgentEvent::OperationSettled {
+                operation_id: OperationId::new("op-1"),
+                status: OperationStatus::Cancelled,
+                durability: crate::SettlementDurability::Confirmed,
+                session_revision: SettlementRevision::Committed(
+                    philo_session::SessionRevision::new(7),
+                ),
+            })
+            .await;
+        assert!(shared.has_committed_settlement());
+        assert!(matches!(
+            shared.settlement_revision(),
+            Some(SettlementRevision::Committed(revision)) if revision.get() == 7
+        ));
+        assert!(rx.recv().await.is_some());
     }
 }

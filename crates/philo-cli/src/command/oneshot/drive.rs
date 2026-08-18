@@ -289,7 +289,38 @@ async fn submit(
         },
     )
     .await?;
+    wait_session_loaded(client, session_id).await?;
     enqueue(client, submit_command(message)).await
+}
+
+async fn wait_session_loaded(client: &FrontendClient, session_id: &str) -> Result<(), u8> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match client
+            .recv_until_async(Instant::now() + Duration::from_millis(50))
+            .await
+        {
+            RecvOutcome::Update(update) => match &update.kind {
+                FrontendUpdateKind::SessionLoaded {
+                    session_id: loaded, ..
+                } if loaded == session_id => return Ok(()),
+                FrontendUpdateKind::CommandRejected { reason } => {
+                    eprintln!("error: {reason}");
+                    return Err(1);
+                }
+                _ => {}
+            },
+            RecvOutcome::Disconnected => {
+                eprintln!("error: the service disconnected");
+                return Err(1);
+            }
+            RecvOutcome::Timeout if Instant::now() < deadline => continue,
+            RecvOutcome::Timeout => {
+                eprintln!("error: timed out waiting for the session to load");
+                return Err(1);
+            }
+        }
+    }
 }
 
 fn submit_command(message: &UserMessage) -> FrontendCommand {

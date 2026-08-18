@@ -2,7 +2,7 @@
 
 use philo_agent_service::{
     ConfirmationDecision, FrontendOperationEvent, FrontendReasoningEffort, FrontendTokenUsage,
-    FrontendUpdateKind,
+    FrontendUpdateKind, ServiceHealth,
 };
 
 use super::*;
@@ -11,7 +11,7 @@ use crate::app::command;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::status::StatusData;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
-use crate::tests::support::frontend_update;
+use crate::tests::support::{frontend_update, idle_snapshot, session_view};
 
 fn app() -> App {
     App::new(StatusData::new("m", "s", InfoLevel::Default), true)
@@ -89,10 +89,7 @@ fn submit_holds_pending_intent_without_transcript_commit() {
         intent_id: 1,
         operation_id: "op-1".to_owned(),
     });
-    assert_eq!(
-        texts(&appended(&committed)),
-        ["", "› hello", ""]
-    );
+    assert_eq!(texts(&appended(&committed)), ["", "› hello", ""]);
 }
 
 #[test]
@@ -133,6 +130,44 @@ fn backpressured_submit_restores_draft_and_attachments() {
 }
 
 #[test]
+fn backpressured_submit_does_not_push_history() {
+    use crate::app::submit::SubmitDispatchResult;
+
+    let mut app = app();
+    run(&mut app, "failed");
+    let intent_id = app.submit_state().intent_id().unwrap();
+    let _ = app.on_action(Action::SubmitDispatchFinished {
+        intent_id,
+        result: SubmitDispatchResult::Backpressured,
+    });
+    assert_eq!(app.input.text(), "failed");
+    for _ in "failed".chars() {
+        app.on_action(Action::Backspace);
+    }
+    run(&mut app, "ok");
+    accept_pending(&mut app);
+
+    type_text(&mut app, "x");
+    app.on_action(Action::MoveUp);
+    assert_eq!(app.input.text(), "ok");
+    app.on_action(Action::MoveUp);
+    assert_eq!(
+        app.input.text(),
+        "ok",
+        "backpressured draft must not enter history"
+    );
+}
+
+#[test]
+fn slash_command_still_enters_history() {
+    let mut app = app();
+    run(&mut app, "/help");
+    type_text(&mut app, "x");
+    app.on_action(Action::MoveUp);
+    assert_eq!(app.input.text(), "/help");
+}
+
+#[test]
 fn rejected_submit_restores_without_committing_transcript() {
     use crate::app::submit::SubmitDispatchResult;
     use philo_agent_service::CommandReject;
@@ -148,9 +183,11 @@ fn rejected_submit_restores_without_committing_transcript() {
         intent_id,
         reason: CommandReject::NoCurrentSession,
     });
-    assert!(texts(&appended(&effects))
-        .iter()
-        .any(|line| line.contains("no current session")));
+    assert!(
+        texts(&appended(&effects))
+            .iter()
+            .any(|line| line.contains("no current session"))
+    );
     assert_eq!(app.input.text(), "draft");
     assert!(
         app.cells
@@ -187,6 +224,138 @@ fn late_submit_accepted_after_new_draft_is_ignored() {
 fn empty_submit_is_a_no_op() {
     let mut app = app();
     assert!(app.on_action(Action::Submit).is_empty());
+}
+
+#[test]
+fn attachments_only_submit_prepares() {
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    let effects = app.on_action(Action::Submit);
+    assert_eq!(
+        effects,
+        vec![Effect::PrepareSubmit {
+            intent_id: 1,
+            text: String::new(),
+            attachments: vec![crate::app::attachment::PendingAttachment::Path(
+                "shots/a.png".to_owned()
+            )],
+        }]
+    );
+    assert!(app.input.is_empty());
+    assert!(app.attachments().is_empty());
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Dispatching(_)
+    ));
+}
+
+#[test]
+fn typing_during_dispatch_backpressure_keeps_attachments() {
+    use crate::app::submit::SubmitDispatchResult;
+
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    let effects = run(&mut app, "keep-text");
+    let Effect::PrepareSubmit { intent_id, .. } = effects[0] else {
+        panic!("expected PrepareSubmit");
+    };
+    type_text(&mut app, "newer");
+    let restored = app.on_action(Action::SubmitDispatchFinished {
+        intent_id,
+        result: SubmitDispatchResult::Backpressured,
+    });
+    assert!(
+        texts(&appended(&restored))
+            .iter()
+            .any(|line| line.contains("服务繁忙，提交未发送"))
+    );
+    assert_eq!(app.input.text(), "newer");
+    assert_eq!(app.attachments().len(), 1);
+    assert_eq!(app.attachments().labels(), vec!["shots/a.png".to_owned()]);
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Editing
+    ));
+}
+
+#[test]
+fn snapshot_while_dispatching_restores_draft_and_attachments() {
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    run(&mut app, "draft");
+    let effects = app.apply_update(&frontend_update(
+        1,
+        FrontendUpdateKind::SnapshotReady(Box::new(idle_snapshot("s"))),
+    ));
+    assert!(
+        texts(&appended(&effects))
+            .iter()
+            .any(|line| line.contains("提交未确认"))
+    );
+    assert_eq!(app.input.text(), "draft");
+    assert_eq!(app.attachments().labels(), vec!["shots/a.png".to_owned()]);
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Editing
+    ));
+}
+
+#[test]
+fn snapshot_accepts_when_live_contains_landed_draft() {
+    use philo_agent_service::FrontendAvailability;
+
+    let mut app = app();
+    run(&mut app, "count the files");
+    let mut snapshot = idle_snapshot("s");
+    snapshot.durable_session_view = Some(session_view("s"));
+    snapshot.availability = FrontendAvailability::Busy {
+        operation_id: "op-landed".to_owned(),
+    };
+    snapshot.live.operation_id = Some("op-landed".to_owned());
+    let effects = app.apply_update(&frontend_update(
+        1,
+        FrontendUpdateKind::SnapshotReady(Box::new(snapshot)),
+    ));
+    assert!(
+        texts(&appended(&effects))
+            .iter()
+            .any(|line| line.contains("count the files"))
+    );
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Accepted {
+            operation_id,
+            ..
+        } if operation_id == "op-landed"
+    ));
+}
+
+#[test]
+fn epoch_ended_while_dispatching_restores_draft_and_attachments() {
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    run(&mut app, "draft");
+    app.set_busy(true, 0);
+    let effects = app.apply_update(&frontend_update(
+        1,
+        FrontendUpdateKind::ServiceHealthChanged {
+            health: ServiceHealth::RuntimeEpochEnded {
+                message: "runtime epoch ended".to_owned(),
+            },
+        },
+    ));
+    assert!(
+        texts(&appended(&effects))
+            .iter()
+            .any(|line| line.contains("runtime epoch ended"))
+    );
+    assert_eq!(app.input.text(), "draft");
+    assert_eq!(app.attachments().labels(), vec!["shots/a.png".to_owned()]);
+    assert!(!app.status.busy);
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Editing
+    ));
 }
 
 #[test]

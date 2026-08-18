@@ -1,9 +1,10 @@
 //! Frontend updates, operation events, compaction, and busy/exit chords.
 
 use philo_agent_service::{
-    DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendGeneration,
-    FrontendMaintenance, FrontendMaintenancePhase, FrontendOperationEvent, FrontendSnapshot,
-    FrontendUpdate, FrontendUpdateKind as Kind, LiveOperationSnapshot, ServiceHealth,
+    DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendContextMessage,
+    FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase, FrontendOperationEvent,
+    FrontendSnapshot, FrontendUpdate, FrontendUpdateKind as Kind, FrontendUserPart,
+    LiveOperationSnapshot, ServiceHealth,
 };
 
 use super::App;
@@ -13,6 +14,7 @@ use crate::app::effect::{Effect, HostRequest};
 use crate::app::listings;
 use crate::app::overlay::Preview;
 use crate::app::session;
+use crate::app::submit::{CancelDispatchResult, PendingSubmission};
 use crate::app::transcript::{InfoLevel, LineKind};
 
 /// Preview rows loaded per session in the picker (the overlay body height).
@@ -242,6 +244,9 @@ impl App {
                 )])])
             }
             FrontendMaintenancePhase::Cancelled => {
+                if !self.manual_compacting {
+                    return Vec::new();
+                }
                 self.clear_manual_compaction();
                 self.ingest_appends(vec![Effect::Append(vec![line(
                     LineKind::Notice,
@@ -394,7 +399,23 @@ impl App {
         if let Some(maintenance) = &snapshot.maintenance {
             let _ = self.apply_maintenance(maintenance);
         }
-        Vec::new()
+        let mut effects = Vec::new();
+        if !matches!(snapshot.health, ServiceHealth::Ok) {
+            effects.extend(self.apply_health(&snapshot.health));
+        }
+        let restored = self.reconcile_dispatching_after_snapshot(snapshot);
+        effects.extend(self.ingest_appends(restored));
+        effects
+    }
+
+    fn reconcile_dispatching_after_snapshot(&mut self, snapshot: &FrontendSnapshot) -> Vec<Effect> {
+        let Some(pending) = self.submit_state.pending().cloned() else {
+            return Vec::new();
+        };
+        if let Some(operation_id) = operation_for_pending_intent(snapshot, &pending) {
+            return self.on_submit_accepted(pending.intent_id, operation_id);
+        }
+        self.restore_pending_after_interrupt(line(LineKind::Notice, "提交未确认，内容已恢复"))
     }
 
     fn apply_live(&mut self, live: &LiveOperationSnapshot) {
@@ -424,16 +445,26 @@ impl App {
                 )])])
             }
             ServiceHealth::RuntimeEpochEnded { message } => {
-                self.ingest_appends(vec![Effect::Append(vec![line(
-                    LineKind::Error,
-                    format!("error: {message}"),
-                )])])
+                self.clear_runtime_presence();
+                let notice = line(LineKind::Error, format!("error: {message}"));
+                let restored = self.restore_pending_after_interrupt(notice.clone());
+                if restored.is_empty() {
+                    self.ingest_appends(vec![Effect::Append(vec![notice])])
+                } else {
+                    self.ingest_appends(restored)
+                }
             }
             ServiceHealth::ShuttingDown => self.ingest_appends(vec![Effect::Append(vec![line(
                 LineKind::Notice,
                 "service is shutting down",
             )])]),
         }
+    }
+
+    fn clear_runtime_presence(&mut self) {
+        self.manual_compacting = false;
+        self.automatic_compacting = false;
+        self.set_busy(false, 0);
     }
 
     fn finish_manual_compaction_message(&mut self, message: Option<&str>) -> Vec<Effect> {
@@ -516,11 +547,92 @@ impl App {
     }
 
     fn cancel_manual_compaction(&mut self) -> Vec<Effect> {
-        self.clear_manual_compaction();
-        vec![
-            Effect::CancelCompaction,
-            Effect::Append(vec![line(LineKind::Notice, "context compaction cancelled")]),
-        ]
+        vec![Effect::CancelCompaction]
+    }
+
+    pub(super) fn on_compaction_cancel_dispatch_finished(
+        &mut self,
+        result: CancelDispatchResult,
+    ) -> Vec<Effect> {
+        match result {
+            CancelDispatchResult::Enqueued(_) => {
+                self.clear_manual_compaction();
+                vec![Effect::Append(vec![line(
+                    LineKind::Notice,
+                    "context compaction cancelled",
+                )])]
+            }
+            CancelDispatchResult::Backpressured => {
+                vec![Effect::Append(vec![line(
+                    LineKind::Notice,
+                    "取消请求未发送",
+                )])]
+            }
+            CancelDispatchResult::Disconnected { lane } => {
+                vec![Effect::Append(vec![line(
+                    LineKind::Error,
+                    format!("error: frontend disconnected ({lane}); cancel not sent"),
+                )])]
+            }
+        }
+    }
+}
+
+fn snapshot_in_flight_ids(snapshot: &FrontendSnapshot) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(id) = &snapshot.live.operation_id {
+        ids.push(id.clone());
+    }
+    for queued in &snapshot.queued {
+        if !ids.iter().any(|id| id == &queued.operation_id) {
+            ids.push(queued.operation_id.clone());
+        }
+    }
+    if let FrontendAvailability::Busy { operation_id } = &snapshot.availability
+        && !ids.iter().any(|id| id == operation_id)
+    {
+        ids.push(operation_id.clone());
+    }
+    ids
+}
+
+fn last_user_parts(snapshot: &FrontendSnapshot) -> Option<&[FrontendUserPart]> {
+    snapshot
+        .durable_session_view
+        .as_ref()?
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            FrontendContextMessage::User { parts } => Some(parts.as_slice()),
+            _ => None,
+        })
+}
+
+/// When the pending draft already landed in the snapshot, the in-flight
+/// live/queued id is this intent's operation.
+fn operation_for_pending_intent(
+    snapshot: &FrontendSnapshot,
+    pending: &PendingSubmission,
+) -> Option<String> {
+    let ids = snapshot_in_flight_ids(snapshot);
+    if ids.is_empty() {
+        return None;
+    }
+    let parts = last_user_parts(snapshot)?;
+    let draft_landed = !pending.draft.is_empty()
+        && parts
+            .iter()
+            .any(|part| matches!(part, FrontendUserPart::Text(text) if text == &pending.draft));
+    let attachments_landed = pending.draft.is_empty()
+        && !pending.attachments.is_empty()
+        && parts
+            .iter()
+            .any(|part| matches!(part, FrontendUserPart::Image { .. }));
+    if draft_landed || attachments_landed {
+        Some(ids[0].clone())
+    } else {
+        None
     }
 }
 

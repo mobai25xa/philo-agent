@@ -5,8 +5,9 @@
 use std::collections::VecDeque;
 
 use philo_agent_service::{
-    CommandDispatch, FrontendAvailability, FrontendClient, FrontendCommand, FrontendRequestId,
-    FrontendRevision, FrontendUpdate, FrontendUpdateKind,
+    CommandDispatch, FrontendAvailability, FrontendClient, FrontendCommand,
+    FrontendMaintenancePhase, FrontendRequestId, FrontendRevision, FrontendSnapshot,
+    FrontendUpdate, FrontendUpdateKind, ServiceHealth,
 };
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -33,11 +34,13 @@ use super::events::{self, Step};
 use super::interrupt::{self, CtrlCDecision, CtrlCPhase};
 use super::output::{FlushReport, PendingOutput};
 use super::scheduler::FrameScheduler;
-use super::tasks::{MediaResult, PendingTasks, TaskCompletion};
 use super::tasks;
+use super::tasks::{MediaResult, PendingTasks, TaskCompletion};
 
 const DRAW_FAILURE_BUDGET: u32 = 3;
 const INPUT_ERROR_BUDGET: u32 = 8;
+const SNAPSHOT_REQUEST_RETRY_BUDGET: u8 = 3;
+const SESSION_LOAD_RETRY_BUDGET: u8 = 3;
 
 /// Production entry: enter the terminal, drive the loop, restore on every path.
 pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRunReport {
@@ -77,6 +80,8 @@ struct FrontendSync {
     epoch: Option<philo_agent_service::FrontendEpoch>,
     revision: FrontendRevision,
     awaiting_snapshot: bool,
+    want_snapshot: bool,
+    snapshot_retries: u8,
     snapshot_request: Option<FrontendRequestId>,
     preview_request: Option<FrontendRequestId>,
     preview_session_id: Option<String>,
@@ -89,6 +94,8 @@ impl FrontendSync {
             epoch: None,
             revision: FrontendRevision::ZERO,
             awaiting_snapshot: false,
+            want_snapshot: false,
+            snapshot_retries: 0,
             snapshot_request: None,
             preview_request: None,
             preview_session_id: None,
@@ -113,12 +120,7 @@ impl FrontendSync {
         if update.revision < self.revision {
             return false;
         }
-        if self.awaiting_snapshot
-            && !matches!(
-                update.kind,
-                FrontendUpdateKind::SnapshotReady(_) | FrontendUpdateKind::ResyncRequired { .. }
-            )
-        {
+        if self.awaiting_snapshot && !allowed_during_snapshot_wait(&update.kind) {
             return false;
         }
         if let Some(id) = update.request_id {
@@ -149,6 +151,17 @@ impl FrontendSync {
     }
 }
 
+fn allowed_during_snapshot_wait(kind: &FrontendUpdateKind) -> bool {
+    matches!(
+        kind,
+        FrontendUpdateKind::SnapshotReady(_)
+            | FrontendUpdateKind::ResyncRequired { .. }
+            | FrontendUpdateKind::SubmitAccepted { .. }
+            | FrontendUpdateKind::CommandRejected { .. }
+            | FrontendUpdateKind::ServiceHealthChanged { .. }
+    )
+}
+
 struct LoopState {
     client: FrontendClient,
     sync: FrontendSync,
@@ -159,6 +172,8 @@ struct LoopState {
     next_cancel_request: u64,
     /// Maps enqueued submit request ids to local intents.
     submit_requests: Vec<(FrontendRequestId, u64)>,
+    pending_session_load: Option<String>,
+    session_load_retries: u8,
 }
 
 impl LoopState {
@@ -173,8 +188,7 @@ impl LoopState {
     }
 
     fn remember_submit(&mut self, request_id: FrontendRequestId, intent_id: u64) {
-        self.submit_requests
-            .retain(|(id, _)| *id != request_id);
+        self.submit_requests.retain(|(id, _)| *id != request_id);
         self.submit_requests.push((request_id, intent_id));
     }
 
@@ -190,12 +204,103 @@ impl LoopState {
     }
 }
 
+fn apply_snapshot_request_dispatch(
+    sync: &mut FrontendSync,
+    dispatch: CommandDispatch<FrontendRequestId>,
+) -> Result<Vec<Effect>, TuiOutcome> {
+    match dispatch {
+        CommandDispatch::Enqueued(id) => {
+            sync.snapshot_request = Some(id);
+            sync.awaiting_snapshot = true;
+            sync.want_snapshot = false;
+            Ok(Vec::new())
+        }
+        CommandDispatch::Backpressured => {
+            sync.awaiting_snapshot = false;
+            if sync.snapshot_retries == 0 {
+                sync.want_snapshot = false;
+            } else {
+                sync.snapshot_retries = sync.snapshot_retries.saturating_sub(1);
+                sync.want_snapshot = true;
+            }
+            Ok(vec![notice_effect("服务繁忙，快照请求未发送")])
+        }
+        CommandDispatch::Disconnected { lane } => Err(TuiOutcome::FrontendRestartRequested {
+            fault: format!("frontend disconnected on snapshot ({lane})"),
+        }),
+    }
+}
+
+fn try_request_snapshot(state: &mut LoopState) -> Result<Vec<Effect>, TuiOutcome> {
+    if !state.sync.want_snapshot || state.sync.awaiting_snapshot {
+        return Ok(Vec::new());
+    }
+    let revision = state.sync.revision;
+    apply_snapshot_request_dispatch(&mut state.sync, state.client.request_snapshot(revision))
+}
+
+fn try_load_session(state: &mut LoopState) -> Result<Vec<Effect>, TuiOutcome> {
+    let Some(session_id) = state.pending_session_load.clone() else {
+        return Ok(Vec::new());
+    };
+    match state.send(FrontendCommand::LoadSession { session_id }) {
+        CommandDispatch::Enqueued(_) => {
+            state.pending_session_load = None;
+            Ok(Vec::new())
+        }
+        CommandDispatch::Backpressured => {
+            if state.session_load_retries == 0 {
+                state.pending_session_load = None;
+            } else {
+                state.session_load_retries = state.session_load_retries.saturating_sub(1);
+            }
+            Ok(vec![notice_effect("服务繁忙，会话加载未发送")])
+        }
+        CommandDispatch::Disconnected { lane } => Err(TuiOutcome::FrontendRestartRequested {
+            fault: format!("frontend disconnected on load ({lane})"),
+        }),
+    }
+}
+
+fn begin_snapshot_resync(state: &mut LoopState) -> Result<Vec<Effect>, TuiOutcome> {
+    state.sync.want_snapshot = true;
+    state.sync.snapshot_retries = SNAPSHOT_REQUEST_RETRY_BUDGET;
+    try_request_snapshot(state)
+}
+
 fn cancel_dispatch_result(dispatch: CommandDispatch<FrontendRequestId>) -> CancelDispatchResult {
     match dispatch {
         CommandDispatch::Enqueued(id) => CancelDispatchResult::Enqueued(id),
         CommandDispatch::Backpressured => CancelDispatchResult::Backpressured,
         CommandDispatch::Disconnected { lane } => CancelDispatchResult::Disconnected { lane },
     }
+}
+
+fn apply_submit_accepted(
+    state: &mut LoopState,
+    app: &mut App,
+    request_id: Option<FrontendRequestId>,
+    operation_id: String,
+) -> Vec<Effect> {
+    if let Some(id) = request_id
+        && let Some(intent_id) = state.take_submit_intent(id)
+    {
+        return app.on_action(Action::SubmitAccepted {
+            intent_id,
+            operation_id,
+        });
+    }
+    let Some(pending) = app.submit_state().pending() else {
+        return Vec::new();
+    };
+    let intent_id = pending.intent_id;
+    if pending.request_id == request_id {
+        return app.on_action(Action::SubmitAccepted {
+            intent_id,
+            operation_id,
+        });
+    }
+    Vec::new()
 }
 
 fn notice_effect(text: impl Into<String>) -> Effect {
@@ -240,26 +345,22 @@ fn dispatch_cancel_operation(
     app: &mut App,
     operation_id: String,
     cancel_request: u64,
-) -> Option<TuiOutcome> {
-    let result = cancel_dispatch_result(state.send(FrontendCommand::CancelOperation {
-        operation_id,
-    }));
+) -> (Vec<Effect>, Option<TuiOutcome>) {
+    let result =
+        cancel_dispatch_result(state.send(FrontendCommand::CancelOperation { operation_id }));
     let disconnected = matches!(&result, CancelDispatchResult::Disconnected { .. });
     let lane = match &result {
         CancelDispatchResult::Disconnected { lane } => Some(*lane),
         _ => None,
     };
-    let _ = apply_cancel_dispatch(state, app, cancel_request, result);
-    if disconnected {
-        Some(TuiOutcome::FrontendRestartRequested {
-            fault: format!(
-                "frontend disconnected on cancel ({})",
-                lane.unwrap_or("unknown")
-            ),
-        })
-    } else {
-        None
-    }
+    let effects = apply_cancel_dispatch(state, app, cancel_request, result);
+    let outcome = disconnected.then(|| TuiOutcome::FrontendRestartRequested {
+        fault: format!(
+            "frontend disconnected on cancel ({})",
+            lane.unwrap_or("unknown")
+        ),
+    });
+    (effects, outcome)
 }
 
 fn apply_ctrl_c_decision(
@@ -267,24 +368,27 @@ fn apply_ctrl_c_decision(
     app: &mut App,
     exit_requested: &mut Option<TuiOutcome>,
     decision: CtrlCDecision,
-) {
+) -> Vec<Effect> {
     match decision {
         CtrlCDecision::UserExit => {
             *exit_requested = Some(TuiOutcome::UserExit);
+            Vec::new()
         }
         CtrlCDecision::Cancel {
             operation_id,
             cancel_request,
         } => {
-            if let Some(outcome) =
-                dispatch_cancel_operation(state, app, operation_id, cancel_request)
-            {
+            let (effects, outcome) =
+                dispatch_cancel_operation(state, app, operation_id, cancel_request);
+            if let Some(outcome) = outcome {
                 *exit_requested = Some(outcome);
             }
+            effects
         }
-        CtrlCDecision::WaitForId { .. } => {}
+        CtrlCDecision::WaitForId { .. } => Vec::new(),
         CtrlCDecision::ForcedExit { code } => {
             *exit_requested = Some(TuiOutcome::ForcedExitRequested { code });
+            Vec::new()
         }
     }
 }
@@ -300,14 +404,15 @@ fn apply_interrupt_pulses(
         return Vec::new();
     };
     let delta = interrupt::take_pulses(rx, seen);
+    let mut effects = Vec::new();
     for _ in 0..delta {
         if exit_requested.is_some() {
             break;
         }
-        let decision = ctrl_c_decision(state, false);
-        apply_ctrl_c_decision(state, app, exit_requested, decision);
+        let decision = ctrl_c_decision(state, app.status.busy);
+        effects.extend(apply_ctrl_c_decision(state, app, exit_requested, decision));
     }
-    Vec::new()
+    effects
 }
 
 /// Testable event loop. Does not own or restore a real terminal session.
@@ -351,6 +456,8 @@ pub(crate) async fn run_loop<B: Backend>(
         ctrl_c: CtrlCPhase::Idle,
         next_cancel_request: 1,
         submit_requests: Vec::new(),
+        pending_session_load: None,
+        session_load_retries: 0,
     };
     let mut interrupt = config.interrupt;
     let mut interrupt_seen = 0u64;
@@ -359,19 +466,21 @@ pub(crate) async fn run_loop<B: Backend>(
     }
 
     if config.session_id.is_empty() {
-        if let CommandDispatch::Enqueued(id) = state.client.request_snapshot(FrontendRevision::ZERO)
+        state.sync.revision = FrontendRevision::ZERO;
+        if let Err(outcome) =
+            begin_snapshot_resync(&mut state).map(|effects| app.ingest_appends(effects))
         {
-            state.sync.snapshot_request = Some(id);
+            return outcome;
         }
-        state.sync.awaiting_snapshot = true;
     } else {
         app.expect_session_load(SessionLoadIntent::Switch);
-        if let CommandDispatch::Disconnected { .. } = state.send(FrontendCommand::LoadSession {
-            session_id: config.session_id.clone(),
-        }) {
-            return TuiOutcome::FrontendRestartRequested {
-                fault: "frontend disconnected on load".to_owned(),
-            };
+        state.pending_session_load = Some(config.session_id.clone());
+        state.session_load_retries = SESSION_LOAD_RETRY_BUDGET;
+        match try_load_session(&mut state) {
+            Ok(effects) => {
+                app.ingest_appends(effects);
+            }
+            Err(outcome) => return outcome,
         }
     }
 
@@ -404,6 +513,25 @@ pub(crate) async fn run_loop<B: Backend>(
             return outcome;
         }
 
+        match try_request_snapshot(&mut state) {
+            Ok(effects) => {
+                if !effects.is_empty() {
+                    app.ingest_appends(effects);
+                    scheduler.invalidate_background(now);
+                }
+            }
+            Err(outcome) => return outcome,
+        }
+        match try_load_session(&mut state) {
+            Ok(effects) => {
+                if !effects.is_empty() {
+                    app.ingest_appends(effects);
+                    scheduler.invalidate_background(now);
+                }
+            }
+            Err(outcome) => return outcome,
+        }
+
         let step = events::next_step(
             &state.client,
             &mut tasks,
@@ -432,14 +560,15 @@ pub(crate) async fn run_loop<B: Backend>(
                 });
                 Vec::new()
             }
-            Step::Task(completion) => match apply_task_with_submit(&mut app, &mut state, completion)
-            {
-                Ok(effects) => effects,
-                Err(outcome) => {
-                    exit_requested = Some(outcome);
-                    Vec::new()
+            Step::Task(completion) => {
+                match apply_task_with_submit(&mut app, &mut state, completion) {
+                    Ok(effects) => effects,
+                    Err(outcome) => {
+                        exit_requested = Some(outcome);
+                        Vec::new()
+                    }
                 }
-            },
+            }
             Step::Input(Ok(event)) => apply_input(
                 &mut app,
                 &mut tasks,
@@ -529,12 +658,14 @@ pub(crate) async fn run_loop<B: Backend>(
                             operation_id: Some(operation_id.clone()),
                             cancel_request,
                         };
-                        if let Some(outcome) = dispatch_cancel_operation(
+                        let (cancel_effects, outcome) = dispatch_cancel_operation(
                             &mut state,
                             &mut app,
                             operation_id,
                             cancel_request,
-                        ) {
+                        );
+                        pending.extend(cancel_effects);
+                        if let Some(outcome) = outcome {
                             exit_requested = Some(outcome);
                         }
                     } else {
@@ -560,12 +691,12 @@ pub(crate) async fn run_loop<B: Backend>(
                         }
                     } else {
                         let decision = ctrl_c_decision(&mut state, true);
-                        apply_ctrl_c_decision(
+                        pending.extend(apply_ctrl_c_decision(
                             &mut state,
                             &mut app,
                             &mut exit_requested,
                             decision,
-                        );
+                        ));
                     }
                 }
                 Effect::StartCompaction => {
@@ -574,9 +705,9 @@ pub(crate) async fn run_loop<B: Backend>(
                     }) {
                         CommandDispatch::Enqueued(_) => {}
                         CommandDispatch::Backpressured => {
-                            pending.extend(app.ingest_appends(vec![notice_effect(
-                                "服务繁忙，压缩请求未发送",
-                            )]));
+                            pending.extend(
+                                app.ingest_appends(vec![notice_effect("服务繁忙，压缩请求未发送")]),
+                            );
                         }
                         CommandDispatch::Disconnected { lane } => {
                             exit_requested = Some(TuiOutcome::FrontendRestartRequested {
@@ -587,25 +718,25 @@ pub(crate) async fn run_loop<B: Backend>(
                 }
                 Effect::CancelCompaction => {
                     if let Some(maintenance_id) = state.maintenance_id.clone() {
-                        let cancel_request = state.next_cancel_request();
-                        match cancel_dispatch_result(state.send(
-                            FrontendCommand::CancelMaintenance { maintenance_id },
-                        )) {
-                            CancelDispatchResult::Enqueued(_) => {}
-                            CancelDispatchResult::Backpressured => {
-                                pending.extend(app.ingest_appends(vec![notice_effect(
-                                    "取消请求未发送",
-                                )]));
-                            }
+                        let result = cancel_dispatch_result(
+                            state.send(FrontendCommand::CancelMaintenance { maintenance_id }),
+                        );
+                        match &result {
                             CancelDispatchResult::Disconnected { lane } => {
-                                let _ = cancel_request;
                                 exit_requested = Some(TuiOutcome::FrontendRestartRequested {
                                     fault: format!(
                                         "frontend disconnected on cancel maintenance ({lane})"
                                     ),
                                 });
                             }
+                            _ => {
+                                pending.extend(app.on_action(
+                                    Action::CompactionCancelDispatchFinished { result },
+                                ));
+                            }
                         }
+                    } else {
+                        pending.extend(app.ingest_appends(vec![notice_effect("取消请求未发送")]));
                     }
                 }
                 Effect::Quit => {
@@ -618,9 +749,9 @@ pub(crate) async fn run_loop<B: Backend>(
                             exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
                         }
                         CommandDispatch::Backpressured => {
-                            pending.extend(app.ingest_appends(vec![notice_effect(
-                                "服务繁忙，关闭请求未发送",
-                            )]));
+                            pending.extend(
+                                app.ingest_appends(vec![notice_effect("服务繁忙，关闭请求未发送")]),
+                            );
                             // Still escalate: user confirmed quit during busy turn.
                             exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
                         }
@@ -654,7 +785,9 @@ fn apply_updates(
         if !state.sync.accept(&update) {
             continue;
         }
-        if let Some(outcome) = track_identities(state, app, &update) {
+        let (tracked, outcome) = track_identities(state, app, &update);
+        effects.extend(tracked);
+        if let Some(outcome) = outcome {
             return Err(outcome);
         }
         if matches!(
@@ -664,12 +797,7 @@ fn apply_updates(
             markdown.reset();
         }
         if let FrontendUpdateKind::ResyncRequired { .. } = &update.kind {
-            if let CommandDispatch::Enqueued(id) =
-                state.client.request_snapshot(state.sync.revision)
-            {
-                state.sync.snapshot_request = Some(id);
-            }
-            state.sync.awaiting_snapshot = true;
+            effects.extend(app.ingest_appends(begin_snapshot_resync(state)?));
             continue;
         }
         if let FrontendUpdateKind::CommandRejected { reason } = &update.kind
@@ -681,21 +809,13 @@ fn apply_updates(
             app.set_preview(&session_id, Preview::Failed(reason.to_string()));
             continue;
         }
-        if let FrontendUpdateKind::SubmitAccepted {
-            operation_id,
-            ..
-        } = &update.kind
-        {
-            let intent_id = update
-                .request_id
-                .and_then(|id| state.take_submit_intent(id))
-                .or_else(|| app.submit_state().intent_id());
-            if let Some(intent_id) = intent_id {
-                effects.extend(app.on_action(Action::SubmitAccepted {
-                    intent_id,
-                    operation_id: operation_id.clone(),
-                }));
-            }
+        if let FrontendUpdateKind::SubmitAccepted { operation_id, .. } = &update.kind {
+            effects.extend(apply_submit_accepted(
+                state,
+                app,
+                update.request_id,
+                operation_id.clone(),
+            ));
             continue;
         }
         if let FrontendUpdateKind::CommandRejected { reason } = &update.kind {
@@ -731,7 +851,7 @@ fn track_identities(
     state: &mut LoopState,
     app: &mut App,
     update: &FrontendUpdate,
-) -> Option<TuiOutcome> {
+) -> (Vec<Effect>, Option<TuiOutcome>) {
     match &update.kind {
         FrontendUpdateKind::OperationAccepted { operation_id, .. } => {
             let waiting = matches!(
@@ -752,7 +872,7 @@ fn track_identities(
                     return dispatch_cancel_operation(state, app, id, cancel_request);
                 }
             }
-            None
+            (Vec::new(), None)
         }
         FrontendUpdateKind::AvailabilityChanged { availability, .. } => {
             match availability {
@@ -767,14 +887,83 @@ fn track_identities(
                 }
                 FrontendAvailability::Compacting { .. } => {}
             }
-            None
+            (Vec::new(), None)
         }
         FrontendUpdateKind::MaintenanceChanged(maintenance) => {
             state.maintenance_id = Some(maintenance.id.clone());
-            None
+            (Vec::new(), None)
         }
-        _ => None,
+        FrontendUpdateKind::SnapshotReady(snapshot) => {
+            track_snapshot_identities(state, app, snapshot)
+        }
+        FrontendUpdateKind::ServiceHealthChanged { health } => {
+            if matches!(health, ServiceHealth::RuntimeEpochEnded { .. }) {
+                state.active_operation_id = None;
+                state.maintenance_id = None;
+                state.ctrl_c.observe_idle();
+            }
+            (Vec::new(), None)
+        }
+        _ => (Vec::new(), None),
     }
+}
+
+fn track_snapshot_identities(
+    state: &mut LoopState,
+    app: &mut App,
+    snapshot: &FrontendSnapshot,
+) -> (Vec<Effect>, Option<TuiOutcome>) {
+    if matches!(snapshot.health, ServiceHealth::RuntimeEpochEnded { .. }) {
+        state.active_operation_id = None;
+        state.maintenance_id = None;
+        state.ctrl_c.observe_idle();
+        return (Vec::new(), None);
+    }
+
+    let waiting = matches!(
+        state.ctrl_c,
+        CtrlCPhase::CancelDispatching {
+            operation_id: None,
+            ..
+        }
+    );
+
+    match &snapshot.availability {
+        FrontendAvailability::Busy { operation_id } => {
+            state.active_operation_id = Some(operation_id.clone());
+            state.ctrl_c.observe_busy(operation_id.clone());
+        }
+        FrontendAvailability::Idle => {
+            state.active_operation_id = None;
+            state.ctrl_c.observe_idle();
+        }
+        FrontendAvailability::Compacting { .. } => {
+            state.active_operation_id = None;
+        }
+    }
+
+    state.maintenance_id = snapshot
+        .maintenance
+        .as_ref()
+        .and_then(|maintenance| match maintenance.phase {
+            FrontendMaintenancePhase::Accepted
+            | FrontendMaintenancePhase::Started
+            | FrontendMaintenancePhase::Progress => Some(maintenance.id.clone()),
+            FrontendMaintenancePhase::Settled
+            | FrontendMaintenancePhase::Failed
+            | FrontendMaintenancePhase::Cancelled => None,
+        });
+
+    if waiting {
+        if let Some(id) = state.ctrl_c.pending_cancel_id().map(str::to_owned) {
+            let cancel_request = state
+                .ctrl_c
+                .cancel_request()
+                .unwrap_or_else(|| state.next_cancel_request());
+            return dispatch_cancel_operation(state, app, id, cancel_request);
+        }
+    }
+    (Vec::new(), None)
 }
 
 fn apply_task(app: &mut App, completion: TaskCompletion) -> Vec<Effect> {
@@ -1271,5 +1460,252 @@ mod tests {
         .await;
         assert_eq!(outcome, TuiOutcome::ForcedExitRequested { code: 130 });
         drop(service);
+    }
+
+    #[tokio::test]
+    async fn unmatched_submit_accepted_does_not_commit_current_intent() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), true);
+        for ch in "draft".chars() {
+            app.on_action(Action::InsertChar(ch));
+        }
+        let effects = app.on_action(Action::Submit);
+        let intent_id = match effects.as_slice() {
+            [Effect::PrepareSubmit { intent_id, .. }] => *intent_id,
+            other => panic!("expected PrepareSubmit, got {other:?}"),
+        };
+        let request_id = philo_agent_service::FrontendRequestId::new(1);
+        app.on_action(Action::SubmitDispatchFinished {
+            intent_id,
+            result: SubmitDispatchResult::Enqueued(request_id),
+        });
+
+        let mut state = loop_state(client);
+        state.remember_submit(request_id, intent_id);
+
+        let unmatched = FrontendUpdate {
+            epoch: philo_agent_service::FrontendEpoch::INITIAL,
+            revision: FrontendRevision::new(1),
+            request_id: Some(philo_agent_service::FrontendRequestId::new(99)),
+            kind: FrontendUpdateKind::SubmitAccepted {
+                operation_id: "op-stale".to_owned(),
+                turn_id: "turn-stale".to_owned(),
+            },
+        };
+        let effects = apply_updates(
+            &mut app,
+            &mut MarkdownRenderer::new(),
+            &mut state,
+            vec![unmatched],
+        )
+        .expect("apply");
+        assert!(effects.is_empty());
+        assert!(matches!(
+            app.submit_state(),
+            crate::app::submit::SubmitState::Dispatching(_)
+        ));
+        assert!(
+            app.cells
+                .cells()
+                .iter()
+                .all(|line| line.kind != LineKind::User)
+        );
+    }
+
+    fn loop_state(client: FrontendClient) -> LoopState {
+        LoopState {
+            client,
+            sync: FrontendSync::new(),
+            preview_generation: 0,
+            active_operation_id: None,
+            maintenance_id: None,
+            ctrl_c: CtrlCPhase::Idle,
+            next_cancel_request: 1,
+            submit_requests: Vec::new(),
+            pending_session_load: None,
+            session_load_retries: 0,
+        }
+    }
+
+    fn dispatching_app(draft: &str) -> (App, u64, philo_agent_service::FrontendRequestId) {
+        let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), true);
+        for ch in draft.chars() {
+            app.on_action(Action::InsertChar(ch));
+        }
+        let effects = app.on_action(Action::Submit);
+        let intent_id = match effects.as_slice() {
+            [Effect::PrepareSubmit { intent_id, .. }] => *intent_id,
+            other => panic!("expected PrepareSubmit, got {other:?}"),
+        };
+        let request_id = philo_agent_service::FrontendRequestId::new(1);
+        app.on_action(Action::SubmitDispatchFinished {
+            intent_id,
+            result: SubmitDispatchResult::Enqueued(request_id),
+        });
+        (app, intent_id, request_id)
+    }
+
+    #[test]
+    fn accept_allows_command_replies_while_awaiting_snapshot() {
+        let mut sync = FrontendSync::new();
+        sync.awaiting_snapshot = true;
+        let accepted = FrontendUpdate {
+            epoch: philo_agent_service::FrontendEpoch::INITIAL,
+            revision: FrontendRevision::new(1),
+            request_id: Some(philo_agent_service::FrontendRequestId::new(1)),
+            kind: FrontendUpdateKind::SubmitAccepted {
+                operation_id: "op-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+            },
+        };
+        assert!(sync.accept(&accepted));
+        assert!(sync.awaiting_snapshot);
+
+        let rejected = FrontendUpdate {
+            revision: FrontendRevision::new(2),
+            kind: FrontendUpdateKind::CommandRejected {
+                reason: philo_agent_service::CommandReject::NoCurrentSession,
+            },
+            ..accepted.clone()
+        };
+        assert!(sync.accept(&rejected));
+
+        let health = FrontendUpdate {
+            revision: FrontendRevision::new(3),
+            kind: FrontendUpdateKind::ServiceHealthChanged {
+                health: philo_agent_service::ServiceHealth::Degraded {
+                    message: "lag".to_owned(),
+                },
+            },
+            ..accepted
+        };
+        assert!(sync.accept(&health));
+        assert!(sync.awaiting_snapshot);
+    }
+
+    #[tokio::test]
+    async fn resync_then_late_submit_accepted_leaves_dispatching() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let (mut app, intent_id, request_id) = dispatching_app("draft");
+        let mut state = loop_state(client);
+        state.remember_submit(request_id, intent_id);
+        state.sync.awaiting_snapshot = true;
+
+        let resync = FrontendUpdate {
+            epoch: philo_agent_service::FrontendEpoch::INITIAL,
+            revision: FrontendRevision::new(1),
+            request_id: None,
+            kind: FrontendUpdateKind::ResyncRequired {
+                latest_revision: FrontendRevision::new(1),
+            },
+        };
+        let accepted = FrontendUpdate {
+            epoch: philo_agent_service::FrontendEpoch::INITIAL,
+            revision: FrontendRevision::new(2),
+            request_id: Some(request_id),
+            kind: FrontendUpdateKind::SubmitAccepted {
+                operation_id: "op-late".to_owned(),
+                turn_id: "turn-late".to_owned(),
+            },
+        };
+        apply_updates(
+            &mut app,
+            &mut MarkdownRenderer::new(),
+            &mut state,
+            vec![resync, accepted],
+        )
+        .expect("apply");
+        assert!(matches!(
+            app.submit_state(),
+            crate::app::submit::SubmitState::Accepted { .. }
+        ));
+        assert!(
+            app.cells
+                .cells()
+                .iter()
+                .any(|line| line.kind == LineKind::User && line.text.contains("draft"))
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_busy_ctrl_c_cancels_with_id() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), true);
+        let mut state = loop_state(client);
+        let update = FrontendUpdate {
+            epoch: philo_agent_service::FrontendEpoch::INITIAL,
+            revision: FrontendRevision::new(1),
+            request_id: None,
+            kind: FrontendUpdateKind::SnapshotReady(Box::new(
+                crate::tests::support::busy_snapshot("s", "op-snap"),
+            )),
+        };
+        apply_updates(
+            &mut app,
+            &mut MarkdownRenderer::new(),
+            &mut state,
+            vec![update],
+        )
+        .expect("apply");
+        assert_eq!(state.active_operation_id.as_deref(), Some("op-snap"));
+        let decision = ctrl_c_decision(&mut state, true);
+        assert!(matches!(
+            decision,
+            CtrlCDecision::Cancel {
+                operation_id,
+                ..
+            } if operation_id == "op-snap"
+        ));
+    }
+
+    #[test]
+    fn backpressured_snapshot_request_does_not_await() {
+        let mut sync = FrontendSync::new();
+        sync.want_snapshot = true;
+        sync.snapshot_retries = SNAPSHOT_REQUEST_RETRY_BUDGET;
+        let effects = apply_snapshot_request_dispatch(&mut sync, CommandDispatch::Backpressured)
+            .expect("dispatch");
+        assert!(!sync.awaiting_snapshot);
+        assert!(sync.want_snapshot);
+        assert_eq!(sync.snapshot_retries, SNAPSHOT_REQUEST_RETRY_BUDGET - 1);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Append(lines) if lines.iter().any(|line| line.text.contains("快照请求未发送"))))
+        );
+
+        sync.snapshot_retries = 0;
+        let _ = apply_snapshot_request_dispatch(&mut sync, CommandDispatch::Backpressured)
+            .expect("exhausted");
+        assert!(!sync.awaiting_snapshot);
+        assert!(!sync.want_snapshot);
+    }
+
+    #[tokio::test]
+    async fn submit_accepted_matches_pending_request_id_without_map() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let (mut app, _intent_id, request_id) = dispatching_app("draft");
+        let mut state = loop_state(client);
+        state.sync.awaiting_snapshot = true;
+        let accepted = FrontendUpdate {
+            epoch: philo_agent_service::FrontendEpoch::INITIAL,
+            revision: FrontendRevision::new(1),
+            request_id: Some(request_id),
+            kind: FrontendUpdateKind::SubmitAccepted {
+                operation_id: "op-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+            },
+        };
+        apply_updates(
+            &mut app,
+            &mut MarkdownRenderer::new(),
+            &mut state,
+            vec![accepted],
+        )
+        .expect("apply");
+        assert!(matches!(
+            app.submit_state(),
+            crate::app::submit::SubmitState::Accepted { .. }
+        ));
     }
 }

@@ -59,14 +59,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode, UsageError> {
     } else {
         std::time::Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE
     };
-    let shutdown = assembly::shutdown_with_deadline(
-        bootstrap,
-        &mut shutdown_interrupt,
-        deadline,
-    )
-    .await;
+    let shutdown =
+        assembly::shutdown_with_deadline(bootstrap, &mut shutdown_interrupt, deadline).await;
     for name in &shutdown.pending {
         eprintln!("error: shutdown deadline exceeded: {name}");
     }
-    Ok(report.exit_code())
+    if shutdown.pending.is_empty() {
+        Ok(report.exit_code())
+    } else {
+        Ok(ExitCode::from(assembly::shutdown_exit_code(
+            report.code,
+            &shutdown.pending,
+        )))
+    }
 }

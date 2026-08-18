@@ -46,8 +46,11 @@ where
         }
         match result {
             Ok(durable) => {
-                let session_ids =
-                    compose_session_catalog(durable, self.snapshot.current_session.as_deref());
+                let session_ids = compose_session_catalog(
+                    durable,
+                    self.snapshot.current_session.as_deref(),
+                    self.snapshot.pending_load_session(),
+                );
                 self.emit(
                     Some(request_id),
                     FrontendUpdateKind::SessionListLoaded { session_ids },
@@ -95,19 +98,22 @@ where
     }
 }
 
-/// Durable ids plus at most one uncommitted `current_session`, then a stable sort.
+/// Durable ids plus committed current and in-flight pending load, then a stable sort.
 pub(super) fn compose_session_catalog(
     durable: impl IntoIterator<Item = SessionId>,
     current_session: Option<&str>,
+    pending_load: Option<&str>,
 ) -> Vec<String> {
     let mut session_ids: Vec<String> = durable
         .into_iter()
         .map(|session_id| session_id.as_str().to_owned())
         .collect();
-    if let Some(current) = current_session.filter(|id| !id.is_empty())
-        && !session_ids.iter().any(|id| id == current)
-    {
-        session_ids.push(current.to_owned());
+    for extra in [current_session, pending_load] {
+        if let Some(id) = extra.filter(|id| !id.is_empty())
+            && !session_ids.iter().any(|existing| existing == id)
+        {
+            session_ids.push(id.to_owned());
+        }
     }
     session_ids.sort();
     session_ids
@@ -137,6 +143,7 @@ mod tests {
                 SessionId::new("sess-m"),
             ],
             None,
+            None,
         );
         assert_eq!(ids, ["sess-a", "sess-m", "sess-z"]);
     }
@@ -146,6 +153,7 @@ mod tests {
         let ids = compose_session_catalog(
             [SessionId::new("sess-z"), SessionId::new("sess-a")],
             Some("sess-service-1"),
+            None,
         );
         assert_eq!(ids, ["sess-a", "sess-service-1", "sess-z"]);
     }
@@ -155,21 +163,32 @@ mod tests {
         let ids = compose_session_catalog(
             [SessionId::new("sess-a"), SessionId::new("sess-b")],
             Some("sess-a"),
+            None,
         );
         assert_eq!(ids, ["sess-a", "sess-b"]);
     }
 
     #[test]
     fn compose_empty_store_without_current_is_empty() {
-        assert!(compose_session_catalog([], None).is_empty());
+        assert!(compose_session_catalog([], None, None).is_empty());
     }
 
     #[test]
     fn compose_empty_store_keeps_only_current() {
         assert_eq!(
-            compose_session_catalog([], Some("sess-service-1")),
+            compose_session_catalog([], Some("sess-service-1"), None),
             ["sess-service-1"]
         );
+    }
+
+    #[test]
+    fn compose_merges_pending_load_without_duplicating() {
+        let ids = compose_session_catalog(
+            [SessionId::new("sess-a")],
+            Some("sess-a"),
+            Some("sess-pending"),
+        );
+        assert_eq!(ids, ["sess-a", "sess-pending"]);
     }
 
     #[test]

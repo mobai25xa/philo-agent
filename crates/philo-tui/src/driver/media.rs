@@ -7,8 +7,10 @@
 use philo_agent_service::FrontendAttachment;
 
 use crate::app::attachment::PendingAttachment;
-use crate::app::transcript::{LineKind, TranscriptLine};
 use crate::platform::image_file;
+
+#[cfg(test)]
+use crate::app::transcript::TranscriptLine;
 
 /// The outcome of resolving one message's attachments.
 pub(crate) struct Resolved {
@@ -66,29 +68,7 @@ pub(crate) fn resolve(attachments: Vec<PendingAttachment>) -> Resolved {
 /// What the user sees when an attachment stops the send.
 #[cfg(test)]
 pub(crate) fn refusal_lines(errors: &[String]) -> Vec<TranscriptLine> {
-    refusal_lines_for_restore(errors, true)
-}
-
-/// What the user sees when an old media result must not overwrite a newer
-/// draft. The failure remains visible while current input stays untouched.
-pub(crate) fn refusal_lines_for_restore(errors: &[String], restored: bool) -> Vec<TranscriptLine> {
-    let mut lines: Vec<TranscriptLine> = errors
-        .iter()
-        .map(|error| TranscriptLine {
-            kind: LineKind::Error,
-            text: format!("error: {error}"),
-        })
-        .collect();
-    let outcome = if restored {
-        "the message was not sent; it is back in the input"
-    } else {
-        "the message was not sent; newer input was left unchanged"
-    };
-    lines.push(TranscriptLine {
-        kind: LineKind::Error,
-        text: outcome.to_owned(),
-    });
-    lines
+    crate::app::transcript::refusal_lines_for_restore(errors, true)
 }
 
 #[cfg(test)]

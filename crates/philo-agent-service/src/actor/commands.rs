@@ -1,12 +1,11 @@
-//! Submit, cancel, install, attach, and other command handlers.
+//! Submit, cancel, install, and other command handlers.
 
 use crate::confirmation::ConfirmationSubmit;
 use crate::error::CommandReject;
-use crate::frontend::command::{DetachReason, FrontendAttachment, FrontendReasoningEffort};
-use crate::frontend::snapshot::ServiceHealth;
+use crate::frontend::command::{FrontendAttachment, FrontendReasoningEffort};
 use crate::frontend::update::FrontendUpdateKind;
 use crate::generation::{AssembleError, AssembleRequest, AssembledGeneration};
-use crate::ids::{FrontendEpoch, FrontendInstanceId, FrontendRequestId};
+use crate::ids::{FrontendEpoch, FrontendRequestId};
 use crate::mapping;
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
 use philo_agent_runtime::{CancelResult, CompactionSpec, MaintenanceId, OperationSpec};
@@ -32,14 +31,17 @@ where
             self.reject_child_capacity(request_id);
             return;
         }
-        let Some(session_id) = self.snapshot.current_session.clone() else {
-            self.emit(
-                Some(request_id),
-                FrontendUpdateKind::CommandRejected {
-                    reason: CommandReject::NoCurrentSession,
-                },
-            );
-            return;
+        let session_id = match self.snapshot.current_session.clone() {
+            Some(session_id) => session_id,
+            None => {
+                self.emit(
+                    Some(request_id),
+                    FrontendUpdateKind::CommandRejected {
+                        reason: CommandReject::NoCurrentSession,
+                    },
+                );
+                return;
+            }
         };
         let user_message = match mapping::user_message(&draft, &attachments) {
             Ok(message) => message,
@@ -88,7 +90,10 @@ where
     }
 
     pub(super) fn handle_confirmation_submit(&mut self, submit: ConfirmationSubmit) {
-        if let Ok((confirmation_id, request)) = self.confirmations.insert(submit) {
+        if let Ok((confirmation_id, request)) = self
+            .confirmations
+            .insert(submit, self.current_lease_generation())
+        {
             self.emit(
                 None,
                 FrontendUpdateKind::ConfirmationRequested {
@@ -113,51 +118,6 @@ where
         self.spawn_install(request_id, name);
     }
 
-    pub(super) fn handle_frontend_attached(
-        &mut self,
-        request_id: FrontendRequestId,
-        frontend_instance_id: FrontendInstanceId,
-    ) {
-        if let Some(previous) = self.attached.clone() {
-            if previous != frontend_instance_id {
-                self.detach_attached(previous, DetachReason::Replaced);
-            }
-        }
-        self.attached = Some(frontend_instance_id);
-        self.health = ServiceHealth::Ok;
-        self.emit(
-            Some(request_id),
-            FrontendUpdateKind::ServiceHealthChanged {
-                health: self.health.clone(),
-            },
-        );
-    }
-
-    pub(super) fn handle_frontend_detached(
-        &mut self,
-        request_id: FrontendRequestId,
-        frontend_instance_id: FrontendInstanceId,
-        reason: DetachReason,
-    ) {
-        if self.attached.as_ref() == Some(&frontend_instance_id) {
-            self.detach_attached(frontend_instance_id, reason);
-        }
-        self.emit(Some(request_id), FrontendUpdateKind::CommandAccepted);
-    }
-
-    fn detach_attached(&mut self, frontend_instance_id: FrontendInstanceId, reason: DetachReason) {
-        if self.attached.as_ref() != Some(&frontend_instance_id) {
-            return;
-        }
-        self.attached = None;
-        match reason {
-            DetachReason::Replaced
-            | DetachReason::UserExit
-            | DetachReason::Restart
-            | DetachReason::Fault { .. } => self.deny_all_confirmations(),
-        }
-    }
-
     pub(super) fn handle_install(
         &mut self,
         request_id: FrontendRequestId,
@@ -166,6 +126,12 @@ where
         result: Result<AssembledGeneration, AssembleError>,
     ) {
         if epoch != self.epoch {
+            self.emit(
+                Some(request_id),
+                FrontendUpdateKind::CommandRejected {
+                    reason: CommandReject::NotAccepting,
+                },
+            );
             return;
         }
         match result {

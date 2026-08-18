@@ -85,6 +85,9 @@ struct SessionFlags {
 struct Registry {
     next: AtomicU64,
     active: Mutex<Option<SessionFlags>>,
+    /// Sticky: `Mutex` poison is consumed by `into_inner()`, but emergency
+    /// restore still needs to diagnose uncertain ownership afterwards.
+    poisoned: AtomicBool,
 }
 
 impl Registry {
@@ -92,6 +95,7 @@ impl Registry {
         Self {
             next: AtomicU64::new(1),
             active: Mutex::new(None),
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -99,30 +103,50 @@ impl Registry {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn activate(&self, flags: SessionFlags) {
-        if let Ok(mut active) = self.active.lock() {
-            *active = Some(flags);
+    fn lock_active(&self) -> (std::sync::MutexGuard<'_, Option<SessionFlags>>, bool) {
+        match self.active.lock() {
+            Ok(guard) => (guard, false),
+            Err(poisoned) => {
+                // `into_inner()` clears Mutex poison; keep a sticky bit so
+                // `try_take_if` can still diagnose after `snapshot()`.
+                self.poisoned.store(true, Ordering::SeqCst);
+                (poisoned.into_inner(), true)
+            }
         }
+    }
+
+    fn activate(&self, flags: SessionFlags) {
+        let (mut active, _) = self.lock_active();
+        *active = Some(flags);
     }
 
     fn snapshot(&self) -> Option<SessionFlags> {
-        self.active.lock().ok().and_then(|guard| *guard)
+        let (active, _) = self.lock_active();
+        *active
     }
 
+    #[allow(dead_code)]
     fn take_if(&self, token: u64) -> Option<SessionFlags> {
-        let mut active = self.active.lock().ok()?;
-        match *active {
-            Some(flags) if flags.token == token => active.take(),
-            _ => None,
-        }
+        self.take_if_recovered(token).0
     }
 
-    fn try_take_if(&self, token: u64) -> Result<Option<SessionFlags>, ()> {
-        let mut active = self.active.lock().map_err(|_| ())?;
-        Ok(match *active {
+    fn take_if_recovered(&self, token: u64) -> (Option<SessionFlags>, bool) {
+        let (mut active, poisoned) = self.lock_active();
+        let taken = match *active {
             Some(flags) if flags.token == token => active.take(),
             _ => None,
-        })
+        };
+        (taken, poisoned)
+    }
+
+    fn try_take_if(&self, token: u64) -> Result<Option<SessionFlags>, Option<SessionFlags>> {
+        let (taken, this_lock_poisoned) = self.take_if_recovered(token);
+        let sticky = self.poisoned.swap(false, Ordering::SeqCst);
+        if this_lock_poisoned || sticky {
+            Err(taken)
+        } else {
+            Ok(taken)
+        }
     }
 }
 
@@ -228,7 +252,8 @@ impl<B: TerminalBackend> ModeOwner<B> {
             return RestoreReport::default();
         }
         self.finished = true;
-        match REGISTRY.take_if(self.token) {
+        let (taken, poisoned) = REGISTRY.take_if_recovered(self.token);
+        let mut report = match taken {
             None => RestoreReport {
                 restored: false,
                 skipped_stale: REGISTRY.snapshot().is_some(),
@@ -238,7 +263,14 @@ impl<B: TerminalBackend> ModeOwner<B> {
                 self.capabilities = flags.capabilities;
                 restore_held_capabilities(&mut self.capabilities, &mut self.backend)
             }
+        };
+        if poisoned {
+            report.failures.push(RestoreFailure {
+                capability: TerminalCapability::RawMode,
+                message: "uncertain ownership: registry lock poisoned".to_owned(),
+            });
         }
+        report
     }
 }
 
@@ -352,8 +384,8 @@ fn emergency_restore_active_session(backend: &mut impl TerminalBackend) -> Resto
             skipped_stale: REGISTRY.snapshot().is_some(),
             ..RestoreReport::default()
         },
-        Err(()) => {
-            let mut caps = flags.capabilities;
+        Err(taken) => {
+            let mut caps = taken.unwrap_or(flags).capabilities;
             let mut report = restore_held_capabilities(&mut caps, backend);
             report.failures.push(RestoreFailure {
                 capability: TerminalCapability::RawMode,
@@ -364,9 +396,7 @@ fn emergency_restore_active_session(backend: &mut impl TerminalBackend) -> Resto
     }
 }
 
-fn build_ratatui_terminal(
-    screen: TuiScreen,
-) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+fn build_ratatui_terminal(screen: TuiScreen) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     let backend = CrosstermBackend::new(stdout());
     match screen {
         TuiScreen::Alternate => Terminal::new(backend),
@@ -490,9 +520,11 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Isolate registry ownership across serialized tests.
-        if let Ok(mut active) = REGISTRY.active.lock() {
-            *active = None;
-        }
+        let (mut active, _) = REGISTRY.lock_active();
+        *active = None;
+        drop(active);
+        REGISTRY.active.clear_poison();
+        REGISTRY.poisoned.store(false, Ordering::SeqCst);
         guard
     }
 
@@ -688,8 +720,18 @@ mod tests {
         assert!(modes.capabilities.raw_mode);
         assert!(modes.capabilities.mouse_capture);
         let _ = modes.finish();
-        assert!(!modes.backend.calls.contains(&BackendOp::EnterAlternateScreen));
-        assert!(!modes.backend.calls.contains(&BackendOp::LeaveAlternateScreen));
+        assert!(
+            !modes
+                .backend
+                .calls
+                .contains(&BackendOp::EnterAlternateScreen)
+        );
+        assert!(
+            !modes
+                .backend
+                .calls
+                .contains(&BackendOp::LeaveAlternateScreen)
+        );
     }
 
     #[test]
@@ -778,5 +820,30 @@ mod tests {
         assert!(chained.load(Ordering::SeqCst));
         let _ = std::panic::take_hook();
         std::panic::set_hook(previous);
+    }
+
+    #[test]
+    fn poisoned_registry_recovers_and_diagnoses_uncertain() {
+        let _lock = lock_terminal_tests();
+        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Inline).expect("setup");
+        modes.finished = true;
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = REGISTRY.active.lock().expect("registry lock");
+            panic!("poison registry");
+        });
+        assert!(
+            REGISTRY.snapshot().is_some(),
+            "poisoned registry must recover the active session"
+        );
+        let mut backend = RecordingBackend::new();
+        let report = emergency_restore_active_session(&mut backend);
+        assert!(report.restored);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.message.contains("uncertain")),
+            "{report:?}"
+        );
     }
 }

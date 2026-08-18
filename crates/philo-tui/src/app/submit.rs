@@ -60,9 +60,7 @@ impl SubmitState {
 pub(crate) enum SubmitDispatchResult {
     Enqueued(FrontendRequestId),
     Backpressured,
-    Disconnected {
-        lane: &'static str,
-    },
+    Disconnected { lane: &'static str },
 }
 
 /// Structured result of `try_command(Cancel*)` for the reducer / interrupt FSM.
@@ -70,7 +68,5 @@ pub(crate) enum SubmitDispatchResult {
 pub(crate) enum CancelDispatchResult {
     Enqueued(FrontendRequestId),
     Backpressured,
-    Disconnected {
-        lane: &'static str,
-    },
+    Disconnected { lane: &'static str },
 }

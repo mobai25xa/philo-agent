@@ -23,7 +23,7 @@ use crate::FrontendClient;
 use crate::bounds::RUNTIME_EVENT_CAP;
 use crate::generation::{AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler};
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
-use crate::service::{AgentService, ServiceDeps};
+use crate::service::{AgentService, ServiceDeps, StartOptions, start_inner};
 
 /// Model port that never starts a stream.
 #[derive(Debug, Default)]
@@ -199,6 +199,7 @@ struct FakeInner {
     cancel_calls: Vec<OperationId>,
     cancel_maintenance_calls: Vec<MaintenanceId>,
     shutdown_calls: Vec<ShutdownMode>,
+    panic_next_child: bool,
     submit_error: Option<AdmissionError>,
     next_op: u64,
     snapshot: RuntimeSnapshot,
@@ -234,6 +235,7 @@ impl FakeRuntimeHandle {
                 cancel_calls: Vec::new(),
                 cancel_maintenance_calls: Vec::new(),
                 shutdown_calls: Vec::new(),
+                panic_next_child: false,
                 submit_error: None,
                 next_op: 1,
                 snapshot: RuntimeSnapshot {
@@ -407,6 +409,21 @@ impl FakeRuntimeHandle {
             .shutdown_calls
             .len()
     }
+
+    /// Last recorded shutdown mode, if any.
+    pub fn last_shutdown_mode(&self) -> Option<ShutdownMode> {
+        self.inner
+            .lock()
+            .expect("fake runtime")
+            .shutdown_calls
+            .last()
+            .copied()
+    }
+
+    /// Panics the next runtime child after it has entered the hold/park point.
+    pub fn panic_next_child(&self) {
+        self.inner.lock().expect("fake runtime").panic_next_child = true;
+    }
 }
 
 async fn park_runtime_child(inner: &Arc<Mutex<FakeInner>>, notify: &Notify) {
@@ -430,6 +447,11 @@ impl RuntimePort for FakeRuntimeHandle {
         async move {
             park_runtime_child(&inner, &notify).await;
             let mut inner = inner.lock().expect("fake runtime");
+            if inner.panic_next_child {
+                inner.panic_next_child = false;
+                drop(inner);
+                panic!("test child panic");
+            }
             if let Some(error) = inner.submit_error.take() {
                 return Err(error);
             }
@@ -535,6 +557,18 @@ impl RuntimeEvents for FakeRuntimeSubscription {
     }
 }
 
+/// Releases a paused command-lane poll once the test has filled that mailbox.
+pub struct CommandLaneHold {
+    tx: watch::Sender<bool>,
+}
+
+impl CommandLaneHold {
+    /// Allows the actor to start polling the ordinary command lane.
+    pub fn release(self) {
+        let _ = self.tx.send(true);
+    }
+}
+
 /// Starts a service against [`FakeRuntimeHandle`] and [`MemorySessionStore`].
 pub fn start_test_service() -> (AgentService, FrontendClient, FakeRuntimeHandle) {
     start_test_service_with(FakeAssembler::new(), MemorySessionStore::new())
@@ -555,4 +589,34 @@ pub fn start_test_service_with(
         initial_generation: test_generation("base"),
     });
     (service, client, handle)
+}
+
+/// Starts a service that does not poll the ordinary command lane until released.
+pub fn start_test_service_with_command_hold() -> (
+    AgentService,
+    FrontendClient,
+    FakeRuntimeHandle,
+    CommandLaneHold,
+) {
+    let (hold_tx, hold_rx) = watch::channel(false);
+    let (runtime, subscription) = FakeRuntimeHandle::pair();
+    let handle = runtime.clone();
+    let (service, client) = start_inner(
+        ServiceDeps {
+            runtime,
+            subscription,
+            sessions: Arc::new(MemorySessionStore::new()),
+            assembler: Arc::new(FakeAssembler::new()),
+            initial_generation: test_generation("base"),
+        },
+        StartOptions {
+            command_hold: Some(hold_rx),
+        },
+    );
+    (service, client, handle, CommandLaneHold { tx: hold_tx })
+}
+
+/// Aborts the service actor so later attach/detach observe a dead host.
+pub fn abort_service_actor(service: &AgentService) {
+    service.abort_actor();
 }

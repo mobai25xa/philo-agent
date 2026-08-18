@@ -95,13 +95,13 @@ impl RuntimeHandle {
         mode: ShutdownMode,
         deadline: Instant,
     ) -> Result<ShutdownReport, ShutdownError> {
+        if let Some(outcome) = self.completion_rx.borrow().clone() {
+            return outcome;
+        }
         if Instant::now() >= deadline {
             return Err(ShutdownError::DeadlineExceeded {
                 pending: vec!["runtime".into()],
             });
-        }
-        if let Some(outcome) = self.completion_rx.borrow().clone() {
-            return outcome;
         }
         if self.shutdown_tx.receiver_count() == 0 {
             return Err(ShutdownError::RuntimeGone);
@@ -179,6 +179,8 @@ impl RuntimeHandle {
                 reliable_staging_cap: 0,
                 transient_len: 0,
                 transient_cap: 0,
+                sealed_model_stream_len: 0,
+                sealed_model_stream_cap: 0,
             };
         }
         rx.await.unwrap_or(OutboundStats {
@@ -186,6 +188,8 @@ impl RuntimeHandle {
             reliable_staging_cap: 0,
             transient_len: 0,
             transient_cap: 0,
+            sealed_model_stream_len: 0,
+            sealed_model_stream_cap: 0,
         })
     }
 }

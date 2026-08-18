@@ -3,6 +3,7 @@
 use philo_agent_service::{ConfirmationDecision, FrontendReasoningEffort};
 
 use super::attachment::PendingAttachment;
+use super::submit::IntentId;
 use super::transcript::TranscriptLine;
 
 /// One service-backed operation requested by a command or overlay.
@@ -23,9 +24,10 @@ pub(crate) enum HostRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Effect {
     Append(Vec<TranscriptLine>),
-    /// Send this message; the driver resolves path attachments into bytes
-    /// first and refuses the send when one cannot be read.
-    Submit {
+    /// Prepare and dispatch a pending submit intent (media decode then
+    /// `try_command`). Local draft stays in AppState until admitted.
+    PrepareSubmit {
+        intent_id: IntentId,
         text: String,
         attachments: Vec<PendingAttachment>,
     },

@@ -14,11 +14,13 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::api::types::{RestoreReport, TuiLaunchConfig, TuiOutcome, TuiRunReport, TuiScreen};
+use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::overlay::Preview;
 use crate::app::state::{App, SessionLoadIntent};
 use crate::app::status::StatusData;
-use crate::app::transcript::InfoLevel;
+use crate::app::submit::{CancelDispatchResult, SubmitDispatchResult};
+use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 use crate::platform::clipboard::ClipboardContent;
 use crate::platform::input::{
     CrosstermInputSource, InputFaultTracker, TerminalInput, TerminalInputFault, TerminalInputSource,
@@ -32,7 +34,7 @@ use super::interrupt::{self, CtrlCDecision, CtrlCPhase};
 use super::output::{FlushReport, PendingOutput};
 use super::scheduler::FrameScheduler;
 use super::tasks::{MediaResult, PendingTasks, TaskCompletion};
-use super::{media, tasks};
+use super::tasks;
 
 const DRAW_FAILURE_BUDGET: u32 = 3;
 const INPUT_ERROR_BUDGET: u32 = 8;
@@ -154,12 +156,53 @@ struct LoopState {
     active_operation_id: Option<String>,
     maintenance_id: Option<String>,
     ctrl_c: CtrlCPhase,
+    next_cancel_request: u64,
+    /// Maps enqueued submit request ids to local intents.
+    submit_requests: Vec<(FrontendRequestId, u64)>,
 }
 
 impl LoopState {
     fn send(&self, command: FrontendCommand) -> CommandDispatch<FrontendRequestId> {
         self.client.try_command(command)
     }
+
+    fn next_cancel_request(&mut self) -> u64 {
+        let id = self.next_cancel_request;
+        self.next_cancel_request = self.next_cancel_request.wrapping_add(1).max(1);
+        id
+    }
+
+    fn remember_submit(&mut self, request_id: FrontendRequestId, intent_id: u64) {
+        self.submit_requests
+            .retain(|(id, _)| *id != request_id);
+        self.submit_requests.push((request_id, intent_id));
+    }
+
+    fn take_submit_intent(&mut self, request_id: FrontendRequestId) -> Option<u64> {
+        if let Some(index) = self
+            .submit_requests
+            .iter()
+            .position(|(id, _)| *id == request_id)
+        {
+            return Some(self.submit_requests.remove(index).1);
+        }
+        None
+    }
+}
+
+fn cancel_dispatch_result(dispatch: CommandDispatch<FrontendRequestId>) -> CancelDispatchResult {
+    match dispatch {
+        CommandDispatch::Enqueued(id) => CancelDispatchResult::Enqueued(id),
+        CommandDispatch::Backpressured => CancelDispatchResult::Backpressured,
+        CommandDispatch::Disconnected { lane } => CancelDispatchResult::Disconnected { lane },
+    }
+}
+
+fn notice_effect(text: impl Into<String>) -> Effect {
+    Effect::Append(vec![TranscriptLine {
+        kind: LineKind::Notice,
+        text: text.into(),
+    }])
 }
 
 fn ctrl_c_decision(state: &mut LoopState, treat_unknown_as_busy: bool) -> CtrlCDecision {
@@ -168,11 +211,60 @@ fn ctrl_c_decision(state: &mut LoopState, treat_unknown_as_busy: bool) -> CtrlCD
     } else if treat_unknown_as_busy && matches!(state.ctrl_c, CtrlCPhase::Idle) {
         state.ctrl_c = CtrlCPhase::Busy { operation_id: None };
     }
-    state.ctrl_c.on_ctrl_c()
+    let cancel_request = state.next_cancel_request();
+    state.ctrl_c.on_ctrl_c(cancel_request)
+}
+
+fn apply_cancel_dispatch(
+    state: &mut LoopState,
+    app: &mut App,
+    cancel_request: u64,
+    result: CancelDispatchResult,
+) -> Vec<Effect> {
+    let notice = state
+        .ctrl_c
+        .on_cancel_dispatch_finished(cancel_request, result.clone());
+    app.on_action(Action::CancelDispatchFinished {
+        request_id: cancel_request,
+        result,
+    });
+    if let Some(notice) = notice {
+        app.ingest_appends(vec![notice_effect(notice)])
+    } else {
+        Vec::new()
+    }
+}
+
+fn dispatch_cancel_operation(
+    state: &mut LoopState,
+    app: &mut App,
+    operation_id: String,
+    cancel_request: u64,
+) -> Option<TuiOutcome> {
+    let result = cancel_dispatch_result(state.send(FrontendCommand::CancelOperation {
+        operation_id,
+    }));
+    let disconnected = matches!(&result, CancelDispatchResult::Disconnected { .. });
+    let lane = match &result {
+        CancelDispatchResult::Disconnected { lane } => Some(*lane),
+        _ => None,
+    };
+    let _ = apply_cancel_dispatch(state, app, cancel_request, result);
+    if disconnected {
+        Some(TuiOutcome::FrontendRestartRequested {
+            fault: format!(
+                "frontend disconnected on cancel ({})",
+                lane.unwrap_or("unknown")
+            ),
+        })
+    } else {
+        None
+    }
 }
 
 fn apply_ctrl_c_decision(
     state: &mut LoopState,
+    app: &mut App,
     exit_requested: &mut Option<TuiOutcome>,
     decision: CtrlCDecision,
 ) {
@@ -180,10 +272,17 @@ fn apply_ctrl_c_decision(
         CtrlCDecision::UserExit => {
             *exit_requested = Some(TuiOutcome::UserExit);
         }
-        CtrlCDecision::Cancel { operation_id } => {
-            let _ = state.send(FrontendCommand::CancelOperation { operation_id });
+        CtrlCDecision::Cancel {
+            operation_id,
+            cancel_request,
+        } => {
+            if let Some(outcome) =
+                dispatch_cancel_operation(state, app, operation_id, cancel_request)
+            {
+                *exit_requested = Some(outcome);
+            }
         }
-        CtrlCDecision::WaitForId => {}
+        CtrlCDecision::WaitForId { .. } => {}
         CtrlCDecision::ForcedExit { code } => {
             *exit_requested = Some(TuiOutcome::ForcedExitRequested { code });
         }
@@ -192,6 +291,7 @@ fn apply_ctrl_c_decision(
 
 fn apply_interrupt_pulses(
     state: &mut LoopState,
+    app: &mut App,
     interrupt: Option<&mut watch::Receiver<u64>>,
     seen: &mut u64,
     exit_requested: &mut Option<TuiOutcome>,
@@ -205,7 +305,7 @@ fn apply_interrupt_pulses(
             break;
         }
         let decision = ctrl_c_decision(state, false);
-        apply_ctrl_c_decision(state, exit_requested, decision);
+        apply_ctrl_c_decision(state, app, exit_requested, decision);
     }
     Vec::new()
 }
@@ -249,6 +349,8 @@ pub(crate) async fn run_loop<B: Backend>(
         active_operation_id: None,
         maintenance_id: None,
         ctrl_c: CtrlCPhase::Idle,
+        next_cancel_request: 1,
+        submit_requests: Vec::new(),
     };
     let mut interrupt = config.interrupt;
     let mut interrupt_seen = 0u64;
@@ -330,7 +432,8 @@ pub(crate) async fn run_loop<B: Backend>(
                 });
                 Vec::new()
             }
-            Step::Task(completion) => match apply_task_with_submit(&mut app, &state, completion) {
+            Step::Task(completion) => match apply_task_with_submit(&mut app, &mut state, completion)
+            {
                 Ok(effects) => effects,
                 Err(outcome) => {
                     exit_requested = Some(outcome);
@@ -396,6 +499,7 @@ pub(crate) async fn run_loop<B: Backend>(
             }
             Step::Interrupt => apply_interrupt_pulses(
                 &mut state,
+                &mut app,
                 interrupt.as_mut(),
                 &mut interrupt_seen,
                 &mut exit_requested,
@@ -408,36 +512,100 @@ pub(crate) async fn run_loop<B: Backend>(
                 Effect::Append(_) => {
                     scheduler.invalidate_background(event_time);
                 }
-                Effect::Submit { text, attachments } => {
-                    let draft_generation = app.draft_generation();
-                    tasks.enqueue_media(text, attachments, draft_generation);
+                Effect::PrepareSubmit {
+                    intent_id,
+                    text,
+                    attachments,
+                } => {
+                    tasks.enqueue_media(intent_id, text, attachments);
                     scheduler.invalidate_immediate(Instant::now());
                 }
                 Effect::ReadClipboard => tasks.start_clipboard(),
                 Effect::WriteClipboard(text) => tasks.start_clipboard_write(text),
                 Effect::CancelActive => {
                     if let Some(operation_id) = state.active_operation_id.clone() {
-                        let _ = state.send(FrontendCommand::CancelOperation { operation_id });
+                        let cancel_request = state.next_cancel_request();
+                        state.ctrl_c = CtrlCPhase::CancelDispatching {
+                            operation_id: Some(operation_id.clone()),
+                            cancel_request,
+                        };
+                        if let Some(outcome) = dispatch_cancel_operation(
+                            &mut state,
+                            &mut app,
+                            operation_id,
+                            cancel_request,
+                        ) {
+                            exit_requested = Some(outcome);
+                        }
                     } else {
                         tasks.cancel_media();
+                        if let Some(submission) = app.submit_state().pending().cloned() {
+                            pending.extend(app.on_action(Action::SubmitMediaRefused {
+                                intent_id: submission.intent_id,
+                                kept: submission.attachments,
+                                errors: vec!["cancelled".to_owned()],
+                            }));
+                        }
                     }
                 }
                 Effect::InterruptCancel => {
                     if state.active_operation_id.is_none() && !app.status.busy {
                         tasks.cancel_media();
+                        if let Some(submission) = app.submit_state().pending().cloned() {
+                            pending.extend(app.on_action(Action::SubmitMediaRefused {
+                                intent_id: submission.intent_id,
+                                kept: submission.attachments,
+                                errors: vec!["cancelled".to_owned()],
+                            }));
+                        }
                     } else {
                         let decision = ctrl_c_decision(&mut state, true);
-                        apply_ctrl_c_decision(&mut state, &mut exit_requested, decision);
+                        apply_ctrl_c_decision(
+                            &mut state,
+                            &mut app,
+                            &mut exit_requested,
+                            decision,
+                        );
                     }
                 }
                 Effect::StartCompaction => {
-                    let _ = state.send(FrontendCommand::StartCompaction {
+                    match state.send(FrontendCommand::StartCompaction {
                         session_id: app.status.session.clone(),
-                    });
+                    }) {
+                        CommandDispatch::Enqueued(_) => {}
+                        CommandDispatch::Backpressured => {
+                            pending.extend(app.ingest_appends(vec![notice_effect(
+                                "服务繁忙，压缩请求未发送",
+                            )]));
+                        }
+                        CommandDispatch::Disconnected { lane } => {
+                            exit_requested = Some(TuiOutcome::FrontendRestartRequested {
+                                fault: format!("frontend disconnected on compaction ({lane})"),
+                            });
+                        }
+                    }
                 }
                 Effect::CancelCompaction => {
                     if let Some(maintenance_id) = state.maintenance_id.clone() {
-                        let _ = state.send(FrontendCommand::CancelMaintenance { maintenance_id });
+                        let cancel_request = state.next_cancel_request();
+                        match cancel_dispatch_result(state.send(
+                            FrontendCommand::CancelMaintenance { maintenance_id },
+                        )) {
+                            CancelDispatchResult::Enqueued(_) => {}
+                            CancelDispatchResult::Backpressured => {
+                                pending.extend(app.ingest_appends(vec![notice_effect(
+                                    "取消请求未发送",
+                                )]));
+                            }
+                            CancelDispatchResult::Disconnected { lane } => {
+                                let _ = cancel_request;
+                                exit_requested = Some(TuiOutcome::FrontendRestartRequested {
+                                    fault: format!(
+                                        "frontend disconnected on cancel maintenance ({lane})"
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
                 Effect::Quit => {
@@ -445,8 +613,21 @@ pub(crate) async fn run_loop<B: Backend>(
                     exit_requested = Some(TuiOutcome::UserExit);
                 }
                 Effect::RequestShutdown => {
-                    let _ = state.send(FrontendCommand::ShutdownRequested);
-                    exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
+                    match state.send(FrontendCommand::ShutdownRequested) {
+                        CommandDispatch::Enqueued(_) => {
+                            exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
+                        }
+                        CommandDispatch::Backpressured => {
+                            pending.extend(app.ingest_appends(vec![notice_effect(
+                                "服务繁忙，关闭请求未发送",
+                            )]));
+                            // Still escalate: user confirmed quit during busy turn.
+                            exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
+                        }
+                        CommandDispatch::Disconnected { .. } => {
+                            exit_requested = Some(TuiOutcome::ProcessShutdownRequested);
+                        }
+                    }
                 }
                 Effect::HardRedraw => {
                     scheduler.request_hard_redraw(Instant::now());
@@ -473,7 +654,9 @@ fn apply_updates(
         if !state.sync.accept(&update) {
             continue;
         }
-        track_identities(state, &update);
+        if let Some(outcome) = track_identities(state, app, &update) {
+            return Err(outcome);
+        }
         if matches!(
             update.kind,
             FrontendUpdateKind::SessionLoaded { .. } | FrontendUpdateKind::SnapshotReady(_)
@@ -498,41 +681,99 @@ fn apply_updates(
             app.set_preview(&session_id, Preview::Failed(reason.to_string()));
             continue;
         }
+        if let FrontendUpdateKind::SubmitAccepted {
+            operation_id,
+            ..
+        } = &update.kind
+        {
+            let intent_id = update
+                .request_id
+                .and_then(|id| state.take_submit_intent(id))
+                .or_else(|| app.submit_state().intent_id());
+            if let Some(intent_id) = intent_id {
+                effects.extend(app.on_action(Action::SubmitAccepted {
+                    intent_id,
+                    operation_id: operation_id.clone(),
+                }));
+            }
+            continue;
+        }
+        if let FrontendUpdateKind::CommandRejected { reason } = &update.kind {
+            if let Some(request_id) = update.request_id
+                && let Some(intent_id) = state.take_submit_intent(request_id)
+            {
+                effects.extend(app.on_action(Action::SubmitCommandRejected {
+                    intent_id,
+                    reason: reason.clone(),
+                }));
+                continue;
+            }
+            // Unique pending without request_id match: still restore.
+            if let Some(intent_id) = app.submit_state().intent_id()
+                && app
+                    .submit_state()
+                    .pending()
+                    .is_some_and(|pending| pending.request_id == update.request_id)
+            {
+                effects.extend(app.on_action(Action::SubmitCommandRejected {
+                    intent_id,
+                    reason: reason.clone(),
+                }));
+                continue;
+            }
+        }
         effects.extend(app.apply_update(&update));
     }
     Ok(effects)
 }
 
-fn track_identities(state: &mut LoopState, update: &FrontendUpdate) {
+fn track_identities(
+    state: &mut LoopState,
+    app: &mut App,
+    update: &FrontendUpdate,
+) -> Option<TuiOutcome> {
     match &update.kind {
         FrontendUpdateKind::OperationAccepted { operation_id, .. } => {
-            let waiting = matches!(state.ctrl_c, CtrlCPhase::Cancelling { operation_id: None });
+            let waiting = matches!(
+                state.ctrl_c,
+                CtrlCPhase::CancelDispatching {
+                    operation_id: None,
+                    ..
+                }
+            );
             state.active_operation_id = Some(operation_id.clone());
             state.ctrl_c.observe_busy(operation_id.clone());
             if waiting {
-                if let Some(id) = state.ctrl_c.pending_cancel_id() {
-                    let _ = state.send(FrontendCommand::CancelOperation {
-                        operation_id: id.to_owned(),
-                    });
+                if let Some(id) = state.ctrl_c.pending_cancel_id().map(str::to_owned) {
+                    let cancel_request = state
+                        .ctrl_c
+                        .cancel_request()
+                        .unwrap_or_else(|| state.next_cancel_request());
+                    return dispatch_cancel_operation(state, app, id, cancel_request);
                 }
             }
+            None
         }
-        FrontendUpdateKind::AvailabilityChanged { availability, .. } => match availability {
-            FrontendAvailability::Busy { operation_id } => {
-                state.active_operation_id = Some(operation_id.clone());
-                state.ctrl_c.observe_busy(operation_id.clone());
+        FrontendUpdateKind::AvailabilityChanged { availability, .. } => {
+            match availability {
+                FrontendAvailability::Busy { operation_id } => {
+                    state.active_operation_id = Some(operation_id.clone());
+                    state.ctrl_c.observe_busy(operation_id.clone());
+                }
+                FrontendAvailability::Idle => {
+                    state.active_operation_id = None;
+                    state.maintenance_id = None;
+                    state.ctrl_c.observe_idle();
+                }
+                FrontendAvailability::Compacting { .. } => {}
             }
-            FrontendAvailability::Idle => {
-                state.active_operation_id = None;
-                state.maintenance_id = None;
-                state.ctrl_c.observe_idle();
-            }
-            FrontendAvailability::Compacting { .. } => {}
-        },
+            None
+        }
         FrontendUpdateKind::MaintenanceChanged(maintenance) => {
             state.maintenance_id = Some(maintenance.id.clone());
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -550,16 +791,15 @@ fn apply_task(app: &mut App, completion: TaskCompletion) -> Vec<Effect> {
         },
         TaskCompletion::Media(MediaResult::Ready { .. }) => Vec::new(),
         TaskCompletion::Media(MediaResult::Refused {
-            text,
+            intent_id,
             kept,
             errors,
-            draft_generation,
-        }) => {
-            let restored = app.restore_draft_if_current(draft_generation, &text, kept);
-            app.ingest_appends(vec![Effect::Append(media::refusal_lines_for_restore(
-                &errors, restored,
-            ))])
-        }
+            ..
+        }) => app.on_action(Action::SubmitMediaRefused {
+            intent_id,
+            kept,
+            errors,
+        }),
         TaskCompletion::Failed(error) => {
             app.ingest_appends(vec![Effect::Append(tasks::task_error(error))])
         }
@@ -683,7 +923,7 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
             None
         }
         CommandDispatch::Backpressured => {
-            let _ = app.ingest_appends(vec![Effect::Append(tasks::task_error(
+            app.ingest_appends(vec![Effect::Append(tasks::task_error(
                 "frontend command backpressured",
             ))]);
             None
@@ -712,36 +952,52 @@ fn finish_clipboard(app: &mut App, result: Result<ClipboardContent, String>) -> 
     }
 }
 
-/// After media decode succeeds, submit the already-decoded attachments.
-fn submit_ready(
-    state: &LoopState,
-    _app: &App,
+/// After media decode succeeds, enqueue Submit and feed the structured result
+/// back into the reducer. Local draft commits only on later `SubmitAccepted`.
+fn submit_ready_with_outcome(
+    state: &mut LoopState,
+    app: &mut App,
+    intent_id: u64,
     draft: String,
     attachments: Vec<philo_agent_service::FrontendAttachment>,
-) -> Option<TuiOutcome> {
-    match state.send(FrontendCommand::Submit { draft, attachments }) {
-        CommandDispatch::Enqueued(_) | CommandDispatch::Backpressured => None,
-        CommandDispatch::Disconnected { .. } => Some(TuiOutcome::FrontendRestartRequested {
-            fault: "frontend disconnected on submit".to_owned(),
-        }),
+) -> Result<Vec<Effect>, TuiOutcome> {
+    let dispatch = state.send(FrontendCommand::Submit { draft, attachments });
+    match dispatch {
+        CommandDispatch::Enqueued(request_id) => {
+            state.remember_submit(request_id, intent_id);
+            Ok(app.on_action(Action::SubmitDispatchFinished {
+                intent_id,
+                result: SubmitDispatchResult::Enqueued(request_id),
+            }))
+        }
+        CommandDispatch::Backpressured => Ok(app.on_action(Action::SubmitDispatchFinished {
+            intent_id,
+            result: SubmitDispatchResult::Backpressured,
+        })),
+        CommandDispatch::Disconnected { lane } => {
+            let _ = app.on_action(Action::SubmitDispatchFinished {
+                intent_id,
+                result: SubmitDispatchResult::Disconnected { lane },
+            });
+            Err(TuiOutcome::FrontendRestartRequested {
+                fault: format!("frontend disconnected on submit ({lane})"),
+            })
+        }
     }
 }
 
 // Wire media-ready into the task path by submitting here.
 fn apply_task_with_submit(
     app: &mut App,
-    state: &LoopState,
+    state: &mut LoopState,
     completion: TaskCompletion,
 ) -> Result<Vec<Effect>, TuiOutcome> {
     match completion {
         TaskCompletion::Media(MediaResult::Ready {
-            draft, attachments, ..
-        }) => {
-            if let Some(outcome) = submit_ready(state, app, draft, attachments) {
-                return Err(outcome);
-            }
-            Ok(Vec::new())
-        }
+            intent_id,
+            draft,
+            attachments,
+        }) => submit_ready_with_outcome(state, app, intent_id, draft, attachments),
         other => Ok(apply_task(app, other)),
     }
 }
@@ -830,7 +1086,7 @@ mod tests {
 
         let inject = async move {
             notified.notified().await;
-            let _ = injector.try_command(philo_agent_service::FrontendCommand::ReadStatus);
+            let _dispatch = injector.try_command(philo_agent_service::FrontendCommand::ReadStatus);
             for _ in 0..16 {
                 tokio::task::yield_now().await;
             }

@@ -25,10 +25,10 @@ confirmation: Allow
 User: 
 User: › first prompt
 User: 
+Notice: busy: the message is queued behind the active turn
 User: 
 User: › queued follow-up
 User: 
-Notice: busy: the message is queued behind the active turn
 Notice: queued behind the active turn
 Notice: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Reasoning: think

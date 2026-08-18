@@ -1,15 +1,48 @@
 //! Public launch configuration and session outcome.
 
-/// Structured result of an explicit restore. Errors are collected rather
-/// than swallowed.
+/// One terminal mode capability acquired during setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalCapability {
+    RawMode,
+    AlternateScreen,
+    MouseCapture,
+    BracketedPaste,
+    KeyboardEnhancement,
+}
+
+impl TerminalCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RawMode => "raw mode",
+            Self::AlternateScreen => "alternate screen",
+            Self::MouseCapture => "mouse capture",
+            Self::BracketedPaste => "bracketed paste",
+            Self::KeyboardEnhancement => "keyboard enhancement",
+        }
+    }
+}
+
+/// One restore step that failed while releasing a held capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreFailure {
+    pub capability: TerminalCapability,
+    pub message: String,
+}
+
+/// Structured result of an explicit finish/restore. Errors are collected
+/// rather than swallowed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestoreReport {
     /// True when this call actually restored the matching live session.
     pub restored: bool,
     /// True when a stale token was ignored so a newer session stays intact.
     pub skipped_stale: bool,
+    /// Capabilities this call attempted to release (capability-driven order).
+    pub attempted: Vec<TerminalCapability>,
+    /// Capabilities successfully released in this call.
+    pub restored_caps: Vec<TerminalCapability>,
     /// Restore steps that failed. Empty on a clean restore or skip.
-    pub errors: Vec<String>,
+    pub failures: Vec<RestoreFailure>,
 }
 
 /// One TUI run: the session outcome plus the owner-thread restore report.

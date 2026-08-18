@@ -241,11 +241,11 @@ fn report_forced_exit() {
 
 fn restore_line_outputs(restore: &RestoreReport) -> Vec<Output> {
     restore
-        .errors
+        .failures
         .iter()
-        .map(|error| Output {
+        .map(|failure| Output {
             channel: Channel::Stderr,
-            text: format!("terminal restore: {error}\n"),
+            text: format!("terminal restore: {}\n", failure.message),
         })
         .collect()
 }
@@ -291,7 +291,18 @@ mod tests {
         let restore = RestoreReport {
             restored: true,
             skipped_stale: false,
-            errors: vec!["raw mode failed".to_owned(), "mouse capture".to_owned()],
+            attempted: Vec::new(),
+            restored_caps: Vec::new(),
+            failures: vec![
+                philo_tui::RestoreFailure {
+                    capability: philo_tui::TerminalCapability::RawMode,
+                    message: "raw mode failed".to_owned(),
+                },
+                philo_tui::RestoreFailure {
+                    capability: philo_tui::TerminalCapability::MouseCapture,
+                    message: "mouse capture".to_owned(),
+                },
+            ],
         };
         let mut outputs = restore_line_outputs(&restore);
         outputs.push(forced_exit_notice());
@@ -314,7 +325,12 @@ mod tests {
         let restore = RestoreReport {
             restored: true,
             skipped_stale: false,
-            errors: vec!["leave alternate".to_owned()],
+            attempted: Vec::new(),
+            restored_caps: Vec::new(),
+            failures: vec![philo_tui::RestoreFailure {
+                capability: philo_tui::TerminalCapability::AlternateScreen,
+                message: "leave alternate".to_owned(),
+            }],
         };
         let restore_first = restore_line_outputs(&restore);
         assert_eq!(restore_first[0].text, "terminal restore: leave alternate\n");

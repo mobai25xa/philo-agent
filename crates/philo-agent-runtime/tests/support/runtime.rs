@@ -9,9 +9,9 @@ use philo_agent_runtime::{
     CompactionError, CompactionReport, CompactionSpec, GenerationDisplay, GenerationId, IdSource,
     MaintenanceAccepted, MaintenanceError, MaintenanceId, MaintenanceResult, OperationAccepted,
     OperationId, OperationOutcome, OperationPhase, OperationSpec, OperationStatus, RuntimeConfig,
-    RuntimeDeps, RuntimeEvent, RuntimeGeneration, RuntimeHandle, RuntimeSnapshot,
-    RuntimeSubscription, SequentialIdSource, SessionId, SettlementDurability, ShutdownMode,
-    ToolCallId, ToolPort, ToolRegistry, UserMessage,
+    RuntimeDeps, RuntimeEvent, RuntimeEventReceiver, RuntimeGeneration, RuntimeHandle,
+    RuntimeSnapshot, SequentialIdSource, SessionId, SettlementDurability, ShutdownMode, ToolCallId,
+    ToolPort, ToolRegistry, UserMessage,
 };
 use philo_session::SessionStore;
 use tokio::sync::Mutex;
@@ -44,14 +44,14 @@ pub async fn start(
     sessions: Arc<dyn SessionStore>,
     _tools: Arc<dyn ToolPort>,
     _config: RuntimeConfig,
-) -> (RuntimeHandle, RuntimeSubscription) {
+) -> (RuntimeHandle, RuntimeEventReceiver) {
     start_with_ids(sessions, Arc::new(SequentialIdSource::new())).await
 }
 
 pub async fn start_with_ids(
     sessions: Arc<dyn SessionStore>,
     ids: Arc<dyn IdSource>,
-) -> (RuntimeHandle, RuntimeSubscription) {
+) -> (RuntimeHandle, RuntimeEventReceiver) {
     start_with_bounds(sessions, ids, ChannelBounds::default()).await
 }
 
@@ -59,13 +59,14 @@ pub async fn start_with_bounds(
     sessions: Arc<dyn SessionStore>,
     ids: Arc<dyn IdSource>,
     bounds: ChannelBounds,
-) -> (RuntimeHandle, RuntimeSubscription) {
-    philo_agent_runtime::AgentRuntime::start(RuntimeDeps {
+) -> (RuntimeHandle, RuntimeEventReceiver) {
+    let parts = philo_agent_runtime::AgentRuntime::start(RuntimeDeps {
         sessions,
         ids,
         bounds,
     })
-    .expect("start runtime")
+    .expect("start runtime");
+    (parts.handle, parts.events)
 }
 
 pub fn event_cap_bounds(event_cap: usize) -> ChannelBounds {
@@ -75,6 +76,7 @@ pub fn event_cap_bounds(event_cap: usize) -> ChannelBounds {
         event_cap,
         queue_max: 32,
         driver_event_budget: 32,
+        reliable_staging_cap: 64,
     }
 }
 
@@ -111,12 +113,12 @@ pub async fn submit_compaction(
 
 /// Cursor that can drain one operation without dropping sibling events.
 pub struct EventCursor {
-    sub: RuntimeSubscription,
+    sub: RuntimeEventReceiver,
     held: VecDeque<RuntimeEvent>,
 }
 
 impl EventCursor {
-    pub fn new(sub: RuntimeSubscription) -> Self {
+    pub fn new(sub: RuntimeEventReceiver) -> Self {
         Self {
             sub,
             held: VecDeque::new(),
@@ -153,7 +155,8 @@ impl EventCursor {
                 return None;
             };
             match event {
-                RuntimeEvent::Agent(agent) => {
+                event @ (RuntimeEvent::Agent(_) | RuntimeEvent::OperationSettled { .. }) => {
+                    let agent = into_agent_event(event).expect("agent-shaped event");
                     if !belongs(&agent, operation_id, *started) {
                         self.held.push_back(RuntimeEvent::Agent(agent));
                         continue;
@@ -182,40 +185,44 @@ impl EventCursor {
             let Some(event) = self.next_incoming(&mut pending).await else {
                 panic!("subscription closed before {operation_id} settled");
             };
-            match event {
-                RuntimeEvent::Agent(agent) => {
-                    if !belongs(&agent, operation_id, started) {
-                        self.held.push_back(RuntimeEvent::Agent(agent));
-                        continue;
-                    }
-                    if matches!(&agent, AgentEvent::OperationStarted { .. }) {
-                        started = true;
-                    }
-                    match &agent {
-                        AgentEvent::AssistantMessageCompleted { message, .. } => {
-                            assistant = Some(message.clone());
-                        }
-                        AgentEvent::TurnFailed { failure: next, .. } => {
-                            failure = Some(next.clone());
-                        }
-                        _ => {}
-                    }
-                    let settled = match &agent {
-                        AgentEvent::OperationSettled {
-                            operation_id: id,
-                            status,
-                            durability,
-                            ..
-                        } if id == operation_id => Some((*status, *durability)),
-                        _ => None,
-                    };
-                    events.push(agent);
-                    if let Some((status, durability)) = settled {
-                        self.held.extend(pending);
-                        return (events, outcome_from(status, durability, assistant, failure));
-                    }
+            let agent = match event {
+                event @ (RuntimeEvent::Agent(_) | RuntimeEvent::OperationSettled { .. }) => {
+                    into_agent_event(event).expect("agent-shaped event")
                 }
-                other => self.held.push_back(other),
+                other => {
+                    self.held.push_back(other);
+                    continue;
+                }
+            };
+            if !belongs(&agent, operation_id, started) {
+                self.held.push_back(RuntimeEvent::Agent(agent));
+                continue;
+            }
+            if matches!(&agent, AgentEvent::OperationStarted { .. }) {
+                started = true;
+            }
+            match &agent {
+                AgentEvent::AssistantMessageCompleted { message, .. } => {
+                    assistant = Some(message.clone());
+                }
+                AgentEvent::TurnFailed { failure: next, .. } => {
+                    failure = Some(next.clone());
+                }
+                _ => {}
+            }
+            let settled = match &agent {
+                AgentEvent::OperationSettled {
+                    operation_id: id,
+                    status,
+                    durability,
+                    ..
+                } if id == operation_id => Some((*status, *durability)),
+                _ => None,
+            };
+            events.push(agent);
+            if let Some((status, durability)) = settled {
+                self.held.extend(pending);
+                return (events, outcome_from(status, durability, assistant, failure));
             }
         }
     }
@@ -225,7 +232,7 @@ impl EventCursor {
 /// runtime events are skipped. Sibling operation events are also skipped,
 /// so multi-operation tests should use [`EventCursor`].
 pub async fn drain_until_settled(
-    sub: &mut RuntimeSubscription,
+    sub: &mut RuntimeEventReceiver,
     operation_id: &OperationId,
 ) -> (Vec<AgentEvent>, OperationOutcome) {
     let mut events = Vec::new();
@@ -236,7 +243,7 @@ pub async fn drain_until_settled(
         let Some(event) = sub.recv().await else {
             panic!("subscription closed before {operation_id} settled");
         };
-        let RuntimeEvent::Agent(agent) = event else {
+        let Some(agent) = into_agent_event(event) else {
             continue;
         };
         if !belongs(&agent, operation_id, started) {
@@ -267,6 +274,25 @@ pub async fn drain_until_settled(
         if let Some((status, durability)) = settled {
             return (events, outcome_from(status, durability, assistant, failure));
         }
+    }
+}
+
+fn into_agent_event(event: RuntimeEvent) -> Option<AgentEvent> {
+    match event {
+        RuntimeEvent::Agent(agent) => Some(agent),
+        RuntimeEvent::OperationSettled {
+            operation_id,
+            status,
+            durability,
+            session_revision,
+            ..
+        } => Some(AgentEvent::OperationSettled {
+            operation_id,
+            status,
+            durability,
+            session_revision,
+        }),
+        _ => None,
     }
 }
 
@@ -408,7 +434,11 @@ pub async fn wait_until_queued(handle: &RuntimeHandle, operation_id: &OperationI
     let deadline = tokio::time::Instant::now() + WAIT_DEADLINE;
     loop {
         let snapshot = handle.snapshot().await;
-        if snapshot.queued.iter().any(|id| id == operation_id) {
+        if snapshot
+            .queued
+            .iter()
+            .any(|queued| queued.operation_id == *operation_id)
+        {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -592,7 +622,7 @@ impl Harness {
 }
 
 pub async fn drain_maintenance(
-    sub: &mut RuntimeSubscription,
+    sub: &mut RuntimeEventReceiver,
     id: &MaintenanceId,
 ) -> MaintenanceResult {
     loop {
@@ -603,6 +633,7 @@ pub async fn drain_maintenance(
             RuntimeEvent::MaintenanceSettled {
                 id: settled,
                 result,
+                ..
             } if settled == *id => {
                 return result;
             }
@@ -624,6 +655,7 @@ async fn drain_maintenance_from_cursor(
             RuntimeEvent::MaintenanceSettled {
                 id: settled,
                 result,
+                ..
             } if settled == *id => {
                 cursor.held.extend(pending);
                 return result;
@@ -745,7 +777,13 @@ impl TestRuntime {
     /// Stop the coordinator and drop this handle so JSONL session locks can
     /// be released before another store instance reopens the same root.
     pub async fn stop(self) {
-        let _ = self.handle.shutdown(ShutdownMode::Forced).await;
+        let _ = self
+            .handle
+            .shutdown(
+                ShutdownMode::Forced,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await;
         drop(self);
         tokio::task::yield_now().await;
     }
@@ -902,7 +940,13 @@ impl TestOp {
 
     /// Stop the shared coordinator so a JSONL root can be reopened.
     pub async fn stop_runtime(self) {
-        let _ = self.handle.shutdown(ShutdownMode::Forced).await;
+        let _ = self
+            .handle
+            .shutdown(
+                ShutdownMode::Forced,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await;
         drop(self);
         tokio::task::yield_now().await;
     }
@@ -929,8 +973,12 @@ impl TestOp {
     }
 
     pub async fn phase(&self) -> OperationPhase {
-        let snapshot = self.handle.snapshot().await;
-        if snapshot.queued.iter().any(|id| id == &self.operation_id) {
+        let snapshot = self.handle.publish_snapshot().await;
+        if snapshot
+            .queued
+            .iter()
+            .any(|queued| queued.operation_id == self.operation_id)
+        {
             return OperationPhase::Queued;
         }
         if let Some(active) = &snapshot.active

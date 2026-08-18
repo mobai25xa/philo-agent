@@ -82,12 +82,12 @@ impl TransientDriverState {
             }
         }
         drop(slots);
-        self.notify.notify_waiters();
+        self.wake();
     }
 
     pub(crate) fn publish_phase(&self, phase: OperationPhase) {
         lock(&self.inner).phase = Some(phase);
-        self.notify.notify_waiters();
+        self.wake();
     }
 
     pub(crate) fn has_data(&self) -> bool {
@@ -110,15 +110,26 @@ impl TransientDriverState {
         }
         slots.sealed_model_stream.extend(open);
         drop(slots);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        // `notify_waiters` wakes current waiters; `notify_one` stores a
+        // permit so a waiter that has not subscribed yet still observes
+        // this publish (lost-wakeup closed).
         self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     pub(crate) async fn wait(&self) {
         loop {
+            // Subscribe before the has_data check so a notify between the
+            // two cannot be lost. Same latch pattern as cancel waits.
+            let notified = self.notify.notified();
             if self.has_data() {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 

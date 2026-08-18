@@ -1,5 +1,6 @@
 //! Service → frontend updates. Every envelope carries epoch + revision.
 
+use crate::error::CommandReject;
 use crate::frontend::command::ConfirmationDecision;
 use crate::frontend::snapshot::FrontendGeneration;
 use crate::frontend::snapshot::{
@@ -24,17 +25,31 @@ pub struct FrontendUpdate {
 /// Update payloads. Terminal facts are not reconstructed from this stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontendUpdateKind {
-    /// The actor accepted a command and started work.
+    /// The actor accepted a command that does not admit Runtime work.
     CommandAccepted,
-    /// The actor refused a command.
+    /// Runtime admitted a submit after `runtime.submit` returned Ok.
+    SubmitAccepted {
+        /// Admitted operation.
+        operation_id: String,
+        /// Turn minted at admission.
+        turn_id: String,
+    },
+    /// Runtime admitted compaction after `start_compaction` returned Ok.
+    CompactionAccepted {
+        /// Admitted maintenance task.
+        maintenance_id: String,
+    },
+    /// The actor refused a dequeued command.
     CommandRejected {
-        /// Stable reason.
-        reason: String,
+        /// Structured refusal.
+        reason: CommandReject,
     },
     /// Runtime admitted an operation.
     OperationAccepted {
         /// Operation id.
         operation_id: String,
+        /// Session that owns the operation.
+        session_id: String,
         /// Turn id.
         turn_id: String,
     },

@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
     AdmissionError, AgentAvailability, CancelResult, CompactionSpec, GenerationDisplay,
@@ -421,18 +421,24 @@ impl RuntimePort for FakeRuntimeHandle {
         async move { inner.lock().expect("fake runtime").snapshot.clone() }
     }
 
-    fn shutdown(&self, mode: ShutdownMode) -> impl Future<Output = ShutdownReport> + Send {
+    fn shutdown(
+        &self,
+        mode: ShutdownMode,
+        _deadline: Instant,
+    ) -> impl Future<Output = Result<ShutdownReport, philo_agent_runtime::ShutdownError>> + Send
+    {
         let inner = self.inner.clone();
         let notify = self.child_started_notify.clone();
         async move {
             park_runtime_child(&inner, &notify).await;
             let mut inner = inner.lock().expect("fake runtime");
             inner.shutdown_calls.push(mode);
-            ShutdownReport {
+            Ok(ShutdownReport {
                 epoch: inner.snapshot.epoch.clone(),
-                shutdown: ShutdownState::Stopped,
+                final_state: ShutdownState::Stopped,
                 settlements: Vec::new(),
-            }
+                diagnostics: Vec::new(),
+            })
         }
     }
 }

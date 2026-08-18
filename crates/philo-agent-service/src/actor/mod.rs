@@ -9,6 +9,7 @@ use snapshot::SnapshotFence;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use philo_agent_runtime::AgentEvent;
 use philo_session::{SessionError, SessionId, SessionStore};
@@ -17,6 +18,7 @@ use tokio::task::JoinSet;
 
 use crate::bounds::{RUNTIME_DRIVER_EVENT_BUDGET, RUNTIME_QUEUE_MAX, STORE_COMMAND_CAP};
 use crate::confirmation::{ConfirmationMap, ConfirmationSubmit};
+use crate::error::CommandReject;
 use crate::frontend::command::{ConfirmationDecision, FrontendCommand};
 use crate::frontend::snapshot::{
     FrontendAvailability, FrontendMaintenance, FrontendMaintenancePhase, QueuedOperationSummary,
@@ -32,9 +34,10 @@ use crate::live::{LiveOperationSnapshot, LiveToolProgress};
 use crate::mapping;
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
 use philo_agent_runtime::{
-    AdmissionError, CancelResult, EpochSettlement, MaintenanceAccepted, MaintenanceError,
-    MaintenanceResult, OperationAccepted, RuntimeEpoch, RuntimeEvent, RuntimeGeneration,
-    RuntimeSnapshot, ShutdownMode, ShutdownReport, TryRecvError,
+    AdmissionError, CancelResult, MaintenanceAccepted, MaintenanceError, MaintenanceResult,
+    OperationAccepted, OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeGeneration,
+    RuntimeSnapshot, SettlementDurability, SettlementRevision, ShutdownMode, ShutdownReport,
+    TryRecvError,
 };
 
 /// Graceful shutdown phases. Forced deadlines belong to the process supervisor.
@@ -84,7 +87,7 @@ pub(crate) enum ServiceTaskResult {
         request_id: FrontendRequestId,
         result: CancelResult,
     },
-    Shutdown(#[allow(dead_code)] ShutdownReport),
+    Shutdown(#[allow(dead_code)] Result<ShutdownReport, philo_agent_runtime::ShutdownError>),
     RuntimeSnapshot {
         epoch: FrontendEpoch,
         snapshot: RuntimeSnapshot,
@@ -260,11 +263,9 @@ where
             command,
         } = envelope;
         match command {
-            FrontendCommand::Submit {
-                session_id,
-                draft,
-                attachments,
-            } => self.handle_submit(request_id, session_id, draft, attachments),
+            FrontendCommand::Submit { draft, attachments } => {
+                self.handle_submit(request_id, draft, attachments)
+            }
             FrontendCommand::CancelOperation { operation_id } => {
                 self.spawn_cancel(request_id, operation_id);
             }
@@ -316,7 +317,7 @@ where
                 None => self.emit(
                     Some(request_id),
                     FrontendUpdateKind::CommandRejected {
-                        reason: "unknown confirmation".into(),
+                        reason: CommandReject::UnknownConfirmation,
                     },
                 ),
             },
@@ -352,7 +353,7 @@ where
             ServiceShutdownState::Stopped => self.emit(
                 Some(request_id),
                 FrontendUpdateKind::CommandRejected {
-                    reason: "service is stopped".into(),
+                    reason: CommandReject::NotAccepting,
                 },
             ),
             _ => self.emit(Some(request_id), FrontendUpdateKind::CommandAccepted),
@@ -362,7 +363,12 @@ where
     fn spawn_shutdown(&mut self) {
         let runtime = self.runtime.clone();
         self.child_tasks.spawn(async move {
-            let report = runtime.shutdown(ShutdownMode::Drain).await;
+            let report = runtime
+                .shutdown(
+                    ShutdownMode::Drain,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await;
             ServiceTaskResult::Shutdown(report)
         });
     }
@@ -391,21 +397,19 @@ where
                     return;
                 }
                 match result {
-                    Ok(accepted) => {
-                        self.live
-                            .accept(accepted.operation_id.as_str(), accepted.turn_id.as_str());
-                        self.emit(
-                            Some(request_id),
-                            FrontendUpdateKind::OperationAccepted {
-                                operation_id: accepted.operation_id.to_string(),
-                                turn_id: accepted.turn_id.to_string(),
-                            },
-                        );
-                    }
+                    Ok(accepted) => self.emit(
+                        Some(request_id),
+                        FrontendUpdateKind::SubmitAccepted {
+                            operation_id: accepted.operation_id.to_string(),
+                            turn_id: accepted.turn_id.to_string(),
+                        },
+                    ),
                     Err(error) => self.emit(
                         Some(request_id),
                         FrontendUpdateKind::CommandRejected {
-                            reason: error.message().to_owned(),
+                            reason: CommandReject::AdmissionFailed {
+                                message: error.message().to_owned(),
+                            },
                         },
                     ),
                 }
@@ -414,23 +418,18 @@ where
                 self.emit_cancel(request_id, result)
             }
             ServiceTaskResult::Compaction { request_id, result } => match result {
-                Ok(accepted) => {
-                    self.maintenance = Some(FrontendMaintenance {
-                        id: accepted.id.to_string(),
-                        phase: FrontendMaintenancePhase::Accepted,
-                        message: None,
-                    });
-                    self.emit(
-                        Some(request_id),
-                        FrontendUpdateKind::MaintenanceChanged(
-                            self.maintenance.clone().expect("just set"),
-                        ),
-                    );
-                }
+                Ok(accepted) => self.emit(
+                    Some(request_id),
+                    FrontendUpdateKind::CompactionAccepted {
+                        maintenance_id: accepted.id.to_string(),
+                    },
+                ),
                 Err(error) => self.emit(
                     Some(request_id),
                     FrontendUpdateKind::CommandRejected {
-                        reason: error.message().to_owned(),
+                        reason: CommandReject::AdmissionFailed {
+                            message: error.message().to_owned(),
+                        },
                     },
                 ),
             },
@@ -499,7 +498,7 @@ where
             self.emit(
                 Some(request_id),
                 FrontendUpdateKind::CommandRejected {
-                    reason: "service child capacity reached".into(),
+                    reason: CommandReject::ChildCapacity,
                 },
             );
             return false;
@@ -512,7 +511,7 @@ where
         self.emit(
             Some(request_id),
             FrontendUpdateKind::CommandRejected {
-                reason: "service child capacity reached".into(),
+                reason: CommandReject::ChildCapacity,
             },
         );
     }
@@ -521,7 +520,7 @@ where
         self.emit(
             Some(request_id),
             FrontendUpdateKind::CommandRejected {
-                reason: "runtime is not accepting work".into(),
+                reason: CommandReject::NotAccepting,
             },
         );
     }
@@ -531,6 +530,7 @@ where
         match event {
             RuntimeEvent::OperationAccepted {
                 operation_id,
+                session_id,
                 turn_id,
             } => {
                 self.live.accept(operation_id.as_str(), turn_id.as_str());
@@ -538,10 +538,24 @@ where
                     None,
                     FrontendUpdateKind::OperationAccepted {
                         operation_id: operation_id.to_string(),
+                        session_id: session_id.to_string(),
                         turn_id: turn_id.to_string(),
                     },
                 );
             }
+            RuntimeEvent::OperationSettled {
+                operation_id,
+                session_id,
+                status,
+                durability,
+                session_revision,
+            } => self.handle_operation_settled(
+                operation_id.as_str(),
+                session_id.as_str(),
+                status,
+                durability,
+                session_revision,
+            ),
             RuntimeEvent::Agent(event) => self.handle_agent_event(event),
             RuntimeEvent::AvailabilityChanged {
                 availability,
@@ -556,7 +570,7 @@ where
                     },
                 );
             }
-            RuntimeEvent::MaintenanceAccepted { id } => {
+            RuntimeEvent::MaintenanceAccepted { id, session_id: _ } => {
                 self.maintenance = Some(FrontendMaintenance {
                     id: id.to_string(),
                     phase: FrontendMaintenancePhase::Accepted,
@@ -580,7 +594,11 @@ where
                 });
                 self.emit_maintenance();
             }
-            RuntimeEvent::MaintenanceSettled { id, result } => {
+            RuntimeEvent::MaintenanceSettled {
+                id,
+                session_id: _,
+                result,
+            } => {
                 let (phase, message) = match result {
                     MaintenanceResult::Compacted(report) => (
                         FrontendMaintenancePhase::Settled,
@@ -630,8 +648,12 @@ where
                     },
                 );
             }
-            RuntimeEvent::EpochEnded { epoch, settlements } => {
-                self.on_epoch_ended(&epoch, &settlements);
+            RuntimeEvent::EpochEnded {
+                epoch,
+                reason: _,
+                forced_count,
+            } => {
+                self.on_epoch_ended(&epoch, forced_count);
             }
             _ => {}
         }
@@ -646,6 +668,7 @@ where
                 }
                 self.queued.push(QueuedOperationSummary {
                     operation_id: operation_id.as_str().to_owned(),
+                    session_id: self.current_session.clone().unwrap_or_default(),
                 });
             }
             AgentEvent::OperationStarted { operation_id } => {
@@ -679,29 +702,6 @@ where
             AgentEvent::ToolExecutionCompleted { tool_call_id, .. } => {
                 self.live.complete_tool(tool_call_id.as_str());
             }
-            AgentEvent::OperationSettled {
-                operation_id,
-                durability,
-                session_revision,
-                ..
-            } => {
-                let id = operation_id.as_str();
-                self.queued.retain(|item| item.operation_id != id);
-                for confirmation_id in self.confirmations.deny_for_operation(id) {
-                    self.emit(
-                        None,
-                        FrontendUpdateKind::ConfirmationResolved {
-                            confirmation_id,
-                            decision: ConfirmationDecision::Deny,
-                        },
-                    );
-                }
-                self.live.settle();
-                if self.queued.is_empty() {
-                    self.availability = FrontendAvailability::Idle;
-                }
-                self.on_operation_settled(*durability, *session_revision);
-            }
             _ => {}
         }
         if let Some(mapped) = mapping::operation_event(&event) {
@@ -709,15 +709,44 @@ where
         }
     }
 
-    fn on_epoch_ended(&mut self, _runtime_epoch: &RuntimeEpoch, settlements: &[EpochSettlement]) {
-        for settlement in settlements {
-            self.handle_agent_event(AgentEvent::OperationSettled {
-                operation_id: settlement.operation_id.clone(),
-                status: settlement.status,
-                durability: settlement.durability,
-                session_revision: None,
-            });
+    fn handle_operation_settled(
+        &mut self,
+        operation_id: &str,
+        session_id: &str,
+        status: OperationStatus,
+        durability: SettlementDurability,
+        session_revision: SettlementRevision,
+    ) {
+        self.queued.retain(|item| item.operation_id != operation_id);
+        for confirmation_id in self.confirmations.deny_for_operation(operation_id) {
+            self.emit(
+                None,
+                FrontendUpdateKind::ConfirmationResolved {
+                    confirmation_id,
+                    decision: ConfirmationDecision::Deny,
+                },
+            );
         }
+        self.live.settle();
+        if self.queued.is_empty() {
+            self.availability = FrontendAvailability::Idle;
+        }
+        self.on_operation_settled(durability, session_revision);
+        self.emit(
+            None,
+            FrontendUpdateKind::OperationEvent(
+                crate::frontend::snapshot::FrontendOperationEvent::OperationSettled {
+                    operation_id: operation_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    status: format!("{status:?}"),
+                    durability: format!("{durability:?}"),
+                    session_revision,
+                },
+            ),
+        );
+    }
+
+    fn on_epoch_ended(&mut self, _runtime_epoch: &RuntimeEpoch, forced_count: usize) {
         self.epoch.bump();
         self.runtime_closed = true;
         self.snapshot_token = self.snapshot_token.saturating_add(1);
@@ -727,7 +756,7 @@ where
         self.availability = FrontendAvailability::Idle;
         self.deny_all_confirmations();
         self.health = ServiceHealth::RuntimeEpochEnded {
-            message: format!("{} forced settlement(s)", settlements.len()),
+            message: format!("{forced_count} forced settlement(s)"),
         };
         self.emit(
             None,
@@ -741,7 +770,7 @@ where
 
     fn on_runtime_disconnected(&mut self) {
         if !self.runtime_closed {
-            self.on_epoch_ended(&RuntimeEpoch::new("closed"), &[]);
+            self.on_epoch_ended(&RuntimeEpoch::new("closed"), 0);
         }
     }
 

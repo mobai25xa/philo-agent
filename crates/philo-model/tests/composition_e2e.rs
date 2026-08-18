@@ -120,12 +120,14 @@ async fn multi_round_tool_loop_with_real_adapter_and_registry() {
     ]);
     let sessions = Arc::new(MemorySessionStore::new());
     let generation = compose_generation(transport.clone(), &root, 2);
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: sessions.clone(),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {
@@ -269,12 +271,14 @@ async fn transport_failure_settles_failed_with_durable_facts() {
     let transport = StubTransport::new([StubResponse::ConnectError]);
     let sessions = Arc::new(MemorySessionStore::new());
     let generation = compose_generation(transport, &root, 2);
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: sessions.clone(),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {
@@ -408,12 +412,14 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
     let transport =
         StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["fine"]))]);
     let generation = compose_generation(transport.clone(), &root, 2);
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions,
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
     let accepted = handle
         .submit(OperationSpec {
             session_id: SessionId::new("m4-004"),
@@ -453,12 +459,14 @@ async fn zero_tool_rounds_requests_without_tools() {
     ))]);
     let sessions = Arc::new(MemorySessionStore::new());
     let generation = compose_generation(transport.clone(), &root, 0);
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions,
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {
@@ -492,12 +500,14 @@ async fn tool_business_errors_continue_the_loop() {
     ]);
     let sessions = Arc::new(MemorySessionStore::new());
     let generation = compose_generation(transport.clone(), &root, 2);
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: sessions.clone(),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {

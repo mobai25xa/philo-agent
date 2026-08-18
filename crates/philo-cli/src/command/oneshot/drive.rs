@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{UserMessage, UserPart};
 use philo_agent_service::{
-    CommandSubmitResult, FrontendAttachment, FrontendAvailability, FrontendClient, FrontendCommand,
+    CommandDispatch, FrontendAttachment, FrontendAvailability, FrontendClient, FrontendCommand,
     FrontendOperationEvent, FrontendUpdateKind, RecvOutcome,
 };
 use philo_session::SessionStore;
@@ -85,9 +85,13 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
             Err(code) => return DriveReport::graceful(code),
         }
     } else {
-        let _ = request
+        match request
             .client
-            .request_snapshot(philo_agent_service::FrontendRevision::ZERO);
+            .request_snapshot(philo_agent_service::FrontendRevision::ZERO)
+        {
+            CommandDispatch::Enqueued(_) | CommandDispatch::Backpressured => {}
+            CommandDispatch::Disconnected { .. } => {}
+        }
     }
 
     let mut renderer = Renderer::new(request.verbosity).with_reasoning(request.show_reasoning);
@@ -152,7 +156,7 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
                     }
                 }
                 FrontendUpdateKind::CommandRejected { reason } => {
-                    rejected = Some(reason.clone());
+                    rejected = Some(reason.to_string());
                     render::write_outputs(&renderer.render_update(&update.kind));
                 }
                 FrontendUpdateKind::SnapshotReady(snapshot) if !submitting => {
@@ -278,10 +282,17 @@ async fn submit(
     session_id: &str,
     message: &UserMessage,
 ) -> Result<(), u8> {
-    enqueue(client, submit_command(session_id, message)).await
+    enqueue(
+        client,
+        FrontendCommand::LoadSession {
+            session_id: session_id.to_owned(),
+        },
+    )
+    .await?;
+    enqueue(client, submit_command(message)).await
 }
 
-fn submit_command(session_id: &str, message: &UserMessage) -> FrontendCommand {
+fn submit_command(message: &UserMessage) -> FrontendCommand {
     let mut draft = String::new();
     let mut attachments = Vec::new();
     for part in message.parts() {
@@ -298,21 +309,17 @@ fn submit_command(session_id: &str, message: &UserMessage) -> FrontendCommand {
             }),
         }
     }
-    FrontendCommand::Submit {
-        session_id: session_id.to_owned(),
-        draft,
-        attachments,
-    }
+    FrontendCommand::Submit { draft, attachments }
 }
 
 async fn enqueue(client: &FrontendClient, command: FrontendCommand) -> Result<(), u8> {
     loop {
         match client.try_command(command.clone()) {
-            CommandSubmitResult::Accepted(_) => return Ok(()),
-            CommandSubmitResult::Backpressured => {
+            CommandDispatch::Enqueued(_) => return Ok(()),
+            CommandDispatch::Backpressured => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            CommandSubmitResult::Disconnected => {
+            CommandDispatch::Disconnected { .. } => {
                 eprintln!("error: the service disconnected");
                 return Err(1);
             }

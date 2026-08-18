@@ -14,4 +14,4 @@ ToolExecutionStarted { tool_batch_id: "batch-1", tool_call_id: "tool-1", index: 
 ToolExecutionCompleted { tool_batch_id: "batch-1", tool_call_id: "tool-1", index: 0, tool_name: "read_file", result: Success { content: "fn main() {}" }, display: Some(FrontendToolDisplay { detail: "read 12 bytes", facts: [("bytes", "12")] }) }
 CancellationRequested { operation_id: "op-1", reason: "Timeout" }
 TurnCancelled { turn_id: "turn-1", reason: "Timeout" }
-OperationSettled { operation_id: "op-1", status: "Cancelled", durability: "Confirmed" }
+OperationSettled { operation_id: "op-1", session_id: "s-1", status: "Cancelled", durability: "Confirmed", session_revision: Unchanged }

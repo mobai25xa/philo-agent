@@ -11,12 +11,12 @@ use crate::runtime_event::is_mergeable;
 use crate::transient::TransientOutbound;
 use crate::{
     ActiveOperationSnapshot, AdmissionError, AgentAvailability, AgentEvent, AgentFailure,
-    CancelResult, ChannelBounds, CompactionSpec, DiagnosticId, DriverExit, EpochSettlement,
-    IdSource, MaintenanceAccepted, MaintenanceError, MaintenanceId, MaintenanceResult,
-    MaintenanceSnapshot, OperationAccepted, OperationId, OperationPhase, OperationSpec,
-    OperationStatus, RuntimeEpoch, RuntimeEvent, RuntimeSnapshot, SessionId,
-    SettledOperationSnapshot, SettlementDurability, ShutdownMode, ShutdownReport, ShutdownState,
-    TurnId,
+    CancelResult, ChannelBounds, CompactionSpec, DiagnosticId, DriverExit, EpochEndReason,
+    ForcedSettlement, IdSource, MaintenanceAccepted, MaintenanceError, MaintenanceId,
+    MaintenanceResult, MaintenanceSnapshot, OperationAccepted, OperationId, OperationPhase,
+    OperationSpec, OperationStatus, QueuedOperationSnapshot, RuntimeEpoch, RuntimeEvent,
+    RuntimeSnapshot, SessionId, SettledOperationSnapshot, SettlementDurability, SettlementRevision,
+    ShutdownMode, ShutdownReport, ShutdownState, TurnId,
 };
 use philo_session::CancelReason;
 use std::collections::{HashMap, VecDeque};
@@ -51,6 +51,9 @@ pub(crate) enum ControlMessage {
         reply: oneshot::Sender<ShutdownReport>,
     },
     InjectCoordinatorPanic,
+    PublishSnapshot {
+        reply: oneshot::Sender<RuntimeSnapshot>,
+    },
 }
 
 struct QueuedOperation {
@@ -292,6 +295,10 @@ impl Coordinator {
             ControlMessage::InjectCoordinatorPanic => {
                 panic!("injected coordinator panic");
             }
+            ControlMessage::PublishSnapshot { reply } => {
+                self.publish_snapshot();
+                let _ = reply.send(self.snapshot_tx.borrow().clone());
+            }
         }
     }
 
@@ -336,13 +343,18 @@ impl Coordinator {
         };
         if self
             .ledger
-            .insert(operation_id.clone(), turn_id.clone())
+            .insert(
+                operation_id.clone(),
+                turn_id.clone(),
+                spec.session_id.clone(),
+            )
             .is_err()
         {
             return Err(AdmissionError::QueueFull);
         }
         self.emit(RuntimeEvent::OperationAccepted {
             operation_id: operation_id.clone(),
+            session_id: spec.session_id.clone(),
             turn_id: turn_id.clone(),
         });
         let queued = QueuedOperation {
@@ -375,8 +387,12 @@ impl Coordinator {
             "maintenance-{}",
             self.next_maintenance.fetch_add(1, Ordering::Relaxed)
         ));
+        let session_id = spec.session_id.clone();
         self.spawn_maintenance(id.clone(), spec);
-        self.emit(RuntimeEvent::MaintenanceAccepted { id: id.clone() });
+        self.emit(RuntimeEvent::MaintenanceAccepted {
+            id: id.clone(),
+            session_id,
+        });
         self.emit(RuntimeEvent::MaintenanceStarted { id: id.clone() });
         self.publish_snapshot();
         Ok(MaintenanceAccepted { id })
@@ -395,19 +411,21 @@ impl Coordinator {
             .iter()
             .position(|queued| queued.operation_id == operation_id)
         {
-            self.queue.remove(index);
+            let queued = self.queue.remove(index).expect("index came from position");
             self.emit(RuntimeEvent::Agent(AgentEvent::CancellationRequested {
                 operation_id: operation_id.clone(),
                 reason: CancelReason::User,
             }));
-            self.emit(RuntimeEvent::Agent(AgentEvent::OperationSettled {
+            self.emit(RuntimeEvent::OperationSettled {
                 operation_id: operation_id.clone(),
+                session_id: queued.spec.session_id.clone(),
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
-                session_revision: None,
-            }));
+                session_revision: SettlementRevision::Unchanged,
+            });
             self.record_settled(
                 operation_id,
+                queued.spec.session_id,
                 OperationStatus::Cancelled,
                 SettlementDurability::Confirmed,
                 None,
@@ -517,28 +535,42 @@ impl Coordinator {
         match event {
             DriverEvent::Agent(agent) => {
                 let starting = matches!(agent, AgentEvent::OperationStarted { .. });
-                let settled = if let Some(active) = &mut self.active {
-                    if let AgentEvent::OperationSettled {
-                        operation_id,
-                        status,
-                        durability,
-                        ..
-                    } = &agent
-                    {
+                if let AgentEvent::OperationSettled {
+                    operation_id,
+                    status,
+                    durability,
+                    session_revision,
+                } = &agent
+                {
+                    if let Some(active) = &mut self.active {
                         active.settled_event_seen = true;
-                        Some((operation_id.clone(), *status, *durability))
-                    } else {
-                        None
                     }
-                } else {
-                    None
-                };
-                if let Some((operation_id, status, durability)) = settled {
+                    let session_id = self
+                        .active
+                        .as_ref()
+                        .map(|active| active.session_id.clone())
+                        .or_else(|| self.ledger.session_id(operation_id))
+                        .expect("settlement belongs to an admitted operation");
                     let failure = self
                         .active
                         .as_ref()
                         .and_then(|active| active.shared.failure());
-                    self.record_settled(operation_id, status, durability, failure);
+                    self.record_settled(
+                        operation_id.clone(),
+                        session_id.clone(),
+                        *status,
+                        *durability,
+                        failure,
+                    );
+                    self.release_transients_for(&agent);
+                    self.emit(RuntimeEvent::OperationSettled {
+                        operation_id: operation_id.clone(),
+                        session_id,
+                        status: *status,
+                        durability: *durability,
+                        session_revision: *session_revision,
+                    });
+                    return;
                 }
                 self.release_transients_for(&agent);
                 self.emit(RuntimeEvent::Agent(agent));
@@ -615,14 +647,16 @@ impl Coordinator {
                     None,
                 ),
             };
-            self.emit(RuntimeEvent::Agent(AgentEvent::OperationSettled {
+            self.emit(RuntimeEvent::OperationSettled {
                 operation_id: active.operation_id.clone(),
+                session_id: active.session_id.clone(),
                 status,
                 durability,
-                session_revision: None,
-            }));
+                session_revision: SettlementRevision::Unchanged,
+            });
             self.record_settled(
                 active.operation_id.clone(),
+                active.session_id.clone(),
                 status,
                 durability,
                 active.shared.failure(),
@@ -686,6 +720,7 @@ impl Coordinator {
         };
         self.emit(RuntimeEvent::MaintenanceSettled {
             id: maintenance.id,
+            session_id: maintenance.session_id,
             result,
         });
         self.maybe_start_next();
@@ -733,14 +768,16 @@ impl Coordinator {
     fn reject_queue(&mut self) {
         let queued: Vec<_> = self.queue.drain(..).collect();
         for item in queued {
-            self.emit(RuntimeEvent::Agent(AgentEvent::OperationSettled {
+            self.emit(RuntimeEvent::OperationSettled {
                 operation_id: item.operation_id.clone(),
+                session_id: item.spec.session_id.clone(),
                 status: OperationStatus::Failed,
                 durability: SettlementDurability::Unconfirmed,
-                session_revision: None,
-            }));
+                session_revision: SettlementRevision::Unchanged,
+            });
             self.record_settled(
                 item.operation_id,
+                item.spec.session_id,
                 OperationStatus::Failed,
                 SettlementDurability::Unconfirmed,
                 None,
@@ -785,19 +822,21 @@ impl Coordinator {
         self.drain_driver_events();
         self.flush_reliable_await().await;
         let mut settlements = Vec::new();
-        while let Some((operation_id, _)) = self.ledger.pop() {
+        while let Some(entry) = self.ledger.pop() {
             let diagnostic_id = self.next_diagnostic();
-            let event = RuntimeEvent::Agent(AgentEvent::OperationSettled {
-                operation_id: operation_id.clone(),
+            let event = RuntimeEvent::OperationSettled {
+                operation_id: entry.operation_id.clone(),
+                session_id: entry.session_id.clone(),
                 status: OperationStatus::Failed,
                 durability: SettlementDurability::Unconfirmed,
-                session_revision: None,
-            });
+                session_revision: SettlementRevision::Unchanged,
+            };
             if self.event_tx.send(event).await.is_err() {
                 break;
             }
             self.last_settled.push(SettledOperationSnapshot {
-                operation_id: operation_id.clone(),
+                operation_id: entry.operation_id.clone(),
+                session_id: entry.session_id.clone(),
                 status: OperationStatus::Failed,
                 durability: SettlementDurability::Unconfirmed,
                 failure: None,
@@ -805,8 +844,9 @@ impl Coordinator {
             if self.last_settled.len() > 32 {
                 self.last_settled.remove(0);
             }
-            settlements.push(EpochSettlement {
-                operation_id,
+            settlements.push(ForcedSettlement {
+                operation_id: entry.operation_id,
+                session_id: entry.session_id,
                 status: OperationStatus::Failed,
                 durability: SettlementDurability::Unconfirmed,
                 diagnostic_id,
@@ -820,16 +860,19 @@ impl Coordinator {
                 .event_tx
                 .send(RuntimeEvent::MaintenanceSettled {
                     id: maintenance.id,
+                    session_id: maintenance.session_id,
                     result: MaintenanceResult::Cancelled,
                 })
                 .await;
         }
         self.shutdown = ShutdownState::Stopped;
+        let forced_count = settlements.len();
         if self
             .event_tx
             .send(RuntimeEvent::EpochEnded {
                 epoch: self.epoch.clone(),
-                settlements: settlements.clone(),
+                reason: EpochEndReason::Shutdown,
+                forced_count,
             })
             .await
             .is_ok()
@@ -839,8 +882,9 @@ impl Coordinator {
         self.publish_snapshot();
         self.finished_report = Some(ShutdownReport {
             epoch: self.epoch.clone(),
-            shutdown: ShutdownState::Stopped,
+            final_state: ShutdownState::Stopped,
             settlements,
+            diagnostics: Vec::new(),
         });
     }
 
@@ -876,12 +920,14 @@ impl Coordinator {
     fn record_settled(
         &mut self,
         operation_id: OperationId,
+        session_id: SessionId,
         status: OperationStatus,
         durability: SettlementDurability,
         failure: Option<AgentFailure>,
     ) {
         self.last_settled.push(SettledOperationSnapshot {
             operation_id,
+            session_id,
             status,
             durability,
             failure,
@@ -913,7 +959,10 @@ impl Coordinator {
             queued: self
                 .queue
                 .iter()
-                .map(|queued| queued.operation_id.clone())
+                .map(|queued| QueuedOperationSnapshot {
+                    operation_id: queued.operation_id.clone(),
+                    session_id: queued.spec.session_id.clone(),
+                })
                 .collect(),
             active: self.active.as_ref().map(|active| ActiveOperationSnapshot {
                 operation_id: active.operation_id.clone(),
@@ -939,8 +988,9 @@ impl Coordinator {
     fn shutdown_report(&self) -> ShutdownReport {
         ShutdownReport {
             epoch: self.epoch.clone(),
-            shutdown: self.shutdown,
+            final_state: self.shutdown,
             settlements: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -1109,6 +1159,10 @@ impl Drop for Coordinator {
                 .maintenance
                 .as_ref()
                 .map(|maintenance| maintenance.id.clone()),
+            maintenance_session_id: self
+                .maintenance
+                .as_ref()
+                .map(|maintenance| maintenance.session_id.clone()),
         });
     }
 }
@@ -1161,9 +1215,7 @@ pub(crate) fn empty_snapshot(epoch: RuntimeEpoch) -> RuntimeSnapshot {
 
 fn settled_operation_id(event: &RuntimeEvent) -> Option<OperationId> {
     match event {
-        RuntimeEvent::Agent(AgentEvent::OperationSettled { operation_id, .. }) => {
-            Some(operation_id.clone())
-        }
+        RuntimeEvent::OperationSettled { operation_id, .. } => Some(operation_id.clone()),
         _ => None,
     }
 }

@@ -77,9 +77,7 @@ impl TurnCx<'_> {
                 for event in executed_events {
                     self.operation.push(event).await;
                 }
-                self.operation
-                    .cancel_committed(commit.revision().get())
-                    .await;
+                self.operation.cancel_committed(commit.revision()).await;
             }
             Err(error) => {
                 self.fail(
@@ -131,7 +129,7 @@ impl TurnCx<'_> {
         match commit {
             Ok(commit) => {
                 self.operation
-                    .fail_confirmed(failure, commit.revision().get())
+                    .fail_confirmed(failure, commit.revision())
                     .await
             }
             Err(error) => {

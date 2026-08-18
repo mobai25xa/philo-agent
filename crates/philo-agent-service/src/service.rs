@@ -1,5 +1,7 @@
 //! Public service handle. The actor lives in [`crate::actor`].
 
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -8,7 +10,7 @@ use crate::bounds::{
     FRONTEND_COMMAND_CAP, FRONTEND_CONTROL_CAP, FRONTEND_SNAPSHOT_CAP, FRONTEND_UPDATE_CAP,
 };
 use crate::confirmation::{ConfirmationGate, ConfirmationMap, gate_pair};
-use crate::error::CommandSubmitResult;
+use crate::error::CommandDispatch;
 use crate::frontend::command::FrontendCommand;
 use crate::frontend::{CommandEnvelope, FrontendClient, FrontendFeed};
 use crate::generation::GenerationAssembler;
@@ -16,7 +18,6 @@ use crate::ids::FrontendRequestId;
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
 use philo_agent_runtime::RuntimeGeneration;
 use philo_session::SessionStore;
-use std::sync::Arc;
 
 /// Dependencies required to start the application service.
 pub struct ServiceDeps<R, S> {
@@ -47,14 +48,16 @@ impl AgentService {
 
     /// Enqueues an explicit shutdown. Does not abort in-flight Runtime work
     /// beyond what [`philo_agent_runtime::ShutdownMode::Drain`] requests.
-    pub fn request_shutdown(&self) -> CommandSubmitResult {
+    pub fn request_shutdown(&self) -> CommandDispatch<FrontendRequestId> {
         match self.control_tx.try_send(CommandEnvelope {
             request_id: FrontendRequestId::new(u64::MAX),
             command: FrontendCommand::ShutdownRequested,
         }) {
-            Ok(()) => CommandSubmitResult::Accepted(FrontendRequestId::new(u64::MAX)),
-            Err(mpsc::error::TrySendError::Full(_)) => CommandSubmitResult::Backpressured,
-            Err(mpsc::error::TrySendError::Closed(_)) => CommandSubmitResult::Disconnected,
+            Ok(()) => CommandDispatch::Enqueued(FrontendRequestId::new(u64::MAX)),
+            Err(mpsc::error::TrySendError::Full(_)) => CommandDispatch::Backpressured,
+            Err(mpsc::error::TrySendError::Closed(_)) => CommandDispatch::Disconnected {
+                lane: "frontend-control",
+            },
         }
     }
 
@@ -76,7 +79,12 @@ where
     let (update_tx, update_rx) = mpsc::channel(FRONTEND_UPDATE_CAP);
     let (confirmations, confirm_rx) = gate_pair();
 
-    let client = FrontendClient::new(command_tx, control_tx.clone(), snapshot_tx, update_rx);
+    let client = FrontendClient::new(
+        command_tx.clone(),
+        control_tx.clone(),
+        snapshot_tx,
+        update_rx,
+    );
     let actor = AgentServiceActor::new(
         deps.runtime,
         deps.subscription,

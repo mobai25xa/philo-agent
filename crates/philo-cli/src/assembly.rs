@@ -354,15 +354,15 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
     });
     let session_store: Arc<dyn SessionStore> = sessions.clone();
     let generation_assembler: Arc<dyn GenerationAssembler> = assembler.clone();
-    let (handle, subscription) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: session_store.clone(),
         ids,
         bounds: Default::default(),
     })
     .map_err(|error| UsageError::new(format!("cannot start the runtime: {}", error.message())))?;
     let (service, client) = philo_agent_service::start(ServiceDeps {
-        runtime: handle,
-        subscription,
+        runtime: parts.handle,
+        subscription: parts.events,
         sessions: session_store,
         assembler: generation_assembler,
         initial_generation,
@@ -386,7 +386,7 @@ pub(crate) async fn shutdown(bootstrap: Bootstrap) {
         ..
     } = bootstrap;
     match client.try_command(FrontendCommand::ShutdownRequested) {
-        philo_agent_service::CommandSubmitResult::Accepted(_) => {}
+        philo_agent_service::CommandDispatch::Enqueued(_) => {}
         _ => {
             let _ = service.request_shutdown();
         }

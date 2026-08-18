@@ -8,7 +8,7 @@ use std::time::Duration;
 use philo_agent_runtime::{
     AgentAvailability, AgentEvent, CancelResult, GenerationConfig, ModelCallSnapshot, ModelError,
     ModelEventStream, ModelPort, OperationOutcome, OperationSpec, OperationStatus, RuntimeConfig,
-    RuntimeFuture, SessionId, SettlementDurability, UserMessage,
+    RuntimeFuture, SessionId, SettlementDurability, SettlementRevision, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore};
 use support::fake_model::{FakeModel, ModelScript};
@@ -151,6 +151,7 @@ async fn queued_cancel_leaves_zero_session_facts() {
             AgentEvent::OperationSettled {
                 status: OperationStatus::Cancelled,
                 durability: SettlementDurability::Confirmed,
+                session_revision: SettlementRevision::Unchanged,
                 ..
             }
         ]

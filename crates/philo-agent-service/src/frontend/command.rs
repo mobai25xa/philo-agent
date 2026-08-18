@@ -57,10 +57,8 @@ pub struct FrontendAttachment {
 /// Commands the TUI (or oneshot frontend) may send.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontendCommand {
-    /// Admit a user turn on `session_id`.
+    /// Admit a user turn on the service's current loaded session.
     Submit {
-        /// Target session.
-        session_id: String,
         /// Draft text. May be empty when attachments are present.
         draft: String,
         /// Optional image parts.
@@ -179,7 +177,6 @@ mod tests {
         );
         assert!(
             !FrontendCommand::Submit {
-                session_id: "s".into(),
                 draft: "hi".into(),
                 attachments: Vec::new(),
             }

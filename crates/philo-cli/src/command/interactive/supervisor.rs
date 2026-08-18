@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use philo_agent_service::{
-    DetachReason, FRONTEND_RESTART_BUDGET, FRONTEND_RESTART_WINDOW_SECS, FrontendCommand,
-    FrontendInstanceId, FrontendRevision,
+    CommandDispatch, DetachReason, FRONTEND_RESTART_BUDGET, FRONTEND_RESTART_WINDOW_SECS,
+    FrontendCommand, FrontendInstanceId, FrontendRevision,
 };
 use philo_tui::{RestoreReport, TuiLaunchConfig, TuiOutcome, TuiRunReport, run_async};
 use tokio::sync::watch;
@@ -97,10 +97,14 @@ impl ProcessSupervisor {
                     frontend_instance_id: instance_id.clone(),
                 });
             if self.instance > 1 {
-                let _ = self
+                match self
                     .bootstrap
                     .client
-                    .request_snapshot(FrontendRevision::ZERO);
+                    .request_snapshot(FrontendRevision::ZERO)
+                {
+                    CommandDispatch::Enqueued(_) | CommandDispatch::Backpressured => {}
+                    CommandDispatch::Disconnected { .. } => {}
+                }
             }
 
             let client = self.bootstrap.client.clone();

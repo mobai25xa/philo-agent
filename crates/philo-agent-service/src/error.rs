@@ -39,15 +39,60 @@ impl fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
-/// Result of [`crate::FrontendClient::try_command`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandSubmitResult {
-    /// The command is on a service lane and will be correlated by this id.
-    Accepted(crate::FrontendRequestId),
+/// Result of crossing a bounded command lane. This is enqueue, not command accept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandDispatch<T> {
+    /// The command was queued on its lane. The actor has not accepted it yet.
+    Enqueued(T),
     /// The target bounded lane is full. The command was not queued.
     Backpressured,
-    /// The service actor is gone.
-    Disconnected,
+    /// The target lane closed. The command was not queued.
+    Disconnected {
+        /// Which lane closed.
+        lane: &'static str,
+    },
+}
+
+/// Why the service actor refused a command after it was dequeued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandReject {
+    /// Submit targeted the current session, but none is loaded.
+    NoCurrentSession,
+    /// The service is shutting down or the runtime is gone.
+    NotAccepting,
+    /// The bounded child-task pool is full.
+    ChildCapacity,
+    /// The command payload could not be interpreted.
+    InvalidInput {
+        /// Stable diagnostic text.
+        reason: String,
+    },
+    /// Runtime admission refused the command.
+    AdmissionFailed {
+        /// Runtime admission diagnostic.
+        message: String,
+    },
+    /// Cancel was not accepted by the runtime.
+    CancelRejected {
+        /// Runtime cancel diagnostic.
+        message: String,
+    },
+    /// The confirmation id is not pending.
+    UnknownConfirmation,
+}
+
+impl fmt::Display for CommandReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCurrentSession => write!(f, "no current session"),
+            Self::NotAccepting => write!(f, "runtime is not accepting work"),
+            Self::ChildCapacity => write!(f, "service child capacity reached"),
+            Self::InvalidInput { reason } => write!(f, "{reason}"),
+            Self::AdmissionFailed { message } => write!(f, "{message}"),
+            Self::CancelRejected { message } => write!(f, "{message}"),
+            Self::UnknownConfirmation => write!(f, "unknown confirmation"),
+        }
+    }
 }
 
 /// Result of [`crate::FrontendClient::recv_until`].

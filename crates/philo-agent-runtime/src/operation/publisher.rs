@@ -3,7 +3,7 @@
 use super::shared::OperationShared;
 use crate::{
     AgentEvent, AgentFailure, AssistantMessage, OperationId, OperationOutcome, OperationPhase,
-    OperationStatus, SettlementDurability, TurnId,
+    OperationStatus, SettlementDurability, SettlementRevision, TurnId,
 };
 use philo_session::CancelReason;
 use std::sync::Arc;
@@ -95,7 +95,11 @@ impl OperationPublisher {
             .await;
     }
 
-    pub async fn succeed(self, assistant: AssistantMessage, session_revision: u64) {
+    pub async fn succeed(
+        self,
+        assistant: AssistantMessage,
+        session_revision: philo_session::SessionRevision,
+    ) {
         self.shared
             .publish(AgentEvent::AssistantMessageCompleted {
                 turn_id: self.shared.turn_id().clone(),
@@ -105,14 +109,18 @@ impl OperationPublisher {
         self.publish_settled(
             OperationStatus::Succeeded,
             SettlementDurability::Confirmed,
-            Some(session_revision),
+            SettlementRevision::Committed(session_revision),
         )
         .await;
         self.shared
             .settle(OperationOutcome::Succeeded { assistant });
     }
 
-    pub async fn fail_confirmed(self, failure: AgentFailure, session_revision: u64) {
+    pub async fn fail_confirmed(
+        self,
+        failure: AgentFailure,
+        session_revision: philo_session::SessionRevision,
+    ) {
         self.shared
             .publish(AgentEvent::TurnFailed {
                 turn_id: self.shared.turn_id().clone(),
@@ -122,21 +130,25 @@ impl OperationPublisher {
         self.fail(
             failure,
             SettlementDurability::Confirmed,
-            Some(session_revision),
+            SettlementRevision::Committed(session_revision),
         )
         .await;
     }
 
     pub async fn fail_unconfirmed(self, failure: AgentFailure) {
-        self.fail(failure, SettlementDurability::Unconfirmed, None)
-            .await;
+        self.fail(
+            failure,
+            SettlementDurability::Unconfirmed,
+            SettlementRevision::Unchanged,
+        )
+        .await;
     }
 
     async fn fail(
         self,
         failure: AgentFailure,
         durability: SettlementDurability,
-        session_revision: Option<u64>,
+        session_revision: SettlementRevision,
     ) {
         self.shared.settle(OperationOutcome::Failed {
             failure,
@@ -152,7 +164,7 @@ impl OperationPublisher {
         self.publish_settled(
             OperationStatus::Cancelled,
             SettlementDurability::Confirmed,
-            None,
+            SettlementRevision::Unchanged,
         )
         .await;
         self.shared.settle(OperationOutcome::Cancelled);
@@ -160,7 +172,7 @@ impl OperationPublisher {
 
     /// Settles as cancelled after the cancellation transaction committed:
     /// publishes `TurnCancelled` before the terminal event.
-    pub async fn cancel_committed(self, session_revision: u64) {
+    pub async fn cancel_committed(self, session_revision: philo_session::SessionRevision) {
         self.shared
             .publish(AgentEvent::TurnCancelled {
                 turn_id: self.shared.turn_id().clone(),
@@ -170,17 +182,19 @@ impl OperationPublisher {
         self.publish_settled(
             OperationStatus::Cancelled,
             SettlementDurability::Confirmed,
-            Some(session_revision),
+            SettlementRevision::Committed(session_revision),
         )
         .await;
         self.shared.settle(OperationOutcome::Cancelled);
     }
 
+    /// Publishes the terminal settlement. `Committed` only after a Session
+    /// transaction actually advanced; never invent a revision.
     async fn publish_settled(
         &self,
         status: OperationStatus,
         durability: SettlementDurability,
-        session_revision: Option<u64>,
+        session_revision: SettlementRevision,
     ) {
         self.shared
             .publish(AgentEvent::OperationSettled {

@@ -11,7 +11,7 @@ use philo_agent_runtime::{
 };
 use philo_agent_service::testing::{FakeAssembler, start_test_service, start_test_service_with};
 use philo_agent_service::{
-    CommandSubmitResult, FrontendAssistantBlock, FrontendCommand, FrontendContextMessage,
+    CommandDispatch, FrontendAssistantBlock, FrontendCommand, FrontendContextMessage,
     FrontendRevision, FrontendUpdate, FrontendUpdateKind, RecvOutcome, RuntimeEvent,
 };
 use philo_session::{
@@ -20,6 +20,15 @@ use philo_session::{
     SessionTransaction, SessionUserPart, TurnId, TurnOutcome,
 };
 use tokio::sync::{Notify, watch};
+
+fn accept_snapshot(
+    client: &philo_agent_service::FrontendClient,
+) -> philo_agent_service::FrontendRequestId {
+    match client.request_snapshot(FrontendRevision::ZERO) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("expected accepted snapshot, got {other:?}"),
+    }
+}
 
 async fn recv_matching(
     client: &philo_agent_service::FrontendClient,
@@ -185,7 +194,7 @@ async fn load_session(client: &philo_agent_service::FrontendClient, session_id: 
         client.try_command(FrontendCommand::LoadSession {
             session_id: session_id.into(),
         }),
-        CommandSubmitResult::Accepted(_)
+        CommandDispatch::Enqueued(_)
     ));
     recv_matching(client, |update| {
         matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
@@ -195,12 +204,14 @@ async fn load_session(client: &philo_agent_service::FrontendClient, session_id: 
 
 fn emit_live(
     runtime: &philo_agent_service::testing::FakeRuntimeHandle,
+    session_id: &str,
     operation_id: &str,
     turn_id: &str,
     text: &str,
 ) {
     runtime.emit(RuntimeEvent::OperationAccepted {
         operation_id: OperationId::new(operation_id),
+        session_id: philo_agent_runtime::SessionId::new(session_id),
         turn_id: philo_agent_runtime::TurnId::new(turn_id),
     });
     runtime.emit_agent(AgentEvent::OperationStarted {
@@ -218,13 +229,17 @@ fn emit_live(
 fn emit_settled(
     runtime: &philo_agent_service::testing::FakeRuntimeHandle,
     operation_id: &str,
+    session_id: &str,
     session_revision: u64,
 ) {
-    runtime.emit_agent(AgentEvent::OperationSettled {
+    runtime.emit(RuntimeEvent::OperationSettled {
         operation_id: OperationId::new(operation_id),
+        session_id: philo_agent_runtime::SessionId::new(session_id),
         status: OperationStatus::Succeeded,
         durability: SettlementDurability::Confirmed,
-        session_revision: Some(session_revision),
+        session_revision: philo_agent_runtime::SettlementRevision::Committed(
+            philo_session::SessionRevision::new(session_revision),
+        ),
     });
 }
 
@@ -402,7 +417,7 @@ async fn stale_view_after_settlement_retries_until_final_once() {
     let store = ScriptedStore::new(inner);
     let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store.clone());
     load_session(&client, "sess-fence").await;
-    emit_live(&runtime, "op-live", "turn-live", "partial");
+    emit_live(&runtime, "sess-fence", "op-live", "turn-live", "partial");
     recv_matching(&client, |update| {
         matches!(
             update.kind,
@@ -412,7 +427,12 @@ async fn stale_view_after_settlement_retries_until_final_once() {
         )
     })
     .await;
-    emit_settled(&runtime, "op-live", final_commit.revision().get());
+    emit_settled(
+        &runtime,
+        "op-live",
+        "sess-fence",
+        final_commit.revision().get(),
+    );
     recv_matching(&client, |update| {
         matches!(
             update.kind,
@@ -424,8 +444,7 @@ async fn stale_view_after_settlement_retries_until_final_once() {
     .await;
     store.prepend(stale);
 
-    let request_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(request_id.is_valid());
+    let _request_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -460,7 +479,7 @@ async fn durable_final_strips_live_before_settlement() {
     .await;
     let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
     load_session(&client, "sess-dup").await;
-    emit_live(&runtime, "op-live", "turn-live", "partial");
+    emit_live(&runtime, "sess-dup", "op-live", "turn-live", "partial");
     recv_matching(&client, |update| {
         matches!(
             update.kind,
@@ -471,8 +490,7 @@ async fn durable_final_strips_live_before_settlement() {
     })
     .await;
 
-    let request_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(request_id.is_valid());
+    let _request_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -504,20 +522,20 @@ async fn superseded_snapshot_does_not_publish() {
     let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
     load_session(&client, "sess-a").await;
 
-    let first = client.request_snapshot(FrontendRevision::ZERO);
+    let first = accept_snapshot(&client);
     hold.wait_held().await;
     assert!(matches!(
         client.try_command(FrontendCommand::LoadSession {
             session_id: "sess-b".into(),
         }),
-        CommandSubmitResult::Accepted(_)
+        CommandDispatch::Enqueued(_)
     ));
     recv_matching(&client, |update| match &update.kind {
         FrontendUpdateKind::SessionLoaded { session_id, .. } => session_id == "sess-b",
         _ => false,
     })
     .await;
-    let second = client.request_snapshot(FrontendRevision::ZERO);
+    let second = accept_snapshot(&client);
     assert!(second > first);
 
     let update = recv_matching(&client, |update| {
@@ -583,7 +601,12 @@ async fn confirmed_settlement_retries_until_required_revision() {
     let store = ScriptedStore::new(inner);
     let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store.clone());
     load_session(&client, "sess-rev").await;
-    emit_settled(&runtime, "op-live", final_commit.revision().get());
+    emit_settled(
+        &runtime,
+        "op-live",
+        "sess-rev",
+        final_commit.revision().get(),
+    );
     recv_matching(&client, |update| {
         matches!(
             update.kind,
@@ -595,8 +618,7 @@ async fn confirmed_settlement_retries_until_required_revision() {
     .await;
     store.prepend(stale);
 
-    let request_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(request_id.is_valid());
+    let _request_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -632,8 +654,7 @@ async fn feed_overflow_resync_snapshot_is_atomic_and_later_revisions_increase() 
     })
     .await;
 
-    let request_id = client.request_snapshot(FrontendRevision::ZERO);
-    assert!(request_id.is_valid());
+    let _request_id = accept_snapshot(&client);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -683,7 +704,7 @@ async fn settlement_during_resync_queues_fenced_snapshot() {
     .await;
     let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
     load_session(&client, "sess-auto").await;
-    emit_live(&runtime, "op-live", "turn-live", "partial");
+    emit_live(&runtime, "sess-auto", "op-live", "turn-live", "partial");
     recv_matching(&client, |update| {
         matches!(
             update.kind,
@@ -704,7 +725,7 @@ async fn settlement_during_resync_queues_fenced_snapshot() {
     })
     .await;
 
-    emit_settled(&runtime, "op-live", 2);
+    emit_settled(&runtime, "op-live", "sess-auto", 2);
     let update = recv_matching(&client, |update| {
         matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
     })
@@ -726,7 +747,10 @@ async fn subscription_lag_requests_runtime_snapshot() {
         availability: AgentAvailability::Busy {
             operation_id: OperationId::new("op-lag"),
         },
-        queued: vec![OperationId::new("op-queued")],
+        queued: vec![philo_agent_runtime::QueuedOperationSnapshot {
+            operation_id: OperationId::new("op-queued"),
+            session_id: philo_agent_runtime::SessionId::new("sess-lag"),
+        }],
         active: None,
         maintenance: None,
         shutdown: ShutdownState::Running,
@@ -746,5 +770,7 @@ async fn subscription_lag_requests_runtime_snapshot() {
         philo_agent_service::FrontendAvailability::Busy { .. }
     ));
     assert_eq!(snapshot.queued.len(), 1);
+    assert_eq!(snapshot.queued[0].operation_id, "op-queued");
+    assert_eq!(snapshot.queued[0].session_id, "sess-lag");
     drop(service);
 }

@@ -2,8 +2,9 @@
 //! maintenance, fault, lag, and epoch lifecycle.
 
 use crate::{
-    AgentAvailability, AgentEvent, CompactionError, CompactionReport, DiagnosticId,
-    EpochSettlement, MaintenanceId, OperationId, RuntimeEpoch, TurnId,
+    AgentAvailability, AgentEvent, CompactionError, CompactionReport, DiagnosticId, MaintenanceId,
+    OperationId, OperationStatus, RuntimeEpoch, SessionId, SettlementDurability,
+    SettlementRevision, TurnId,
 };
 
 /// Terminal result of a maintenance task.
@@ -15,13 +16,29 @@ pub enum MaintenanceResult {
     Panicked { diagnostic_id: DiagnosticId },
 }
 
+/// Why one runtime epoch ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EpochEndReason {
+    Shutdown,
+    CoordinatorFault,
+    EventSinkClosed,
+}
+
 /// Events emitted on the single bounded runtime subscription.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuntimeEvent {
     OperationAccepted {
         operation_id: OperationId,
+        session_id: SessionId,
         turn_id: TurnId,
+    },
+    OperationSettled {
+        operation_id: OperationId,
+        session_id: SessionId,
+        status: OperationStatus,
+        durability: SettlementDurability,
+        session_revision: SettlementRevision,
     },
     Agent(AgentEvent),
     AvailabilityChanged {
@@ -30,6 +47,7 @@ pub enum RuntimeEvent {
     },
     MaintenanceAccepted {
         id: MaintenanceId,
+        session_id: SessionId,
     },
     MaintenanceStarted {
         id: MaintenanceId,
@@ -40,6 +58,7 @@ pub enum RuntimeEvent {
     },
     MaintenanceSettled {
         id: MaintenanceId,
+        session_id: SessionId,
         result: MaintenanceResult,
     },
     RuntimeFault {
@@ -51,11 +70,12 @@ pub enum RuntimeEvent {
     },
     EpochEnded {
         epoch: RuntimeEpoch,
-        settlements: Vec<EpochSettlement>,
+        reason: EpochEndReason,
+        forced_count: usize,
     },
 }
 
-/// Outcome of [`crate::RuntimeSubscription::try_recv`].
+/// Outcome of [`crate::RuntimeEventReceiver::try_recv`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryRecvError {
     Empty,

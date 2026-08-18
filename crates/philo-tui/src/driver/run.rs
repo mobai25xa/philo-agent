@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 use philo_agent_service::{
-    CommandSubmitResult, FrontendAvailability, FrontendClient, FrontendCommand, FrontendRequestId,
+    CommandDispatch, FrontendAvailability, FrontendClient, FrontendCommand, FrontendRequestId,
     FrontendRevision, FrontendUpdate, FrontendUpdateKind,
 };
 use ratatui::Terminal;
@@ -134,9 +134,7 @@ impl FrontendSync {
                 return false;
             }
             if matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
-                && self
-                    .snapshot_request
-                    .is_some_and(|expected| expected.is_valid() && expected != id)
+                && self.snapshot_request.is_some_and(|expected| expected != id)
             {
                 return false;
             }
@@ -159,7 +157,7 @@ struct LoopState {
 }
 
 impl LoopState {
-    fn send(&self, command: FrontendCommand) -> CommandSubmitResult {
+    fn send(&self, command: FrontendCommand) -> CommandDispatch<FrontendRequestId> {
         self.client.try_command(command)
     }
 }
@@ -259,12 +257,14 @@ pub(crate) async fn run_loop<B: Backend>(
     }
 
     if config.session_id.is_empty() {
-        let id = state.client.request_snapshot(FrontendRevision::ZERO);
-        state.sync.snapshot_request = Some(id);
+        if let CommandDispatch::Enqueued(id) = state.client.request_snapshot(FrontendRevision::ZERO)
+        {
+            state.sync.snapshot_request = Some(id);
+        }
         state.sync.awaiting_snapshot = true;
     } else {
         app.expect_session_load(SessionLoadIntent::Switch);
-        if let CommandSubmitResult::Disconnected = state.send(FrontendCommand::LoadSession {
+        if let CommandDispatch::Disconnected { .. } = state.send(FrontendCommand::LoadSession {
             session_id: config.session_id.clone(),
         }) {
             return TuiOutcome::FrontendRestartRequested {
@@ -481,8 +481,11 @@ fn apply_updates(
             markdown.reset();
         }
         if let FrontendUpdateKind::ResyncRequired { .. } = &update.kind {
-            let id = state.client.request_snapshot(state.sync.revision);
-            state.sync.snapshot_request = Some(id);
+            if let CommandDispatch::Enqueued(id) =
+                state.client.request_snapshot(state.sync.revision)
+            {
+                state.sync.snapshot_request = Some(id);
+            }
             state.sync.awaiting_snapshot = true;
             continue;
         }
@@ -492,7 +495,7 @@ fn apply_updates(
             && let Some(session_id) = state.sync.preview_session_id.take()
         {
             state.sync.preview_request = None;
-            app.set_preview(&session_id, Preview::Failed(reason.clone()));
+            app.set_preview(&session_id, Preview::Failed(reason.to_string()));
             continue;
         }
         effects.extend(app.apply_update(&update));
@@ -669,7 +672,7 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
         },
     };
     match state.send(command.clone()) {
-        CommandSubmitResult::Accepted(id) => {
+        CommandDispatch::Enqueued(id) => {
             match &command {
                 FrontendCommand::PreviewSession { .. } => state.sync.preview_request = Some(id),
                 FrontendCommand::InstallModel { .. } | FrontendCommand::SetReasoning { .. } => {
@@ -679,13 +682,13 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
             }
             None
         }
-        CommandSubmitResult::Backpressured => {
+        CommandDispatch::Backpressured => {
             let _ = app.ingest_appends(vec![Effect::Append(tasks::task_error(
                 "frontend command backpressured",
             ))]);
             None
         }
-        CommandSubmitResult::Disconnected => Some(TuiOutcome::FrontendRestartRequested {
+        CommandDispatch::Disconnected { .. } => Some(TuiOutcome::FrontendRestartRequested {
             fault: "frontend disconnected".to_owned(),
         }),
     }
@@ -712,17 +715,13 @@ fn finish_clipboard(app: &mut App, result: Result<ClipboardContent, String>) -> 
 /// After media decode succeeds, submit the already-decoded attachments.
 fn submit_ready(
     state: &LoopState,
-    app: &App,
+    _app: &App,
     draft: String,
     attachments: Vec<philo_agent_service::FrontendAttachment>,
 ) -> Option<TuiOutcome> {
-    match state.send(FrontendCommand::Submit {
-        session_id: app.status.session.clone(),
-        draft,
-        attachments,
-    }) {
-        CommandSubmitResult::Accepted(_) | CommandSubmitResult::Backpressured => None,
-        CommandSubmitResult::Disconnected => Some(TuiOutcome::FrontendRestartRequested {
+    match state.send(FrontendCommand::Submit { draft, attachments }) {
+        CommandDispatch::Enqueued(_) | CommandDispatch::Backpressured => None,
+        CommandDispatch::Disconnected { .. } => Some(TuiOutcome::FrontendRestartRequested {
             fault: "frontend disconnected on submit".to_owned(),
         }),
     }
@@ -860,6 +859,7 @@ mod tests {
     fn busy_events(runtime: &philo_agent_service::testing::FakeRuntimeHandle, operation_id: &str) {
         runtime.emit(philo_agent_service::RuntimeEvent::OperationAccepted {
             operation_id: philo_agent_runtime::OperationId::new(operation_id),
+            session_id: philo_agent_runtime::SessionId::new("s-1"),
             turn_id: philo_agent_runtime::TurnId::new("turn-1"),
         });
         runtime.emit(philo_agent_service::RuntimeEvent::AvailabilityChanged {

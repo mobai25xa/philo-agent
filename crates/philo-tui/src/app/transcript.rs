@@ -450,8 +450,10 @@ mod tests {
             },
             FrontendOperationEvent::OperationSettled {
                 operation_id: "op-1".to_owned(),
+                session_id: "s-1".to_owned(),
                 status: "Cancelled".to_owned(),
                 durability: "Confirmed".to_owned(),
+                session_revision: philo_agent_service::SettlementRevision::Unchanged,
             },
         ]
     }

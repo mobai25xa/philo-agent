@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use philo_agent_runtime::{
     AgentEvent, AgentFailureKind, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ModelAssistantBlock,
-    ModelMessage, OperationOutcome, OperationStatus, RuntimeConfig, SettlementDurability, UserPart,
+    ModelMessage, OperationOutcome, OperationStatus, RuntimeConfig, SettlementDurability,
+    SettlementRevision, UserPart,
 };
 use philo_session::{
     ContextMessage, MemorySessionStore, SessionAssistantBlock, SessionCommit, SessionContextView,
@@ -248,6 +249,7 @@ async fn single_turn_success() {
         event,
         AgentEvent::OperationSettled {
             status: OperationStatus::Succeeded,
+            session_revision: SettlementRevision::Committed(_),
             ..
         }
     )));

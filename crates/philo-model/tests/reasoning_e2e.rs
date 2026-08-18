@@ -145,12 +145,14 @@ async fn reasoning_flows_replay_and_stay_out_of_the_session() {
         None,
         ChatReasoningFormat::ContentOnly,
     );
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: sessions.clone(),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {
@@ -307,12 +309,14 @@ async fn unsupported_effort_settles_the_operation_failed() {
         Some(ReasoningEffort::High),
         ChatReasoningFormat::None,
     );
-    let (handle, mut sub) = AgentRuntime::start(RuntimeDeps {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions: sessions.clone(),
         ids: Arc::new(SequentialIdSource::new()),
         bounds: ChannelBounds::default(),
     })
     .expect("start runtime");
+    let handle = parts.handle;
+    let mut sub = parts.events;
 
     let accepted = handle
         .submit(OperationSpec {

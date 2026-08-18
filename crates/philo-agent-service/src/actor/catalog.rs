@@ -2,6 +2,7 @@
 
 use philo_session::{SessionError, SessionId};
 
+use crate::error::CommandReject;
 use crate::frontend::update::FrontendUpdateKind;
 use crate::ids::{FrontendEpoch, FrontendRequestId};
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
@@ -54,7 +55,9 @@ where
             Err(error) => self.emit(
                 Some(request_id),
                 FrontendUpdateKind::CommandRejected {
-                    reason: catalog_error_reason(&error),
+                    reason: CommandReject::InvalidInput {
+                        reason: catalog_error_reason(&error),
+                    },
                 },
             ),
         }

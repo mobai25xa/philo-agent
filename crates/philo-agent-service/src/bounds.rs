@@ -3,6 +3,8 @@
 //! Full channels return an explicit error, merge, or `needs_resync`. They
 //! never grow into unbounded containers.
 
+pub use philo_agent_runtime::{RUNTIME_RELIABLE_STAGING_CAP, TRANSIENT_KIND_COUNT};
+
 /// Runtime command-lane capacity (service does not own this channel).
 pub const RUNTIME_COMMAND_CAP: usize = 32;
 /// Runtime control-lane capacity (service does not own this channel).

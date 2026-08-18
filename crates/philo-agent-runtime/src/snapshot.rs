@@ -57,13 +57,20 @@ pub struct ModelCallSnapshot {
 pub struct RuntimeSnapshot {
     pub epoch: RuntimeEpoch,
     pub availability: AgentAvailability,
-    pub queued: Vec<OperationId>,
+    pub queued: Vec<QueuedOperationSnapshot>,
     pub active: Option<ActiveOperationSnapshot>,
     pub maintenance: Option<MaintenanceSnapshot>,
     pub shutdown: ShutdownState,
     pub last_settled: Vec<SettledOperationSnapshot>,
     /// Monotonic coordinator publication counter. Bumped on every snapshot.
     pub runtime_revision: u64,
+}
+
+/// One queued operation in the runtime observation snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedOperationSnapshot {
+    pub operation_id: OperationId,
+    pub session_id: SessionId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +91,7 @@ pub struct MaintenanceSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettledOperationSnapshot {
     pub operation_id: OperationId,
+    pub session_id: SessionId,
     pub status: OperationStatus,
     pub durability: SettlementDurability,
     pub failure: Option<AgentFailure>,
@@ -106,9 +114,12 @@ pub enum ShutdownState {
 }
 
 /// Report returned by [`crate::RuntimeHandle::shutdown`].
+///
+/// `final_state == Stopped` is only valid when the Runtime supervisor wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShutdownReport {
     pub epoch: RuntimeEpoch,
-    pub shutdown: ShutdownState,
-    pub settlements: Vec<crate::EpochSettlement>,
+    pub final_state: ShutdownState,
+    pub settlements: Vec<crate::ForcedSettlement>,
+    pub diagnostics: Vec<crate::ShutdownDiagnostic>,
 }

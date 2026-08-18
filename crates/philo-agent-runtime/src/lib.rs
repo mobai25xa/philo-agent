@@ -27,6 +27,7 @@ mod transient;
 pub use bounds::{
     ChannelBounds, DELTA_MERGE_CHUNK_MAX, RUNTIME_COMMAND_CAP, RUNTIME_CONTROL_CAP,
     RUNTIME_DRIVER_EVENT_BUDGET, RUNTIME_EVENT_CAP, RUNTIME_QUEUE_MAX,
+    RUNTIME_RELIABLE_STAGING_CAP, TRANSIENT_KIND_COUNT,
 };
 pub use compaction::{CompactionError, CompactionReport};
 pub use config::{
@@ -34,8 +35,8 @@ pub use config::{
     DEFAULT_TOOL_CANCEL_GRACE, GenerationConfig, ReasoningEffort, RuntimeConfig, ToolChoice,
 };
 pub use error::{
-    AdmissionError, CancelResult, DriverExit, DriverInvariantError, EpochSettlement,
-    MaintenanceError, StartError,
+    AdmissionError, CancelResult, DriverExit, DriverInvariantError, ForcedSettlement,
+    MaintenanceError, ShutdownDiagnostic, ShutdownError, StartError,
 };
 pub use event::AgentEvent;
 pub use generation::{GenerationDisplay, RuntimeGeneration};
@@ -52,6 +53,7 @@ pub use model::{
 pub use outcome::{
     AgentAvailability, AgentError, AgentFailure, AgentFailureKind, ModelCallPhase,
     OperationOutcome, OperationPhase, OperationStatus, RunningToolBatchPhase, SettlementDurability,
+    SettlementRevision,
 };
 pub use philo_session::CancelReason;
 pub use philo_tools::{
@@ -60,11 +62,12 @@ pub use philo_tools::{
     ToolInvokeEnd, ToolPort, ToolPortError, ToolProgressSink, ToolRegistry, ToolRegistryBuilder,
     ToolResult, ToolResultError, ToolSchema, ToolSchemaInput,
 };
-pub use runtime::{AgentRuntime, RuntimeDeps};
-pub use runtime_event::{MaintenanceResult, RuntimeEvent, TryRecvError};
+pub use runtime::{AgentRuntime, RuntimeDeps, RuntimeParts};
+pub use runtime_event::{EpochEndReason, MaintenanceResult, RuntimeEvent, TryRecvError};
 pub use snapshot::{
-    ActiveOperationSnapshot, MaintenanceSnapshot, ModelCallSnapshot, RuntimeSnapshot,
-    SettledOperationSnapshot, ShutdownMode, ShutdownReport, ShutdownState, TurnSnapshot,
+    ActiveOperationSnapshot, MaintenanceSnapshot, ModelCallSnapshot, QueuedOperationSnapshot,
+    RuntimeSnapshot, SettledOperationSnapshot, ShutdownMode, ShutdownReport, ShutdownState,
+    TurnSnapshot,
 };
 pub use spec::{CompactionSpec, MaintenanceAccepted, OperationAccepted, OperationSpec};
-pub use subscription::RuntimeSubscription;
+pub use subscription::RuntimeEventReceiver;

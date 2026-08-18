@@ -1,6 +1,7 @@
 //! Submit, cancel, install, attach, and other command handlers.
 
 use crate::confirmation::ConfirmationSubmit;
+use crate::error::CommandReject;
 use crate::frontend::command::{DetachReason, FrontendAttachment, FrontendReasoningEffort};
 use crate::frontend::snapshot::ServiceHealth;
 use crate::frontend::update::FrontendUpdateKind;
@@ -20,7 +21,6 @@ where
     pub(super) fn handle_submit(
         &mut self,
         request_id: FrontendRequestId,
-        session_id: String,
         draft: String,
         attachments: Vec<FrontendAttachment>,
     ) {
@@ -32,26 +32,33 @@ where
             self.reject_child_capacity(request_id);
             return;
         }
+        let Some(session_id) = self.current_session.clone() else {
+            self.emit(
+                Some(request_id),
+                FrontendUpdateKind::CommandRejected {
+                    reason: CommandReject::NoCurrentSession,
+                },
+            );
+            return;
+        };
         let user_message = match mapping::user_message(&draft, &attachments) {
             Ok(message) => message,
             Err(reason) => {
                 self.emit(
                     Some(request_id),
-                    FrontendUpdateKind::CommandRejected { reason },
+                    FrontendUpdateKind::CommandRejected {
+                        reason: CommandReject::InvalidInput { reason },
+                    },
                 );
                 return;
             }
         };
-        if self.current_session.is_none() {
-            self.current_session = Some(session_id.clone());
-        }
         let spec = OperationSpec {
             session_id: mapping::session_runtime_id(&session_id),
             user_message,
             generation: self.generation.current(),
             service_request_id: Some(request_id.to_string()),
         };
-        self.emit(Some(request_id), FrontendUpdateKind::CommandAccepted);
         let runtime = self.runtime.clone();
         let epoch = self.epoch;
         self.spawn_work(request_id, async move {
@@ -195,7 +202,9 @@ where
             other => self.emit(
                 Some(request_id),
                 FrontendUpdateKind::CommandRejected {
-                    reason: format!("{other:?}"),
+                    reason: CommandReject::CancelRejected {
+                        message: format!("{other:?}"),
+                    },
                 },
             ),
         }

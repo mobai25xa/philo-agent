@@ -1,14 +1,17 @@
-//! Bounded runtime event subscription. Does not expose the mpsc type.
+//! Bounded runtime event receiver. Does not expose the mpsc type.
+//!
+//! The receiver can be taken once from [`crate::RuntimeParts`]. There is no
+//! public `subscribe()` that copies the reliable outlet.
 
 use crate::{RuntimeEvent, TryRecvError};
 use tokio::sync::mpsc;
 
 /// Single bounded event outlet from one runtime epoch.
-pub struct RuntimeSubscription {
+pub struct RuntimeEventReceiver {
     pub(crate) events: mpsc::Receiver<RuntimeEvent>,
 }
 
-impl RuntimeSubscription {
+impl RuntimeEventReceiver {
     pub async fn recv(&mut self) -> Option<RuntimeEvent> {
         self.events.recv().await
     }

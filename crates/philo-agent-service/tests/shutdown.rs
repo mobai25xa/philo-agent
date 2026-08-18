@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use philo_agent_service::testing::{FakeAssembler, start_test_service, start_test_service_with};
 use philo_agent_service::{
-    CommandSubmitResult, FrontendCommand, FrontendUpdate, FrontendUpdateKind, RecvOutcome,
+    CommandDispatch, FrontendCommand, FrontendUpdate, FrontendUpdateKind, RecvOutcome,
     STORE_COMMAND_CAP,
 };
 use philo_session::MemorySessionStore;
@@ -38,17 +38,29 @@ async fn drain_updates(client: &philo_agent_service::FrontendClient) {
     {}
 }
 
+async fn load_session(client: &philo_agent_service::FrontendClient) {
+    assert!(matches!(
+        client.try_command(FrontendCommand::LoadSession {
+            session_id: "sess-cap".into(),
+        }),
+        CommandDispatch::Enqueued(_)
+    ));
+    recv_matching(client, |update| {
+        matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+    })
+    .await;
+}
+
 async fn submit_until(client: &philo_agent_service::FrontendClient, count: usize) {
     let mut accepted = 0usize;
     while accepted < count {
         match client.try_command(FrontendCommand::Submit {
-            session_id: format!("sess-{accepted}"),
             draft: format!("hello-{accepted}"),
             attachments: Vec::new(),
         }) {
-            CommandSubmitResult::Accepted(_) => accepted += 1,
-            CommandSubmitResult::Backpressured => tokio::task::yield_now().await,
-            CommandSubmitResult::Disconnected => panic!("command lane closed while submitting"),
+            CommandDispatch::Enqueued(_) => accepted += 1,
+            CommandDispatch::Backpressured => tokio::task::yield_now().await,
+            CommandDispatch::Disconnected { .. } => panic!("command lane closed while submitting"),
         }
     }
 }
@@ -56,6 +68,7 @@ async fn submit_until(client: &philo_agent_service::FrontendClient, count: usize
 #[tokio::test(flavor = "multi_thread")]
 async fn join_completes_after_64_children_and_shutdown() {
     let (service, client, runtime) = start_test_service();
+    load_session(&client).await;
     let hold = runtime.hold_children();
 
     submit_until(&client, STORE_COMMAND_CAP).await;
@@ -63,11 +76,10 @@ async fn join_completes_after_64_children_and_shutdown() {
     drain_updates(&client).await;
 
     let overflow = match client.try_command(FrontendCommand::Submit {
-        session_id: "sess-overflow".into(),
         draft: "too many".into(),
         attachments: Vec::new(),
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("overflow enqueue {other:?}"),
     };
     let rejected = recv_matching(&client, |update| {
@@ -78,7 +90,7 @@ async fn join_completes_after_64_children_and_shutdown() {
     match &rejected.kind {
         FrontendUpdateKind::CommandRejected { reason } => {
             assert!(
-                reason.contains("capacity"),
+                reason.to_string().contains("capacity"),
                 "expected capacity rejection, got {reason}"
             );
         }
@@ -87,14 +99,14 @@ async fn join_completes_after_64_children_and_shutdown() {
 
     assert!(matches!(
         service.request_shutdown(),
-        CommandSubmitResult::Accepted(_)
+        CommandDispatch::Enqueued(_)
     ));
     runtime
         .wait_child_started((STORE_COMMAND_CAP as u64) + 1)
         .await;
     assert!(matches!(
         service.request_shutdown(),
-        CommandSubmitResult::Accepted(_)
+        CommandDispatch::Enqueued(_)
     ));
     tokio::task::yield_now().await;
 
@@ -112,18 +124,19 @@ async fn cancel_and_install_terminal_updates_are_not_dropped() {
     let assembler = FakeAssembler::new().with_hold(rx);
     let assemble_started = assembler.clone();
     let (service, client, runtime) = start_test_service_with(assembler, MemorySessionStore::new());
+    load_session(&client).await;
     let runtime_hold = runtime.hold_children();
 
     let install_id = match client.try_command(FrontendCommand::InstallModel {
         name: "fast".into(),
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("install {other:?}"),
     };
     let cancel_id = match client.try_command(FrontendCommand::CancelOperation {
         operation_id: "op-1".into(),
     }) {
-        CommandSubmitResult::Accepted(id) => id,
+        CommandDispatch::Enqueued(id) => id,
         other => panic!("cancel {other:?}"),
     };
 
@@ -154,7 +167,7 @@ async fn cancel_and_install_terminal_updates_are_not_dropped() {
 
     assert!(matches!(
         service.request_shutdown(),
-        CommandSubmitResult::Accepted(_)
+        CommandDispatch::Enqueued(_)
     ));
     tokio::time::timeout(Duration::from_secs(2), service.join())
         .await

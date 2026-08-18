@@ -8,9 +8,9 @@ use std::sync::Arc;
 use philo_agent_runtime::{
     AgentEvent, AgentFailure, AgentFailureKind, AgentRuntime, ChannelBounds, GenerationDisplay,
     GenerationId, IdSource, ModelPort, OperationId, OperationOutcome, OperationSpec,
-    OperationStatus, RuntimeConfig, RuntimeDeps, RuntimeEvent, RuntimeGeneration, RuntimeHandle,
-    RuntimeSubscription, SequentialIdSource, SessionId, SettlementDurability, ToolPort,
-    ToolRegistry, UserMessage,
+    OperationStatus, RuntimeConfig, RuntimeDeps, RuntimeEvent, RuntimeEventReceiver,
+    RuntimeGeneration, RuntimeHandle, SequentialIdSource, SessionId, SettlementDurability,
+    ToolPort, ToolRegistry, UserMessage,
 };
 use philo_session::SessionStore;
 
@@ -47,26 +47,27 @@ pub async fn start(
     sessions: Arc<dyn SessionStore>,
     _tools: Arc<dyn ToolPort>,
     _config: RuntimeConfig,
-) -> (RuntimeHandle, RuntimeSubscription) {
+) -> (RuntimeHandle, RuntimeEventReceiver) {
     start_with_ids(sessions, Arc::new(SequentialIdSource::new()))
 }
 
 pub fn start_with_ids(
     sessions: Arc<dyn SessionStore>,
     ids: Arc<dyn IdSource>,
-) -> (RuntimeHandle, RuntimeSubscription) {
-    AgentRuntime::start(RuntimeDeps {
+) -> (RuntimeHandle, RuntimeEventReceiver) {
+    let parts = AgentRuntime::start(RuntimeDeps {
         sessions,
         ids,
         bounds: ChannelBounds::default(),
     })
-    .expect("start runtime")
+    .expect("start runtime");
+    (parts.handle, parts.events)
 }
 
 pub fn start_runtime(
     sessions: Arc<dyn SessionStore>,
     ids: Arc<dyn IdSource>,
-) -> (RuntimeHandle, RuntimeSubscription) {
+) -> (RuntimeHandle, RuntimeEventReceiver) {
     start_with_ids(sessions, ids)
 }
 
@@ -91,7 +92,7 @@ pub async fn submit_prompt(
 /// Collects AgentEvents for `operation_id` until it settles. Non-agent
 /// runtime events are skipped. Sibling operation events are also skipped.
 pub async fn drain_until_settled(
-    sub: &mut RuntimeSubscription,
+    sub: &mut RuntimeEventReceiver,
     operation_id: &OperationId,
 ) -> (Vec<AgentEvent>, OperationOutcome) {
     let mut events = Vec::new();
@@ -102,7 +103,7 @@ pub async fn drain_until_settled(
         let Some(event) = sub.recv().await else {
             panic!("subscription closed before {operation_id} settled");
         };
-        let RuntimeEvent::Agent(agent) = event else {
+        let Some(agent) = into_agent_event(event) else {
             continue;
         };
         if !belongs(&agent, operation_id, started) {
@@ -133,6 +134,25 @@ pub async fn drain_until_settled(
         if let Some((status, durability)) = settled {
             return (events, outcome_from(status, durability, assistant, failure));
         }
+    }
+}
+
+fn into_agent_event(event: RuntimeEvent) -> Option<AgentEvent> {
+    match event {
+        RuntimeEvent::Agent(agent) => Some(agent),
+        RuntimeEvent::OperationSettled {
+            operation_id,
+            status,
+            durability,
+            session_revision,
+            ..
+        } => Some(AgentEvent::OperationSettled {
+            operation_id,
+            status,
+            durability,
+            session_revision,
+        }),
+        _ => None,
     }
 }
 

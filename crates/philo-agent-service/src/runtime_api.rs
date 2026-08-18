@@ -2,14 +2,16 @@
 //!
 //! [`RuntimePort`] / [`RuntimeEvents`] let tests inject
 //! [`crate::testing::FakeRuntimeHandle`] while production code uses
-//! [`philo_agent_runtime::RuntimeHandle`] / [`philo_agent_runtime::RuntimeSubscription`].
+//! [`philo_agent_runtime::RuntimeHandle`] / [`philo_agent_runtime::RuntimeEventReceiver`].
 
 use std::future::Future;
+use std::time::Instant;
 
 use philo_agent_runtime::{
     AdmissionError, CancelResult, CompactionSpec, MaintenanceAccepted, MaintenanceError,
-    MaintenanceId, OperationAccepted, OperationId, OperationSpec, RuntimeEvent, RuntimeHandle,
-    RuntimeSnapshot, RuntimeSubscription, ShutdownMode, ShutdownReport, TryRecvError,
+    MaintenanceId, OperationAccepted, OperationId, OperationSpec, RuntimeEvent,
+    RuntimeEventReceiver, RuntimeHandle, RuntimeSnapshot, ShutdownError, ShutdownMode,
+    ShutdownReport, TryRecvError,
 };
 
 /// Cloneable runtime control plane. Does not hold an engine.
@@ -35,8 +37,12 @@ pub trait RuntimePort: Clone + Send + Sync + 'static {
     /// Reads the coordinator snapshot.
     fn snapshot(&self) -> impl Future<Output = RuntimeSnapshot> + Send;
 
-    /// Stops the coordinator.
-    fn shutdown(&self, mode: ShutdownMode) -> impl Future<Output = ShutdownReport> + Send;
+    /// Stops the coordinator. Success only comes from the real supervisor.
+    fn shutdown(
+        &self,
+        mode: ShutdownMode,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<ShutdownReport, ShutdownError>> + Send;
 }
 
 /// Bounded runtime event subscription. Must be consumed continuously.
@@ -75,17 +81,21 @@ impl RuntimePort for RuntimeHandle {
         RuntimeHandle::snapshot(self)
     }
 
-    fn shutdown(&self, mode: ShutdownMode) -> impl Future<Output = ShutdownReport> + Send {
-        RuntimeHandle::shutdown(self, mode)
+    fn shutdown(
+        &self,
+        mode: ShutdownMode,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<ShutdownReport, ShutdownError>> + Send {
+        RuntimeHandle::shutdown(self, mode, deadline)
     }
 }
 
-impl RuntimeEvents for RuntimeSubscription {
+impl RuntimeEvents for RuntimeEventReceiver {
     fn recv(&mut self) -> impl Future<Output = Option<RuntimeEvent>> + Send {
-        RuntimeSubscription::recv(self)
+        RuntimeEventReceiver::recv(self)
     }
 
     fn try_recv(&mut self) -> Result<RuntimeEvent, TryRecvError> {
-        RuntimeSubscription::try_recv(self)
+        RuntimeEventReceiver::try_recv(self)
     }
 }

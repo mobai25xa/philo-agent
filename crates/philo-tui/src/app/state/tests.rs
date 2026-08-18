@@ -512,8 +512,10 @@ fn overlays_never_swallow_agent_events() {
     app.sync_confirmation(Some((1, title, body)));
     let effects = app.on_operation_event(&FrontendOperationEvent::OperationSettled {
         operation_id: "op-1".to_owned(),
+        session_id: "s-1".to_owned(),
         status: "Succeeded".to_owned(),
         durability: "Confirmed".to_owned(),
+        session_revision: philo_agent_service::SettlementRevision::Unchanged,
     });
     assert!(effects.is_empty(), "agent events write the store directly");
     assert!(

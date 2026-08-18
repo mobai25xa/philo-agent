@@ -1,10 +1,11 @@
 //! Fenced snapshot composition. Durable view and live state share one barrier.
 
+use crate::error::CommandReject;
 use crate::frontend::snapshot::{
     DurableSessionView, FrontendAvailability, FrontendSnapshot, QueuedOperationSummary,
 };
 use crate::frontend::update::FrontendUpdateKind;
-use crate::ids::{FrontendEpoch, FrontendRequestId, FrontendRevision};
+use crate::ids::{FrontendEpoch, FrontendRequestId};
 use crate::live::LiveOperationSnapshot;
 use crate::mapping;
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
@@ -19,8 +20,6 @@ pub(crate) struct SnapshotFence {
     frontend_epoch: FrontendEpoch,
     request_id: Option<FrontendRequestId>,
     session_id: Option<String>,
-    #[allow(dead_code)]
-    service_state_revision: FrontendRevision,
     runtime_revision: u64,
     required_session_revision: u64,
     active_operation_id: Option<String>,
@@ -103,7 +102,9 @@ where
             Err(reason) => {
                 self.emit(
                     Some(request_id),
-                    FrontendUpdateKind::CommandRejected { reason },
+                    FrontendUpdateKind::CommandRejected {
+                        reason: CommandReject::InvalidInput { reason },
+                    },
                 );
                 return;
             }
@@ -137,17 +138,19 @@ where
     pub(super) fn on_operation_settled(
         &mut self,
         durability: SettlementDurability,
-        session_revision: Option<u64>,
+        session_revision: philo_agent_runtime::SettlementRevision,
     ) {
         if durability == SettlementDurability::Confirmed {
-            if let (Some(session_id), Some(revision)) =
-                (self.current_session.clone(), session_revision)
+            if let (
+                Some(session_id),
+                philo_agent_runtime::SettlementRevision::Committed(revision),
+            ) = (self.current_session.clone(), session_revision)
             {
                 let required = self
                     .required_session_revision
                     .entry(session_id)
                     .or_insert(0);
-                *required = (*required).max(revision);
+                *required = (*required).max(revision.get());
             }
         }
         if self.feed.is_resyncing() {
@@ -212,7 +215,6 @@ where
             frontend_epoch: self.epoch,
             request_id,
             session_id: self.current_session.clone(),
-            service_state_revision: self.revision,
             runtime_revision: self.applied_runtime_revision,
             required_session_revision: self.required_for(self.current_session.as_deref()),
             active_operation_id: self.live.operation_id.clone(),
@@ -348,8 +350,9 @@ where
         self.queued = snapshot
             .queued
             .iter()
-            .map(|operation_id| QueuedOperationSummary {
-                operation_id: operation_id.to_string(),
+            .map(|queued| QueuedOperationSummary {
+                operation_id: queued.operation_id.to_string(),
+                session_id: queued.session_id.to_string(),
             })
             .collect();
         self.maintenance = snapshot.maintenance.map(|maintenance| {

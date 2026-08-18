@@ -79,7 +79,10 @@ mod tests {
         assert!(
             started.is_ok(),
             "{}",
-            started.err().map(|error| error.message().to_owned()).unwrap_or_default()
+            started
+                .err()
+                .map(|error| error.message().to_owned())
+                .unwrap_or_default()
         );
     }
 }

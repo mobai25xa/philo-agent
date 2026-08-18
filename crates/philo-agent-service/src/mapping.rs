@@ -253,16 +253,6 @@ pub fn operation_event(event: &AgentEvent) -> Option<FrontendOperationEvent> {
             turn_id: turn_id.as_str().to_owned(),
             reason: format!("{reason:?}"),
         },
-        AgentEvent::OperationSettled {
-            operation_id,
-            status,
-            durability,
-            session_revision: _,
-        } => FrontendOperationEvent::OperationSettled {
-            operation_id: operation_id.as_str().to_owned(),
-            status: format!("{status:?}"),
-            durability: format!("{durability:?}"),
-        },
         _ => return None,
     })
 }

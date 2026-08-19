@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use philo_agent_runtime::{
-    ActiveOperationSnapshot, AgentAvailability, AgentEvent, ModelCallId, OperationId,
-    OperationPhase, OperationStatus, RuntimeEpoch, RuntimeSnapshot, SettlementDurability,
-    ShutdownState,
+    ActiveOperationSnapshot, AgentAvailability, AgentEvent, MaintenanceId, ModelCallId,
+    OperationId, OperationPhase, OperationStatus, RuntimeEpoch, RuntimeSnapshot,
+    SettlementDurability, ShutdownState, TokenUsage,
 };
 use philo_agent_service::testing::{FakeAssembler, start_test_service, start_test_service_with};
 use philo_agent_service::{
@@ -225,7 +225,9 @@ fn submit_hello(
     }
 }
 
-async fn current_session_id(client: &philo_agent_service::FrontendClient) -> Option<String> {
+async fn frontend_snapshot(
+    client: &philo_agent_service::FrontendClient,
+) -> philo_agent_service::FrontendSnapshot {
     let request_id = accept_snapshot(client);
     let update = recv_matching(client, |update| {
         update.request_id == Some(request_id)
@@ -233,9 +235,13 @@ async fn current_session_id(client: &philo_agent_service::FrontendClient) -> Opt
     })
     .await;
     match update.kind {
-        FrontendUpdateKind::SnapshotReady(snapshot) => snapshot.current_session_id,
+        FrontendUpdateKind::SnapshotReady(snapshot) => *snapshot,
         other => panic!("expected snapshot, got {other:?}"),
     }
+}
+
+async fn current_session_id(client: &philo_agent_service::FrontendClient) -> Option<String> {
+    frontend_snapshot(client).await.current_session_id
 }
 
 fn emit_live(
@@ -335,7 +341,7 @@ impl SessionStore for ScriptedStore {
 struct AfterReadStore {
     inner: Arc<MemorySessionStore>,
     target: usize,
-    reads: AtomicUsize,
+    reads: Arc<AtomicUsize>,
     parked: Arc<AtomicUsize>,
     parked_notify: Arc<Notify>,
     go: watch::Receiver<bool>,
@@ -343,6 +349,7 @@ struct AfterReadStore {
 
 struct AfterReadHold {
     tx: watch::Sender<bool>,
+    reads: Arc<AtomicUsize>,
     parked: Arc<AtomicUsize>,
     parked_notify: Arc<Notify>,
     target: usize,
@@ -359,7 +366,11 @@ impl AfterReadHold {
         }
     }
 
-    fn release(self) {
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
         let _ = self.tx.send(true);
     }
 }
@@ -367,19 +378,21 @@ impl AfterReadHold {
 impl AfterReadStore {
     fn gate_after(inner: Arc<MemorySessionStore>, target: usize) -> (Self, AfterReadHold) {
         let (tx, rx) = watch::channel(false);
+        let reads = Arc::new(AtomicUsize::new(0));
         let parked = Arc::new(AtomicUsize::new(0));
         let parked_notify = Arc::new(Notify::new());
         (
             Self {
                 inner,
                 target,
-                reads: AtomicUsize::new(0),
+                reads: reads.clone(),
                 parked: parked.clone(),
                 parked_notify: parked_notify.clone(),
                 go: rx,
             },
             AfterReadHold {
                 tx,
+                reads,
                 parked,
                 parked_notify,
                 target,
@@ -1141,7 +1154,7 @@ async fn submit_during_first_pending_load_is_no_current_session() {
         seed_session(&inner, "sess-a").await;
         seed_session(&inner, "sess-b").await;
         let (store, hold) = AfterReadStore::gate_after(inner, 1);
-        let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
 
         assert!(matches!(
             client.try_command(FrontendCommand::LoadSession {
@@ -1164,6 +1177,7 @@ async fn submit_during_first_pending_load_is_no_current_session() {
             } => {}
             other => panic!("expected NoCurrentSession, got {other:?}"),
         }
+        assert_eq!(runtime.submitted(), 0);
 
         hold.release();
         recv_matching(&client, |update| {
@@ -1177,14 +1191,18 @@ async fn submit_during_first_pending_load_is_no_current_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn submit_during_replacement_load_targets_current_session() {
+async fn submit_during_replacement_load_is_rejected_without_runtime_submit() {
     tokio::time::timeout(Duration::from_secs(8), async {
         let inner = Arc::new(MemorySessionStore::new());
         seed_session(&inner, "sess-a").await;
         seed_session(&inner, "sess-b").await;
-        let (store, hold) = AfterReadStore::gate_after(inner, 2);
-        let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
+        let (store, hold) = AfterReadStore::gate_after(inner, 3);
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
         load_session(&client, "sess-a").await;
+        let view_a = frontend_snapshot(&client)
+            .await
+            .durable_session_view
+            .expect("loaded A view");
 
         assert!(matches!(
             client.try_command(FrontendCommand::LoadSession {
@@ -1195,20 +1213,24 @@ async fn submit_during_replacement_load_targets_current_session() {
         hold.wait_held().await;
 
         let request_id = submit_hello(&client);
-        let accepted = recv_matching(&client, |update| {
+        let rejected = recv_matching(&client, |update| {
             update.request_id == Some(request_id)
-                && matches!(
-                    update.kind,
-                    FrontendUpdateKind::SubmitAccepted { .. }
-                        | FrontendUpdateKind::CommandRejected { .. }
-                )
+                && matches!(update.kind, FrontendUpdateKind::CommandRejected { .. })
         })
         .await;
-        assert!(
-            matches!(accepted.kind, FrontendUpdateKind::SubmitAccepted { .. }),
-            "submit must target current A while B is loading, got {:?}",
-            accepted.kind
+        assert!(matches!(
+            rejected.kind,
+            FrontendUpdateKind::CommandRejected {
+                reason: CommandReject::NoCurrentSession,
+            }
+        ));
+        assert_eq!(runtime.submitted(), 0);
+        let pending_snapshot = frontend_snapshot(&client).await;
+        assert_eq!(
+            pending_snapshot.current_session_id.as_deref(),
+            Some("sess-a")
         );
+        assert_eq!(pending_snapshot.durable_session_view, Some(view_a));
 
         hold.release();
         recv_matching(&client, |update| match &update.kind {
@@ -1216,6 +1238,15 @@ async fn submit_during_replacement_load_targets_current_session() {
             _ => false,
         })
         .await;
+
+        let request_id = submit_hello(&client);
+        recv_matching(&client, |update| {
+            update.request_id == Some(request_id)
+                && matches!(update.kind, FrontendUpdateKind::SubmitAccepted { .. })
+        })
+        .await;
+        assert_eq!(runtime.submitted(), 1);
+        assert_eq!(runtime.last_submitted_session().as_deref(), Some("sess-b"));
         drop(service);
     })
     .await
@@ -1438,13 +1469,14 @@ async fn settled_session_mismatch_is_protocol_error() {
         seed_session(&store, "sess-b").await;
         let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
         load_session(&client, "sess-a").await;
-        runtime.emit_operation_accepted(
-            OperationId::new("op-a"),
-            philo_agent_runtime::SessionId::new("sess-a"),
-            philo_agent_runtime::TurnId::new("turn-a"),
-        );
+        emit_live(&runtime, "sess-a", "op-a", "turn-a", "partial-a");
         recv_matching(&client, |update| {
-            matches!(update.kind, FrontendUpdateKind::OperationAccepted { .. })
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::TextDelta { .. }
+                )
+            )
         })
         .await;
         runtime.emit_operation_settled(
@@ -1458,24 +1490,31 @@ async fn settled_session_mismatch_is_protocol_error() {
             matches!(update.kind, FrontendUpdateKind::ServiceHealthChanged { .. })
         })
         .await;
+        let mismatched = recv_matching(&client, |update| {
+            matches!(
+                &update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled {
+                        operation_id,
+                        session_id,
+                        ..
+                    }
+                ) if operation_id == "op-a" && session_id == "sess-b"
+            )
+        })
+        .await;
+        assert!(is_operation_settled(&mismatched.kind));
+        recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::ResyncRequired { .. })
+        })
+        .await;
 
         let request_id = accept_snapshot(&client);
-        let mut saw_settled = false;
-        let update = loop {
-            let update = recv_matching(&client, |_| true).await;
-            if is_operation_settled(&update.kind) {
-                saw_settled = true;
-            }
-            if update.request_id == Some(request_id)
+        let update = recv_matching(&client, |update| {
+            update.request_id == Some(request_id)
                 && matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
-            {
-                break update;
-            }
-        };
-        assert!(
-            !saw_settled,
-            "ownership mismatch must not forward OperationSettled"
-        );
+        })
+        .await;
         let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
             unreachable!();
         };
@@ -1487,10 +1526,43 @@ async fn settled_session_mismatch_is_protocol_error() {
             "mismatch must be visible: {:?}",
             snapshot.config_notices
         );
+        assert!(matches!(
+            snapshot.health,
+            philo_agent_service::ServiceHealth::Degraded { .. }
+        ));
         assert_eq!(
             snapshot.durable_session_view.as_ref().unwrap().revision,
             1,
             "A floor must not rise from a B settlement"
+        );
+        assert_eq!(snapshot.live.operation_id.as_deref(), Some("op-a"));
+        assert_eq!(snapshot.live.turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(snapshot.live.text, "partial-a");
+
+        runtime.emit_operation_settled(
+            OperationId::new("op-a"),
+            philo_agent_runtime::SessionId::new("sess-a"),
+            OperationStatus::Succeeded,
+            SettlementDurability::Confirmed,
+            philo_agent_runtime::SettlementRevision::Unchanged,
+        );
+        recv_matching(&client, |update| {
+            matches!(
+                &update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled {
+                        operation_id,
+                        session_id,
+                        ..
+                    }
+                ) if operation_id == "op-a" && session_id == "sess-a"
+            )
+        })
+        .await;
+        let snapshot = frontend_snapshot(&client).await;
+        assert!(
+            snapshot.live.operation_id.is_none(),
+            "the later correct settlement must still own and clear op-a"
         );
 
         load_session(&client, "sess-b").await;
@@ -1525,24 +1597,31 @@ async fn settled_without_accepted_is_protocol_error() {
             matches!(update.kind, FrontendUpdateKind::ServiceHealthChanged { .. })
         })
         .await;
+        let missing = recv_matching(&client, |update| {
+            matches!(
+                &update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled {
+                        operation_id,
+                        session_id,
+                        ..
+                    }
+                ) if operation_id == "op-ghost" && session_id == "sess-a"
+            )
+        })
+        .await;
+        assert!(is_operation_settled(&missing.kind));
+        recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::ResyncRequired { .. })
+        })
+        .await;
 
         let request_id = accept_snapshot(&client);
-        let mut saw_settled = false;
-        let update = loop {
-            let update = recv_matching(&client, |_| true).await;
-            if is_operation_settled(&update.kind) {
-                saw_settled = true;
-            }
-            if update.request_id == Some(request_id)
+        let update = recv_matching(&client, |update| {
+            update.request_id == Some(request_id)
                 && matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
-            {
-                break update;
-            }
-        };
-        assert!(
-            !saw_settled,
-            "missing ownership must not forward OperationSettled"
-        );
+        })
+        .await;
         let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
             unreachable!();
         };
@@ -1554,6 +1633,10 @@ async fn settled_without_accepted_is_protocol_error() {
             "missing ownership must be visible: {:?}",
             snapshot.config_notices
         );
+        assert!(matches!(
+            snapshot.health,
+            philo_agent_service::ServiceHealth::Degraded { .. }
+        ));
         assert_eq!(
             snapshot.durable_session_view.as_ref().unwrap().revision,
             1,
@@ -1652,6 +1735,171 @@ async fn runtime_revision_is_not_session_floor() {
     })
     .await
     .expect("runtime revision floor test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_event_during_store_read_reloads_fenced_snapshot() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let inner = Arc::new(MemorySessionStore::new());
+        seed_session(&inner, "sess-cursor").await;
+        let (store, hold) = AfterReadStore::gate_after(inner, 2);
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
+        load_session(&client, "sess-cursor").await;
+
+        let request_id = accept_snapshot(&client);
+        hold.wait_held().await;
+        runtime.emit_operation_accepted(
+            OperationId::new("op-new"),
+            philo_agent_runtime::SessionId::new("sess-cursor"),
+            philo_agent_runtime::TurnId::new("turn-new"),
+        );
+        recv_matching(&client, |update| {
+            matches!(
+                &update.kind,
+                FrontendUpdateKind::OperationAccepted {
+                    operation_id,
+                    session_id,
+                    turn_id,
+                } if operation_id == "op-new"
+                    && session_id == "sess-cursor"
+                    && turn_id == "turn-new"
+            )
+        })
+        .await;
+        hold.release();
+
+        let update = recv_matching(&client, |update| {
+            update.request_id == Some(request_id)
+                && matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(snapshot) = update.kind else {
+            unreachable!();
+        };
+        assert!(
+            hold.reads() >= 3,
+            "a live event after token capture must force a fresh store read"
+        );
+        assert_eq!(snapshot.live.operation_id.as_deref(), Some("op-new"));
+        assert_eq!(snapshot.live.turn_id.as_deref(), Some("turn-new"));
+        drop(service);
+    })
+    .await
+    .expect("runtime event during store read test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn older_runtime_snapshot_cannot_overwrite_newer_projection() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let store = MemorySessionStore::new();
+        seed_session(&store, "sess-runtime").await;
+        let (service, client, runtime) = start_test_service_with(FakeAssembler::new(), store);
+        load_session(&client, "sess-runtime").await;
+
+        runtime.set_snapshot(RuntimeSnapshot {
+            epoch: RuntimeEpoch::new("epoch-1"),
+            availability: AgentAvailability::Busy {
+                operation_id: OperationId::new("op-10"),
+            },
+            queued: vec![philo_agent_runtime::QueuedOperationSnapshot {
+                operation_id: OperationId::new("queued-10"),
+                session_id: philo_agent_runtime::SessionId::new("sess-runtime"),
+            }],
+            active: Some(ActiveOperationSnapshot {
+                operation_id: OperationId::new("op-10"),
+                turn_id: philo_agent_runtime::TurnId::new("turn-10"),
+                session_id: philo_agent_runtime::SessionId::new("sess-runtime"),
+                phase: OperationPhase::PreparingTurn,
+                started: true,
+            }),
+            maintenance: Some(philo_agent_runtime::MaintenanceSnapshot {
+                id: MaintenanceId::new("maint-10"),
+                session_id: philo_agent_runtime::SessionId::new("sess-runtime"),
+            }),
+            shutdown: ShutdownState::Running,
+            last_settled: Vec::new(),
+            runtime_revision: 10,
+        });
+        runtime.emit(RuntimeEvent::SubscriptionLagged { dropped: 1 });
+        let first = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(first) = first.kind else {
+            unreachable!();
+        };
+        assert_eq!(first.live.operation_id.as_deref(), Some("op-10"));
+
+        runtime.emit_agent(AgentEvent::ModelCallStarted {
+            model_call_id: ModelCallId::new("model-10"),
+        });
+        runtime.emit_agent(AgentEvent::ModelUsageUpdated {
+            model_call_id: ModelCallId::new("model-10"),
+            usage: TokenUsage {
+                input_tokens: Some(42),
+                output_tokens: Some(7),
+                ..TokenUsage::default()
+            },
+        });
+        recv_matching(&client, |update| {
+            matches!(
+                update.kind,
+                FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::ModelUsageUpdated { .. }
+                )
+            )
+        })
+        .await;
+
+        runtime.set_snapshot(RuntimeSnapshot {
+            epoch: RuntimeEpoch::new("epoch-1"),
+            availability: AgentAvailability::Idle,
+            queued: vec![philo_agent_runtime::QueuedOperationSnapshot {
+                operation_id: OperationId::new("queued-9"),
+                session_id: philo_agent_runtime::SessionId::new("sess-runtime"),
+            }],
+            active: Some(ActiveOperationSnapshot {
+                operation_id: OperationId::new("op-9"),
+                turn_id: philo_agent_runtime::TurnId::new("turn-9"),
+                session_id: philo_agent_runtime::SessionId::new("sess-runtime"),
+                phase: OperationPhase::PreparingTurn,
+                started: true,
+            }),
+            maintenance: Some(philo_agent_runtime::MaintenanceSnapshot {
+                id: MaintenanceId::new("maint-9"),
+                session_id: philo_agent_runtime::SessionId::new("sess-runtime"),
+            }),
+            shutdown: ShutdownState::Running,
+            last_settled: Vec::new(),
+            runtime_revision: 9,
+        });
+        runtime.emit(RuntimeEvent::SubscriptionLagged { dropped: 1 });
+        let second = recv_matching(&client, |update| {
+            matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
+        })
+        .await;
+        let FrontendUpdateKind::SnapshotReady(second) = second.kind else {
+            unreachable!();
+        };
+        assert!(matches!(
+            second.availability,
+            philo_agent_service::FrontendAvailability::Busy { ref operation_id }
+                if operation_id == "op-10"
+        ));
+        assert_eq!(second.queued.len(), 1);
+        assert_eq!(second.queued[0].operation_id, "queued-10");
+        assert_eq!(
+            second.maintenance.as_ref().map(|item| item.id.as_str()),
+            Some("maint-10")
+        );
+        assert_eq!(second.live.operation_id.as_deref(), Some("op-10"));
+        assert_eq!(second.live.turn_id.as_deref(), Some("turn-10"));
+        assert_eq!(second.usage.and_then(|usage| usage.input_tokens), Some(42));
+        assert_eq!(second.usage.and_then(|usage| usage.output_tokens), Some(7));
+        drop(service);
+    })
+    .await
+    .expect("stale runtime snapshot test timed out");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -457,7 +457,7 @@ async fn epoch_diagnostic_emits_no_settlement() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fake_forwards_duplicate_settled_events() {
+async fn fake_forwards_each_duplicate_settled_event_once() {
     let (service, client, runtime) = start_test_service();
     runtime.emit_operation_accepted(
         OperationId::new("op-dup"),
@@ -485,11 +485,16 @@ async fn fake_forwards_duplicate_settled_events() {
         matches!(update.kind, FrontendUpdateKind::ServiceHealthChanged { .. })
     })
     .await;
+    let second = recv_matching(&client, |update| {
+        !settled(std::slice::from_ref(update)).is_empty()
+    })
+    .await;
     let extras = drain_briefly(&client).await;
     assert_eq!(settled(&[first]).len(), 1);
+    assert_eq!(settled(&[second]).len(), 1);
     assert!(
         settled(&extras).is_empty(),
-        "duplicate settled is a protocol error, not a second terminal: {extras:?}"
+        "each runtime settlement must be forwarded exactly once: {extras:?}"
     );
     drop(service);
 }

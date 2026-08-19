@@ -196,6 +196,7 @@ impl GenerationAssembler for FakeAssembler {
 
 struct FakeInner {
     submitted: Vec<String>,
+    submitted_sessions: Vec<String>,
     cancel_calls: Vec<OperationId>,
     cancel_maintenance_calls: Vec<MaintenanceId>,
     shutdown_calls: Vec<ShutdownMode>,
@@ -232,6 +233,7 @@ impl FakeRuntimeHandle {
         let handle = Self {
             inner: Arc::new(Mutex::new(FakeInner {
                 submitted: Vec::new(),
+                submitted_sessions: Vec::new(),
                 cancel_calls: Vec::new(),
                 cancel_maintenance_calls: Vec::new(),
                 shutdown_calls: Vec::new(),
@@ -363,6 +365,16 @@ impl FakeRuntimeHandle {
             .cloned()
     }
 
+    /// Last submitted session id, if any.
+    pub fn last_submitted_session(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("fake runtime")
+            .submitted_sessions
+            .last()
+            .cloned()
+    }
+
     /// Recorded cancel calls.
     pub fn cancel_calls(&self) -> usize {
         self.inner.lock().expect("fake runtime").cancel_calls.len()
@@ -460,6 +472,7 @@ impl RuntimePort for FakeRuntimeHandle {
             inner
                 .submitted
                 .push(spec.generation.generation_id.to_string());
+            inner.submitted_sessions.push(spec.session_id.to_string());
             Ok(OperationAccepted {
                 operation_id: OperationId::new(format!("op-{index}")),
                 turn_id: TurnId::new(format!("turn-{index}")),
@@ -616,7 +629,8 @@ pub fn start_test_service_with_command_hold() -> (
     (service, client, handle, CommandLaneHold { tx: hold_tx })
 }
 
-/// Aborts the service actor so later attach/detach observe a dead host.
-pub fn abort_service_actor(service: &AgentService) {
+/// Aborts the service actor and waits until its task has actually stopped.
+pub async fn abort_service_actor_and_wait(service: &AgentService) {
     service.abort_actor();
+    service.wait_stopped().await;
 }

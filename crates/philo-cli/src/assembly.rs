@@ -914,7 +914,7 @@ mod tests {
         let dir = temp_dir("reload-disconnected");
         let assembler = assembler(&dir, "https://example.test/v1/chat/completions");
         let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
-        philo_agent_service::testing::abort_service_actor(&service);
+        philo_agent_service::testing::abort_service_actor_and_wait(&service).await;
         apply_config_reload(&client, &assembler, Err(UsageError::new("invalid TOML")));
         assert_eq!(
             assembler.take_reload_fault().as_deref(),

@@ -8,8 +8,8 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::actor::AgentServiceActor;
 use crate::bounds::{
-    FRONTEND_COMMAND_CAP, FRONTEND_CONTROL_CAP, FRONTEND_SNAPSHOT_CAP, FRONTEND_SUPERVISOR_CAP,
-    FRONTEND_UPDATE_CAP,
+    FRONTEND_COMMAND_CAP, FRONTEND_CONTROL_CAP, FRONTEND_CRITICAL_CAP, FRONTEND_SNAPSHOT_CAP,
+    FRONTEND_SUPERVISOR_CAP, FRONTEND_UPDATE_CAP,
 };
 use crate::confirmation::{ConfirmationGate, ConfirmationMap, gate_pair};
 use crate::error::CommandDispatch;
@@ -18,9 +18,10 @@ use crate::frontend::lease::{
     AttachError, DetachError, DetachReport, FrontendLease, SupervisorCommand,
 };
 use crate::frontend::supervisor::{SupervisorEnvelope, SupervisorReply, exchange_supervisor};
-use crate::frontend::{CommandEnvelope, FrontendClient, FrontendFeed};
+use crate::frontend::update::FrontendUpdate;
+use crate::frontend::{CommandEnvelope, FrontendClient, FrontendFeed, ReplyCredits};
 use crate::generation::GenerationAssembler;
-use crate::ids::{FrontendInstanceId, FrontendRequestId};
+use crate::ids::{FrontendInstanceId, FrontendRequestId, RequestIdSource};
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
 use philo_agent_runtime::RuntimeGeneration;
 use philo_session::SessionStore;
@@ -45,6 +46,9 @@ pub struct AgentService {
     abort: AbortHandle,
     confirmations: ConfirmationGate,
     control_tx: mpsc::Sender<CommandEnvelope>,
+    critical_tx: mpsc::WeakSender<FrontendUpdate>,
+    credits: ReplyCredits,
+    request_ids: Arc<RequestIdSource>,
     supervisor_tx: mpsc::Sender<SupervisorEnvelope>,
 }
 
@@ -121,15 +125,30 @@ impl AgentService {
     /// Enqueues an explicit shutdown. Does not abort in-flight Runtime work
     /// beyond what [`philo_agent_runtime::ShutdownMode::Drain`] requests.
     pub fn request_shutdown(&self) -> CommandDispatch<FrontendRequestId> {
+        let request_id = self.request_ids.next();
+        let Some(critical_tx) = self.critical_tx.upgrade() else {
+            return CommandDispatch::Disconnected {
+                lane: "frontend-control",
+            };
+        };
+        if !self.credits.reserve(&critical_tx, request_id, 1) {
+            return CommandDispatch::Backpressured;
+        }
         match self.control_tx.try_send(CommandEnvelope {
-            request_id: FrontendRequestId::new(u64::MAX),
+            request_id,
             command: FrontendCommand::ShutdownRequested,
         }) {
-            Ok(()) => CommandDispatch::Enqueued(FrontendRequestId::new(u64::MAX)),
-            Err(mpsc::error::TrySendError::Full(_)) => CommandDispatch::Backpressured,
-            Err(mpsc::error::TrySendError::Closed(_)) => CommandDispatch::Disconnected {
-                lane: "frontend-control",
-            },
+            Ok(()) => CommandDispatch::Enqueued(request_id),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.credits.cancel(request_id);
+                CommandDispatch::Backpressured
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.credits.cancel(request_id);
+                CommandDispatch::Disconnected {
+                    lane: "frontend-control",
+                }
+            }
         }
     }
 
@@ -181,6 +200,10 @@ where
     let (control_tx, control_rx) = mpsc::channel(FRONTEND_CONTROL_CAP);
     let (snapshot_tx, snapshot_rx) = mpsc::channel(FRONTEND_SNAPSHOT_CAP);
     let (update_tx, update_rx) = mpsc::channel(FRONTEND_UPDATE_CAP);
+    let (critical_tx, critical_rx) = mpsc::channel(FRONTEND_CRITICAL_CAP);
+    let critical_weak = critical_tx.downgrade();
+    let credits = ReplyCredits::new();
+    let request_ids = Arc::new(RequestIdSource::new());
     let (supervisor_tx, supervisor_rx) = mpsc::channel(FRONTEND_SUPERVISOR_CAP);
     let (confirmations, confirm_rx) = gate_pair();
 
@@ -188,7 +211,11 @@ where
         command_tx.clone(),
         control_tx.clone(),
         snapshot_tx,
+        critical_weak.clone(),
         update_rx,
+        critical_rx,
+        credits.clone(),
+        request_ids.clone(),
     );
     let actor = AgentServiceActor::new(
         deps.runtime,
@@ -197,7 +224,7 @@ where
         deps.assembler,
         deps.initial_generation,
         ConfirmationMap::new(),
-        FrontendFeed::new(update_tx),
+        FrontendFeed::new(update_tx, critical_tx, credits.clone()),
     );
     let join = tokio::spawn(actor.run(
         command_rx,
@@ -214,6 +241,9 @@ where
             abort,
             confirmations,
             control_tx,
+            critical_tx: critical_weak,
+            credits,
+            request_ids,
             supervisor_tx,
         },
         client,

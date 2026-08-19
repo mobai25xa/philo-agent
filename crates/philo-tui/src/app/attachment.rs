@@ -4,6 +4,8 @@
 //! bytes the driver already decoded. Filesystem and clipboard access belong
 //! to the platform layer, resolution to the driver.
 
+use crate::api::types::TuiRecoveryAttachment;
+
 /// One image queued for the next user message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingAttachment {
@@ -28,6 +30,40 @@ impl PendingAttachment {
                 bytes,
                 origin,
             } => format!("{origin} ({media_type}, {})", human_bytes(bytes.len())),
+        }
+    }
+}
+
+impl From<TuiRecoveryAttachment> for PendingAttachment {
+    fn from(attachment: TuiRecoveryAttachment) -> Self {
+        match attachment {
+            TuiRecoveryAttachment::Path(path) => Self::Path(path),
+            TuiRecoveryAttachment::Image {
+                media_type,
+                bytes,
+                origin,
+            } => Self::Image {
+                media_type,
+                bytes,
+                origin,
+            },
+        }
+    }
+}
+
+impl From<PendingAttachment> for TuiRecoveryAttachment {
+    fn from(attachment: PendingAttachment) -> Self {
+        match attachment {
+            PendingAttachment::Path(path) => Self::Path(path),
+            PendingAttachment::Image {
+                media_type,
+                bytes,
+                origin,
+            } => Self::Image {
+                media_type,
+                bytes,
+                origin,
+            },
         }
     }
 }

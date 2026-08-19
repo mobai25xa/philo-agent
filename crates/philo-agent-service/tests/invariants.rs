@@ -190,6 +190,61 @@ async fn feed_overflow_stays_bounded_and_requests_resync() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn request_terminals_survive_an_overflowed_ordinary_feed() {
+    let (service, client, runtime) = start_test_service();
+    for index in 0..200 {
+        runtime.emit_agent(AgentEvent::TextDelta {
+            delta: format!("overflow-{index}"),
+        });
+    }
+    let consumed_deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.consumed() < 200 && Instant::now() < consumed_deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(runtime.consumed() >= 200);
+
+    let submit_id = match client.try_command(FrontendCommand::Submit {
+        draft: "no current session".into(),
+        attachments: Vec::new(),
+    }) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("submit dispatch failed: {other:?}"),
+    };
+    let cancel_id = match client.try_command(FrontendCommand::CancelOperation {
+        operation_id: "missing-operation".into(),
+    }) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("cancel dispatch failed: {other:?}"),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_submit = false;
+    let mut saw_cancel = false;
+    while !(saw_submit && saw_cancel) && Instant::now() < deadline {
+        match client
+            .recv_until_async(Instant::now() + Duration::from_millis(50))
+            .await
+        {
+            RecvOutcome::Update(update) if update.request_id == Some(submit_id) => {
+                saw_submit = matches!(update.kind, FrontendUpdateKind::CommandRejected { .. });
+            }
+            RecvOutcome::Update(update) if update.request_id == Some(cancel_id) => {
+                saw_cancel = matches!(
+                    update.kind,
+                    FrontendUpdateKind::CommandAccepted
+                        | FrontendUpdateKind::CommandRejected { .. }
+                );
+            }
+            RecvOutcome::Update(_) | RecvOutcome::Timeout => {}
+            RecvOutcome::Disconnected => panic!("frontend disconnected"),
+        }
+    }
+    assert!(saw_submit, "submit rejection was lost during resync");
+    assert!(saw_cancel, "cancel terminal was lost during resync");
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn snapshot_is_session_view_plus_live_not_event_log() {
     let store = MemorySessionStore::new();
     seed_session(&store, "sess-snap").await;

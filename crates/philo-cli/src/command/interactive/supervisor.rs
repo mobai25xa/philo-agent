@@ -11,8 +11,8 @@ use philo_agent_service::{
     FRONTEND_RESTART_WINDOW_SECS, FrontendInstanceId, FrontendRevision,
 };
 use philo_tui::{
-    RestoreFailure, RestoreReport, TerminalCapability, TuiLaunchConfig, TuiOutcome, TuiRunReport,
-    run_async,
+    RestoreFailure, RestoreReport, TerminalCapability, TuiLaunchConfig, TuiOutcome, TuiRecovery,
+    TuiRecoveryAttachment, TuiRunReport, run_async,
 };
 use tokio::sync::watch;
 
@@ -130,6 +130,7 @@ impl ProcessSupervisor {
     }
 
     pub(super) fn run(mut self, session_id: String) -> Result<ExitCode, UsageError> {
+        let mut pending_recovery = None;
         loop {
             self.instance += 1;
             let instance_id = FrontendInstanceId::new(format!("cli-tui-{}", self.instance));
@@ -146,22 +147,26 @@ impl ProcessSupervisor {
             }
 
             let client = self.bootstrap.client.clone();
-            let config = launch_config(
-                &self.bootstrap,
-                session_id.clone(),
-                self.interrupt_rx.clone(),
-            );
             let session = run_registered_frontend(
                 &self.runtime,
                 &self.bootstrap.service,
                 instance_id,
                 Instant::now() + assembly::FRONTEND_REGISTRATION_GRACE,
-                || self.runtime.block_on(run_async(client, config)),
+                || {
+                    let config = launch_config(
+                        &self.bootstrap,
+                        session_id.clone(),
+                        self.interrupt_rx.clone(),
+                        pending_recovery.take(),
+                    );
+                    self.runtime.block_on(run_async(client, config))
+                },
             );
 
             let report = match session {
                 RegisteredFrontend::AttachFailed(error) => {
                     eprintln!("error: frontend attach failed: {error}");
+                    report_recovery(pending_recovery.as_ref());
                     return Ok(self.shutdown(1, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE));
                 }
                 RegisteredFrontend::Finished { output, detach } => {
@@ -170,12 +175,24 @@ impl ProcessSupervisor {
                             if let Err(error) = &detach {
                                 eprintln!("error: frontend detach: {error}");
                             }
+                            report_recovery(
+                                output
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|report| report.recovery.as_ref()),
+                            );
                             return Ok(self.cleanup_uncertain_detach());
                         }
                         DetachFollowUp::ServiceUnavailable => {
                             if let Err(error) = &detach {
                                 eprintln!("error: frontend detach: {error}");
                             }
+                            report_recovery(
+                                output
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|report| report.recovery.as_ref()),
+                            );
                             return Ok(
                                 self.shutdown(1, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE)
                             );
@@ -191,6 +208,7 @@ impl ProcessSupervisor {
                                         fault: "frontend panicked".to_owned(),
                                     },
                                     restore: uncertain_panic_restore(),
+                                    recovery: None,
                                 },
                             }
                         }
@@ -198,18 +216,28 @@ impl ProcessSupervisor {
                 }
             };
 
-            report_restore(&report.restore);
-            match report.outcome {
+            let TuiRunReport {
+                outcome,
+                restore,
+                recovery,
+            } = report;
+            report_restore(&restore);
+            pending_recovery = recovery;
+            match outcome {
                 TuiOutcome::UserExit | TuiOutcome::ProcessShutdownRequested => {
                     return Ok(self.shutdown(0, Instant::now() + assembly::PROCESS_SHUTDOWN_GRACE));
                 }
                 TuiOutcome::FrontendRestartRequested { fault: _ } => {
                     if !self.budget.allow() {
-                        return Ok(self.fallback("frontend restart budget exhausted", session_id));
+                        return Ok(self.fallback(
+                            "frontend restart budget exhausted",
+                            session_id,
+                            pending_recovery.take(),
+                        ));
                     }
                 }
                 TuiOutcome::FallbackRequested { fault } => {
-                    return Ok(self.fallback(&fault, session_id));
+                    return Ok(self.fallback(&fault, session_id, pending_recovery.take()));
                 }
                 TuiOutcome::ForcedExitRequested { code } => {
                     report_forced_exit();
@@ -219,8 +247,9 @@ impl ProcessSupervisor {
         }
     }
 
-    fn fallback(self, fault: &str, session_id: String) -> ExitCode {
+    fn fallback(self, fault: &str, session_id: String, recovery: Option<TuiRecovery>) -> ExitCode {
         eprintln!("error: falling back to line output: {fault}");
+        report_recovery(recovery.as_ref());
         let client = self.bootstrap.client.clone();
         let sessions = self.bootstrap.sessions.clone();
         let verbosity = self.bootstrap.settings.verbosity;
@@ -287,6 +316,38 @@ fn report_restore(restore: &RestoreReport) {
     render::write_outputs(&restore_line_outputs(restore));
 }
 
+fn report_recovery(recovery: Option<&TuiRecovery>) {
+    render::write_outputs(&recovery_line_outputs(recovery));
+}
+
+fn recovery_line_outputs(recovery: Option<&TuiRecovery>) -> Vec<Output> {
+    let Some(recovery) = recovery else {
+        return Vec::new();
+    };
+    let mut outputs = Vec::new();
+    if !recovery.draft.is_empty() {
+        outputs.push(Output {
+            channel: Channel::Stderr,
+            text: format!("unsent draft preserved:\n{}\n", recovery.draft),
+        });
+    }
+    outputs.extend(recovery.attachments.iter().map(|attachment| {
+        let label = match attachment {
+            TuiRecoveryAttachment::Path(path) => path.clone(),
+            TuiRecoveryAttachment::Image {
+                media_type,
+                bytes,
+                origin,
+            } => format!("{origin} ({media_type}, {} bytes)", bytes.len()),
+        };
+        Output {
+            channel: Channel::Stderr,
+            text: format!("unsent attachment preserved: {label}\n"),
+        }
+    }));
+    outputs
+}
+
 fn uncertain_panic_restore() -> RestoreReport {
     RestoreReport {
         restored: false,
@@ -326,6 +387,7 @@ fn launch_config(
     bootstrap: &Bootstrap,
     session_id: String,
     interrupt: watch::Receiver<u64>,
+    recovery: Option<TuiRecovery>,
 ) -> TuiLaunchConfig {
     TuiLaunchConfig {
         session_id,
@@ -335,13 +397,14 @@ fn launch_config(
         context_window: bootstrap.settings.context_window,
         screen: bootstrap.settings.screen,
         interrupt: Some(interrupt),
+        recovery,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use philo_agent_service::testing::{abort_service_actor, start_test_service};
+    use philo_agent_service::testing::{abort_service_actor_and_wait, start_test_service};
 
     #[test]
     fn restart_budget_allows_three_faults_then_denies() {
@@ -350,6 +413,36 @@ mod tests {
         assert!(budget.allow());
         assert!(budget.allow());
         assert!(!budget.allow());
+    }
+
+    #[test]
+    fn fallback_makes_unsent_recovery_visible() {
+        let recovery = TuiRecovery {
+            draft: "keep this".to_owned(),
+            attachments: vec![
+                TuiRecoveryAttachment::Path("shots/a.png".to_owned()),
+                TuiRecoveryAttachment::Image {
+                    media_type: "image/png".to_owned(),
+                    bytes: vec![1, 2, 3],
+                    origin: "clipboard image".to_owned(),
+                },
+            ],
+        };
+
+        let outputs = recovery_line_outputs(Some(&recovery));
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs[0].text.contains("keep this"));
+        assert!(outputs[1].text.contains("shots/a.png"));
+        assert!(
+            outputs[2]
+                .text
+                .contains("clipboard image (image/png, 3 bytes)")
+        );
+        assert!(
+            outputs
+                .iter()
+                .all(|output| output.channel == Channel::Stderr)
+        );
     }
 
     #[test]
@@ -455,7 +548,7 @@ mod tests {
         let runtime = test_runtime();
         let _enter = runtime.enter();
         let (service, _client, _handle) = start_test_service();
-        abort_service_actor(&service);
+        runtime.block_on(abort_service_actor_and_wait(&service));
         let mut started = false;
         let session = run_registered_frontend(
             &runtime,

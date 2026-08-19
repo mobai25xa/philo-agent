@@ -42,6 +42,7 @@ where
         result: Result<Vec<SessionId>, SessionError>,
     ) {
         if epoch != self.epoch {
+            self.feed.cancel_request(request_id);
             return;
         }
         match result {

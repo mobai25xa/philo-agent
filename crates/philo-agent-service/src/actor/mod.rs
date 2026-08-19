@@ -131,8 +131,13 @@ pub(crate) struct AgentServiceActor<R, S> {
     notices: Vec<String>,
     latest_snapshot: Option<FrontendRequestId>,
     latest_preview: Option<(FrontendRequestId, u64)>,
-    /// Runtime snapshot cursor. Never used as a JSONL session floor.
-    applied_runtime_revision: u64,
+    /// Service-local live cursor. Every runtime event and accepted runtime
+    /// snapshot advances it; a fenced store read is stale when this exceeds
+    /// the cursor captured in its token.
+    live_cursor: u64,
+    /// Newest accepted coordinator snapshot revision in the current runtime
+    /// epoch. This is never used as a JSONL session floor.
+    applied_runtime_snapshot_revision: u64,
     runtime_snapshot_inflight: bool,
     session_seq: u64,
     runtime_closed: bool,
@@ -176,7 +181,8 @@ where
             notices: Vec::new(),
             latest_snapshot: None,
             latest_preview: None,
-            applied_runtime_revision: 0,
+            live_cursor: 0,
+            applied_runtime_snapshot_revision: 0,
             runtime_snapshot_inflight: false,
             session_seq: 0,
             runtime_closed: false,
@@ -264,12 +270,14 @@ where
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)),
-                    if self.feed.pending_resync() =>
+                    if self.feed.pending_resync() || self.feed.pending_critical() =>
                 {
+                    self.feed.flush_pending_critical();
                     self.feed.flush_resync(self.epoch, self.revision);
                 }
             }
 
+            self.feed.flush_pending_critical();
             self.feed.flush_resync(self.epoch, self.revision);
             if self.should_stop() {
                 break;
@@ -725,7 +733,7 @@ where
     }
 
     fn handle_runtime_event(&mut self, event: RuntimeEvent) {
-        self.applied_runtime_revision = self.applied_runtime_revision.saturating_add(1);
+        self.live_cursor = self.live_cursor.saturating_add(1);
         match event {
             RuntimeEvent::OperationAccepted {
                 operation_id,
@@ -955,24 +963,25 @@ where
         durability: SettlementDurability,
         session_revision: SettlementRevision,
     ) {
-        self.queued.retain(|item| item.operation_id != operation_id);
-        for confirmation_id in self.confirmations.deny_for_operation(operation_id) {
-            self.emit(
-                None,
-                FrontendUpdateKind::ConfirmationResolved {
-                    confirmation_id,
-                    decision: ConfirmationDecision::Deny,
-                },
-            );
-        }
-        if self.live.operation_id.as_deref() == Some(operation_id) {
-            self.live.settle();
-        }
-        if self.queued.is_empty() && self.live.operation_id.is_none() {
-            self.availability = FrontendAvailability::Idle;
-        }
-        if !self.apply_operation_settled(operation_id, session_id, durability, session_revision) {
-            return;
+        let applied =
+            self.apply_operation_settled(operation_id, session_id, durability, session_revision);
+        if applied {
+            self.queued.retain(|item| item.operation_id != operation_id);
+            for confirmation_id in self.confirmations.deny_for_operation(operation_id) {
+                self.emit(
+                    None,
+                    FrontendUpdateKind::ConfirmationResolved {
+                        confirmation_id,
+                        decision: ConfirmationDecision::Deny,
+                    },
+                );
+            }
+            if self.live.operation_id.as_deref() == Some(operation_id) {
+                self.live.settle();
+            }
+            if self.queued.is_empty() && self.live.operation_id.is_none() {
+                self.availability = FrontendAvailability::Idle;
+            }
         }
         self.emit(
             None,
@@ -986,11 +995,20 @@ where
                 },
             ),
         );
+        if applied {
+            if self.feed.is_resyncing() {
+                self.begin_fenced_snapshot(self.latest_snapshot);
+            }
+        } else {
+            self.feed.force_resync();
+            self.feed.flush_resync(self.epoch, self.revision);
+        }
     }
 
     fn on_epoch_ended(&mut self, _runtime_epoch: &RuntimeEpoch, forced_count: usize) {
         self.epoch.bump();
         self.runtime_closed = true;
+        self.applied_runtime_snapshot_revision = 0;
         self.snapshot.on_epoch_reset();
         self.live.clear();
         self.queued.clear();
@@ -1022,16 +1040,30 @@ where
         }
     }
 
-    fn emit(&mut self, request_id: Option<FrontendRequestId>, mut kind: FrontendUpdateKind) {
+    fn emit(&mut self, request_id: Option<FrontendRequestId>, kind: FrontendUpdateKind) {
+        if matches!(
+            self.emit_result(request_id, kind),
+            crate::frontend::feed::FeedPush::Backpressured
+        ) {
+            self.feed.force_resync();
+        }
+    }
+
+    fn emit_result(
+        &mut self,
+        request_id: Option<FrontendRequestId>,
+        mut kind: FrontendUpdateKind,
+    ) -> crate::frontend::feed::FeedPush {
         let revision = self.revision.bump();
         if let FrontendUpdateKind::SnapshotReady(snapshot) = &mut kind {
             snapshot.revision = revision;
             snapshot.epoch = self.epoch;
         }
-        let _ = self
+        let result = self
             .feed
             .push(FrontendUpdate::new(self.epoch, revision, request_id, kind));
         self.feed.flush_resync(self.epoch, self.revision);
+        result
     }
 
     fn notice(&mut self, text: String) {

@@ -28,8 +28,9 @@ pub(crate) struct SnapshotLoadToken {
     requested_floor: u64,
     request_id: Option<FrontendRequestId>,
     frontend_epoch: FrontendEpoch,
-    /// Runtime snapshot cursor at capture. Never a substitute for session floor.
-    runtime_revision: u64,
+    /// Service-local live cursor at capture. The view is stale when the actor's
+    /// cursor is greater; this is never a substitute for the session floor.
+    live_cursor: u64,
     active_operation_id: Option<String>,
     active_turn_id: Option<String>,
 }
@@ -38,6 +39,23 @@ pub(crate) struct SnapshotLoadToken {
 pub(crate) enum SessionViewKind {
     Load,
     Snapshot,
+}
+
+impl SnapshotLoadToken {
+    fn live_projection_stale(
+        &self,
+        current_live_cursor: u64,
+        active_operation_id: Option<&str>,
+        active_turn_id: Option<&str>,
+    ) -> bool {
+        debug_assert!(
+            current_live_cursor >= self.live_cursor,
+            "service-local live cursor must be monotonic"
+        );
+        current_live_cursor > self.live_cursor
+            || self.active_operation_id.as_deref() != active_operation_id
+            || self.active_turn_id.as_deref() != active_turn_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -114,7 +132,6 @@ impl SnapshotState {
         self.current_session = Some(session_id);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn has_pending_load(&self) -> bool {
         self.pending_load.is_some()
     }
@@ -208,7 +225,7 @@ impl SnapshotState {
         durability: SettlementDurability,
         session_revision: SettlementRevision,
     ) -> SettledApply {
-        match self.operation_session.remove(operation_id) {
+        match self.operation_session.get(operation_id).map(String::as_str) {
             None => SettledApply::ProtocolError {
                 message: format!(
                     "protocol error: settled operation {operation_id} has no accepted session"
@@ -220,6 +237,7 @@ impl SnapshotState {
                 ),
             },
             Some(_) => {
+                self.operation_session.remove(operation_id);
                 if durability == SettlementDurability::Confirmed
                     && let SettlementRevision::Committed(revision) = session_revision
                 {
@@ -247,7 +265,7 @@ impl SnapshotState {
         session_id: String,
         request_id: Option<FrontendRequestId>,
         frontend_epoch: FrontendEpoch,
-        runtime_revision: u64,
+        live_cursor: u64,
         active_operation_id: Option<String>,
         active_turn_id: Option<String>,
     ) -> SnapshotLoadToken {
@@ -258,19 +276,22 @@ impl SnapshotState {
             session_id,
             request_id,
             frontend_epoch,
-            runtime_revision,
+            live_cursor,
             active_operation_id,
             active_turn_id,
         }
     }
 
-    fn begin_inflight(&mut self, pending: PendingReload) -> bool {
+    fn begin_inflight(&mut self, pending: PendingReload) -> (bool, Option<FrontendRequestId>) {
         if self.inflight.contains(&pending.session_id) {
-            self.pending_reload = Some(pending);
-            return false;
+            let superseded = self
+                .pending_reload
+                .replace(pending)
+                .and_then(|pending| pending.request_id);
+            return (false, superseded);
         }
         self.inflight.insert(pending.session_id.clone());
-        true
+        (true, None)
     }
 
     fn end_inflight(&mut self, session_id: &str) -> Option<PendingReload> {
@@ -365,6 +386,7 @@ where
             ViewKind::Preview { .. } => None,
         };
         if epoch != self.epoch {
+            self.feed.cancel_request(request_id);
             return;
         }
         let view = match result {
@@ -395,6 +417,7 @@ where
                 if self.latest_preview.is_some_and(|(latest_id, latest_gen)| {
                     request_id < latest_id || request_generation < latest_gen
                 }) {
+                    self.feed.cancel_request(request_id);
                     return;
                 }
                 self.emit(
@@ -419,12 +442,7 @@ where
             .snapshot
             .apply_settled(operation_id, session_id, durability, session_revision)
         {
-            SettledApply::Applied => {
-                if self.feed.is_resyncing() {
-                    self.begin_fenced_snapshot(self.latest_snapshot);
-                }
-                true
-            }
+            SettledApply::Applied => true,
             SettledApply::ProtocolError { message } => {
                 self.notice(message.clone());
                 self.health = ServiceHealth::Degraded {
@@ -456,10 +474,10 @@ where
         if epoch != self.epoch {
             return;
         }
-        self.apply_runtime_snapshot(snapshot);
+        let applied = self.apply_runtime_snapshot(snapshot);
         if self.feed.is_resyncing() {
             self.begin_fenced_snapshot(self.latest_snapshot);
-        } else {
+        } else if applied {
             self.emit(
                 None,
                 FrontendUpdateKind::AvailabilityChanged {
@@ -470,7 +488,7 @@ where
         }
     }
 
-    fn begin_fenced_snapshot(&mut self, request_id: Option<FrontendRequestId>) {
+    pub(super) fn begin_fenced_snapshot(&mut self, request_id: Option<FrontendRequestId>) {
         self.snapshot.bump_generation();
         self.latest_snapshot = request_id;
         match self.snapshot.current_session.clone() {
@@ -496,7 +514,11 @@ where
             kind,
             request_id,
         };
-        if !self.snapshot.begin_inflight(pending) {
+        let (started, superseded) = self.snapshot.begin_inflight(pending);
+        if let Some(request_id) = superseded.filter(|id| Some(*id) != request_id) {
+            self.feed.cancel_request(request_id);
+        }
+        if !started {
             return;
         }
         let spawn_id = request_id.unwrap_or(FrontendRequestId::INVALID);
@@ -527,7 +549,7 @@ where
             session_id.to_owned(),
             request_id,
             self.epoch,
-            self.applied_runtime_revision,
+            self.live_cursor,
             self.live.operation_id.clone(),
             self.live.turn_id.clone(),
         )
@@ -541,7 +563,15 @@ where
         pending: Option<PendingReload>,
     ) {
         match self.evaluate_token(&token, view.revision().get(), kind) {
-            TokenDecision::Drop => self.maybe_schedule_pending(pending),
+            TokenDecision::Drop => {
+                let pending_request = pending.as_ref().and_then(|pending| pending.request_id);
+                if token.request_id != pending_request
+                    && let Some(request_id) = token.request_id
+                {
+                    self.feed.cancel_request(request_id);
+                }
+                self.maybe_schedule_pending(pending);
+            }
             TokenDecision::Reload => {
                 let reload = if kind == SessionViewKind::Load
                     && self.snapshot.pending_load_is(&token.session_id)
@@ -614,12 +644,11 @@ where
     }
 
     fn snapshot_live_stale(&self, token: &SnapshotLoadToken) -> bool {
-        if self.live.operation_id != token.active_operation_id
-            || self.live.turn_id != token.active_turn_id
-        {
-            return true;
-        }
-        self.applied_runtime_revision < token.runtime_revision
+        token.live_projection_stale(
+            self.live_cursor,
+            self.live.operation_id.as_deref(),
+            self.live.turn_id.as_deref(),
+        )
     }
 
     fn publish_session_view(
@@ -661,6 +690,9 @@ where
 
     fn schedule_reload(&mut self, pending: PendingReload) {
         if !self.is_accepting_work() {
+            if let Some(request_id) = pending.request_id {
+                self.feed.cancel_request(request_id);
+            }
             return;
         }
         let allowed = match pending.kind {
@@ -668,6 +700,9 @@ where
             SessionViewKind::Snapshot => self.snapshot.is_current_session(&pending.session_id),
         };
         if !allowed {
+            if let Some(request_id) = pending.request_id {
+                self.feed.cancel_request(request_id);
+            }
             return;
         }
         if !self.snapshot.begin_reload_attempt(&pending.session_id) {
@@ -779,11 +814,11 @@ where
         request_id: Option<FrontendRequestId>,
         snapshot: FrontendSnapshot,
     ) {
-        self.feed.on_snapshot_ready();
-        self.emit(
+        let result = self.emit_result(
             request_id,
             FrontendUpdateKind::SnapshotReady(Box::new(snapshot)),
         );
+        self.feed.on_snapshot_ready(result);
     }
 
     fn request_runtime_snapshot(&mut self) {
@@ -799,9 +834,12 @@ where
         });
     }
 
-    fn apply_runtime_snapshot(&mut self, snapshot: RuntimeSnapshot) {
-        self.applied_runtime_revision =
-            self.applied_runtime_revision.max(snapshot.runtime_revision);
+    fn apply_runtime_snapshot(&mut self, snapshot: RuntimeSnapshot) -> bool {
+        if snapshot.runtime_revision < self.applied_runtime_snapshot_revision {
+            return false;
+        }
+        self.applied_runtime_snapshot_revision = snapshot.runtime_revision;
+        self.live_cursor = self.live_cursor.saturating_add(1);
         self.availability = mapping::availability(&snapshot.availability);
         self.queued = snapshot
             .queued
@@ -838,6 +876,7 @@ where
             }
         }
         self.drop_foreign_live();
+        true
     }
 }
 
@@ -845,6 +884,7 @@ where
 mod tests {
     use super::SNAPSHOT_RELOAD_ATTEMPT_MAX;
     use super::SnapshotState;
+    use crate::ids::FrontendEpoch;
     use philo_agent_runtime::{SettlementDurability, SettlementRevision};
     use philo_session::SessionRevision;
 
@@ -872,6 +912,24 @@ mod tests {
         state.commit_current("sess-a".into());
         assert_eq!(state.current_session.as_deref(), Some("sess-a"));
         assert!(state.pending_load_is("sess-b"));
+    }
+
+    #[test]
+    fn live_token_staleness_is_monotonic_and_identity_sensitive() {
+        let state = SnapshotState::new();
+        let token = state.capture_token(
+            "sess-a".into(),
+            None,
+            FrontendEpoch::INITIAL,
+            7,
+            Some("op-a".into()),
+            Some("turn-a".into()),
+        );
+
+        assert!(!token.live_projection_stale(7, Some("op-a"), Some("turn-a")));
+        assert!(token.live_projection_stale(8, Some("op-a"), Some("turn-a")));
+        assert!(token.live_projection_stale(7, Some("op-b"), Some("turn-a")));
+        assert!(token.live_projection_stale(7, Some("op-a"), Some("turn-b")));
     }
 
     #[test]
@@ -964,6 +1022,17 @@ mod tests {
         ));
         assert_eq!(state.required_for("sess-a"), 0);
         assert_eq!(state.required_for("sess-b"), 0);
+        assert_eq!(state.session_of("op-a"), Some("sess-a"));
+        assert!(matches!(
+            state.apply_settled(
+                "op-a",
+                "sess-a",
+                SettlementDurability::Confirmed,
+                SettlementRevision::Unchanged,
+            ),
+            super::SettledApply::Applied
+        ));
+        assert_eq!(state.session_of("op-a"), None);
 
         let missing = state.apply_settled(
             "op-missing",

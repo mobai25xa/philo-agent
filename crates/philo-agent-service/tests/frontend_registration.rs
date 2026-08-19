@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use philo_agent_service::testing::{
-    abort_service_actor, start_test_service, start_test_service_with_command_hold,
+    abort_service_actor_and_wait, start_test_service, start_test_service_with_command_hold,
 };
 use philo_agent_service::{
     AttachError, CommandDispatch, CommandReject, ConfirmationDecision, ConfirmationRequest,
@@ -313,7 +313,7 @@ async fn detach_after_service_abort_is_gone_or_disconnected() {
         .attach_frontend(id("front-a"), deadline())
         .await
         .expect("attach");
-    abort_service_actor(&service);
+    abort_service_actor_and_wait(&service).await;
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         service.detach_frontend(lease, Instant::now() + Duration::from_millis(200)),
@@ -334,7 +334,7 @@ async fn detach_after_service_abort_is_gone_or_disconnected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_after_service_abort_is_gone_or_disconnected() {
     let (service, _client, _runtime) = start_test_service();
-    abort_service_actor(&service);
+    abort_service_actor_and_wait(&service).await;
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         service.attach_frontend(id("front-a"), Instant::now() + Duration::from_millis(200)),

@@ -14,7 +14,7 @@ use ratatui::backend::Backend;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::api::types::{TuiLaunchConfig, TuiOutcome, TuiRunReport, TuiScreen};
+use crate::api::types::{TuiLaunchConfig, TuiOutcome, TuiRecovery, TuiRunReport, TuiScreen};
 use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::overlay::Preview;
@@ -53,12 +53,13 @@ pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRu
                     fault: error.fault.to_string(),
                 },
                 restore: error.restore,
+                recovery: config.recovery,
             };
         }
     };
     let shift_enter = session.shift_enter;
     let mut input = CrosstermInputSource::new();
-    let outcome = run_loop(
+    let report = run_loop_report(
         client,
         config,
         &mut session.terminal,
@@ -68,7 +69,11 @@ pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRu
     )
     .await;
     let restore = session.finish();
-    TuiRunReport { outcome, restore }
+    TuiRunReport {
+        outcome: report.outcome,
+        restore,
+        recovery: report.recovery,
+    }
 }
 
 /// Alias of [`run_async`]. The production path is `run_async` only.
@@ -415,7 +420,20 @@ fn apply_interrupt_pulses(
     effects
 }
 
-/// Testable event loop. Does not own or restore a real terminal session.
+struct LoopReport {
+    outcome: TuiOutcome,
+    recovery: Option<TuiRecovery>,
+}
+
+fn finish_loop(outcome: TuiOutcome, app: App) -> LoopReport {
+    LoopReport {
+        outcome,
+        recovery: app.into_recovery(),
+    }
+}
+
+/// Testable compatibility wrapper. Does not own or restore a real terminal session.
+#[cfg(test)]
 pub(crate) async fn run_loop<B: Backend>(
     client: FrontendClient,
     config: TuiLaunchConfig,
@@ -424,6 +442,19 @@ pub(crate) async fn run_loop<B: Backend>(
     shift_enter: bool,
     screen: TuiScreen,
 ) -> TuiOutcome {
+    run_loop_report(client, config, terminal, input, shift_enter, screen)
+        .await
+        .outcome
+}
+
+async fn run_loop_report<B: Backend>(
+    client: FrontendClient,
+    mut config: TuiLaunchConfig,
+    terminal: &mut Terminal<B>,
+    input: &mut impl TerminalInputSource,
+    shift_enter: bool,
+    screen: TuiScreen,
+) -> LoopReport {
     let mut status = StatusData::new(
         &config.model_name,
         &config.session_id,
@@ -435,6 +466,9 @@ pub(crate) async fn run_loop<B: Backend>(
     );
     status.context_window = config.context_window;
     let mut app = App::new(status, config.show_reasoning);
+    if let Some(recovery) = config.recovery.take() {
+        app.apply_recovery(recovery);
+    }
     let mut markdown = MarkdownRenderer::new();
 
     let start = Instant::now();
@@ -470,7 +504,7 @@ pub(crate) async fn run_loop<B: Backend>(
         if let Err(outcome) =
             begin_snapshot_resync(&mut state).map(|effects| app.ingest_appends(effects))
         {
-            return outcome;
+            return finish_loop(outcome, app);
         }
     } else {
         app.expect_session_load(SessionLoadIntent::Switch);
@@ -480,7 +514,7 @@ pub(crate) async fn run_loop<B: Backend>(
             Ok(effects) => {
                 app.ingest_appends(effects);
             }
-            Err(outcome) => return outcome,
+            Err(outcome) => return finish_loop(outcome, app),
         }
     }
 
@@ -501,16 +535,19 @@ pub(crate) async fn run_loop<B: Backend>(
             if report.failed {
                 draw_failures = draw_failures.saturating_add(1);
                 if draw_failures >= DRAW_FAILURE_BUDGET {
-                    return TuiOutcome::FrontendRestartRequested {
-                        fault: "draw failed repeatedly".to_owned(),
-                    };
+                    return finish_loop(
+                        TuiOutcome::FrontendRestartRequested {
+                            fault: "draw failed repeatedly".to_owned(),
+                        },
+                        app,
+                    );
                 }
             } else {
                 draw_failures = 0;
             }
         }
         if let Some(outcome) = exit_requested {
-            return outcome;
+            return finish_loop(outcome, app);
         }
 
         match try_request_snapshot(&mut state) {
@@ -520,7 +557,7 @@ pub(crate) async fn run_loop<B: Backend>(
                     scheduler.invalidate_background(now);
                 }
             }
-            Err(outcome) => return outcome,
+            Err(outcome) => return finish_loop(outcome, app),
         }
         match try_load_session(&mut state) {
             Ok(effects) => {
@@ -529,7 +566,7 @@ pub(crate) async fn run_loop<B: Backend>(
                     scheduler.invalidate_background(now);
                 }
             }
-            Err(outcome) => return outcome,
+            Err(outcome) => return finish_loop(outcome, app),
         }
 
         let step = events::next_step(
@@ -1164,10 +1201,11 @@ fn submit_ready_with_outcome(
             result: SubmitDispatchResult::Backpressured,
         })),
         CommandDispatch::Disconnected { lane } => {
-            let _ = app.on_action(Action::SubmitDispatchFinished {
+            let effects = app.on_action(Action::SubmitDispatchFinished {
                 intent_id,
                 result: SubmitDispatchResult::Disconnected { lane },
             });
+            app.ingest_appends(effects);
             Err(TuiOutcome::FrontendRestartRequested {
                 fault: format!("frontend disconnected on submit ({lane})"),
             })
@@ -1210,6 +1248,7 @@ mod tests {
             context_window: None,
             screen: TuiScreen::Inline,
             interrupt: None,
+            recovery: None,
         }
     }
 
@@ -1525,6 +1564,46 @@ mod tests {
             pending_session_load: None,
             session_load_retries: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn disconnected_submit_is_returned_as_recovery() {
+        let (service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        philo_agent_service::testing::abort_service_actor_and_wait(&service).await;
+        let mut app = App::new(StatusData::new("m", "s", InfoLevel::Default), true);
+        app.on_paste("/image shots/a.png");
+        app.on_action(Action::Submit);
+        app.on_paste("draft");
+        let effects = app.on_action(Action::Submit);
+        let intent_id = match effects.as_slice() {
+            [Effect::PrepareSubmit { intent_id, .. }] => *intent_id,
+            other => panic!("expected PrepareSubmit, got {other:?}"),
+        };
+        let mut state = loop_state(client);
+
+        let outcome = submit_ready_with_outcome(
+            &mut state,
+            &mut app,
+            intent_id,
+            "draft".to_owned(),
+            Vec::new(),
+        )
+        .expect_err("dead service must disconnect submit");
+        let report = finish_loop(outcome, app);
+
+        assert!(matches!(
+            report.outcome,
+            TuiOutcome::FrontendRestartRequested { .. }
+        ));
+        assert_eq!(
+            report.recovery,
+            Some(TuiRecovery {
+                draft: "draft".to_owned(),
+                attachments: vec![crate::api::types::TuiRecoveryAttachment::Path(
+                    "shots/a.png".to_owned()
+                )],
+            })
+        );
     }
 
     fn dispatching_app(draft: &str) -> (App, u64, philo_agent_service::FrontendRequestId) {

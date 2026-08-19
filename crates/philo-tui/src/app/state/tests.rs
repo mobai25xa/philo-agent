@@ -130,6 +130,83 @@ fn backpressured_submit_restores_draft_and_attachments() {
 }
 
 #[test]
+fn disconnected_submit_restores_editable_draft_and_attachments() {
+    use crate::app::submit::SubmitDispatchResult;
+
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    let effects = run(&mut app, "keep me");
+    let Effect::PrepareSubmit { intent_id, .. } = effects[0] else {
+        panic!("expected PrepareSubmit");
+    };
+
+    app.on_action(Action::SubmitDispatchFinished {
+        intent_id,
+        result: SubmitDispatchResult::Disconnected {
+            lane: "frontend-command",
+        },
+    });
+
+    assert_eq!(app.input.text(), "keep me");
+    assert_eq!(app.attachments().labels(), ["shots/a.png"]);
+    assert!(matches!(
+        app.submit_state(),
+        crate::app::submit::SubmitState::Editing
+    ));
+}
+
+#[test]
+fn recovery_does_not_overwrite_a_newer_local_edit() {
+    use crate::api::types::{TuiRecovery, TuiRecoveryAttachment};
+
+    let mut app = app();
+    type_text(&mut app, "newer");
+    let restored = app.apply_recovery(TuiRecovery {
+        draft: "older".to_owned(),
+        attachments: vec![TuiRecoveryAttachment::Path("shots/a.png".to_owned())],
+    });
+
+    assert!(!restored);
+    assert_eq!(app.input.text(), "newer");
+    assert_eq!(app.attachments().labels(), ["shots/a.png"]);
+}
+
+#[test]
+fn recovery_restores_once_into_a_pristine_composer() {
+    use crate::api::types::{TuiRecovery, TuiRecoveryAttachment};
+
+    let mut app = app();
+    let recovery = TuiRecovery {
+        draft: "preserved".to_owned(),
+        attachments: vec![TuiRecoveryAttachment::Path("shots/a.png".to_owned())],
+    };
+    assert!(app.apply_recovery(recovery.clone()));
+    assert_eq!(app.input.text(), "preserved");
+    assert_eq!(app.attachments().labels(), ["shots/a.png"]);
+
+    assert!(!app.apply_recovery(recovery));
+    assert_eq!(app.input.text(), "preserved");
+    assert_eq!(app.attachments().labels(), ["shots/a.png"]);
+}
+
+#[test]
+fn loop_exit_captures_submit_still_waiting_for_media() {
+    use crate::api::types::{TuiRecovery, TuiRecoveryAttachment};
+
+    let mut app = app();
+    run(&mut app, "/image shots/a.png");
+    run(&mut app, "pending");
+
+    assert_eq!(
+        app.into_recovery(),
+        Some(TuiRecovery {
+            draft: "pending".to_owned(),
+            attachments: vec![TuiRecoveryAttachment::Path("shots/a.png".to_owned())],
+        })
+    );
+}
+
+#[test]
 fn backpressured_submit_does_not_push_history() {
     use crate::app::submit::SubmitDispatchResult;
 

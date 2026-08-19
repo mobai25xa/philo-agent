@@ -22,6 +22,18 @@ pub const STORE_COMMAND_CAP: usize = 64;
 pub const BLOCKING_TOOL_QUEUE: usize = 32;
 /// Service → frontend update lane.
 pub const FRONTEND_UPDATE_CAP: usize = 64;
+/// Reserved service → frontend lane for request terminals and recovery facts.
+///
+/// Preview requests can hold two replies; all other requests hold one. The
+/// capacity covers queued commands plus the bounded child pool, control and
+/// snapshot lanes, runtime terminals, confirmation resolutions, and one
+/// resync/snapshot recovery pair.
+pub const FRONTEND_CRITICAL_CAP: usize = 2 * (FRONTEND_COMMAND_CAP + STORE_COMMAND_CAP)
+    + FRONTEND_CONTROL_CAP
+    + FRONTEND_SNAPSHOT_CAP
+    + RUNTIME_QUEUE_MAX
+    + CONFIRMATION_MAP_CAP
+    + 2;
 /// Frontend command lane (submit, queries, install).
 pub const FRONTEND_COMMAND_CAP: usize = 32;
 /// Frontend control lane (cancel, confirmation, shutdown).

@@ -27,6 +27,15 @@ where
             self.reject_not_accepting(request_id);
             return;
         }
+        if self.snapshot.has_pending_load() {
+            self.emit(
+                Some(request_id),
+                FrontendUpdateKind::CommandRejected {
+                    reason: CommandReject::NoCurrentSession,
+                },
+            );
+            return;
+        }
         if !self.can_spawn_work() {
             self.reject_child_capacity(request_id);
             return;
@@ -143,6 +152,8 @@ where
                             display: mapping::frontend_generation(&next),
                         },
                     );
+                } else {
+                    self.feed.cancel_request(request_id);
                 }
             }
             Err(error) => {
@@ -155,6 +166,8 @@ where
                             message: error.message,
                         },
                     );
+                } else {
+                    self.feed.cancel_request(request_id);
                 }
             }
         }

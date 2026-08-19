@@ -45,6 +45,33 @@ pub struct RestoreReport {
     pub failures: Vec<RestoreFailure>,
 }
 
+/// One attachment preserved when a TUI instance cannot dispatch a submit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TuiRecoveryAttachment {
+    /// A path registered by `/image`; the next TUI resolves it on submit.
+    Path(String),
+    /// Image bytes already decoded by the previous TUI instance.
+    Image {
+        media_type: String,
+        bytes: Vec<u8>,
+        /// Original path or clipboard label shown in the composer.
+        origin: String,
+    },
+}
+
+/// Editable composer contents carried across a frontend restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiRecovery {
+    pub draft: String,
+    pub attachments: Vec<TuiRecoveryAttachment>,
+}
+
+impl TuiRecovery {
+    pub fn is_empty(&self) -> bool {
+        self.draft.is_empty() && self.attachments.is_empty()
+    }
+}
+
 /// One TUI run: the session outcome plus the owner-thread restore report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiRunReport {
@@ -52,6 +79,8 @@ pub struct TuiRunReport {
     pub outcome: TuiOutcome,
     /// Structured terminal restore result. Never silently discarded.
     pub restore: RestoreReport,
+    /// Composer contents that were not accepted by the Service.
+    pub recovery: Option<TuiRecovery>,
 }
 
 /// Alternate screen versus an inline viewport on the main buffer.
@@ -79,6 +108,8 @@ pub struct TuiLaunchConfig {
     /// Supervisor-owned Ctrl+C pulse counter. `None` in tests that do not
     /// inject signals. The TUI never writes the terminal or exits the process.
     pub interrupt: Option<tokio::sync::watch::Receiver<u64>>,
+    /// One-shot composer contents from the previous TUI instance.
+    pub recovery: Option<TuiRecovery>,
 }
 
 /// How the interactive session ended. Process exit codes belong to the

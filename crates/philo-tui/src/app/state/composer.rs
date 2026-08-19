@@ -4,12 +4,68 @@ use philo_agent_service::CommandReject;
 
 use super::App;
 use super::line;
+use crate::api::types::{TuiRecovery, TuiRecoveryAttachment};
 use crate::app::attachment::PendingAttachment;
 use crate::app::effect::Effect;
 use crate::app::submit::{IntentId, PendingSubmission, SubmitDispatchResult, SubmitState};
 use crate::app::transcript::LineKind;
 
 impl App {
+    /// Restores a previous instance only while this composer is still
+    /// pristine. A newer local edit wins, but can still receive attachments.
+    pub(crate) fn apply_recovery(&mut self, recovery: TuiRecovery) -> bool {
+        if recovery.is_empty() || !matches!(self.submit_state, SubmitState::Editing) {
+            return false;
+        }
+        let attachments = recovery
+            .attachments
+            .into_iter()
+            .map(PendingAttachment::from)
+            .collect();
+        if self.draft_generation == 0 && self.input.is_empty() {
+            self.restore_draft(&recovery.draft, attachments);
+            return true;
+        }
+        if self.attachments.is_empty() {
+            self.bump_draft_generation();
+            self.attachments.extend(attachments);
+        }
+        false
+    }
+
+    /// Consumes composer state at loop exit. Pending media work has not reached
+    /// the Service, while a newer local edit keeps the same generation priority
+    /// used by ordinary submit refusal handling.
+    pub(crate) fn into_recovery(mut self) -> Option<TuiRecovery> {
+        let state = std::mem::take(&mut self.submit_state);
+        let (draft, attachments) = match state {
+            SubmitState::Editing | SubmitState::Accepted { .. } => {
+                (self.input.take_text(), self.attachments.take())
+            }
+            SubmitState::Dispatching(pending)
+                if self.draft_generation == pending.held_generation =>
+            {
+                (pending.draft, pending.attachments)
+            }
+            SubmitState::Dispatching(pending) => {
+                let attachments = if self.attachments.is_empty() {
+                    pending.attachments
+                } else {
+                    self.attachments.take()
+                };
+                (self.input.take_text(), attachments)
+            }
+        };
+        let recovery = TuiRecovery {
+            draft,
+            attachments: attachments
+                .into_iter()
+                .map(TuiRecoveryAttachment::from)
+                .collect(),
+        };
+        (!recovery.is_empty()).then_some(recovery)
+    }
+
     /// Pastes text verbatim (bracketed paste never submits).
     pub fn on_paste(&mut self, text: &str) -> Vec<Effect> {
         if self.confirm.is_some() || self.picker.is_some() {

@@ -73,6 +73,10 @@ impl TerminalCapabilities {
             TerminalCapability::KeyboardEnhancement => self.keyboard_enhancement,
         }
     }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -125,28 +129,43 @@ impl Registry {
         *active
     }
 
-    #[allow(dead_code)]
-    fn take_if(&self, token: u64) -> Option<SessionFlags> {
-        self.take_if_recovered(token).0
-    }
-
-    fn take_if_recovered(&self, token: u64) -> (Option<SessionFlags>, bool) {
-        let (mut active, poisoned) = self.lock_active();
-        let taken = match *active {
-            Some(flags) if flags.token == token => active.take(),
+    fn snapshot_if_recovered(&self, token: u64) -> (Option<SessionFlags>, bool) {
+        let (active, poisoned) = self.lock_active();
+        let snapshot = match *active {
+            Some(flags) if flags.token == token => Some(flags),
             _ => None,
         };
-        (taken, poisoned)
+        (snapshot, poisoned)
     }
 
-    fn try_take_if(&self, token: u64) -> Result<Option<SessionFlags>, Option<SessionFlags>> {
-        let (taken, this_lock_poisoned) = self.take_if_recovered(token);
+    fn try_snapshot_if(&self, token: u64) -> Result<Option<SessionFlags>, Option<SessionFlags>> {
+        let (snapshot, this_lock_poisoned) = self.snapshot_if_recovered(token);
         let sticky = self.poisoned.swap(false, Ordering::SeqCst);
         if this_lock_poisoned || sticky {
-            Err(taken)
+            Err(snapshot)
         } else {
-            Ok(taken)
+            Ok(snapshot)
         }
+    }
+
+    fn commit_capabilities_if(
+        &self,
+        token: u64,
+        capabilities: TerminalCapabilities,
+    ) -> (bool, bool) {
+        let (mut active, poisoned) = self.lock_active();
+        let committed = match active.as_mut() {
+            Some(flags) if flags.token == token => {
+                if capabilities.is_empty() {
+                    *active = None;
+                } else {
+                    flags.capabilities = capabilities;
+                }
+                true
+            }
+            _ => false,
+        };
+        (committed, poisoned)
     }
 }
 
@@ -251,20 +270,35 @@ impl<B: TerminalBackend> ModeOwner<B> {
         if self.finished {
             return RestoreReport::default();
         }
-        self.finished = true;
-        let (taken, poisoned) = REGISTRY.take_if_recovered(self.token);
-        let mut report = match taken {
-            None => RestoreReport {
-                restored: false,
-                skipped_stale: REGISTRY.snapshot().is_some(),
-                ..RestoreReport::default()
-            },
+        let (registered, read_poisoned) = REGISTRY.snapshot_if_recovered(self.token);
+        let (mut report, commit_poisoned) = match registered {
+            None => {
+                self.finished = true;
+                (
+                    RestoreReport {
+                        restored: false,
+                        skipped_stale: REGISTRY.snapshot().is_some(),
+                        ..RestoreReport::default()
+                    },
+                    false,
+                )
+            }
             Some(flags) => {
                 self.capabilities = flags.capabilities;
-                restore_held_capabilities(&mut self.capabilities, &mut self.backend)
+                let mut report =
+                    restore_held_capabilities(&mut self.capabilities, &mut self.backend);
+                let (committed, commit_poisoned) =
+                    REGISTRY.commit_capabilities_if(self.token, self.capabilities);
+                if committed {
+                    self.finished = self.capabilities.is_empty();
+                } else {
+                    report.skipped_stale = REGISTRY.snapshot().is_some();
+                    self.finished = true;
+                }
+                (report, commit_poisoned)
             }
         };
-        if poisoned {
+        if read_poisoned || commit_poisoned {
             report.failures.push(RestoreFailure {
                 capability: TerminalCapability::RawMode,
                 message: "uncertain ownership: registry lock poisoned".to_owned(),
@@ -374,19 +408,34 @@ fn emergency_restore_active_session(backend: &mut impl TerminalBackend) -> Resto
     if std::thread::current().id() != flags.owner {
         return RestoreReport::default();
     }
-    match REGISTRY.try_take_if(flags.token) {
-        Ok(Some(taken)) => {
-            let mut caps = taken.capabilities;
-            restore_held_capabilities(&mut caps, backend)
+    match REGISTRY.try_snapshot_if(flags.token) {
+        Ok(Some(registered)) => {
+            let mut caps = registered.capabilities;
+            let mut report = restore_held_capabilities(&mut caps, backend);
+            let (committed, poisoned) = REGISTRY.commit_capabilities_if(flags.token, caps);
+            if !committed {
+                report.skipped_stale = REGISTRY.snapshot().is_some();
+            }
+            if poisoned {
+                report.failures.push(RestoreFailure {
+                    capability: TerminalCapability::RawMode,
+                    message: "uncertain ownership: registry lock unavailable".to_owned(),
+                });
+            }
+            report
         }
         Ok(None) => RestoreReport {
             restored: false,
             skipped_stale: REGISTRY.snapshot().is_some(),
             ..RestoreReport::default()
         },
-        Err(taken) => {
-            let mut caps = taken.unwrap_or(flags).capabilities;
+        Err(registered) => {
+            let mut caps = registered.unwrap_or(flags).capabilities;
             let mut report = restore_held_capabilities(&mut caps, backend);
+            let (committed, _) = REGISTRY.commit_capabilities_if(flags.token, caps);
+            if !committed {
+                report.skipped_stale = REGISTRY.snapshot().is_some();
+            }
             report.failures.push(RestoreFailure {
                 capability: TerminalCapability::RawMode,
                 message: "uncertain ownership: registry lock unavailable".to_owned(),
@@ -685,6 +734,57 @@ mod tests {
     }
 
     #[test]
+    fn failed_restore_is_retryable_until_all_capabilities_are_released() {
+        let _lock = lock_terminal_tests();
+        let backend = RecordingBackend::new().with_restore_fail(vec![TerminalCapability::RawMode]);
+        let mut modes = run_setup(backend, TuiScreen::Inline).expect("setup");
+        let first = modes.finish();
+        assert!(
+            first
+                .failures
+                .iter()
+                .any(|failure| { failure.capability == TerminalCapability::RawMode })
+        );
+        assert!(!modes.finished);
+        assert_eq!(
+            REGISTRY.snapshot().map(|flags| flags.token),
+            Some(modes.token)
+        );
+
+        modes.backend.restore_fail.clear();
+        let second = modes.finish();
+        assert!(second.failures.is_empty());
+        assert!(second.restored);
+        assert!(modes.finished);
+        assert!(REGISTRY.snapshot().is_none());
+        assert_eq!(
+            modes
+                .backend
+                .calls
+                .iter()
+                .filter(|op| **op == BackendOp::DisableRawMode)
+                .count(),
+            2
+        );
+        for operation in [
+            BackendOp::PopKeyboardEnhancement,
+            BackendOp::DisableBracketedPaste,
+            BackendOp::DisableMouseCapture,
+        ] {
+            assert_eq!(
+                modes
+                    .backend
+                    .calls
+                    .iter()
+                    .filter(|recorded| **recorded == operation)
+                    .count(),
+                1,
+                "successful capability must not be restored twice: {operation:?}"
+            );
+        }
+    }
+
+    #[test]
     fn consecutive_finish_is_idempotent() {
         let _lock = lock_terminal_tests();
         let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Inline).expect("setup");
@@ -770,6 +870,30 @@ mod tests {
             lines.iter().any(|line| line.contains("raw mode")),
             "expected diagnostic lines, got {lines:?}"
         );
+    }
+
+    #[test]
+    fn drop_retries_capability_left_by_failed_finish() {
+        let _capture = capture_diagnostics();
+        let backend = RecordingBackend::new().with_restore_fail(vec![TerminalCapability::RawMode]);
+        let mut modes = run_setup(backend, TuiScreen::Inline).expect("setup");
+        let token = modes.token;
+        let first = modes.finish();
+        assert_eq!(first.failures.len(), 1);
+        assert!(!modes.finished);
+
+        drop(modes);
+        assert_eq!(REGISTRY.snapshot().map(|flags| flags.token), Some(token));
+        let lines = diagnostic_lines();
+        assert!(
+            lines.iter().any(|line| line.contains("raw mode")),
+            "expected retry diagnostic lines, got {lines:?}"
+        );
+
+        let mut recovery = RecordingBackend::new();
+        let report = emergency_restore_active_session(&mut recovery);
+        assert!(report.failures.is_empty());
+        assert!(REGISTRY.snapshot().is_none());
     }
 
     #[test]

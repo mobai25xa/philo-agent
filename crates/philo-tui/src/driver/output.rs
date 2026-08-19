@@ -40,6 +40,14 @@ impl PendingOutput {
         };
 
         let mut report = FlushReport::default();
+        // Backend draws move the physical cursor through every changed cell.
+        // Keep it hidden until ratatui restores the composer cursor at the end
+        // of this frame, otherwise streaming diffs visibly drag it around.
+        if let Err(error) = terminal.hide_cursor() {
+            scheduler.retry_frame(permit, error);
+            report.failed = true;
+            return report;
+        }
         if permit.hard_clear {
             if let Err(error) = terminal.clear() {
                 scheduler.retry_frame(permit, error);
@@ -322,6 +330,7 @@ mod tests {
     struct FlakyBackend {
         inner: TestBackend,
         fail_draws: usize,
+        cursor_ops: Vec<&'static str>,
     }
 
     impl Backend for FlakyBackend {
@@ -331,6 +340,7 @@ mod tests {
         where
             I: Iterator<Item = (u16, u16, &'a Cell)>,
         {
+            self.cursor_ops.push("draw");
             if self.fail_draws > 0 {
                 self.fail_draws -= 1;
                 return Err(io::Error::other("flaky draw"));
@@ -339,10 +349,12 @@ mod tests {
         }
 
         fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.cursor_ops.push("hide");
             self.inner.hide_cursor().map_err(|error| match error {})
         }
 
         fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.cursor_ops.push("show");
             self.inner.show_cursor().map_err(|error| match error {})
         }
 
@@ -356,6 +368,7 @@ mod tests {
             &mut self,
             position: P,
         ) -> Result<(), Self::Error> {
+            self.cursor_ops.push("set");
             self.inner
                 .set_cursor_position(position)
                 .map_err(|error| match error {})
@@ -410,6 +423,7 @@ mod tests {
         let mut terminal = Terminal::new(FlakyBackend {
             inner: TestBackend::new(80, 24),
             fail_draws: 1,
+            cursor_ops: Vec::new(),
         })
         .expect("flaky terminal");
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
@@ -453,5 +467,35 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(screen.contains("latest-pass"), "{screen}");
+    }
+
+    #[test]
+    fn frame_hides_cursor_while_writing_the_diff() {
+        let start = Instant::now();
+        let mut terminal = Terminal::new(FlakyBackend {
+            inner: TestBackend::new(80, 24),
+            fail_draws: 0,
+            cursor_ops: Vec::new(),
+        })
+        .expect("tracking terminal");
+        terminal.backend_mut().cursor_ops.clear();
+        let app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
+        let mut markdown = MarkdownRenderer::new();
+        let mut scheduler = FrameScheduler::new(start);
+
+        let report = PendingOutput.flush(
+            &mut terminal,
+            &app,
+            &mut markdown,
+            false,
+            &mut scheduler,
+            start,
+        );
+
+        assert_eq!(report.draws, 1);
+        assert_eq!(
+            terminal.backend().cursor_ops,
+            vec!["hide", "draw", "show", "set"]
+        );
     }
 }

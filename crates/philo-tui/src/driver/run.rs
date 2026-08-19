@@ -584,12 +584,18 @@ async fn run_loop_report<B: Backend>(
         let effects = match step {
             Step::Update(first) => {
                 let updates = events::drain_ready_updates(&state.client, first);
-                apply_updates(&mut app, &mut markdown, &mut state, updates).unwrap_or_else(
-                    |outcome| {
-                        exit_requested = Some(outcome);
-                        Vec::new()
-                    },
+                apply_update_batch(
+                    &mut app,
+                    &mut markdown,
+                    &mut state,
+                    &mut scheduler,
+                    event_time,
+                    updates,
                 )
+                .unwrap_or_else(|outcome| {
+                    exit_requested = Some(outcome);
+                    Vec::new()
+                })
             }
             Step::UpdatesDisconnected => {
                 exit_requested = Some(TuiOutcome::FrontendRestartRequested {
@@ -598,6 +604,7 @@ async fn run_loop_report<B: Backend>(
                 Vec::new()
             }
             Step::Task(completion) => {
+                scheduler.invalidate_background(event_time);
                 match apply_task_with_submit(&mut app, &mut state, completion) {
                     Ok(effects) => effects,
                     Err(outcome) => {
@@ -663,13 +670,16 @@ async fn run_loop_report<B: Backend>(
                 }
                 Vec::new()
             }
-            Step::Interrupt => apply_interrupt_pulses(
-                &mut state,
-                &mut app,
-                interrupt.as_mut(),
-                &mut interrupt_seen,
-                &mut exit_requested,
-            ),
+            Step::Interrupt => {
+                scheduler.invalidate_immediate(event_time);
+                apply_interrupt_pulses(
+                    &mut state,
+                    &mut app,
+                    interrupt.as_mut(),
+                    &mut interrupt_seen,
+                    &mut exit_requested,
+                )
+            }
         };
 
         let mut pending: VecDeque<Effect> = effects.into();
@@ -809,6 +819,21 @@ async fn run_loop_report<B: Backend>(
             }
         }
     }
+}
+
+fn apply_update_batch(
+    app: &mut App,
+    markdown: &mut MarkdownRenderer,
+    state: &mut LoopState,
+    scheduler: &mut FrameScheduler,
+    event_time: Instant,
+    updates: Vec<FrontendUpdate>,
+) -> Result<Vec<Effect>, TuiOutcome> {
+    let effects = apply_updates(app, markdown, state, updates)?;
+    // Most frontend updates mutate App directly and intentionally return no
+    // append effect. They still need a final frame after activity stops.
+    scheduler.invalidate_background(event_time);
+    Ok(effects)
 }
 
 fn apply_updates(
@@ -1564,6 +1589,93 @@ mod tests {
             pending_session_load: None,
             session_load_retries: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn effectless_terminal_update_batch_keeps_a_final_frame_scheduled() {
+        let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
+        let mut app = App::new(StatusData::new("m", "s-1", InfoLevel::Default), true);
+        let mut markdown = MarkdownRenderer::new();
+        let mut state = loop_state(client);
+        let start = Instant::now();
+        let mut scheduler = FrameScheduler::new(start);
+        scheduler.take_frame(start).expect("initial frame");
+
+        let updates = vec![
+            FrontendUpdate {
+                epoch: philo_agent_service::FrontendEpoch::INITIAL,
+                revision: FrontendRevision::new(1),
+                request_id: None,
+                kind: FrontendUpdateKind::AvailabilityChanged {
+                    availability: FrontendAvailability::Busy {
+                        operation_id: "op-1".to_owned(),
+                    },
+                    queued: 0,
+                },
+            },
+            FrontendUpdate {
+                epoch: philo_agent_service::FrontendEpoch::INITIAL,
+                revision: FrontendRevision::new(2),
+                request_id: None,
+                kind: FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::TextDelta {
+                        delta: "complete response tail".to_owned(),
+                    },
+                ),
+            },
+            FrontendUpdate {
+                epoch: philo_agent_service::FrontendEpoch::INITIAL,
+                revision: FrontendRevision::new(3),
+                request_id: None,
+                kind: FrontendUpdateKind::OperationEvent(
+                    philo_agent_service::FrontendOperationEvent::OperationSettled {
+                        operation_id: "op-1".to_owned(),
+                        session_id: "s-1".to_owned(),
+                        status: "Succeeded".to_owned(),
+                        durability: "Confirmed".to_owned(),
+                        session_revision: philo_agent_service::SettlementRevision::Unchanged,
+                    },
+                ),
+            },
+            FrontendUpdate {
+                epoch: philo_agent_service::FrontendEpoch::INITIAL,
+                revision: FrontendRevision::new(4),
+                request_id: None,
+                kind: FrontendUpdateKind::AvailabilityChanged {
+                    availability: FrontendAvailability::Idle,
+                    queued: 0,
+                },
+            },
+        ];
+        let event_time = start + std::time::Duration::from_millis(1);
+        let effects = apply_update_batch(
+            &mut app,
+            &mut markdown,
+            &mut state,
+            &mut scheduler,
+            event_time,
+            updates,
+        )
+        .expect("apply terminal batch");
+
+        assert!(
+            effects.is_empty(),
+            "the state-only update path is intentional"
+        );
+        assert!(!app.animation_active(), "settlement stops the activity row");
+        assert!(!app.status.busy, "idle clears the busy status");
+        assert!(
+            app.cells
+                .cells()
+                .iter()
+                .any(|cell| cell.text.contains("complete response tail"))
+        );
+        scheduler.sync_animation(app.animation_active(), event_time);
+        assert_eq!(scheduler.animation_deadline(), None);
+        let deadline = scheduler
+            .frame_deadline()
+            .expect("the terminal update must leave a final frame pending");
+        assert!(scheduler.take_frame(deadline).is_some());
     }
 
     #[tokio::test]

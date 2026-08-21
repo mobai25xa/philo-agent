@@ -234,10 +234,10 @@ impl Coordinator {
             join = join_driver_if(&mut self.driver_join, reap) => self.on_driver_join(join),
             join = join_maintenance_if(&mut self.maintenance_join, reap) => self.on_maintenance_join(join),
             permit = reserve_if_outbound(&event_tx, has_outbound) => {
-                if let Some(Ok(permit)) = permit {
-                    if let Some(event) = self.pop_outbound() {
-                        permit.send(event);
-                    }
+                if let Some(Ok(permit)) = permit
+                    && let Some(event) = self.pop_outbound()
+                {
+                    permit.send(event);
                 }
             }
             _ = wait_driver_transients(&self.active, wait_transients) => {
@@ -597,17 +597,15 @@ impl Coordinator {
                     );
                     return;
                 }
-                if let AgentEvent::ModelCallStarted { model_call_id } = &agent {
-                    if let Some(active) = &mut self.active {
-                        active.last_model_call_id = Some(model_call_id.clone());
-                    }
+                if let AgentEvent::ModelCallStarted { model_call_id } = &agent
+                    && let Some(active) = &mut self.active
+                {
+                    active.last_model_call_id = Some(model_call_id.clone());
                 }
                 self.release_transients_for(&agent);
                 self.emit(RuntimeEvent::Agent(agent));
-                if starting {
-                    if let Some(active) = &mut self.active {
-                        active.started = true;
-                    }
+                if starting && let Some(active) = &mut self.active {
+                    active.started = true;
                 }
             }
         }
@@ -1233,10 +1231,10 @@ impl Coordinator {
             return Vec::new();
         };
         let (phase, events) = active.shared.drain_transients();
-        if let Some(phase) = phase {
-            if let Some(active) = &mut self.active {
-                active.phase = phase;
-            }
+        if let Some(phase) = phase
+            && let Some(active) = &mut self.active
+        {
+            active.phase = phase;
         }
         events
     }

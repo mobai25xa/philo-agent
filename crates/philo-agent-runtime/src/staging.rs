@@ -53,6 +53,10 @@ impl ReliableStaging {
         self.remaining() >= PRODUCER_STAGING_RESERVE
     }
 
+    // Returning the event by value on overflow is the API: the producer
+    // reclaims ownership without cloning. Boxing the error would allocate
+    // on the hot backpressure path just to shrink the Result.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn push(&self, event: RuntimeEvent) -> Result<(), RuntimeEvent> {
         let mut inner = lock(&self.inner);
         if inner.queue.len() >= inner.cap {

@@ -218,15 +218,15 @@ impl ModelEventStream for NormalizedStream {
                         block_id,
                         replay_token,
                     } => {
-                        if let Some(entry) = self.text.remove(&block_id) {
-                            if !entry.text.is_empty() {
-                                self.captured.push(CapturedItem {
-                                    index: entry.index,
-                                    content: CapturedContent::Text { text: entry.text },
-                                    replay_requirement: entry.replay_requirement,
-                                    replay_token,
-                                });
-                            }
+                        if let Some(entry) = self.text.remove(&block_id)
+                            && !entry.text.is_empty()
+                        {
+                            self.captured.push(CapturedItem {
+                                index: entry.index,
+                                content: CapturedContent::Text { text: entry.text },
+                                replay_requirement: entry.replay_requirement,
+                                replay_token,
+                            });
                         }
                     }
                     sdk::ModelEvent::ReasoningStarted {

@@ -1,85 +1,176 @@
-//! Slash-command execution and Tab completion.
+//! Slash-command execution and the auto command menu.
 
 use super::App;
 use super::line;
 use crate::app::attachment::PendingAttachment;
 use crate::app::command::{self, Command};
 use crate::app::effect::{Effect, HostRequest};
+use crate::app::text;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 
-/// An open command-completion menu: the candidates and the cycling cursor
-/// (`None` while the input still holds the shared prefix).
+/// One rendered menu row: the marker-plus-usage cell and the summary cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct CompletionMenu {
-    candidates: Vec<&'static str>,
-    selected: Option<usize>,
+pub(crate) struct MenuRow {
+    pub(crate) usage: String,
+    pub(crate) summary: String,
 }
 
-impl CompletionMenu {
+/// The frame the renderer paints above the composer while the menu is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandMenuFrame {
+    pub(crate) rows: Vec<MenuRow>,
+    pub(crate) selected: usize,
+}
+
+/// The auto command menu: live-filtered candidates plus the highlight
+/// cursor. It opens by itself whenever the draft is a bare `/word` and
+/// closes as soon as the draft stops being one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CommandMenu {
+    candidates: Vec<&'static str>,
+    selected: usize,
+}
+
+impl CommandMenu {
     fn new(candidates: Vec<&'static str>) -> Self {
         Self {
             candidates,
-            selected: None,
+            selected: 0,
         }
     }
 
-    /// Advances to the next candidate and returns its name.
-    fn cycle(&mut self) -> &'static str {
-        let next = match self.selected {
-            None => 0,
-            Some(index) => (index + 1) % self.candidates.len(),
-        };
-        self.selected = Some(next);
-        self.candidates[next]
+    /// Re-filters after an edit. The highlight resets only when the
+    /// candidate list actually changed.
+    fn update(&mut self, candidates: Vec<&'static str>) {
+        if candidates != self.candidates {
+            self.candidates = candidates;
+            self.selected = 0;
+        }
     }
 
-    /// The single row shown above the input while the menu is open.
-    pub fn line(&self) -> String {
-        let names: Vec<String> = self
+    /// Moves the highlight; returns whether it actually moved.
+    fn move_up(&mut self) -> bool {
+        if self.selected == 0 {
+            return false;
+        }
+        self.selected -= 1;
+        true
+    }
+
+    /// Moves the highlight; returns whether it actually moved.
+    fn move_down(&mut self) -> bool {
+        if self.selected + 1 >= self.candidates.len() {
+            return false;
+        }
+        self.selected += 1;
+        true
+    }
+
+    /// The highlighted command name.
+    fn selected_name(&self) -> &'static str {
+        self.candidates[self.selected]
+    }
+
+    /// Projects at most `max_rows` rows for `width` cells, windowed so the
+    /// highlighted row stays visible. Each row is `{marker}{usage}  {summary}`.
+    pub(super) fn frame(&self, width: usize, max_rows: usize) -> CommandMenuFrame {
+        let rows = max_rows.max(1).min(self.candidates.len());
+        let start = if self.selected >= rows {
+            self.selected + 1 - rows
+        } else {
+            0
+        };
+        let usage_width = self
             .candidates
             .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                if self.selected == Some(index) {
-                    format!("[{name}]")
-                } else {
-                    (*name).to_owned()
+            .map(|name| command::spec(name).usage.len())
+            .max()
+            .unwrap_or(0);
+        let rows = (start..start + rows)
+            .map(|index| {
+                let spec = command::spec(self.candidates[index]);
+                let marker = if index == self.selected { ">" } else { " " };
+                let usage = format!("{marker} {:<usage_width$}  ", spec.usage);
+                let summary_width = width.saturating_sub(text::width(&usage));
+                MenuRow {
+                    usage: text::truncate(&usage, width),
+                    summary: text::truncate(spec.summary, summary_width),
                 }
             })
             .collect();
-        format!("commands: {}", names.join(" "))
+        CommandMenuFrame {
+            rows,
+            selected: self.selected - start,
+        }
     }
 }
 
 impl App {
-    /// Tab: completes the command word. A single candidate completes
-    /// outright; several open the menu at their shared prefix and each
-    /// further Tab cycles through them.
-    pub(super) fn complete(&mut self) -> Vec<Effect> {
-        if let Some(menu) = self.completion.as_mut() {
-            let name = menu.cycle();
-            self.bump_draft_generation();
-            self.input.set_text(&format!("/{name}"));
-            return vec![];
-        }
+    /// Re-derives the menu from the current draft: open over a bare
+    /// `/word`, re-filtered on every edit, closed otherwise.
+    pub(super) fn sync_completion(&mut self) {
         let candidates: Vec<&'static str> = command::candidates(&self.input.text())
             .iter()
             .map(|spec| spec.name)
             .collect();
-        match candidates.len() {
-            0 => {}
-            1 => {
-                self.bump_draft_generation();
-                self.input.set_text(&format!("/{} ", candidates[0]));
-            }
-            _ => {
-                self.bump_draft_generation();
-                self.input
-                    .set_text(&format!("/{}", command::common_prefix(&candidates)));
-                self.completion = Some(CompletionMenu::new(candidates));
+        if candidates.is_empty() {
+            self.completion = None;
+        } else if let Some(menu) = &mut self.completion {
+            menu.update(candidates);
+        } else {
+            self.completion = Some(CommandMenu::new(candidates));
+        }
+    }
+
+    /// `Tab`: accepts the highlighted command while the menu is open;
+    /// otherwise (re)opens the menu without changing the draft.
+    pub(super) fn complete(&mut self) -> Vec<Effect> {
+        if self.completion.is_some() {
+            return self.accept_completion();
+        }
+        self.sync_completion();
+        vec![]
+    }
+
+    /// Tab on an open menu: fills `/name ` and closes the menu.
+    pub(super) fn accept_completion(&mut self) -> Vec<Effect> {
+        let Some(name) = self.selected_command() else {
+            return vec![];
+        };
+        self.bump_draft_generation();
+        self.input.set_text(&format!("/{name} "));
+        self.completion = None;
+        vec![]
+    }
+
+    /// Up/Down on an open menu: moves the highlight.
+    pub(super) fn move_completion(&mut self, up: bool) -> Vec<Effect> {
+        if let Some(menu) = &mut self.completion {
+            if up {
+                menu.move_up();
+            } else {
+                menu.move_down();
             }
         }
         vec![]
+    }
+
+    /// Enter on an open menu: runs the highlighted command exactly as if
+    /// it had been typed and submitted.
+    pub(super) fn execute_completion(&mut self) -> Vec<Effect> {
+        let Some(name) = self.selected_command() else {
+            return vec![];
+        };
+        let text = format!("/{name}");
+        let _ = self.input.take_text();
+        self.bump_draft_generation();
+        self.completion = None;
+        self.history.push(text.clone());
+        self.run_command(&text)
+    }
+
+    fn selected_command(&self) -> Option<&'static str> {
+        self.completion.as_ref().map(CommandMenu::selected_name)
     }
 
     #[allow(clippy::too_many_lines)]

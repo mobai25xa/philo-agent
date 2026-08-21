@@ -473,7 +473,7 @@ async fn run_loop_report<B: Backend>(
 
     let start = Instant::now();
     let mut scheduler = FrameScheduler::new(start);
-    let mut output = PendingOutput::default();
+    let mut output = PendingOutput;
     let mut tasks = PendingTasks::new();
     let mut input_faults = InputFaultTracker::new(INPUT_ERROR_BUDGET);
     let mut pending_zero_resize = false;
@@ -925,14 +925,12 @@ fn track_identities(
             );
             state.active_operation_id = Some(operation_id.clone());
             state.ctrl_c.observe_busy(operation_id.clone());
-            if waiting {
-                if let Some(id) = state.ctrl_c.pending_cancel_id().map(str::to_owned) {
-                    let cancel_request = state
-                        .ctrl_c
-                        .cancel_request()
-                        .unwrap_or_else(|| state.next_cancel_request());
-                    return dispatch_cancel_operation(state, app, id, cancel_request);
-                }
+            if waiting && let Some(id) = state.ctrl_c.pending_cancel_id().map(str::to_owned) {
+                let cancel_request = state
+                    .ctrl_c
+                    .cancel_request()
+                    .unwrap_or_else(|| state.next_cancel_request());
+                return dispatch_cancel_operation(state, app, id, cancel_request);
             }
             (Vec::new(), None)
         }
@@ -1016,14 +1014,12 @@ fn track_snapshot_identities(
             | FrontendMaintenancePhase::Cancelled => None,
         });
 
-    if waiting {
-        if let Some(id) = state.ctrl_c.pending_cancel_id().map(str::to_owned) {
-            let cancel_request = state
-                .ctrl_c
-                .cancel_request()
-                .unwrap_or_else(|| state.next_cancel_request());
-            return dispatch_cancel_operation(state, app, id, cancel_request);
-        }
+    if waiting && let Some(id) = state.ctrl_c.pending_cancel_id().map(str::to_owned) {
+        let cancel_request = state
+            .ctrl_c
+            .cancel_request()
+            .unwrap_or_else(|| state.next_cancel_request());
+        return dispatch_cancel_operation(state, app, id, cancel_request);
     }
     (Vec::new(), None)
 }

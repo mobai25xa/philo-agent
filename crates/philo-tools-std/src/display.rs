@@ -75,23 +75,20 @@ pub(crate) fn edit_hunk(text: &str, old_string: &str, new_string: &str) -> (Stri
 
     let mut rows = Vec::new();
     let before = first.saturating_sub(EDIT_CONTEXT_LINES)..first;
-    for index in before {
-        rows.push(format!("  {}", lines[index].1));
-    }
-    let mut removed = 0usize;
-    for index in first..=last {
-        rows.push(format!("-{}", lines[index].1));
-        removed += 1;
-    }
+    rows.extend(before.map(|index| format!("  {}", lines[index].1)));
+    rows.extend(
+        lines[first..=last]
+            .iter()
+            .map(|(_, line)| format!("-{line}")),
+    );
+    let removed = last + 1 - first;
     let mut added = 0usize;
     for line in new_block.lines() {
         rows.push(format!("+{line}"));
         added += 1;
     }
     let after_end = (last + 1 + EDIT_CONTEXT_LINES).min(lines.len());
-    for index in last + 1..after_end {
-        rows.push(format!("  {}", lines[index].1));
-    }
+    rows.extend((last + 1..after_end).map(|index| format!("  {}", lines[index].1)));
     (rows.join("\n"), added, removed)
 }
 

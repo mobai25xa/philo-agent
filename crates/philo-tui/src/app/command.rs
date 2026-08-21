@@ -154,24 +154,13 @@ pub fn candidates(input: &str) -> Vec<&'static CommandSpec> {
         .collect()
 }
 
-/// The longest prefix shared by every name, for the first Tab press.
-pub fn common_prefix(names: &[&str]) -> String {
-    let Some((first, rest)) = names.split_first() else {
-        return String::new();
-    };
-    let mut prefix = String::new();
-    for (index, ch) in first.char_indices() {
-        let candidate_len = index + ch.len_utf8();
-        if rest
-            .iter()
-            .all(|name| name.starts_with(&first[..candidate_len]))
-        {
-            prefix.push(ch);
-        } else {
-            break;
-        }
-    }
-    prefix
+/// The table entry for a candidate name. Menu candidates always come from
+/// the table, so the lookup cannot fail.
+pub fn spec(name: &str) -> &'static CommandSpec {
+    COMMANDS
+        .iter()
+        .find(|spec| spec.name == name)
+        .expect("candidate names come from the table")
 }
 
 /// Maps a typed level onto the frontend reasoning vocabulary.
@@ -312,14 +301,6 @@ mod tests {
             "arguments are not completed"
         );
         assert!(names("plain text").is_empty());
-    }
-
-    #[test]
-    fn common_prefix_extends_as_far_as_it_can() {
-        assert_eq!(common_prefix(&["sessions", "status"]), "s");
-        assert_eq!(common_prefix(&["sessions"]), "sessions");
-        assert_eq!(common_prefix(&["help", "new"]), "");
-        assert_eq!(common_prefix(&[]), "");
     }
 
     #[test]

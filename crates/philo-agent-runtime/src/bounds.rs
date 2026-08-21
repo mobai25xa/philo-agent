@@ -72,24 +72,33 @@ mod tests {
 
     #[test]
     fn zero_reliable_staging_cap_is_rejected() {
-        let mut bounds = ChannelBounds::default();
-        bounds.reliable_staging_cap = 0;
+        let bounds = ChannelBounds {
+            reliable_staging_cap: 0,
+            ..ChannelBounds::default()
+        };
         assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
     }
 
     #[test]
     fn reliable_staging_cap_below_producer_reserve_is_rejected() {
-        let mut bounds = ChannelBounds::default();
-        bounds.reliable_staging_cap = crate::staging::PRODUCER_STAGING_RESERVE - 1;
+        let bounds = ChannelBounds {
+            reliable_staging_cap: crate::staging::PRODUCER_STAGING_RESERVE - 1,
+            ..ChannelBounds::default()
+        };
         assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
-        bounds.reliable_staging_cap = crate::staging::PRODUCER_STAGING_RESERVE;
+        let bounds = ChannelBounds {
+            reliable_staging_cap: crate::staging::PRODUCER_STAGING_RESERVE,
+            ..ChannelBounds::default()
+        };
         assert_eq!(bounds.validate(), Ok(bounds));
     }
 
     #[test]
     fn zero_queue_max_is_rejected() {
-        let mut bounds = ChannelBounds::default();
-        bounds.queue_max = 0;
+        let bounds = ChannelBounds {
+            queue_max: 0,
+            ..ChannelBounds::default()
+        };
         assert_eq!(bounds.validate(), Err(crate::StartError::InvalidBounds));
     }
 }

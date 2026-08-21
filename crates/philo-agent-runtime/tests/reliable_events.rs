@@ -261,7 +261,7 @@ async fn transient_does_not_starve_or_block_terminal() {
         ModelScript::tool_call(0, Some("call-1"), Some("echo"), &["{}"]),
         ModelScript::text(&["done"]),
     ]));
-    let chunks = std::iter::repeat("x").take(512);
+    let chunks = std::iter::repeat_n("x", 512);
     let tools = Arc::new(FakeTool::one(
         echo(),
         FakeToolResult::streaming_success(chunks, "ok"),

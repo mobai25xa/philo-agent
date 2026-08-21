@@ -28,4 +28,5 @@ pub use snapshot::{
 pub use update::{FrontendUpdate, FrontendUpdateKind};
 
 pub(crate) use client::CommandEnvelope;
+pub(crate) use client::FrontendLanes;
 pub(crate) use feed::{FrontendFeed, ReplyCredits};

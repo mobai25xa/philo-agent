@@ -1,5 +1,0 @@
----
-source: crates/philo-tui/src/app/state.rs
-expression: "app.completion_line().expect(\"menu is open\")"
----
-commands: help new sessions model reasoning compact image verbose status config quit

@@ -55,10 +55,10 @@ impl App {
         if self.has_overlay() || !self.is_selecting() {
             return vec![];
         }
-        if let Some(pos) = self.pointer_pos(x, y, true) {
-            if let Some(selection) = self.selection.as_mut() {
-                selection.head = pos;
-            }
+        if let Some(pos) = self.pointer_pos(x, y, true)
+            && let Some(selection) = self.selection.as_mut()
+        {
+            selection.head = pos;
         }
         vec![]
     }

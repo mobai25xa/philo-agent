@@ -1,0 +1,16 @@
+---
+source: crates/philo-tui/src/render/frame.rs
+expression: rendered
+---
+  ────────────────────────────────────────────────────────────────────────────
+
+
+
+
+  > /sessions  pick a session to continue
+    /status    session, model, usage and the tool lineup
+
+
+  › /s
+
+gpt-test  session-中 文

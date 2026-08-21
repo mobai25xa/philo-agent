@@ -115,17 +115,8 @@ fn classify_io_error(error: &std::io::Error) -> TerminalInputFault {
         ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof | ErrorKind::NotConnected => {
             TerminalInputFault::StreamTerminated
         }
-        ErrorKind::NotFound
-        | ErrorKind::PermissionDenied
-        | ErrorKind::InvalidInput
-        | ErrorKind::Other => {
-            let message = error.to_string().to_ascii_lowercase();
-            if message.contains("handle") || message.contains("bad file") {
-                TerminalInputFault::InvalidHandle
-            } else {
-                TerminalInputFault::InvalidHandle
-            }
-        }
+        // Handle-shaped OS errors and every other kind degrade the same
+        // way: the input source is rebuilt or the run falls back.
         _ => TerminalInputFault::InvalidHandle,
     }
 }

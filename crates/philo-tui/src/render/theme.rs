@@ -100,3 +100,11 @@ pub(crate) fn status_idle() -> Style {
 pub(crate) fn status_busy() -> Style {
     Style::default().fg(Color::Yellow)
 }
+
+pub(crate) fn menu_usage() -> Style {
+    Style::default().fg(ACCENT)
+}
+
+pub(crate) fn menu_selected() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED)
+}

@@ -1111,10 +1111,10 @@ fn coalesce_unconsumed_progress(events: &mut Vec<AgentEvent>, from: usize) {
     let mut last_index = std::collections::HashMap::<ToolCallId, usize>::new();
     let mut keep = vec![true; events.len()];
     for (index, event) in events.iter().enumerate().skip(from) {
-        if let AgentEvent::ToolExecutionProgress { tool_call_id, .. } = event {
-            if let Some(previous) = last_index.insert(tool_call_id.clone(), index) {
-                keep[previous] = false;
-            }
+        if let AgentEvent::ToolExecutionProgress { tool_call_id, .. } = event
+            && let Some(previous) = last_index.insert(tool_call_id.clone(), index)
+        {
+            keep[previous] = false;
         }
     }
     let mut kept = Vec::with_capacity(events.len());

@@ -86,6 +86,33 @@ async fn request_maps_system_history_tools_and_generation() {
     assert_eq!(body["tool_choice"], "auto");
 }
 
+/// ADR-0006 accepts an empty block list as "empty final text"; the SDK still
+/// requires non-empty assistant content, so replay maps it to the `(empty)`
+/// marker instead of failing request validation at Prepare.
+#[tokio::test]
+async fn empty_assistant_history_replays_as_placeholder_text() {
+    let transport =
+        StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
+    let adapter = adapter_over(transport.clone());
+    let stream = adapter
+        .start(snapshot(
+            vec![
+                user("hello"),
+                ModelMessage::Assistant { blocks: Vec::new() },
+                user("continue"),
+            ],
+            Vec::new(),
+        ))
+        .await
+        .expect("empty assistant history must not fail request validation");
+    collect_ok(stream).await;
+
+    let body = &transport.request_bodies()[0];
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["content"][0]["text"], "(empty)");
+    assert_eq!(body["messages"][2]["role"], "user");
+}
+
 #[tokio::test]
 async fn compatible_chat_sends_cache_identity_and_affinity_headers() {
     let transport =

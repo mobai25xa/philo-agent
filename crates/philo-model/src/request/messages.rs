@@ -12,6 +12,12 @@ const SUMMARY_INSTRUCTION_PREFIX: &str = "Summary of earlier conversation:\n";
 /// every tool-result message to carry at least one non-empty text block.
 const EMPTY_TOOL_RESULT_TEXT: &str = "(empty)";
 
+/// Model-visible placeholder replayed for an accepted empty assistant output
+/// (ADR-0006 "空列表表示空最终文本"): the SDK requires assistant content to
+/// carry at least one item, so the durable empty-blocks fact maps to the same
+/// marker as empty tool results.
+const EMPTY_ASSISTANT_TEXT: &str = "(empty)";
+
 /// Canonical, stable model-visible text replayed for a tool call that never
 /// executed because its turn was cancelled.
 const CANCELLED_TOOL_RESULT_TEXT: &str =
@@ -107,6 +113,17 @@ fn map_assistant(
             sdk::BlockId::new(position as u64),
             u32::try_from(position).map_err(|_| history_error("assistant item index"))?,
             content,
+            sdk::ReplayRequirement::None,
+            None,
+        ));
+    }
+    if items.is_empty() {
+        items.push(sdk::ResponseItem::new(
+            sdk::BlockId::new(0),
+            0,
+            sdk::AssistantContent::Text {
+                text: EMPTY_ASSISTANT_TEXT.to_owned(),
+            },
             sdk::ReplayRequirement::None,
             None,
         ));

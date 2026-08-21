@@ -84,16 +84,16 @@ impl ToolProgressBridge {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             window.push(text);
-            if window.should_flush() {
-                if let Some(tail) = window.take_tail() {
-                    drop(window);
-                    sink_shared.publish_tool_progress(AgentEvent::ToolExecutionProgress {
-                        tool_batch_id: sink_batch.clone(),
-                        tool_call_id: sink_call.clone(),
-                        index,
-                        tail,
-                    });
-                }
+            if window.should_flush()
+                && let Some(tail) = window.take_tail()
+            {
+                drop(window);
+                sink_shared.publish_tool_progress(AgentEvent::ToolExecutionProgress {
+                    tool_batch_id: sink_batch.clone(),
+                    tool_call_id: sink_call.clone(),
+                    index,
+                    tail,
+                });
             }
         });
         (

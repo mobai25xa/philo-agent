@@ -134,21 +134,31 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRende
 
     let hint_width = usize::from(inset_h(Rect::new(area.x, area.y, area.width, 1)).width);
     let hint = app
-        .completion_line()
-        .or_else(|| {
-            if app.attachments().is_empty() {
-                None
-            } else {
-                app.attachments().summary()
-            }
-        })
+        .attachments()
+        .summary()
         .map(|line| text::truncate(&line, hint_width));
     let hint_height = u16::from(hint.is_some());
-    let remaining = area.height.saturating_sub(hint_height);
+
+    let menu_capacity =
+        usize::from(area.height.saturating_sub(hint_height)).min(COMMAND_MENU_MAX_ROWS);
+    let menu = app.command_menu_frame(hint_width, menu_capacity);
+    let menu_height =
+        u16::try_from(menu.as_ref().map_or(0, |frame| frame.rows.len())).unwrap_or(u16::MAX);
+
+    let remaining = area
+        .height
+        .saturating_sub(hint_height)
+        .saturating_sub(menu_height);
     let remaining_area = Rect::new(area.x, area.y, area.width, remaining);
-    let hint_area = inset_h(Rect::new(
+    let menu_area = inset_h(Rect::new(
         area.x,
         remaining_area.bottom(),
+        area.width,
+        menu_height,
+    ));
+    let hint_area = inset_h(Rect::new(
+        area.x,
+        menu_area.bottom(),
         area.width,
         hint_height,
     ));
@@ -158,8 +168,38 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRende
     } else {
         app.note_history_layout(width, 0);
     }
+    draw_command_menu(frame, menu, menu_area);
     if let Some(hint) = hint {
         frame.render_widget(Paragraph::new(Line::styled(hint, theme::meta())), hint_area);
+    }
+}
+
+/// Upper bound on visible command-menu rows; the list scrolls inside it.
+const COMMAND_MENU_MAX_ROWS: usize = 10;
+
+fn draw_command_menu(
+    frame: &mut ratatui::Frame<'_>,
+    menu: Option<crate::app::state::CommandMenuFrame>,
+    area: Rect,
+) {
+    let Some(menu) = menu else {
+        return;
+    };
+    if area.is_empty() {
+        return;
+    }
+    for (index, row) in menu.rows.iter().enumerate() {
+        let row_area = Rect::new(area.x, area.y + index as u16, area.width, 1);
+        let (usage_style, summary_style) = if index == menu.selected {
+            (theme::menu_selected(), theme::menu_selected())
+        } else {
+            (theme::menu_usage(), theme::meta())
+        };
+        let line = Line::from(vec![
+            Span::styled(row.usage.to_owned(), usage_style),
+            Span::styled(row.summary.to_owned(), summary_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_area);
     }
 }
 
@@ -222,16 +262,16 @@ fn draw_remaining_band(
             frame.render_widget(Paragraph::new(lines), chrome_area);
         }
     }
-    if let Some(tool) = tool {
-        if !tool_area.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    text::truncate(&tool, width),
-                    theme::activity_tool(),
-                )),
-                tool_area,
-            );
-        }
+    if let Some(tool) = tool
+        && !tool_area.is_empty()
+    {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                text::truncate(&tool, width),
+                theme::activity_tool(),
+            )),
+            tool_area,
+        );
     }
 }
 
@@ -437,6 +477,20 @@ mod tests {
         let mut approval = app();
         approval.sync_confirmation(Some((1, "write file".to_owned(), "src/main.rs".to_owned())));
         assert_eq!(composer_row(&approval), expected);
+    }
+
+    #[test]
+    fn the_command_menu_paints_above_the_composer() {
+        let mut app = app();
+        for ch in "/s".chars() {
+            app.on_action(Action::InsertChar(ch));
+        }
+        let rendered = render(&app, 80, VIEWPORT_HEIGHT);
+        assert!(
+            shows(&rendered, "> /sessions  pick a session to continue"),
+            "the highlighted row leads the menu: {rendered}"
+        );
+        crate::tests::assert_tui_snapshot!("m18_command_menu", rendered);
     }
 
     #[test]

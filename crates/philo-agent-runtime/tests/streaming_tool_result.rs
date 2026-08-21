@@ -117,7 +117,7 @@ async fn flood_keeps_at_most_one_unconsumed_progress_per_call() {
         ModelScript::text(&["done"]),
     ]));
     let sessions = Arc::new(MemorySessionStore::new());
-    let chunks = std::iter::repeat("x").take(20_000);
+    let chunks = std::iter::repeat_n("x", 20_000);
     let tools = Arc::new(FakeTool::one(
         echo(),
         FakeToolResult::streaming_success(chunks, "ok"),

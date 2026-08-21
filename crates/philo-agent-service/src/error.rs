@@ -96,6 +96,10 @@ impl fmt::Display for CommandReject {
 }
 
 /// Result of [`crate::FrontendClient::recv_until`].
+// The update variant is the hot path and is always moved out by value;
+// boxing it would allocate per received update just to shrink the
+// timeout/disconnected payloads.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecvOutcome {
     /// One frontend update.

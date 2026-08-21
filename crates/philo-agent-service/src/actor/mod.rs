@@ -943,10 +943,10 @@ where
                     });
                 }
             }
-            AgentEvent::ToolExecutionCompleted { tool_call_id, .. } => {
-                if self.live_accepts_agent_events() {
-                    self.live.complete_tool(tool_call_id.as_str());
-                }
+            AgentEvent::ToolExecutionCompleted { tool_call_id, .. }
+                if self.live_accepts_agent_events() =>
+            {
+                self.live.complete_tool(tool_call_id.as_str());
             }
             _ => {}
         }

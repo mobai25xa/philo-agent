@@ -16,6 +16,15 @@ pub(crate) struct CommandEnvelope {
     pub command: FrontendCommand,
 }
 
+/// The three command lanes plus the weak critical sender, grouped so the
+/// client constructor stays within a readable argument count.
+pub(crate) struct FrontendLanes {
+    pub(crate) command: mpsc::Sender<CommandEnvelope>,
+    pub(crate) control: mpsc::Sender<CommandEnvelope>,
+    pub(crate) snapshot: mpsc::Sender<CommandEnvelope>,
+    pub(crate) critical: mpsc::WeakSender<FrontendUpdate>,
+}
+
 /// TUI-facing handle. Clone shares the same lanes and the same update receiver.
 #[derive(Clone)]
 pub struct FrontendClient {
@@ -30,20 +39,17 @@ pub struct FrontendClient {
 
 impl FrontendClient {
     pub(crate) fn new(
-        command_tx: mpsc::Sender<CommandEnvelope>,
-        control_tx: mpsc::Sender<CommandEnvelope>,
-        snapshot_tx: mpsc::Sender<CommandEnvelope>,
-        critical_tx: mpsc::WeakSender<FrontendUpdate>,
+        lanes: FrontendLanes,
         update_rx: mpsc::Receiver<FrontendUpdate>,
         critical_rx: mpsc::Receiver<FrontendUpdate>,
         credits: ReplyCredits,
         ids: Arc<RequestIdSource>,
     ) -> Self {
         Self {
-            command_tx,
-            control_tx,
-            snapshot_tx,
-            critical_tx,
+            command_tx: lanes.command,
+            control_tx: lanes.control,
+            snapshot_tx: lanes.snapshot,
+            critical_tx: lanes.critical,
             credits,
             update_rx: Arc::new(Mutex::new(FrontendUpdateReceiver::new(
                 update_rx,
@@ -304,10 +310,12 @@ mod tests {
         let (_update_tx, update_rx) = mpsc::channel(1);
         let (critical_tx, critical_rx) = mpsc::channel(FRONTEND_COMMAND_CAP + 4);
         let client = FrontendClient::new(
-            command_tx,
-            control_tx,
-            snapshot_tx,
-            critical_tx.downgrade(),
+            FrontendLanes {
+                command: command_tx,
+                control: control_tx,
+                snapshot: snapshot_tx,
+                critical: critical_tx.downgrade(),
+            },
             update_rx,
             critical_rx,
             ReplyCredits::new(),
@@ -334,10 +342,12 @@ mod tests {
         let (_update_tx, update_rx) = mpsc::channel(1);
         let (critical_tx, critical_rx) = mpsc::channel(1);
         let client = FrontendClient::new(
-            command_tx,
-            control_tx,
-            snapshot_tx,
-            critical_tx.downgrade(),
+            FrontendLanes {
+                command: command_tx,
+                control: control_tx,
+                snapshot: snapshot_tx,
+                critical: critical_tx.downgrade(),
+            },
             update_rx,
             critical_rx,
             ReplyCredits::new(),
@@ -361,10 +371,12 @@ mod tests {
         let (_update_tx, update_rx) = mpsc::channel(1);
         let (critical_tx, critical_rx) = mpsc::channel(1);
         let client = FrontendClient::new(
-            command_tx,
-            control_tx,
-            snapshot_tx,
-            critical_tx.downgrade(),
+            FrontendLanes {
+                command: command_tx,
+                control: control_tx,
+                snapshot: snapshot_tx,
+                critical: critical_tx.downgrade(),
+            },
             update_rx,
             critical_rx,
             ReplyCredits::new(),
@@ -387,10 +399,12 @@ mod tests {
         let (update_tx, update_rx) = mpsc::channel(1);
         let (critical_tx, critical_rx) = mpsc::channel(1);
         let client = FrontendClient::new(
-            command_tx,
-            control_tx,
-            snapshot_tx,
-            critical_tx.downgrade(),
+            FrontendLanes {
+                command: command_tx,
+                control: control_tx,
+                snapshot: snapshot_tx,
+                critical: critical_tx.downgrade(),
+            },
             update_rx,
             critical_rx,
             ReplyCredits::new(),

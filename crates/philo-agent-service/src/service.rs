@@ -19,7 +19,7 @@ use crate::frontend::lease::{
 };
 use crate::frontend::supervisor::{SupervisorEnvelope, SupervisorReply, exchange_supervisor};
 use crate::frontend::update::FrontendUpdate;
-use crate::frontend::{CommandEnvelope, FrontendClient, FrontendFeed, ReplyCredits};
+use crate::frontend::{CommandEnvelope, FrontendClient, FrontendFeed, FrontendLanes, ReplyCredits};
 use crate::generation::GenerationAssembler;
 use crate::ids::{FrontendInstanceId, FrontendRequestId, RequestIdSource};
 use crate::runtime_api::{RuntimeEvents, RuntimePort};
@@ -208,10 +208,12 @@ where
     let (confirmations, confirm_rx) = gate_pair();
 
     let client = FrontendClient::new(
-        command_tx.clone(),
-        control_tx.clone(),
-        snapshot_tx,
-        critical_weak.clone(),
+        FrontendLanes {
+            command: command_tx.clone(),
+            control: control_tx.clone(),
+            snapshot: snapshot_tx,
+            critical: critical_weak.clone(),
+        },
         update_rx,
         critical_rx,
         credits.clone(),

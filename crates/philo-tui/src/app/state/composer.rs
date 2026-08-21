@@ -72,12 +72,12 @@ impl App {
             return vec![];
         }
         self.exit_armed = false;
-        self.completion = None;
         self.clear_selection();
         self.history.reset_browse();
         self.bump_draft_generation();
         self.input.insert_str(text);
         self.disarm_quit_unless_typing_quit();
+        self.sync_completion();
         vec![]
     }
 
@@ -120,6 +120,7 @@ impl App {
         self.bump_draft_generation();
         self.input.set_text(text);
         self.attachments.extend(attachments);
+        self.sync_completion();
     }
 
     pub(super) fn insert_char(&mut self, ch: char) -> Vec<Effect> {
@@ -128,6 +129,7 @@ impl App {
         self.history.reset_browse();
         self.input.insert_char(ch);
         self.disarm_quit_unless_typing_quit();
+        self.sync_completion();
         vec![]
     }
 
@@ -137,6 +139,7 @@ impl App {
         self.history.reset_browse();
         self.input.insert_newline();
         self.disarm_quit_unless_typing_quit();
+        self.sync_completion();
         vec![]
     }
 
@@ -145,6 +148,7 @@ impl App {
         self.bump_draft_generation();
         self.input.backspace();
         self.disarm_quit_unless_typing_quit();
+        self.sync_completion();
         vec![]
     }
 
@@ -153,6 +157,7 @@ impl App {
         self.bump_draft_generation();
         self.input.delete();
         self.disarm_quit_unless_typing_quit();
+        self.sync_completion();
         vec![]
     }
 
@@ -410,6 +415,7 @@ impl App {
         if let Some(text) = self.history.prev(&self.input.text()) {
             self.bump_draft_generation();
             self.input.set_text(&text);
+            self.sync_completion();
         }
     }
 
@@ -417,6 +423,7 @@ impl App {
         if let Some(text) = self.history.next() {
             self.bump_draft_generation();
             self.input.set_text(&text);
+            self.sync_completion();
         }
     }
 }

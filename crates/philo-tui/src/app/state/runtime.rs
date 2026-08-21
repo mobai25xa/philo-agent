@@ -521,6 +521,7 @@ impl App {
             self.input.clear();
             self.history.reset_browse();
             self.exit_armed = false;
+            self.sync_completion();
             return vec![];
         }
         if self.manual_compacting {

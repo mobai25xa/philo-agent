@@ -25,7 +25,8 @@ use super::status::StatusData;
 use super::submit::SubmitState;
 use super::transcript::{InfoLevel, LineKind, Transcript, TranscriptLine};
 
-use commands::CompletionMenu;
+use commands::CommandMenu;
+pub(crate) use commands::CommandMenuFrame;
 
 pub(crate) use overlays::SessionLoadIntent;
 
@@ -45,8 +46,8 @@ pub(crate) struct App {
     picker: Option<SessionPicker>,
     /// The approval prompt, while a confirmation request is pending.
     confirm: Option<ConfirmPrompt>,
-    /// The command-completion menu, while Tab is cycling.
-    completion: Option<CompletionMenu>,
+    /// The auto command menu, while the draft is a bare `/word`.
+    completion: Option<CommandMenu>,
     /// Images waiting for the next message (`/image`, `Ctrl+V`).
     attachments: Attachments,
     /// Changes whenever draft contents are consumed or edited. Background
@@ -238,9 +239,15 @@ impl App {
         self.confirm.is_none() && self.picker.is_none()
     }
 
-    /// The completion menu row, while it is open.
-    pub fn completion_line(&self) -> Option<String> {
-        self.completion.as_ref().map(CompletionMenu::line)
+    /// The menu frame to paint above the composer, while it is open.
+    pub(crate) fn command_menu_frame(
+        &self,
+        width: usize,
+        max_rows: usize,
+    ) -> Option<CommandMenuFrame> {
+        self.completion
+            .as_ref()
+            .map(|menu| menu.frame(width, max_rows))
     }
 
     /// Handles one interpreted key action.
@@ -250,23 +257,34 @@ impl App {
     }
 
     fn dispatch_action(&mut self, action: Action) -> Vec<Effect> {
+        // Key-release events under the kitty protocol surface as `None`;
+        // they are fully inert: no exit disarm, no menu churn.
+        if matches!(action, Action::None) {
+            return vec![];
+        }
         if self.confirm.is_some() {
             return self.on_confirm_action(action);
         }
         if self.picker.is_some() {
             return self.on_picker_action(action);
         }
-        if self.completion.is_some() && matches!(action, Action::Escape) {
-            self.completion = None;
-            return vec![];
+        if self.completion.is_some() {
+            match action {
+                Action::Escape => {
+                    self.completion = None;
+                    return vec![];
+                }
+                Action::MoveUp => return self.move_completion(true),
+                Action::MoveDown => return self.move_completion(false),
+                Action::Submit => return self.execute_completion(),
+                Action::Complete => return self.accept_completion(),
+                _ => {}
+            }
         }
         // Any interaction other than the quit chord disarms the two-step
         // exit; anything but another `/quit` disarms the running-turn exit.
         if !matches!(action, Action::CtrlC) {
             self.exit_armed = false;
-        }
-        if !matches!(action, Action::Complete) {
-            self.completion = None;
         }
         match action {
             Action::InsertChar(ch) => self.insert_char(ch),

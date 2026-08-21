@@ -230,10 +230,10 @@ impl ActivityState {
                 if matches!(self.current, Some(ActivityKind::Cancelling(_))) {
                     return;
                 }
-                if let Some(ActivityKind::Tool { running, .. }) = &mut self.current {
-                    if let Some(tool) = running.iter_mut().find(|tool| tool.index == *index) {
-                        tool.tail = sanitize_live_tail(tail);
-                    }
+                if let Some(ActivityKind::Tool { running, .. }) = &mut self.current
+                    && let Some(tool) = running.iter_mut().find(|tool| tool.index == *index)
+                {
+                    tool.tail = sanitize_live_tail(tail);
                 }
             }
             FrontendOperationEvent::ToolExecutionCompleted { index, .. } => {

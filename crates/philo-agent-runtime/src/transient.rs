@@ -84,10 +84,9 @@ impl TransientDriverState {
             } => {
                 if slots.tool_progress.len() >= TOOL_PROGRESS_SLOTS_MAX
                     && !slots.tool_progress.contains_key(tool_call_id)
+                    && let Some(oldest) = slots.tool_progress.keys().next().cloned()
                 {
-                    if let Some(oldest) = slots.tool_progress.keys().next().cloned() {
-                        slots.tool_progress.remove(&oldest);
-                    }
+                    slots.tool_progress.remove(&oldest);
                 }
                 slots.tool_progress.insert(tool_call_id.clone(), event);
             }
@@ -395,10 +394,10 @@ impl TransientCoalescer {
             *held = merge_events(held.clone(), event.clone()).unwrap_or(event);
             return;
         }
-        if self.slots.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.slots.remove(&oldest);
-            }
+        if self.slots.len() >= self.cap
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.slots.remove(&oldest);
         }
         self.slots.insert(key.clone(), event);
         self.order.push_back(key);

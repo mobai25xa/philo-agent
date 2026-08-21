@@ -4,17 +4,9 @@ use crate::{GenerationId, ModelPort, RuntimeConfig, ToolPort};
 use std::sync::Arc;
 
 /// Display metadata for a generation. Must not contain secrets.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GenerationDisplay {
     pub model_name: String,
-}
-
-impl Default for GenerationDisplay {
-    fn default() -> Self {
-        Self {
-            model_name: String::new(),
-        }
-    }
 }
 
 /// Immutable model/tools/config snapshot used at admission and throughout

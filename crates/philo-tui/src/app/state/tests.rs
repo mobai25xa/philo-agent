@@ -679,43 +679,98 @@ fn anything_between_two_quits_disarms_the_running_turn_exit() {
     assert!(!effects.contains(&Effect::Quit), "it asks again");
 }
 
-#[test]
-fn tab_completes_a_unique_command_and_cycles_ambiguous_ones() {
-    let mut app = app();
-    type_text(&mut app, "/se");
-    app.on_action(Action::Complete);
-    assert_eq!(app.input.text(), "/sessions ");
-    assert!(app.completion_line().is_none());
-
-    app.input.clear();
-    type_text(&mut app, "/s");
-    app.on_action(Action::Complete);
-    assert_eq!(app.input.text(), "/s", "the shared prefix is already typed");
-    assert_eq!(
-        app.completion_line(),
-        Some("commands: sessions status".to_owned())
-    );
-    app.on_action(Action::Complete);
-    assert_eq!(app.input.text(), "/sessions");
-    assert_eq!(
-        app.completion_line(),
-        Some("commands: [sessions] status".to_owned())
-    );
-    app.on_action(Action::Complete);
-    assert_eq!(app.input.text(), "/status");
-    app.on_action(Action::Complete);
-    assert_eq!(app.input.text(), "/sessions", "the cycle wraps");
+/// The open menu's rows as plain `{usage}{summary}` text.
+fn menu_rows(app: &App) -> Vec<String> {
+    app.command_menu_frame(80, 10)
+        .expect("menu is open")
+        .rows
+        .iter()
+        .map(|row| format!("{}{}", row.usage, row.summary))
+        .collect()
 }
 
 #[test]
-fn tab_on_an_empty_slash_opens_the_whole_table() {
+fn typing_a_slash_opens_the_menu_and_typing_filters_it() {
     let mut app = app();
     type_text(&mut app, "/");
-    app.on_action(Action::Complete);
-    crate::tests::assert_tui_snapshot!(
-        "command_completion",
-        app.completion_line().expect("menu is open")
+    let frame = app
+        .command_menu_frame(80, command::COMMANDS.len())
+        .expect("menu is open");
+    assert_eq!(frame.rows.len(), command::COMMANDS.len());
+    assert_eq!(frame.selected, 0);
+    // The renderer's own cap keeps the list bounded.
+    assert_eq!(
+        app.command_menu_frame(80, 10)
+            .expect("menu is open")
+            .rows
+            .len(),
+        10
     );
+
+    type_text(&mut app, "s");
+    let frame = app.command_menu_frame(80, 10).expect("menu is open");
+    assert_eq!(frame.rows.len(), 2);
+    assert!(frame.rows[0].usage.starts_with("> /sessions"));
+    assert_eq!(frame.rows[0].summary, "pick a session to continue");
+    assert!(frame.rows[1].usage.starts_with("  /status"));
+
+    type_text(&mut app, "e");
+    let frame = app.command_menu_frame(80, 10).expect("menu is open");
+    assert_eq!(frame.rows.len(), 1);
+    assert_eq!(frame.selected, 0);
+}
+
+#[test]
+fn enter_executes_the_highlighted_command() {
+    let mut app = app();
+    type_text(&mut app, "/se");
+    let effects = app.on_action(Action::Submit);
+    assert_eq!(host_requests(&effects), vec![HostRequest::OpenSessions]);
+    assert_eq!(texts(&appended(&effects))[0], "/sessions");
+    assert!(app.input.is_empty());
+    assert!(app.command_menu_frame(80, 10).is_none());
+}
+
+#[test]
+fn tab_accepts_the_highlighted_command() {
+    let mut app = app();
+    type_text(&mut app, "/s");
+    app.on_action(Action::MoveDown);
+    app.on_action(Action::Complete);
+    assert_eq!(app.input.text(), "/status ");
+    assert!(app.command_menu_frame(80, 10).is_none());
+
+    // With the menu closed, Tab reopens it without changing the draft.
+    app.on_action(Action::Backspace);
+    app.on_action(Action::Escape);
+    assert!(app.command_menu_frame(80, 10).is_none());
+    app.on_action(Action::Complete);
+    assert_eq!(app.input.text(), "/status");
+    assert!(app.command_menu_frame(80, 10).is_some());
+}
+
+#[test]
+fn menu_navigation_moves_the_highlight_only() {
+    let mut app = app();
+    run(&mut app, "older draft");
+    accept_pending(&mut app);
+    type_text(&mut app, "/s");
+    let before = app.input.text();
+
+    app.on_action(Action::MoveDown);
+    assert_eq!(
+        app.command_menu_frame(80, 10).expect("menu").selected,
+        1,
+        "down moves the highlight"
+    );
+    app.on_action(Action::MoveUp);
+    app.on_action(Action::MoveUp);
+    assert_eq!(
+        app.command_menu_frame(80, 10).expect("menu").selected,
+        0,
+        "the first row does not move"
+    );
+    assert_eq!(app.input.text(), before, "the draft is untouched");
 }
 
 #[test]
@@ -723,28 +778,91 @@ fn escape_closes_the_completion_menu_without_cancelling() {
     let mut app = app();
     app.set_busy(true, 0);
     type_text(&mut app, "/s");
-    app.on_action(Action::Complete);
     assert!(app.on_action(Action::Escape).is_empty(), "no cancel");
-    assert!(app.completion_line().is_none());
+    assert!(app.command_menu_frame(80, 10).is_none());
     assert_eq!(app.on_action(Action::Escape), vec![Effect::CancelActive]);
 }
 
 #[test]
-fn typing_closes_the_completion_menu() {
+fn edits_reopen_and_close_the_menu() {
+    let mut plain = app();
     let mut app = app();
     type_text(&mut app, "/s");
-    app.on_action(Action::Complete);
-    app.on_action(Action::InsertChar('t'));
-    assert!(app.completion_line().is_none());
+    assert_eq!(menu_rows(&app).len(), 2);
+
+    // A word that matches nothing closes the menu; backspacing reopens it.
+    type_text(&mut app, "z");
+    assert!(app.command_menu_frame(80, 10).is_none());
+    app.on_action(Action::Backspace);
+    assert_eq!(menu_rows(&app).len(), 2);
+
+    // An argument ends the command word and closes the menu.
+    type_text(&mut app, " 0.5");
+    assert!(app.command_menu_frame(80, 10).is_none());
+
+    // Plain text never opens a menu.
+    type_text(&mut plain, "plain text");
+    assert!(plain.command_menu_frame(80, 10).is_none());
+    plain.on_action(Action::Complete);
+    assert!(plain.command_menu_frame(80, 10).is_none());
 }
 
 #[test]
-fn tab_without_a_slash_does_nothing() {
+fn noop_key_release_events_keep_the_menu_open() {
     let mut app = app();
-    type_text(&mut app, "plain");
-    app.on_action(Action::Complete);
-    assert_eq!(app.input.text(), "plain");
-    assert!(app.completion_line().is_none());
+    type_text(&mut app, "/s");
+    assert_eq!(menu_rows(&app).len(), 2);
+    // Kitty-protocol key releases surface as Action::None; they must be
+    // inert instead of closing the menu between press and release.
+    app.on_action(Action::None);
+    assert_eq!(menu_rows(&app).len(), 2);
+}
+
+#[test]
+fn non_editing_interactions_keep_the_menu_open() {
+    let mut app = app();
+    type_text(&mut app, "/s");
+    for action in [
+        Action::PageTranscriptUp,
+        Action::PageTranscriptDown,
+        Action::ScrollTranscript(3),
+        Action::ToggleLevel,
+        Action::Redraw,
+        Action::MoveLeft,
+        Action::MoveRight,
+    ] {
+        app.on_action(action.clone());
+        assert_eq!(
+            menu_rows(&app).len(),
+            2,
+            "{action:?} must not close the menu"
+        );
+    }
+}
+
+#[test]
+fn ctrl_c_clearing_the_draft_closes_the_menu() {
+    let mut app = app();
+    type_text(&mut app, "/s");
+    assert!(app.command_menu_frame(80, 10).is_some());
+    app.on_action(Action::CtrlC);
+    assert!(app.input.is_empty());
+    assert!(app.command_menu_frame(80, 10).is_none());
+}
+
+#[test]
+fn an_empty_slash_opens_the_whole_table() {
+    let mut app = app();
+    type_text(&mut app, "/");
+    let frame = app
+        .command_menu_frame(80, command::COMMANDS.len())
+        .expect("menu is open");
+    let rows = frame
+        .rows
+        .iter()
+        .map(|row| format!("{}{}", row.usage, row.summary))
+        .collect::<Vec<_>>();
+    crate::tests::assert_tui_snapshot!("command_menu", rows.join("\n"));
 }
 
 #[test]

@@ -203,21 +203,17 @@ pub(crate) async fn abort_and_join<T: Send + 'static>(
 
 pub(crate) async fn join_epoch_children(children: EpochChildren) -> Vec<String> {
     let mut forced = Vec::new();
-    if let Some(join) = children.driver {
-        match abort_and_join(join, EPOCH_CHILD_JOIN_DEADLINE).await {
-            ChildJoinOutcome::DeadlineExceeded => {
-                forced.push("operation driver exceeded epoch join deadline".to_owned());
-            }
-            _ => {}
-        }
+    if let Some(join) = children.driver
+        && let ChildJoinOutcome::DeadlineExceeded =
+            abort_and_join(join, EPOCH_CHILD_JOIN_DEADLINE).await
+    {
+        forced.push("operation driver exceeded epoch join deadline".to_owned());
     }
-    if let Some(join) = children.maintenance {
-        match abort_and_join(join, EPOCH_CHILD_JOIN_DEADLINE).await {
-            ChildJoinOutcome::DeadlineExceeded => {
-                forced.push("maintenance driver exceeded epoch join deadline".to_owned());
-            }
-            _ => {}
-        }
+    if let Some(join) = children.maintenance
+        && let ChildJoinOutcome::DeadlineExceeded =
+            abort_and_join(join, EPOCH_CHILD_JOIN_DEADLINE).await
+    {
+        forced.push("maintenance driver exceeded epoch join deadline".to_owned());
     }
     forced
 }

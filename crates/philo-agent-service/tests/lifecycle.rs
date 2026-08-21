@@ -147,7 +147,7 @@ fn maintenance_phases(updates: &[FrontendUpdate]) -> Vec<FrontendMaintenancePhas
     updates
         .iter()
         .filter_map(|update| match &update.kind {
-            FrontendUpdateKind::MaintenanceChanged(maintenance) => Some(maintenance.phase.clone()),
+            FrontendUpdateKind::MaintenanceChanged(maintenance) => Some(maintenance.phase),
             _ => None,
         })
         .collect()
@@ -507,7 +507,7 @@ async fn real_submit_counts_accepted_and_settled_once() {
         load_session(&client, "sess-1").await;
         let request_id = submit(&client, "hello");
         let updates = collect_until(&client, |updates| {
-            submit_accepted_count(updates) >= 1 && settled(updates).len() >= 1
+            submit_accepted_count(updates) >= 1 && !settled(updates).is_empty()
         })
         .await;
         assert_eq!(submit_accepted_count(&updates), 1);

@@ -147,13 +147,13 @@ fn reads_nested_and_absolute_paths_inside_the_root() {
 }
 
 #[test]
-fn empty_file_reads_as_empty_success() {
+fn empty_file_reads_with_an_explicit_marker() {
     let root = TempRoot::new();
     root.file("empty.txt", &[]);
     let registry = registry(ReadTool::new(&root.path));
     assert_eq!(
         content_of(&invoke(&registry, r#"{"path":"empty.txt"}"#)),
-        ""
+        "(empty file)"
     );
 }
 
@@ -247,8 +247,8 @@ fn byte_limit_truncates_at_a_row_boundary_with_a_marker() {
     let content = content_of(&result);
     assert!(content.starts_with("    1|0123456789\n    2|0123456789\n"));
     assert!(
-        content.contains("[read truncated: showing first 2 of 10 lines"),
-        "marker states the truncation explicitly: {content}"
+        content.contains("[read truncated: showing lines 1-2 of 10; use offset=3 to continue]"),
+        "marker states the window and the next offset: {content}"
     );
     let display = result.display().expect("display present");
     assert!(
@@ -267,7 +267,59 @@ fn line_limit_truncates_with_a_marker() {
     let result = invoke(&registry, r#"{"path":"lines.txt"}"#);
     let content = content_of(&result);
     assert!(content.starts_with("    1|a\n    2|b\n"));
-    assert!(content.contains("showing first 2 of 4 lines"));
+    assert!(
+        content
+            .contains("[read stopped by limit at line 2; 2 more lines; use offset=3 to continue]"),
+        "{content}"
+    );
+}
+
+#[test]
+fn offset_and_limit_page_through_large_files() {
+    let root = TempRoot::new();
+    root.file("paged.txt", b"one\ntwo\nthree\nfour\nfive\n");
+    let registry = registry(ReadTool::new(&root.path));
+    let result = invoke(&registry, r#"{"path":"paged.txt","offset":3,"limit":2}"#);
+    let content = content_of(&result);
+    assert!(
+        content.starts_with("    3|three\n    4|four\n"),
+        "rows keep their real line numbers: {content}"
+    );
+    assert!(
+        content
+            .contains("[read stopped by limit at line 4; 1 more lines; use offset=5 to continue]"),
+        "{content}"
+    );
+    let display = result.display().expect("display present");
+    assert_eq!(fact(display, "start_line"), "3");
+    assert_eq!(fact(display, "end_line"), "4");
+    assert_eq!(fact(display, "lines_shown"), "2");
+}
+
+#[test]
+fn offset_beyond_eof_is_a_business_error() {
+    let root = TempRoot::new();
+    root.file("short.txt", b"only\n");
+    let registry = registry(ReadTool::new(&root.path));
+    let result = invoke(&registry, r#"{"path":"short.txt","offset":9}"#);
+    assert_eq!(error_code_of(&result), error_code::INVALID_ARGUMENTS);
+    let ToolResult::Error { message, .. } = result.result() else {
+        panic!("expected error");
+    };
+    assert!(message.contains("beyond end of file"), "{message}");
+}
+
+#[test]
+fn first_line_exceeding_the_byte_budget_names_the_line() {
+    let root = TempRoot::new();
+    root.file("huge-line.txt", "Z".repeat(200).as_bytes());
+    let registry = registry(ReadTool::new(&root.path).with_max_bytes(32));
+    let result = invoke(&registry, r#"{"path":"huge-line.txt"}"#);
+    let content = content_of(&result);
+    assert!(
+        content.contains("[read truncated: line 1 alone exceeds the 32-byte output budget"),
+        "{content}"
+    );
 }
 
 #[test]

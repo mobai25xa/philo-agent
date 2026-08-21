@@ -6,6 +6,7 @@ pub(crate) enum FieldError {
     Missing,
     NotAString,
     NotANumber,
+    NotABool,
     BadEscape,
 }
 
@@ -31,6 +32,18 @@ pub(crate) fn optional_u64(json: &str, key: &str) -> Result<Option<u64>, FieldEr
     raw.parse::<u64>()
         .map(Some)
         .map_err(|_| FieldError::NotANumber)
+}
+
+/// Extracts an optional top-level boolean field (`true` / `false`).
+pub(crate) fn optional_bool(json: &str, key: &str) -> Result<Option<bool>, FieldError> {
+    let Some(raw) = raw_value(json, key) else {
+        return Ok(None);
+    };
+    match raw.as_str() {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        _ => Err(FieldError::NotABool),
+    }
 }
 
 fn extract_string(json: &str, key: &str) -> Result<String, FieldError> {

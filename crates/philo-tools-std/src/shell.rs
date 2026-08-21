@@ -218,8 +218,11 @@ impl ShellTool {
             truncate_output(&merged, self.max_output_bytes, self.max_output_lines);
         let mut model_text = format!("exit_code: {exit_code}\n{truncated_text}");
         if truncated {
+            let total_lines = merged.lines().count();
+            let shown_lines = truncated_text.lines().count();
             model_text.push_str(&format!(
-                "\n[shell output truncated: {} bytes total]",
+                "\n[shell output truncated: showing last {shown_lines} of \
+                 {total_lines} lines, {} bytes total]",
                 merged.len()
             ));
         }
@@ -436,25 +439,37 @@ fn cap_display(text: &str, max_bytes: usize) -> (String, bool) {
     (text[start..].to_owned(), true)
 }
 
-/// Dual byte/line truncation at a character boundary.
+/// Dual byte/line truncation keeping the TAIL of the output: errors, panic
+/// traces, and build summaries live at the end (pi `truncateTail` precedent).
+/// A single line larger than the byte budget keeps its tail, cut at a
+/// character boundary.
 fn truncate_output(text: &str, max_bytes: usize, max_lines: usize) -> (String, bool) {
-    let mut kept = String::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
     let mut truncated = false;
-    for (index, line) in text.lines().enumerate() {
-        let row_len = line.len() + 1;
-        if index >= max_lines || kept.len() + row_len > max_bytes {
+    for line in lines.iter().rev() {
+        if kept.len() >= max_lines {
             truncated = true;
             break;
         }
-        if index > 0 {
-            kept.push('\n');
+        let row_len = line.len() + 1;
+        if used + row_len > max_bytes {
+            truncated = true;
+            if kept.is_empty() {
+                let mut start = line.len().saturating_sub(max_bytes);
+                while start < line.len() && !line.is_char_boundary(start) {
+                    start += 1;
+                }
+                kept.push(&line[start..]);
+            }
+            break;
         }
-        kept.push_str(line);
+        used += row_len;
+        kept.push(line);
     }
-    if !truncated && kept.len() < text.len() && text.len() > max_bytes {
-        truncated = true;
-    }
-    (kept, truncated)
+    kept.reverse();
+    (kept.join("\n"), truncated)
 }
 
 impl ToolHandler for ShellTool {

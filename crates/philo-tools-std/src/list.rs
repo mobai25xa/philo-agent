@@ -1,5 +1,5 @@
 //! Root-constrained single-level directory listing with optional glob
-//! filtering and an entry-count truncation limit.
+//! filtering and dual entry-count/byte truncation limits.
 
 use std::path::PathBuf;
 
@@ -8,7 +8,7 @@ use philo_tools::{
     ToolHandlerEndFuture, ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd, ToolResult,
 };
 
-use crate::args::{optional_string, required_string};
+use crate::args::{optional_string, optional_u64};
 use crate::display::card;
 use crate::error_code;
 use crate::helpers::{field_error, io_error, path_error, stopped_if_requested};
@@ -20,20 +20,25 @@ pub const LIST_TOOL_NAME: &str = "list";
 /// Default upper bound of returned directory entries.
 pub const DEFAULT_MAX_LIST_ENTRIES: usize = 500;
 
+/// Default upper bound of returned listing bytes.
+pub const DEFAULT_MAX_LIST_BYTES: usize = 64 * 1024;
+
 /// Single-level directory listing constrained to a root directory. Entries
-/// are typed (`dir` / `file`), sorted directories-first then by name, and
-/// optionally filtered by a glob over the entry name.
+/// are typed (`dir` / `file`), sorted directories-first then by name
+/// (case-insensitive), and optionally filtered by a glob over the entry name.
 pub struct ListTool {
     root: PathBuf,
     max_entries: usize,
+    max_bytes: usize,
 }
 
 impl ListTool {
-    /// Creates a list tool rooted at `root` with the default entry limit.
+    /// Creates a list tool rooted at `root` with the default limits.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             max_entries: DEFAULT_MAX_LIST_ENTRIES,
+            max_bytes: DEFAULT_MAX_LIST_BYTES,
         }
     }
 
@@ -43,14 +48,22 @@ impl ListTool {
         self
     }
 
+    /// Overrides the byte limit (minimum 1).
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes.max(1);
+        self
+    }
+
     /// Returns the model-facing definition registered for this tool.
     pub fn definition() -> ToolDefinition {
         ToolDefinition::new(
             LIST_TOOL_NAME,
             "List the entries of a directory inside the workspace root (one \
              level, not recursive). Each line is 'dir<TAB>name' or \
-             'file<TAB>name'. An optional glob filters entry names.",
-            r#"{"type":"object","properties":{"path":{"type":"string","description":"Directory to list, resolved against the root; defaults to the root itself"},"glob":{"type":"string","description":"Optional glob filtering entry names, e.g. *.rs"}},"required":["path"]}"#,
+             'file<TAB>name'. An optional glob filters entry names. Output is \
+             capped by an entry limit (default 500) and a byte cap; the \
+             truncation marker states how to see more.",
+            r#"{"type":"object","properties":{"path":{"type":"string","description":"Directory to list, resolved against the root; defaults to the root itself"},"glob":{"type":"string","description":"Optional glob filtering entry names, e.g. *.rs"},"limit":{"type":"integer","description":"Optional maximum number of entries to return (capped by the configured limit)"}}}"#,
             EffectClass::ReadOnly,
         )
         .expect("list tool definition is valid")
@@ -60,8 +73,8 @@ impl ListTool {
         if let Some(stopped) = stopped_if_requested(cancel) {
             return stopped;
         }
-        let path = match required_string(arguments.as_str(), "path") {
-            Ok(path) => path,
+        let path = match optional_string(arguments.as_str(), "path") {
+            Ok(path) => path.unwrap_or_else(|| ".".to_owned()),
             Err(error) => return ToolInvokeEnd::Done(field_error("path", &error)),
         };
         let glob = match optional_string(arguments.as_str(), "glob") {
@@ -79,6 +92,13 @@ impl ListTool {
                     ));
                 }
             },
+        };
+        let effective_limit = match optional_u64(arguments.as_str(), "limit") {
+            Ok(Some(value)) => usize::try_from(value)
+                .unwrap_or(usize::MAX)
+                .clamp(1, self.max_entries),
+            Ok(None) => self.max_entries,
+            Err(error) => return ToolInvokeEnd::Done(field_error("limit", &error)),
         };
 
         let target = match resolve_in_root(&self.root, &path, true) {
@@ -99,7 +119,8 @@ impl ListTool {
             Ok(reader) => reader,
             Err(error) => return ToolInvokeEnd::Done(io_error(error.kind())),
         };
-        let mut entries: Vec<(bool, String)> = Vec::new();
+        // (is_dir, name, lowercase name): the lowercase key drives the sort.
+        let mut entries: Vec<(bool, String, String)> = Vec::new();
         for entry in reader {
             if let Some(stopped) = stopped_if_requested(cancel) {
                 return stopped;
@@ -111,26 +132,61 @@ impl ListTool {
             {
                 continue;
             }
-            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-            entries.push((is_dir, name));
+            // file_type() does not follow symlinks: re-stat link entries so a
+            // symlinked directory is still typed as dir. Entries whose type
+            // cannot be determined are skipped rather than misreported.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = if file_type.is_symlink() {
+                match entry.metadata() {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(_) => continue,
+                }
+            } else {
+                file_type.is_dir()
+            };
+            let lower = name.to_lowercase();
+            entries.push((is_dir, name, lower));
         }
-        // Deterministic order: directories first, then names.
-        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        // Deterministic order: directories first, then case-insensitive names
+        // (raw-name comparison breaks case-only ties stably).
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
         let total = entries.len();
-        let truncated = total > self.max_entries;
-        let mut lines = Vec::with_capacity(entries.len().min(self.max_entries));
-        for (is_dir, name) in entries.into_iter().take(self.max_entries) {
-            lines.push(format!("{}\t{name}", if is_dir { "dir" } else { "file" }));
+        let mut lines: Vec<String> = Vec::new();
+        let mut used_bytes = 0usize;
+        for (is_dir, name, _) in &entries {
+            if lines.len() >= effective_limit {
+                break;
+            }
+            let row = format!("{}\t{name}", if *is_dir { "dir" } else { "file" });
+            let row_len = row.len() + 1;
+            if used_bytes + row_len > self.max_bytes {
+                break;
+            }
+            used_bytes += row_len;
+            lines.push(row);
         }
         let shown = lines.len();
-        let mut model_text = lines.join("\n");
+        let truncated = total > shown;
+        let mut model_text = if total == 0 {
+            "(empty directory)".to_owned()
+        } else {
+            lines.join("\n")
+        };
         if truncated {
             if !model_text.is_empty() {
                 model_text.push('\n');
             }
             model_text.push_str(&format!(
-                "[list truncated: showing first {shown} of {total} entries]"
+                "[list truncated: showing first {shown} of {total} entries; \
+                 raise \"limit\" (max {}) or narrow the path/glob]",
+                self.max_entries
             ));
         }
 

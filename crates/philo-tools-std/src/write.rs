@@ -12,6 +12,7 @@ use crate::args::required_string;
 use crate::display::{MAX_PLUS_DISPLAY_LINES, card, plus_lines};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, path_error, stopped_if_cancelled};
+use crate::mutation::with_file_mutation;
 use crate::path::resolve_in_root;
 
 /// Stable registry name of the write tool.
@@ -62,35 +63,39 @@ impl WriteTool {
             );
         }
 
-        let previous_bytes = std::fs::metadata(&target).ok().map(|meta| meta.len());
-        if let Some(parent) = target.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            return io_error(error.kind());
-        }
-        if let Err(error) = std::fs::write(&target, content.as_bytes()) {
-            return io_error(error.kind());
-        }
+        // Parent creation plus the write hold the per-path mutation lock so
+        // a concurrent edit/write on the same file cannot interleave.
+        with_file_mutation(&target, || {
+            let previous_bytes = std::fs::metadata(&target).ok().map(|meta| meta.len());
+            if let Some(parent) = target.parent()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                return io_error(error.kind());
+            }
+            if let Err(error) = std::fs::write(&target, content.as_bytes()) {
+                return io_error(error.kind());
+            }
 
-        let bytes = content.len();
-        let confirmation = match previous_bytes {
-            None => format!("created {path} ({bytes} bytes)"),
-            Some(was) => format!("overwrote {path} ({bytes} bytes, was {was} bytes)"),
-        };
-        let created = previous_bytes.is_none();
-        let (detail, added, truncated) = plus_lines(&content, MAX_PLUS_DISPLAY_LINES);
-        let display = card(
-            if created { "Added" } else { "Wrote" },
-            path,
-            "diff",
-            detail,
-        )
-        .with_fact("added", added.to_string())
-        .with_fact("removed", "0")
-        .with_fact("bytes", bytes.to_string())
-        .with_fact("operation", if created { "created" } else { "overwrote" })
-        .with_fact("truncated", truncated.to_string());
-        RichToolResult::new(ToolResult::success(confirmation)).with_display(display)
+            let bytes = content.len();
+            let confirmation = match previous_bytes {
+                None => format!("created {path} ({bytes} bytes)"),
+                Some(was) => format!("overwrote {path} ({bytes} bytes, was {was} bytes)"),
+            };
+            let created = previous_bytes.is_none();
+            let (detail, added, truncated) = plus_lines(&content, MAX_PLUS_DISPLAY_LINES);
+            let display = card(
+                if created { "Added" } else { "Wrote" },
+                path,
+                "diff",
+                detail,
+            )
+            .with_fact("added", added.to_string())
+            .with_fact("removed", "0")
+            .with_fact("bytes", bytes.to_string())
+            .with_fact("operation", if created { "created" } else { "overwrote" })
+            .with_fact("truncated", truncated.to_string());
+            RichToolResult::new(ToolResult::success(confirmation)).with_display(display)
+        })
     }
 }
 

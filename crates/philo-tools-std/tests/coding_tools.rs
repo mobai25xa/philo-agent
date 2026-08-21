@@ -107,13 +107,119 @@ fn list_truncates_with_a_marker_and_reports_totals() {
     let tool = ListTool::new(&root.path).with_max_entries(2);
     let result = call(&tool, r#"{"path":"."}"#);
     let content = content_of(&result);
-    assert!(content.contains("[list truncated: showing first 2 of 5 entries]"));
+    assert!(
+        content.contains("[list truncated: showing first 2 of 5 entries"),
+        "marker states the truncation explicitly: {content}"
+    );
+    assert!(
+        content.contains("raise \"limit\""),
+        "marker tells the model how to see more: {content}"
+    );
     let display = result.display().expect("display present");
     assert!(
         display
             .facts()
             .iter()
             .any(|f| f.name() == "entries_total" && f.value() == "5")
+    );
+}
+
+#[test]
+fn list_reports_empty_directories_explicitly() {
+    let root = TempRoot::new();
+    std::fs::create_dir_all(root.path.join("void")).expect("dir");
+    let tool = ListTool::new(&root.path);
+    let result = call(&tool, r#"{"path":"void"}"#);
+    assert_eq!(content_of(&result), "(empty directory)");
+}
+
+#[test]
+fn list_limit_argument_caps_the_call_and_defaults_path_to_root() {
+    let root = TempRoot::new();
+    for index in 0..4 {
+        root.file(&format!("f{index}.txt"), b"x");
+    }
+    let tool = ListTool::new(&root.path);
+
+    // No path: the root itself is listed.
+    let default_root = call(&tool, "{}");
+    assert_eq!(content_of(&default_root).lines().count(), 4);
+
+    // Call-level limit caps the listing; the marker reports the true total.
+    let limited = call(&tool, r#"{"limit":2}"#);
+    let content = content_of(&limited);
+    assert!(
+        content.contains("[list truncated: showing first 2 of 4 entries"),
+        "{content}"
+    );
+
+    // A call limit above the configured cap is clamped to it.
+    let clamped = call(
+        &ListTool::new(&root.path).with_max_entries(3),
+        r#"{"limit":99}"#,
+    );
+    let content = content_of(&clamped);
+    assert!(
+        content.contains("[list truncated: showing first 3 of 4 entries"),
+        "{content}"
+    );
+}
+
+#[test]
+fn list_sorts_names_case_insensitively() {
+    let root = TempRoot::new();
+    root.file("B.txt", b"b");
+    root.file("a.txt", b"a");
+    root.file("Zebra", b"z");
+    root.file("apple2", b"a");
+    let tool = ListTool::new(&root.path);
+    let content = call(&tool, r#"{"path":"."}"#);
+    let names: Vec<&str> = content_of(&content)
+        .lines()
+        .map(|l| l.split('\t').nth(1).expect("name"))
+        .collect();
+    assert_eq!(names, vec!["a.txt", "apple2", "B.txt", "Zebra"]);
+}
+
+#[test]
+fn list_classifies_directory_symlinks_and_skips_unstatable_entries() {
+    let root = TempRoot::new();
+    std::fs::create_dir_all(root.path.join("real-dir")).expect("dir");
+    root.file("plain.txt", b"x");
+
+    let link = root.path.join("linked-dir");
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(root.path.join("real-dir"), &link).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(root.path.join("real-dir"), &link).is_ok();
+    if !linked {
+        // Symlink creation needs privileges on some Windows setups; the
+        // classification path is still covered on unix and privileged wins.
+        return;
+    }
+
+    let tool = ListTool::new(&root.path);
+    let result = call(&tool, r#"{"path":"."}"#);
+    let content = content_of(&result);
+    assert!(
+        content.contains("dir\tlinked-dir"),
+        "symlinked directories are typed as dir: {content}"
+    );
+}
+
+#[test]
+fn list_byte_cap_truncates_with_the_same_marker() {
+    let root = TempRoot::new();
+    for index in 0..6 {
+        root.file(&format!("f{index}.txt"), b"x");
+    }
+    // Each row is "file\tfN.txt\n" (12-13 bytes); a 40-byte budget fits 3.
+    let tool = ListTool::new(&root.path).with_max_bytes(40);
+    let result = call(&tool, r#"{"path":"."}"#);
+    let content = content_of(&result);
+    assert!(
+        content.contains("[list truncated: showing first 3 of 6 entries"),
+        "byte cap truncates at a row boundary with the shared marker: {content}"
     );
 }
 
@@ -171,19 +277,81 @@ fn grep_skips_binaries_reports_no_matches_and_truncates() {
     let none = call(&tool, r#"{"pattern":"absent-pattern"}"#);
     assert!(content_of(&none).contains("no matches"));
 
+    // Scanning stops at the match limit: only the first two matches exist
+    // on the channels, and the marker says how to proceed.
     let truncated = call(&tool, r#"{"pattern":"needle"}"#);
     let content = content_of(&truncated);
     assert!(content.contains("needle"));
-    assert!(content.contains("[grep truncated: showing first 2 of 3 matches]"));
+    assert!(
+        content.contains("[grep truncated: match limit of 2 reached"),
+        "{content}"
+    );
     let display = truncated.display().expect("display present");
-    assert_eq!(display.detail(), "text.txt:1\ntext.txt:2\ntext.txt:3");
+    assert_eq!(display.detail(), "text.txt:1\ntext.txt:2");
     assert!(
         !display.detail().contains("needle"),
         "locs omit the matched line text"
     );
-    assert_eq!(fact(display, "matches_total"), "3");
+    assert_eq!(fact(display, "matches_total"), "2");
+    assert_eq!(fact(display, "limit_reached"), "true");
     assert_eq!(fact(display, "verb"), "Searched");
     assert_eq!(fact(display, "body"), "locs");
+}
+
+#[test]
+fn grep_truncates_overlong_match_lines() {
+    let root = TempRoot::new();
+    let long_line = "x".repeat(2000);
+    root.file(
+        "wide.txt",
+        format!("{long_line}\nshort needle\n").as_bytes(),
+    );
+    let tool = GrepTool::new(&root.path);
+    let result = call(&tool, r#"{"pattern":"x|needle"}"#);
+    let content = content_of(&result);
+    let wide_row = content
+        .lines()
+        .find(|line| line.contains("wide.txt:1:"))
+        .expect("match row for the oversized line");
+    assert!(
+        wide_row.chars().count() < 600 && wide_row.ends_with("... [truncated]"),
+        "oversized lines are capped with a suffix: {wide_row}"
+    );
+    assert!(
+        content.contains("short needle"),
+        "normal lines pass through"
+    );
+}
+
+#[test]
+fn grep_byte_cap_truncates_output() {
+    let root = TempRoot::new();
+    root.file(
+        "big.txt",
+        b"matchme matchme matchme matchme\n".repeat(64).as_slice(),
+    );
+    let tool = GrepTool::new(&root.path)
+        .with_max_matches(64)
+        .with_max_bytes(256);
+    let result = call(&tool, r#"{"pattern":"matchme"}"#);
+    let content = content_of(&result);
+    assert!(
+        content.contains("output exceeded 256 bytes"),
+        "byte cap is reported in the truncation marker: {content}"
+    );
+}
+
+#[test]
+fn grep_ignore_case_matches() {
+    let root = TempRoot::new();
+    root.file("case.txt", b"Needle In Haystack\n");
+    let tool = GrepTool::new(&root.path);
+
+    let sensitive = call(&tool, r#"{"pattern":"needle"}"#);
+    assert!(content_of(&sensitive).contains("no matches"));
+
+    let insensitive = call(&tool, r#"{"pattern":"needle","ignore_case":true}"#);
+    assert!(content_of(&insensitive).contains("case.txt:1:Needle In Haystack"));
 }
 
 #[test]
@@ -341,6 +509,44 @@ fn edit_supports_deletion_with_an_empty_new_string() {
     assert_eq!(
         std::fs::read_to_string(root.path.join("del.txt")).unwrap(),
         "keep keep"
+    );
+}
+
+#[test]
+fn edit_matches_lf_old_string_in_a_crlf_file_and_preserves_crlf() {
+    let root = TempRoot::new();
+    root.file("win.txt", b"first line\r\nold_name();\r\nlast\r\n");
+    let tool = EditTool::new(&root.path);
+    let result = call(
+        &tool,
+        r#"{"path":"win.txt","old_string":"old_name();","new_string":"new_name();"}"#,
+    );
+    assert!(
+        content_of(&result).starts_with("edited win.txt"),
+        "an LF old_string must hit a CRLF file: {:?}",
+        result.result()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path.join("win.txt")).unwrap(),
+        "first line\r\nnew_name();\r\nlast\r\n",
+        "the file's CRLF endings are preserved"
+    );
+}
+
+#[test]
+fn edit_preserves_a_utf8_bom() {
+    let root = TempRoot::new();
+    root.file("bom.txt", b"\xEF\xBB\xBFheader value\n");
+    let tool = EditTool::new(&root.path);
+    let result = call(
+        &tool,
+        r#"{"path":"bom.txt","old_string":"header value","new_string":"title"}"#,
+    );
+    assert!(content_of(&result).starts_with("edited bom.txt"));
+    assert_eq!(
+        std::fs::read(root.path.join("bom.txt")).unwrap(),
+        b"\xEF\xBB\xBFtitle\n",
+        "the BOM survives the replacement"
     );
 }
 
@@ -527,7 +733,7 @@ fn shell_cancel_after_spawn_returns_stopped_not_timeout() {
 }
 
 #[test]
-fn shell_truncates_long_output_with_a_marker() {
+fn shell_truncates_long_output_keeping_the_tail() {
     let root = TempRoot::new();
     let tool = ShellTool::new(&root.path).with_max_output_lines(2);
     let command = if cfg!(windows) {
@@ -537,12 +743,17 @@ fn shell_truncates_long_output_with_a_marker() {
     };
     let result = shell_call(&tool, command);
     let content = content_of(&result);
-    assert!(content.contains("line-1"));
-    assert!(!content.contains("line-5"));
-    assert!(content.contains("[shell output truncated"), "{content}");
+    // Errors and summaries live at the end of command output, so the tail
+    // is what survives truncation.
+    assert!(content.contains("line-5"));
+    assert!(!content.contains("line-1"), "{content}");
+    assert!(
+        content.contains("[shell output truncated: showing last 2 of 5 lines"),
+        "{content}"
+    );
     let display = result.display().expect("display present");
     assert!(
-        display.detail().contains("line-5"),
+        display.detail().contains("line-1"),
         "small outputs still fit in the display cap"
     );
 }

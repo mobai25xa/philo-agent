@@ -20,7 +20,9 @@
 //! [`BlockingPool::wrap_handler`] and/or [`BlockingToolExecutor`] so the
 //! work runs on `tokio::task::spawn_blocking` under a bounded semaphore.
 //! `shell` stays native async (io-util + process + time) and must not enter
-//! the blocking pool.
+//! the blocking pool. `edit` / `write` additionally serialize their
+//! read-modify-write cycles per resolved target path (see `mutation`), so
+//! concurrent calls on one file cannot interleave.
 //!
 //! # Stable business-error codes
 //!
@@ -48,6 +50,7 @@ mod edit;
 mod grep;
 mod helpers;
 mod list;
+mod mutation;
 mod path;
 mod read;
 mod shell;
@@ -58,8 +61,8 @@ pub use blocking::{
     DEFAULT_BLOCKING_TOOL_QUEUE, blocking_fs_handler,
 };
 pub use edit::{EDIT_TOOL_NAME, EditTool};
-pub use grep::{DEFAULT_MAX_GREP_MATCHES, GREP_TOOL_NAME, GrepTool};
-pub use list::{DEFAULT_MAX_LIST_ENTRIES, LIST_TOOL_NAME, ListTool};
+pub use grep::{DEFAULT_MAX_GREP_BYTES, DEFAULT_MAX_GREP_MATCHES, GREP_TOOL_NAME, GrepTool};
+pub use list::{DEFAULT_MAX_LIST_BYTES, DEFAULT_MAX_LIST_ENTRIES, LIST_TOOL_NAME, ListTool};
 pub use read::{DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_READ_LINES, READ_TOOL_NAME, ReadTool};
 pub use shell::{
     DEFAULT_SHELL_MAX_DISPLAY_BYTES, DEFAULT_SHELL_MAX_OUTPUT_BYTES,

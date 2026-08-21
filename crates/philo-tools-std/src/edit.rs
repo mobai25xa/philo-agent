@@ -1,5 +1,8 @@
 //! Root-constrained exact-string replacement: `old_string` must occur
 //! exactly once; zero and multiple occurrences are distinguishable errors.
+//! Matching is line-ending tolerant: content and `old_string` are normalized
+//! to LF, and the file's original line endings (plus any BOM) are restored
+//! on write.
 
 use std::path::PathBuf;
 
@@ -12,6 +15,7 @@ use crate::args::required_string;
 use crate::display::{card, edit_hunk};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
+use crate::mutation::with_file_mutation;
 use crate::path::resolve_in_root;
 
 /// Stable registry name of the edit tool.
@@ -37,7 +41,8 @@ impl EditTool {
              the workspace root. old_string must match exactly once: zero \
              matches and multiple matches are distinct errors (add more \
              surrounding context to disambiguate). new_string may be empty to \
-             delete the matched text.",
+             delete the matched text. Line endings are matched tolerantly \
+             (LF matches CRLF files) and the file's endings are preserved.",
             r#"{"type":"object","properties":{"path":{"type":"string","description":"File path to edit, resolved against the root directory"},"old_string":{"type":"string","description":"Exact text to replace; must occur exactly once"},"new_string":{"type":"string","description":"Replacement text; empty deletes the match"}},"required":["path","old_string","new_string"]}"#,
             EffectClass::Workspace,
         )
@@ -74,54 +79,81 @@ impl EditTool {
                 format!("path is a directory, not a file: {path}"),
             );
         }
-        let bytes = match std::fs::read(&target) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return not_found(&path);
+
+        // The read-match-write cycle holds the per-path mutation lock so a
+        // concurrent edit/write on the same file cannot interleave.
+        with_file_mutation(&target, || {
+            let bytes = match std::fs::read(&target) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return not_found(&path);
+                }
+                Err(error) => return io_error(error.kind()),
+            };
+            let Ok(full_text) = String::from_utf8(bytes) else {
+                return RichToolResult::error(
+                    error_code::NOT_UTF8,
+                    format!("file is not valid UTF-8 text: {path}"),
+                );
+            };
+
+            // Strip the BOM before matching; models never include it in
+            // old_string. It is re-attached verbatim on write.
+            let (bom, content) = match full_text.strip_prefix('\u{FEFF}') {
+                Some(rest) => ("\u{FEFF}", rest),
+                None => ("", full_text.as_str()),
+            };
+            // Normalize line endings for matching so an LF old_string hits a
+            // CRLF file; the original ending is restored on write.
+            let crlf = content.contains("\r\n");
+            let normalized = normalize_to_lf(content);
+            let old_normalized = normalize_to_lf(&old_string);
+
+            let occurrences = normalized.matches(&old_normalized).count();
+            if occurrences == 0 {
+                return RichToolResult::error(
+                    error_code::NO_MATCH,
+                    format!("old_string not found in {path}"),
+                );
             }
-            Err(error) => return io_error(error.kind()),
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            return RichToolResult::error(
-                error_code::NOT_UTF8,
-                format!("file is not valid UTF-8 text: {path}"),
-            );
-        };
+            if occurrences > 1 {
+                return RichToolResult::error(
+                    error_code::NOT_UNIQUE,
+                    format!(
+                        "old_string occurs {occurrences} times in {path}; add more \
+                         surrounding context to make it unique"
+                    ),
+                );
+            }
+            let edited = normalized.replacen(&old_normalized, &new_string, 1);
+            let restored = if crlf {
+                edited.replace('\n', "\r\n")
+            } else {
+                edited
+            };
+            let final_text = format!("{bom}{restored}");
+            if let Err(error) = std::fs::write(&target, final_text.as_bytes()) {
+                return io_error(error.kind());
+            }
 
-        let occurrences = text.matches(&old_string).count();
-        if occurrences == 0 {
-            return RichToolResult::error(
-                error_code::NO_MATCH,
-                format!("old_string not found in {path}"),
+            let confirmation = format!(
+                "edited {path}: replaced 1 occurrence ({} -> {} bytes)",
+                full_text.len(),
+                final_text.len()
             );
-        }
-        if occurrences > 1 {
-            return RichToolResult::error(
-                error_code::NOT_UNIQUE,
-                format!(
-                    "old_string occurs {occurrences} times in {path}; add more \
-                     surrounding context to make it unique"
-                ),
-            );
-        }
-        let edited = text.replacen(&old_string, &new_string, 1);
-        if let Err(error) = std::fs::write(&target, edited.as_bytes()) {
-            return io_error(error.kind());
-        }
-
-        let confirmation = format!(
-            "edited {path}: replaced 1 occurrence ({} -> {} bytes)",
-            text.len(),
-            edited.len()
-        );
-        let (hunk, added, removed) = edit_hunk(&text, &old_string, &new_string);
-        let display = card("Edited", path, "diff", hunk)
-            .with_fact("added", added.to_string())
-            .with_fact("removed", removed.to_string())
-            .with_fact("bytes_before", text.len().to_string())
-            .with_fact("bytes_after", edited.len().to_string());
-        RichToolResult::new(ToolResult::success(confirmation)).with_display(display)
+            let (hunk, added, removed) = edit_hunk(&normalized, &old_normalized, &new_string);
+            let display = card("Edited", path, "diff", hunk)
+                .with_fact("added", added.to_string())
+                .with_fact("removed", removed.to_string())
+                .with_fact("bytes_before", full_text.len().to_string())
+                .with_fact("bytes_after", final_text.len().to_string());
+            RichToolResult::new(ToolResult::success(confirmation)).with_display(display)
+        })
     }
+}
+
+fn normalize_to_lf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 impl ToolHandler for EditTool {

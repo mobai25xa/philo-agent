@@ -1,5 +1,6 @@
-//! Root-constrained whole-file text reader with line numbers and a
-//! byte/line dual truncation limit (M10 upgrade of the M4 tool).
+//! Root-constrained text reader with line numbers, `offset`/`limit`
+//! paging, and a byte/line dual truncation limit (M10 upgrade of the M4
+//! tool).
 
 use std::path::PathBuf;
 
@@ -8,7 +9,7 @@ use philo_tools::{
     ToolHandlerFuture, ToolInvokeCx, ToolInvokeEnd,
 };
 
-use crate::args::required_string;
+use crate::args::{optional_u64, required_string};
 use crate::display::card;
 use crate::error_code;
 use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
@@ -26,9 +27,10 @@ pub const DEFAULT_MAX_READ_LINES: usize = 2000;
 /// File extensions the read tool refuses as images (suggesting `--image`).
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
-/// Whole-file text reader constrained to a root directory. Output lines are
-/// prefixed with their 1-based line number; content beyond the byte or line
-/// limit is truncated with an explicit marker.
+/// Text reader constrained to a root directory. Output lines are prefixed
+/// with their 1-based line number; `offset`/`limit` page through large
+/// files, and content beyond the byte or line limit is truncated with an
+/// actionable continuation marker.
 pub struct ReadTool {
     root: PathBuf,
     max_bytes: usize,
@@ -63,9 +65,10 @@ impl ReadTool {
             READ_TOOL_NAME,
             "Read a UTF-8 text file located inside the workspace root. Relative \
              paths resolve against the root. Output lines carry line-number \
-             prefixes; content beyond the size limits is truncated with a marker. \
-             Images and other binary files are rejected.",
-            r#"{"type":"object","properties":{"path":{"type":"string","description":"File path to read, resolved against the root directory"}},"required":["path"]}"#,
+             prefixes; use offset (1-based line number) and limit to page \
+             through large files — the truncation marker states the next \
+             offset. Images and other binary files are rejected.",
+            r#"{"type":"object","properties":{"path":{"type":"string","description":"File path to read, resolved against the root directory"},"offset":{"type":"integer","description":"Optional 1-based line number to start reading from"},"limit":{"type":"integer","description":"Optional maximum number of lines to read"}},"required":["path"]}"#,
             EffectClass::ReadOnly,
         )
         .expect("read tool definition is valid")
@@ -76,6 +79,20 @@ impl ReadTool {
             Ok(path) => path,
             Err(error) => return field_error("path", &error),
         };
+        let offset = match optional_u64(arguments.as_str(), "offset") {
+            Ok(offset) => offset,
+            Err(error) => return field_error("offset", &error),
+        };
+        let limit = match optional_u64(arguments.as_str(), "limit") {
+            Ok(limit) => limit,
+            Err(error) => return field_error("limit", &error),
+        };
+        let start_line = usize::try_from(offset.unwrap_or(1).max(1)).unwrap_or(usize::MAX);
+        let effective_lines = limit.map_or(self.max_lines, |value| {
+            usize::try_from(value)
+                .unwrap_or(usize::MAX)
+                .clamp(1, self.max_lines)
+        });
         let target = match resolve_in_root(&self.root, &path, true) {
             Ok(target) => target,
             Err(error) => return path_error(&path, &error),
@@ -124,34 +141,77 @@ impl ReadTool {
             );
         };
 
-        // Model channel: line numbers, then the dual limit. Truncation is
-        // final here — nothing above the tool boundary re-truncates.
+        // Model channel: line numbers from the requested offset, then the
+        // dual limit. Truncation is final here — nothing above the tool
+        // boundary re-truncates.
         let lines_total = text.lines().count();
+        if lines_total == 0 {
+            let display = card("Read", path, "none", "")
+                .with_fact("start_line", "0")
+                .with_fact("end_line", "0")
+                .with_fact("lines_shown", "0")
+                .with_fact("lines_total", "0")
+                .with_fact("bytes_total", total_bytes.to_string())
+                .with_fact("truncated", "false");
+            return RichToolResult::new(philo_tools::ToolResult::success(
+                "(empty file)".to_owned(),
+            ))
+            .with_display(display);
+        }
+        if start_line > lines_total {
+            return RichToolResult::error(
+                error_code::INVALID_ARGUMENTS,
+                format!("offset {start_line} is beyond end of file ({lines_total} lines)"),
+            );
+        }
+
         let mut numbered = String::new();
         let mut emitted_lines = 0usize;
-        let mut truncated = false;
-        for (index, line) in text.lines().enumerate() {
+        let mut stopped_by_budget = false;
+        let mut stopped_by_limit_param = false;
+        for (index, line) in text.lines().enumerate().skip(start_line - 1) {
+            if emitted_lines >= effective_lines {
+                stopped_by_limit_param = true;
+                break;
+            }
             let row = format!("{:>5}|{}\n", index + 1, line);
-            if emitted_lines >= self.max_lines || numbered.len() + row.len() > self.max_bytes {
-                truncated = true;
+            if numbered.len() + row.len() > self.max_bytes {
+                stopped_by_budget = true;
                 break;
             }
             numbered.push_str(&row);
             emitted_lines += 1;
         }
+        let end_line = start_line + emitted_lines.saturating_sub(1);
+
         let mut model_text = numbered;
-        if truncated {
+        let truncated;
+        if emitted_lines == 0 && stopped_by_budget {
+            truncated = true;
             model_text.push_str(&format!(
-                "[read truncated: showing first {emitted_lines} of {lines_total} lines \
-                 ({total_bytes} bytes total)]"
+                "[read truncated: line {start_line} alone exceeds the {}-byte \
+                 output budget; use shell to slice it]",
+                self.max_bytes
             ));
+        } else if stopped_by_budget {
+            truncated = true;
+            model_text.push_str(&format!(
+                "[read truncated: showing lines {start_line}-{end_line} of \
+                 {lines_total}; use offset={} to continue]",
+                end_line + 1
+            ));
+        } else {
+            let remaining = lines_total - end_line;
+            truncated = false;
+            if stopped_by_limit_param && remaining > 0 {
+                model_text.push_str(&format!(
+                    "[read stopped by limit at line {end_line}; {remaining} more \
+                     lines; use offset={} to continue]",
+                    end_line + 1
+                ));
+            }
         }
 
-        let (start_line, end_line) = if emitted_lines == 0 {
-            (0, 0)
-        } else {
-            (1, emitted_lines)
-        };
         let display = card("Read", path, "none", "")
             .with_fact("start_line", start_line.to_string())
             .with_fact("end_line", end_line.to_string())

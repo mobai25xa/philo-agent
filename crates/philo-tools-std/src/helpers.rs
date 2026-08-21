@@ -29,6 +29,7 @@ pub(crate) fn field_error(key: &str, error: &FieldError) -> RichToolResult {
         FieldError::Missing => format!("missing required argument: {key}"),
         FieldError::NotAString => format!("argument '{key}' must be a string"),
         FieldError::NotANumber => format!("argument '{key}' must be a non-negative integer"),
+        FieldError::NotABool => format!("argument '{key}' must be a boolean"),
         FieldError::BadEscape => format!("argument '{key}' contains an invalid escape sequence"),
     };
     RichToolResult::error(error_code::INVALID_ARGUMENTS, message)

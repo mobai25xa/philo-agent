@@ -113,8 +113,12 @@ async fn empty_assistant_history_replays_as_placeholder_text() {
     assert_eq!(body["messages"][2]["role"], "user");
 }
 
+/// v3 cutover: compatible Chat deployments speak the frozen conservative
+/// fallback spelling — no cache identity fields, no affinity headers, and
+/// no usage-requesting stream options. Cache pinning on third-party
+/// gateways now belongs to catalog entries, never per-assembly opt-ins.
 #[tokio::test]
-async fn compatible_chat_sends_cache_identity_and_affinity_headers() {
+async fn compatible_chat_stays_conservative_without_cache_identity() {
     let transport =
         StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
     let adapter = PhiloModelAdapter::builder(
@@ -133,12 +137,12 @@ async fn compatible_chat_sends_cache_identity_and_affinity_headers() {
     collect_ok(stream).await;
 
     let body = &transport.request_bodies()[0];
-    assert_eq!(body["prompt_cache_key"], "session-1");
-    assert_eq!(body["stream_options"]["include_usage"], true);
+    assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("stream_options").is_none());
     let headers = &transport.requests()[0].headers;
-    assert_eq!(headers["session_id"], "session-1");
-    assert_eq!(headers["x-client-request-id"], "session-1");
-    assert_eq!(headers["x-session-affinity"], "session-1");
+    assert!(headers.get("session_id").is_none());
+    assert!(headers.get("x-client-request-id").is_none());
+    assert!(headers.get("x-session-affinity").is_none());
 }
 
 const STUB_RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";

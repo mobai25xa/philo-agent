@@ -364,8 +364,10 @@ async fn compatible_reasoning_effort_profile_uses_the_common_request_shape() {
     assert_eq!(body["reasoning_effort"], "low");
     assert_eq!(body["max_tokens"], 256);
     assert!(body.get("max_completion_tokens").is_none());
-    assert_eq!(body["prompt_cache_key"], "session-1");
-    assert_eq!(body["stream_options"]["include_usage"], true);
+    // v3 cutover: the conservative fallback spelling carries no cache
+    // identity and no usage-requesting stream options.
+    assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("stream_options").is_none());
 }
 
 #[tokio::test]

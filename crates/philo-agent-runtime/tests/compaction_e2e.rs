@@ -114,6 +114,7 @@ fn config() -> RuntimeConfig {
             keep_recent_turns: 1,
             estimate_bytes_per_token: 1,
         },
+        recovery: Default::default(),
     }
 }
 
@@ -260,6 +261,7 @@ async fn summary_model_failure_warns_without_blocking_the_turn_or_leaving_a_trac
                 keep_recent_turns: 0,
                 ..config().compaction
             },
+            recovery: Default::default(),
             ..config()
         },
     )

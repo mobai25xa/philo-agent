@@ -56,6 +56,7 @@ fn config(max_tool_rounds: u32, operation_timeout: Option<Duration>) -> RuntimeC
         operation_timeout,
         tool_cancel_grace: std::time::Duration::from_millis(300),
         compaction: Default::default(),
+        recovery: Default::default(),
     }
 }
 

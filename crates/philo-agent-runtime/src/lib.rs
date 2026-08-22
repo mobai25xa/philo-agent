@@ -34,7 +34,8 @@ pub use bounds::{
 pub use compaction::{CompactionError, CompactionReport};
 pub use config::{
     CompactionConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS,
-    DEFAULT_TOOL_CANCEL_GRACE, GenerationConfig, ReasoningEffort, RuntimeConfig, ToolChoice,
+    DEFAULT_TOOL_CANCEL_GRACE, GenerationConfig, ReasoningEffort, RecoveryConfig, RuntimeConfig,
+    ToolChoice,
 };
 pub use error::{
     AdmissionError, CancelResult, DriverExit, DriverInvariantError, ForcedSettlement,
@@ -49,8 +50,8 @@ pub use ids::{
 };
 pub use message::{AssistantMessage, InvalidUserMessage, UserMessage, UserPart};
 pub use model::{
-    ModelAssistantBlock, ModelError, ModelEvent, ModelEventStream, ModelMessage, ModelPort,
-    ModelToolCall, ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
+    ModelAssistantBlock, ModelError, ModelEvent, ModelEventStream, ModelFailureClass, ModelMessage,
+    ModelPort, ModelToolCall, ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
 };
 pub use outcome::{
     AgentAvailability, AgentError, AgentFailure, AgentFailureKind, ModelCallPhase,

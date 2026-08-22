@@ -248,6 +248,28 @@ impl Transcript {
                     format!("compaction failed: {message}; continuing without compaction"),
                 )]);
             }
+            FrontendOperationEvent::ModelRetryScheduled {
+                attempt,
+                max_retries,
+                delay_ms,
+                reason,
+                ..
+            } => {
+                // The failed attempt's streamed text is discarded; close the
+                // open view and reset per-call flags so the retry renders
+                // cleanly.
+                store.close_open();
+                self.wrote_answer_this_call = false;
+                self.think_header_written = false;
+                let seconds = format!("{:.1}", *delay_ms as f64 / 1000.0);
+                store.push_closed([line(
+                    LineKind::Error,
+                    format!(
+                        "model call interrupted; retrying (attempt {attempt}/{max_retries}, \
+                         waiting {seconds}s): {reason}"
+                    ),
+                )]);
+            }
             FrontendOperationEvent::CancellationRequested { reason, .. } => {
                 store.close_open();
                 if verbose {

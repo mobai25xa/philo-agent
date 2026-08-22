@@ -105,6 +105,7 @@ async fn truncated_tool_output_is_the_single_source_of_truth() {
             operation_timeout: None,
             tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
+            recovery: Default::default(),
         },
     );
     let parts = AgentRuntime::start(RuntimeDeps {

@@ -165,6 +165,7 @@ impl CodingProfile {
             operation_timeout: None,
             tool_cancel_grace: philo_agent_runtime::DEFAULT_TOOL_CANCEL_GRACE,
             compaction: Default::default(),
+            recovery: philo_agent_runtime::RecoveryConfig::default(),
         }
     }
 }

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use philo_agent_runtime::{CompactionConfig, ReasoningEffort};
+use philo_agent_runtime::{CompactionConfig, ReasoningEffort, RecoveryConfig};
 use philo_model::{
     ChatReasoningFormat, DEFAULT_USER_AGENT, ModelCompat, ModelContinuationPolicy, ModelProtocol,
     ModelRequestHeaders,
@@ -37,6 +37,12 @@ pub struct Deployment {
     pub compat: ModelCompat,
     pub chat_reasoning_format: Option<ChatReasoningFormat>,
     pub continuation_policy: ModelContinuationPolicy,
+    /// Transport-level response-head deadline (`[recovery]`), applied at
+    /// assembly time.
+    pub response_head_timeout: Option<Duration>,
+    /// Transport-level stream-idle deadline (`[recovery]`), applied at
+    /// assembly time.
+    pub stream_idle_timeout: Option<Duration>,
 }
 
 /// One effective non-secret setting shown through the interactive `/config`
@@ -60,6 +66,8 @@ pub struct Settings {
     pub max_parallel_tool_calls: Option<u32>,
     pub operation_timeout: Option<Duration>,
     pub shell_timeout_secs: Option<u64>,
+    /// Turn-engine model-call recovery policy.
+    pub recovery: RecoveryConfig,
     pub verbosity: Verbosity,
     pub show_reasoning: bool,
     /// Mapped screen for `TuiLaunchConfig`. `/config` shows the configured token
@@ -407,6 +415,87 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         None => None,
     };
 
+    let recovery = RecoveryConfig {
+        enabled: match from_file(file.recovery_enabled.as_ref()) {
+            Some(picked) => {
+                record("recovery.enabled", picked.value.to_string(), picked.source);
+                picked.value
+            }
+            None => {
+                record("recovery.enabled", "true".to_owned(), "default");
+                true
+            }
+        },
+        max_retries: match from_file(file.recovery_max_retries.as_ref()) {
+            Some(picked) => {
+                record(
+                    "recovery.max_retries",
+                    picked.value.to_string(),
+                    picked.source,
+                );
+                u32::try_from(picked.value).map_err(|_| {
+                    UsageError::new(format!(
+                        "recovery.max_retries is out of range: {}",
+                        picked.value
+                    ))
+                })?
+            }
+            None => {
+                record("recovery.max_retries", "3".to_owned(), "default");
+                3
+            }
+        },
+        backoff_base_ms: match from_file(file.recovery_backoff_base_ms.as_ref()) {
+            Some(picked) => {
+                record(
+                    "recovery.backoff_base_ms",
+                    picked.value.to_string(),
+                    picked.source,
+                );
+                positive_u64("[recovery].backoff_base_ms", picked.value)?
+            }
+            None => 500,
+        },
+        backoff_max_ms: match from_file(file.recovery_backoff_max_ms.as_ref()) {
+            Some(picked) => {
+                record(
+                    "recovery.backoff_max_ms",
+                    picked.value.to_string(),
+                    picked.source,
+                );
+                positive_u64("[recovery].backoff_max_ms", picked.value)?
+            }
+            None => 8_000,
+        },
+    };
+
+    let response_head_timeout = match from_file(file.recovery_response_head_timeout_secs.as_ref())
+    {
+        Some(picked) => {
+            record(
+                "recovery.response_head_timeout_secs",
+                picked.value.to_string(),
+                picked.source,
+            );
+            let seconds = positive_u64("[recovery].response_head_timeout_secs", picked.value)?;
+            (seconds > 0).then_some(Duration::from_secs(seconds))
+        }
+        None => None,
+    };
+
+    let stream_idle_timeout = match from_file(file.recovery_stream_idle_timeout_secs.as_ref()) {
+        Some(picked) => {
+            record(
+                "recovery.stream_idle_timeout_secs",
+                picked.value.to_string(),
+                picked.source,
+            );
+            let seconds = positive_u64("[recovery].stream_idle_timeout_secs", picked.value)?;
+            (seconds > 0).then_some(Duration::from_secs(seconds))
+        }
+        None => None,
+    };
+
     let verbosity = if cli.quiet {
         record("verbosity", "quiet".to_owned(), "flag");
         Verbosity::Quiet
@@ -480,6 +569,8 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
             compat,
             chat_reasoning_format,
             continuation_policy,
+            response_head_timeout,
+            stream_idle_timeout,
         },
         data_dir,
         context_window,
@@ -494,6 +585,7 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         max_parallel_tool_calls,
         operation_timeout,
         shell_timeout_secs,
+        recovery,
         verbosity,
         show_reasoning,
         screen,

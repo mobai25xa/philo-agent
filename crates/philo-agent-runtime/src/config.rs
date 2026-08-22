@@ -78,6 +78,79 @@ impl Default for CompactionConfig {
     }
 }
 
+/// Turn-engine model-call recovery policy. When a model call fails with a
+/// [`crate::ModelFailureClass::Recoverable`] error, the engine may re-issue
+/// the identical call (same kernel effect) after a bounded full-jitter
+/// backoff. Failed attempts commit nothing durable, so recovery never
+/// duplicates tool executions or assistant output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryConfig {
+    /// Master switch; `false` restores the fail-fast behavior.
+    pub enabled: bool,
+    /// Additional identical attempts per model call after the first failure
+    /// (`0` keeps one attempt per call).
+    pub max_retries: u32,
+    /// Exponential backoff base delay for the first retry.
+    pub backoff_base_ms: u64,
+    /// Exponential backoff cap.
+    pub backoff_max_ms: u64,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries: 3,
+            backoff_base_ms: 500,
+            backoff_max_ms: 8_000,
+        }
+    }
+}
+
+impl RecoveryConfig {
+    /// Full-jitter backoff delay before retry number `retry` (1-based),
+    /// capped by `backoff_max_ms`.
+    pub fn backoff_delay(&self, retry: u32) -> std::time::Duration {
+        let exponent = retry.saturating_sub(1).min(16);
+        let cap = self.backoff_max_ms.max(self.backoff_base_ms);
+        let bounded = self
+            .backoff_base_ms
+            .saturating_mul(1_u64 << exponent)
+            .min(cap);
+        let jitter = bounded / 4;
+        let delay = if jitter == 0 {
+            bounded
+        } else {
+            let offset = u64::from(backoff_jitter(jitter));
+            bounded - offset
+        };
+        std::time::Duration::from_millis(delay)
+    }
+}
+
+/// Dependency-free pseudo-random offset in `[0, bound)` for full-jitter
+/// backoff; entropy comes from the wall clock.
+fn backoff_jitter(bound: u64) -> u32 {
+    thread_local! {
+        static STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    STATE.with(|state| {
+        let mut value = state.get();
+        if value == 0 {
+            value = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.subsec_nanos() as u64 ^ (since.as_secs() << 20))
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1;
+        }
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        state.set(value);
+        (value % bound.max(1)) as u32
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeConfig {
     pub system_prompt: String,
@@ -102,6 +175,8 @@ pub struct RuntimeConfig {
     pub tool_cancel_grace: std::time::Duration,
     /// Pre-turn and manual context-compaction policy (M13).
     pub compaction: CompactionConfig,
+    /// Model-call recovery policy applied by the turn engine.
+    pub recovery: RecoveryConfig,
 }
 
 /// Default shared in-flight cancel grace.
@@ -118,6 +193,7 @@ impl Default for RuntimeConfig {
             operation_timeout: None,
             tool_cancel_grace: DEFAULT_TOOL_CANCEL_GRACE,
             compaction: CompactionConfig::default(),
+            recovery: RecoveryConfig::default(),
         }
     }
 }

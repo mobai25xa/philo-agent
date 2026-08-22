@@ -270,6 +270,9 @@ impl ActivityState {
             | FrontendOperationEvent::TurnCancelled { reason, .. } => {
                 self.replace(ActivityKind::Cancelling(reason.clone()));
             }
+            FrontendOperationEvent::ModelRetryScheduled { .. } => {
+                self.replace(ActivityKind::Waiting("retry"));
+            }
             FrontendOperationEvent::AssistantMessageCompleted { .. } => {
                 self.set(ActivityKind::Waiting("wait"));
             }

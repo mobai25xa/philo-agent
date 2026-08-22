@@ -39,6 +39,7 @@ async fn runtime(
             operation_timeout: None,
             tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
+            recovery: Default::default(),
         },
         tools,
     )

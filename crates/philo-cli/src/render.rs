@@ -312,6 +312,26 @@ impl Renderer {
                     failure.message(),
                 )));
             }
+            AgentEvent::ModelRetryScheduled {
+                attempt,
+                max_retries,
+                delay_ms,
+                reason,
+                ..
+            } => {
+                self.close_reasoning(&mut outputs);
+                if self.stdout_open {
+                    outputs.push(out("\n"));
+                    self.stdout_open = false;
+                }
+                if !self.quiet() {
+                    let seconds = format!("{:.1}", *delay_ms as f64 / 1000.0);
+                    outputs.push(err(format!(
+                        "warning: model call interrupted; retrying \
+                         (attempt {attempt}/{max_retries}, waiting {seconds}s): {reason}\n"
+                    )));
+                }
+            }
             AgentEvent::OperationSettled {
                 status, durability, ..
             } => {
@@ -399,6 +419,26 @@ impl Renderer {
                 self.close_reasoning(&mut outputs);
                 if self.verbose() {
                     outputs.push(err(format!("model call {model_call_id}\n")));
+                }
+            }
+            FrontendOperationEvent::ModelRetryScheduled {
+                attempt,
+                max_retries,
+                delay_ms,
+                reason,
+                ..
+            } => {
+                self.close_reasoning(&mut outputs);
+                if self.stdout_open {
+                    outputs.push(out("\n"));
+                    self.stdout_open = false;
+                }
+                if !self.quiet() {
+                    let seconds = format!("{:.1}", *delay_ms as f64 / 1000.0);
+                    outputs.push(err(format!(
+                        "warning: model call interrupted; retrying \
+                         (attempt {attempt}/{max_retries}, waiting {seconds}s): {reason}\n"
+                    )));
                 }
             }
             FrontendOperationEvent::ModelResponseStarted {

@@ -253,6 +253,19 @@ pub fn operation_event(event: &AgentEvent) -> Option<FrontendOperationEvent> {
             turn_id: turn_id.as_str().to_owned(),
             reason: format!("{reason:?}"),
         },
+        AgentEvent::ModelRetryScheduled {
+            model_call_id,
+            attempt,
+            max_retries,
+            delay_ms,
+            reason,
+        } => FrontendOperationEvent::ModelRetryScheduled {
+            model_call_id: model_call_id.as_str().to_owned(),
+            attempt: *attempt,
+            max_retries: *max_retries,
+            delay_ms: *delay_ms,
+            reason: reason.clone(),
+        },
         _ => return None,
     })
 }

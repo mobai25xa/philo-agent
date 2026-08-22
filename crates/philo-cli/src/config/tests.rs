@@ -145,8 +145,7 @@ fn reserved_header_errors_name_the_layer_without_exposing_the_value() {
     let config = load_layers(Some(&global), None).expect("syntax and types load");
 
     let error = super::resolve::resolve(&resolvable_cli(), &config)
-        .err()
-        .expect("credential header must fail");
+        .expect_err("credential header must fail");
     assert!(error.0.contains("authorization"), "{error:?}");
     assert!(error.0.contains("global config"), "{error:?}");
     assert!(!error.0.contains("do-not-print"), "{error:?}");
@@ -231,6 +230,78 @@ fn every_section_reads_its_key_domain() {
     assert_eq!(config.shell_timeout_secs.expect("shell").value, 90);
     assert!(!config.show_reasoning.expect("reasoning").value);
     assert_eq!(config.screen.expect("screen").value, "inline");
+}
+
+#[test]
+fn recovery_section_parses_every_key() {
+    let dir = TempDir::new();
+    let path = dir.write(
+        "recovery.toml",
+        "[recovery]\n\
+         enabled = false\n\
+         max_retries = 5\n\
+         backoff_base_ms = 250\n\
+         backoff_max_ms = 4000\n\
+         response_head_timeout_secs = 30\n\
+         stream_idle_timeout_secs = 60\n",
+    );
+
+    let config = load_layers(Some(&path), None).expect("loads");
+    assert!(!config.recovery_enabled.expect("enabled").value);
+    assert_eq!(config.recovery_max_retries.expect("retries").value, 5);
+    assert_eq!(
+        config
+            .recovery_backoff_base_ms
+            .expect("backoff base")
+            .value,
+        250
+    );
+    assert_eq!(
+        config.recovery_backoff_max_ms.expect("backoff cap").value,
+        4_000
+    );
+    assert_eq!(
+        config
+            .recovery_response_head_timeout_secs
+            .expect("head timeout")
+            .value,
+        30
+    );
+    assert_eq!(
+        config
+            .recovery_stream_idle_timeout_secs
+            .expect("idle timeout")
+            .value,
+        60
+    );
+}
+
+#[test]
+fn recovery_rejects_negative_and_invalid_values() {
+    let dir = TempDir::new();
+    let negative = dir.write("negative.toml", "[recovery]\nmax_retries = -1\n");
+    assert!(
+        load_layers(Some(&negative), None)
+            .expect_err("negative retries")
+            .0
+            .contains("must be a non-negative integer")
+    );
+
+    let zero_base = dir.write("zero-base.toml", "[recovery]\nbackoff_base_ms = 0\n");
+    assert!(
+        load_layers(Some(&zero_base), None)
+            .expect_err("zero backoff base")
+            .0
+            .contains("must be a positive integer")
+    );
+
+    let wrong_type = dir.write("wrong-type.toml", "[recovery]\nenabled = \"yes\"\n");
+    assert!(
+        load_layers(Some(&wrong_type), None)
+            .expect_err("wrong type")
+            .0
+            .contains("must be a boolean, found string")
+    );
 }
 
 #[test]
@@ -410,8 +481,7 @@ fn invalid_ui_screen_is_a_hard_error() {
         layer: Layer::Global,
     });
     let error = super::resolve::resolve(&resolvable_cli(), &file)
-        .err()
-        .expect("invalid screen must fail");
+        .expect_err("invalid screen must fail");
     assert!(
         error.0.contains("invalid [ui].screen 'fullscreen'"),
         "{error:?}"
@@ -522,8 +592,7 @@ fn prefer_continuation_is_responses_only_and_needs_no_support_key() {
         layer: Layer::Project,
     });
     let error = super::resolve::resolve(&resolvable_cli(), &chat_prefer)
-        .err()
-        .expect("Chat + prefer fails at resolve");
+        .expect_err("Chat + prefer fails at resolve");
     assert!(error.0.contains("OpenAI Responses protocol"), "{error:?}");
 
     let mut responses_prefer = deployment_file();
@@ -561,8 +630,7 @@ fn reasoning_format_is_chat_only_and_shown_when_set() {
         layer: Layer::Project,
     });
     let error = super::resolve::resolve(&resolvable_cli(), &responses)
-        .err()
-        .expect("reasoning_format is Chat-only");
+        .expect_err("reasoning_format is Chat-only");
     assert!(error.0.contains("reasoning_format"), "{error:?}");
     assert!(error.0.contains("OpenAI Chat"), "{error:?}");
 
@@ -789,8 +857,7 @@ fn compaction_threshold_must_be_a_finite_ratio() {
             layer: Layer::Project,
         });
         let error = super::resolve::resolve(&resolvable_cli(), &file)
-            .err()
-            .expect("invalid threshold must fail");
+            .expect_err("invalid threshold must fail");
         assert!(
             error.0.contains("greater than 0 and at most 1"),
             "{error:?}"

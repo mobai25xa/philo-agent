@@ -25,6 +25,7 @@ fn config(max_parallel: u32, grace: Duration) -> RuntimeConfig {
         operation_timeout: None,
         tool_cancel_grace: grace,
         compaction: Default::default(),
+        recovery: Default::default(),
     }
 }
 

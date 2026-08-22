@@ -23,6 +23,7 @@ fn config(max_parallel_tool_calls: u32) -> RuntimeConfig {
         operation_timeout: None,
         tool_cancel_grace: std::time::Duration::from_millis(300),
         compaction: Default::default(),
+        recovery: Default::default(),
     }
 }
 

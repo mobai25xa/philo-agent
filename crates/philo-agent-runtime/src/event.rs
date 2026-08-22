@@ -120,6 +120,19 @@ pub enum AgentEvent {
         operation_id: OperationId,
         reason: CancelReason,
     },
+    /// Transient: a model call failed with a recoverable delivery fault and
+    /// the engine will re-issue the identical call after `delay_ms`. Never
+    /// written to the Session. The failed attempt's streamed deltas are
+    /// discarded; consumers should close any open streaming view on receipt.
+    ModelRetryScheduled {
+        model_call_id: ModelCallId,
+        /// Retry ordinal about to run (1-based).
+        attempt: u32,
+        max_retries: u32,
+        delay_ms: u64,
+        /// Bounded diagnostic summary of why the attempt failed.
+        reason: String,
+    },
     /// The cancellation terminal facts committed durably; published before
     /// the matching `OperationSettled`. The reason is `User` or `Timeout`.
     TurnCancelled {

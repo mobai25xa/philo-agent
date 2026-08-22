@@ -1,17 +1,19 @@
 use std::fmt::Write as _;
 
 use philo::api::stable::PhiloError;
-use philo_agent_runtime::ModelError;
+use philo_agent_runtime::{ModelFailureClass, ModelError};
 
 /// Normalizes any SDK failure into the runtime `ModelError`, carrying a
 /// redacted diagnostic summary. Every `PhiloErrorKind` takes this single path;
 /// no new runtime failure path is introduced.
 pub(crate) fn model_error(error: &PhiloError) -> ModelError {
+    let class = failure_class(error);
     let mut message = format!(
-        "philo model call failed: kind={:?} stage={:?} code={}",
+        "philo model call failed: kind={:?} stage={:?} code={} class={:?}",
         error.kind(),
         error.context().stage(),
-        error.code()
+        error.code(),
+        class
     );
 
     // ErrorDetails, ErrorContext, and RetryReport are the SDK's explicitly
@@ -65,7 +67,52 @@ pub(crate) fn model_error(error: &PhiloError) -> ModelError {
         write!(message, " cause={cause:?}").expect("writing to String cannot fail");
     }
 
-    ModelError::new(message)
+    ModelError::with_class(message, class)
+}
+
+/// Maps the SDK's redacted classification onto the runtime's recovery
+/// vocabulary. The SDK owns attempt-level retries for everything before a
+/// 2xx response; anything surfacing here either exhausted that policy or
+/// happened mid-stream, where only delivery faults are worth one fresh
+/// identical attempt by the caller.
+fn failure_class(error: &PhiloError) -> ModelFailureClass {
+    use philo::api::stable::{ErrorDetails as Details, ProtocolStage as Protocol, TimeoutKind as Timeout};
+
+    match error.details() {
+        // Connect/DNS/TLS/write failures and mid-body drops: a fresh attempt
+        // rebuilds the whole request, so ambiguity is harmless at this layer.
+        Details::Transport { .. } => ModelFailureClass::Recoverable,
+        // Stream cut before the terminal event (e.g. `incomplete_response`).
+        Details::Protocol { stage: Protocol::Termination, .. } => ModelFailureClass::Recoverable,
+        // Provider sent malformed or contradictory events; structural.
+        Details::Protocol { .. } | Details::Configuration { .. }
+        | Details::Validation { .. } | Details::Capability { .. }
+        | Details::Credential | Details::ProtocolEncode { .. }
+        | Details::Replay { .. } => ModelFailureClass::Fatal,
+        // Provider aborted the stream remotely: transient.
+        Details::RemoteStream { .. } => ModelFailureClass::Recoverable,
+        // A stalled stream is a delivery fault regardless of which deadline
+        // expired; a fresh attempt gets its own budgets.
+        Details::Timeout { kind: Timeout::StreamIdle | Timeout::ResponseHead } => {
+            ModelFailureClass::Recoverable
+        }
+        // Whole-call budget exhausted: retrying here would fight the
+        // caller's own operation timeout.
+        Details::Timeout { kind: Timeout::Total } => ModelFailureClass::Fatal,
+        Details::Http { status, .. } => {
+            let code = status.as_u16();
+            if code == 408 || code == 409 || code == 429 || code >= 500 {
+                ModelFailureClass::Recoverable
+            } else {
+                ModelFailureClass::Fatal
+            }
+        }
+        // Cancellation is a decision, not a fault to retry through.
+        Details::Cancelled => ModelFailureClass::Fatal,
+        // The SDK enum is non-exhaustive: unknown future details stay fatal
+        // until classified deliberately.
+        _ => ModelFailureClass::Fatal,
+    }
 }
 
 fn deepest_cause(error: &(dyn std::error::Error + 'static)) -> Option<String> {

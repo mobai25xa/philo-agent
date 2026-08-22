@@ -77,6 +77,8 @@ impl App {
             }
         }
         if self.selection.is_some_and(Selection::is_collapsed) {
+            let anchor = self.selection.unwrap().anchor;
+            self.toggle_reasoning_block(anchor.cell, anchor.row);
             self.clear_selection();
         }
         vec![]
@@ -98,7 +100,8 @@ impl App {
             return;
         }
         let width = self.layout_width.get();
-        self.cells.refresh_wraps(width);
+        self.cells
+            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
         self.scroll
             .unfollow_keep_wrapped(&self.cells.wrap_rows(), height);
     }

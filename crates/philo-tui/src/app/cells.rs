@@ -15,6 +15,7 @@ use super::transcript::{LineKind, TranscriptLine};
 struct WrapCache {
     width: usize,
     closed_upto: usize,
+    revision: u64,
     rows: Vec<Vec<String>>,
 }
 
@@ -23,6 +24,7 @@ impl Default for WrapCache {
         Self {
             width: usize::MAX,
             closed_upto: 0,
+            revision: 0,
             rows: Vec::new(),
         }
     }
@@ -34,12 +36,22 @@ impl WrapCache {
     }
 }
 
+/// Whether each reasoning run renders collapsed. Keyed by the run's first
+/// cell index; other indices are never queried.
+pub(crate) type Collapser<'a> = &'a dyn Fn(usize) -> bool;
+
+#[cfg(test)]
+pub(crate) fn expanded() -> Collapser<'static> {
+    &|_| false
+}
+
 /// Canonical history for one TUI session: one ordered cell list plus an
 /// optional in-place open cursor on the last cell.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TranscriptStore {
     cells: Vec<TranscriptLine>,
     open: Option<usize>,
+    wrap_revision: u64,
     cache: RefCell<WrapCache>,
 }
 
@@ -51,7 +63,13 @@ impl TranscriptStore {
     pub fn clear(&mut self) {
         self.cells.clear();
         self.open = None;
+        self.wrap_revision = self.wrap_revision.wrapping_add(1);
         self.cache.borrow_mut().invalidate();
+    }
+
+    /// Manual reasoning fold changes must rebuild cached rows.
+    pub(crate) fn bump_wrap_revision(&mut self) {
+        self.wrap_revision = self.wrap_revision.wrapping_add(1);
     }
 
     /// All cells, including the open cell when one exists.
@@ -79,6 +97,10 @@ impl TranscriptStore {
 
     #[cfg(test)]
     pub fn open_index(&self) -> Option<usize> {
+        self.open
+    }
+
+    pub(crate) fn open_cell(&self) -> Option<usize> {
         self.open
     }
 
@@ -141,19 +163,29 @@ impl TranscriptStore {
         );
     }
 
-    /// Rebuild wrap rows when the width changes. The closed prefix is
-    /// stable; always rewrap from `open_index.unwrap_or(len)`.
-    pub(crate) fn refresh_wraps(&self, width: usize) {
+    /// Rebuild wrap rows when the width changes or a manual reasoning fold
+    /// bumped the revision. The closed prefix is stable; always rewrap from
+    /// `open_index.unwrap_or(len)`.
+    pub(crate) fn refresh_wraps(&self, width: usize, collapsed: Collapser<'_>) {
         self.assert_open_last();
         let mut cache = self.cache.borrow_mut();
+        if cache.revision != self.wrap_revision {
+            *cache = WrapCache {
+                width,
+                revision: self.wrap_revision,
+                ..WrapCache::default()
+            };
+        }
         if width == 0 {
             cache.invalidate();
             cache.width = 0;
+            cache.revision = self.wrap_revision;
             return;
         }
         if cache.width != width {
             cache.invalidate();
             cache.width = width;
+            cache.revision = self.wrap_revision;
         }
         let rewrap_from = self.open.unwrap_or(self.cells.len());
         if cache.closed_upto > rewrap_from {
@@ -164,16 +196,37 @@ impl TranscriptStore {
             cache.rows.truncate(self.cells.len());
             cache.closed_upto = self.cells.len();
         }
+        let runs = ReasoningRuns::scan(&self.cells);
         let start = cache.closed_upto.min(rewrap_from);
         cache.rows.truncate(start);
         cache.closed_upto = start;
-        for cell in &self.cells[start..rewrap_from] {
-            cache.rows.push(wrap_line(cell, width, None));
+        for index in start..rewrap_from {
+            let row = project_cell(
+                &self.cells[index],
+                width,
+                self.prev_kind(index),
+                &runs,
+                index,
+                collapsed,
+            );
+            cache.rows.push(row);
             cache.closed_upto += 1;
         }
-        for cell in &self.cells[rewrap_from..] {
-            cache.rows.push(wrap_line(cell, width, None));
+        for index in rewrap_from..self.cells.len() {
+            let row = project_cell(
+                &self.cells[index],
+                width,
+                self.prev_kind(index),
+                &runs,
+                index,
+                collapsed,
+            );
+            cache.rows.push(row);
         }
+    }
+
+    fn prev_kind(&self, index: usize) -> Option<LineKind> {
+        index.checked_sub(1).map(|prev| self.cells[prev].kind)
     }
 
     pub(crate) fn wrap_rows(&self) -> Ref<'_, [Vec<String>]> {
@@ -185,8 +238,9 @@ impl TranscriptStore {
         width: usize,
         height: usize,
         scroll: &ScrollState,
+        collapsed: Collapser<'_>,
     ) -> VisibleSlice {
-        self.refresh_wraps(width);
+        self.refresh_wraps(width, collapsed);
         let wrapped = self.wrap_rows();
         visible_from_wraps(self, &wrapped, width, height, scroll)
     }
@@ -456,22 +510,123 @@ fn slice_from_wraps(
 pub(crate) fn wrap_line(
     cell: &TranscriptLine,
     width: usize,
-    _prev: Option<LineKind>,
+    prev: Option<LineKind>,
 ) -> Vec<String> {
-    match cell.kind {
+    let mut rows = match cell.kind {
         LineKind::User => text::wrap_user(&cell.text, width),
         LineKind::Answer => text::wrap_answer(&cell.text, width, true),
         LineKind::Tool => text::wrap_hanging(&cell.text, width),
         LineKind::Reasoning => text::wrap_reasoning(&cell.text, width),
         _ => text::wrap(&cell.text, width),
+    };
+    if needs_leading_gap(prev, cell.kind) && !rows.is_empty() {
+        rows.insert(0, String::new());
     }
+    rows
+}
+
+/// Consecutive Reasoning cells form one visual think block. The scan maps
+/// every reasoning index to its run head and the block's body line count
+/// (logical lines; the head's own first line is the `think` header).
+struct ReasoningRuns {
+    head_of: Vec<usize>,
+    body_lines: Vec<usize>,
+}
+
+impl ReasoningRuns {
+    fn scan(cells: &[TranscriptLine]) -> Self {
+        let mut head_of = vec![usize::MAX; cells.len()];
+        let mut body_lines = vec![0usize; cells.len()];
+        let mut index = 0;
+        while index < cells.len() {
+            if cells[index].kind != LineKind::Reasoning {
+                index += 1;
+                continue;
+            }
+            let head = index;
+            let mut total = 0usize;
+            while index < cells.len() && cells[index].kind == LineKind::Reasoning {
+                let count = cells[index].text.lines().count().max(1);
+                total += if index == head {
+                    count.saturating_sub(1)
+                } else {
+                    count
+                };
+                head_of[index] = head;
+                index += 1;
+            }
+            body_lines[head] = total.max(1);
+        }
+        Self {
+            head_of,
+            body_lines,
+        }
+    }
+
+    fn collapsed_header(
+        &self,
+        index: usize,
+        collapsed: Collapser<'_>,
+    ) -> std::option::Option<usize> {
+        let head = self.head_of[index];
+        if head == usize::MAX || !collapsed(head) {
+            return None;
+        }
+        if head == index {
+            Some(self.body_lines[head])
+        } else {
+            None
+        }
+    }
+}
+
+/// One display row list for a cell: normal wrap, or the collapsed
+/// `think · N 行` header / hidden body when its run is folded.
+fn project_cell(
+    cell: &TranscriptLine,
+    width: usize,
+    prev: Option<LineKind>,
+    runs: &ReasoningRuns,
+    index: usize,
+    collapsed: Collapser<'_>,
+) -> Vec<String> {
+    if cell.kind == LineKind::Reasoning
+        && let Some(count) = runs.collapsed_header(index, collapsed)
+    {
+        return vec![format!("think · {count} 行")];
+    }
+    if cell.kind == LineKind::Reasoning && runs.head_of[index] != usize::MAX {
+        let head = runs.head_of[index];
+        if collapsed(head) {
+            return Vec::new();
+        }
+    }
+    wrap_line(cell, width, prev)
+}
+
+fn needs_leading_gap(prev: Option<LineKind>, cur: LineKind) -> bool {
+    matches!(
+        (prev, cur),
+        (
+            Some(LineKind::Tool | LineKind::Answer),
+            LineKind::Tool | LineKind::Answer
+        )
+    )
 }
 
 #[cfg(test)]
 fn wrap_all(cells: &[TranscriptLine], width: usize) -> Vec<Vec<String>> {
     cells
         .iter()
-        .map(|cell| wrap_line(cell, width, None))
+        .enumerate()
+        .map(|(index, cell)| {
+            let prev = if index == 0 {
+                None
+            } else {
+                Some(cells[index - 1].kind)
+            };
+            wrap_line(cell, width, prev)
+        })
         .collect()
 }
 
@@ -709,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn each_answer_cell_gets_its_own_lead_bullet() {
+    fn block_boundaries_get_a_leading_gap_row() {
         let cells = vec![
             line(LineKind::Answer, "abcdefgh"),
             line(LineKind::Answer, "ijklmnop"),
@@ -717,10 +872,29 @@ mod tests {
             line(LineKind::Answer, "next"),
         ];
         let scroll = ScrollState::follow();
-        let slice = visible_slice(&cells, 6, 8, &scroll);
+        let slice = visible_slice(&cells, 6, 10, &scroll);
         assert_eq!(
             texts(&slice),
-            ["• abcd", "  efgh", "• ijkl", "  mnop", "▸ read", "• next"]
+            [
+                "• abcd", "  efgh", "", "• ijkl", "  mnop", "", "▸ read", "", "• next"
+            ]
+        );
+    }
+
+    #[test]
+    fn user_and_reasoning_boundaries_stay_gap_free() {
+        let cells = vec![
+            line(LineKind::User, "› prompt"),
+            line(LineKind::Answer, "reply"),
+            line(LineKind::Reasoning, "think"),
+            line(LineKind::Reasoning, "  more think"),
+            line(LineKind::Meta, "note"),
+        ];
+        let scroll = ScrollState::follow();
+        let slice = visible_slice(&cells, 20, 8, &scroll);
+        assert_eq!(
+            texts(&slice),
+            ["› prompt", "• reply", "think", "│ more think", "note"]
         );
     }
 
@@ -734,6 +908,48 @@ mod tests {
         assert_eq!(texts(&slice), ["one", "two"]);
         assert!(slice.at_top);
         assert!(slice.at_bottom);
+    }
+
+    #[test]
+    fn sealed_reasoning_runs_project_a_collapsed_header() {
+        let mut store = TranscriptStore::default();
+        store.push_closed([
+            meta("a"),
+            crate::app::transcript::line(LineKind::Reasoning, "think"),
+            crate::app::transcript::line(LineKind::Reasoning, "  body one"),
+            crate::app::transcript::line(LineKind::Reasoning, "  body two"),
+            meta("tail"),
+        ]);
+        store.refresh_wraps(80, &|head| head == 1);
+        let slice = store.visible_slice(80, 10, &ScrollState::follow(), &|head| head == 1);
+        assert_eq!(
+            texts(&slice),
+            ["a", "think · 2 行", "tail"],
+            "the folded run renders one header row"
+        );
+
+        let mut store = TranscriptStore::default();
+        store.push_closed([crate::app::transcript::line(LineKind::Reasoning, "think")]);
+        store.refresh_wraps(80, &|_| true);
+        let slice = store.visible_slice(80, 10, &ScrollState::follow(), &|_| true);
+        assert_eq!(texts(&slice), ["think · 1 行"]);
+    }
+
+    #[test]
+    fn fold_toggles_rebuild_cached_rows() {
+        let mut store = TranscriptStore::default();
+        store.push_closed([crate::app::transcript::line(LineKind::Reasoning, "think")]);
+        store.refresh_wraps(80, &|_| true);
+        {
+            let rows = store.wrap_rows();
+            assert_eq!(rows[0], vec!["think · 1 行".to_owned()]);
+        }
+        store.bump_wrap_revision();
+        store.refresh_wraps(80, &|_| false);
+        {
+            let rows = store.wrap_rows();
+            assert_eq!(rows[0], wrap_line(&store.cells()[0], 80, None));
+        }
     }
 
     #[test]
@@ -779,13 +995,13 @@ mod tests {
     fn wrap_cache_is_keyed_by_width_and_rewraps_from_open() {
         let mut store = TranscriptStore::new();
         store.push_closed((0..3).map(|i| meta(&format!("中文{i}"))));
-        store.refresh_wraps(4);
+        store.refresh_wraps(4, expanded());
         assert_eq!(store.cached_width(), 4);
         assert_eq!(store.cached_closed_upto(), 3);
         let narrow = store.wrap_rows().to_vec();
         assert_eq!(narrow[0], ["中文", "0"]);
 
-        store.refresh_wraps(4);
+        store.refresh_wraps(4, expanded());
         assert_eq!(
             store.cached_closed_upto(),
             3,
@@ -793,24 +1009,24 @@ mod tests {
         );
         assert_eq!(&*store.wrap_rows(), narrow.as_slice());
 
-        store.refresh_wraps(80);
+        store.refresh_wraps(80, expanded());
         assert_eq!(store.cached_width(), 80);
         assert_eq!(store.wrap_rows()[0], ["中文0"]);
 
-        store.refresh_wraps(4);
+        store.refresh_wraps(4, expanded());
         assert_eq!(&*store.wrap_rows(), narrow.as_slice());
 
         store.push_closed([meta("中文3")]);
-        store.refresh_wraps(4);
+        store.refresh_wraps(4, expanded());
         assert_eq!(store.cached_closed_upto(), 4);
         assert_eq!(store.wrap_rows()[3], ["中文", "3"]);
 
         store.begin(LineKind::Meta, "中文");
-        store.refresh_wraps(4);
+        store.refresh_wraps(4, expanded());
         assert_eq!(store.cached_closed_upto(), 4);
         assert_eq!(store.wrap_rows()[4], ["中文"]);
         store.write_open("live");
-        store.refresh_wraps(4);
+        store.refresh_wraps(4, expanded());
         assert_eq!(
             store.cached_closed_upto(),
             4,

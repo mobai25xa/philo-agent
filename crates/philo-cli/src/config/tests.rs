@@ -423,6 +423,33 @@ fn invalid_ui_screen_is_a_hard_error() {
 }
 
 #[test]
+fn terminal_bg_parses_hex_and_flows_into_settings() {
+    use super::resolve::parse_hex_color;
+
+    assert_eq!(parse_hex_color("#1A1B26").unwrap(), (0x1a, 0x1b, 0x26));
+    assert_eq!(parse_hex_color("1a1b26").unwrap(), (26, 27, 38));
+    assert!(parse_hex_color("#1b2").is_err());
+    assert!(parse_hex_color("#1a1b2g").is_err());
+    assert!(parse_hex_color("#1a1b26ff").is_err());
+    assert!(parse_hex_color("not-a-color").is_err());
+
+    let mut file = deployment_file();
+    file.terminal_bg = Some(Sourced {
+        value: "#201f2a".to_owned(),
+        layer: Layer::Project,
+    });
+    let settings = super::resolve::resolve(&resolvable_cli(), &file).expect("resolves");
+    assert_eq!(settings.terminal_bg, Some((0x20, 0x1f, 0x2a)));
+    assert!(settings.entries.iter().any(|entry| {
+        entry.key == "terminal_bg" && entry.value == "#201f2a" && entry.source == "project"
+    }));
+
+    let unset =
+        super::resolve::resolve(&resolvable_cli(), &deployment_file()).expect("defaults resolve");
+    assert_eq!(unset.terminal_bg, None);
+}
+
+#[test]
 fn retired_protocol_names_fail_with_migration_text() {
     let compatible = parse_protocol("openai-chat-compatible").expect_err("old dialect");
     assert!(compatible.0.contains("protocol=openai-chat"));

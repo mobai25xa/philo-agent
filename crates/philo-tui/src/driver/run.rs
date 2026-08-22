@@ -44,6 +44,7 @@ const SESSION_LOAD_RETRY_BUDGET: u8 = 3;
 
 /// Production entry: enter the terminal, drive the loop, restore on every path.
 pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRunReport {
+    crate::render::theme::init_palette(config.terminal_palette);
     let screen = config.screen;
     let mut session = match TerminalSession::enter(screen) {
         Ok(session) => session,
@@ -1268,6 +1269,7 @@ mod tests {
             show_reasoning: true,
             context_window: None,
             screen: TuiScreen::Inline,
+            terminal_palette: None,
             interrupt: None,
             recovery: None,
         }

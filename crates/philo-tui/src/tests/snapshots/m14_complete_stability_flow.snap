@@ -18,32 +18,32 @@ Notice: turn cancelled (user)
 Meta: done (cancelled)
 
 TOOL
-00:     8901234567890123456789012345678901
-01:     23456789 中 文  é 👩‍💻
-02:     ```rust
-03:     fn main() { println!("稳 定 "); }
-04:     ```
+00:       中 文  é 👩‍💻
+01:       ```rust
+02:       fn main() { println!("稳 定 ");
+03:       }
+04:       ```
 05: 
-06:   read_file  path: src/中 文 .rs
-07:   | tool  read_file
-08:     long composer draft 中 文  é 👩‍💻
-09:     long composer draft 中 文  é 👩‍💻
-10:     long composer draft
-11: model-m14  session-m14  queued 1
+06:     read_file  path: src/中 文 .rs
+07:     | tool  read_file
+08:       long composer draft 中 文  é 👩‍💻
+09:       long composer draft 中 文  é 👩‍💻
+10:       long composer draft
+11: model-m14 · session-m14 · queued 1
 
 CANCELLING
-00:     fn main() { println!("稳 定 "); }
-01:     ```
-02: 
-03:   • read_file  src/中 文 .rs
-04:   context compacted
-05:   • after tool
-06:   • late-but-preserved
-07:   | cancel  user
-08:     long composer draft 中 文  é 👩‍💻
-09:     long composer draft 中 文  é 👩‍💻
-10:     long composer draft
-11: model-m14  session-m14  queued 1
+00: 
+01: 
+02:     • read_file  src/中 文 .rs
+03:     context compacted
+04:     • after tool
+05: 
+06:     • late-but-preserved
+07:     | cancel  user
+08:       long composer draft 中 文  é 👩‍💻
+09:       long composer draft 中 文  é 👩‍💻
+10:       long composer draft
+11: model-m14 · session-m14 · queued 1
 
 APPROVAL
 00: approval required  ·  write workspace...
@@ -53,8 +53,8 @@ APPROVAL
 04: 
 05: 
 06: 
-07:   ! Approval required
-08:     long composer draft 中 文  é 👩‍💻
-09:     long composer draft 中 文  é 👩‍💻
-10:     long composer draft
-11: model-m14  session-m14
+07:     ! Approval required
+08:       long composer draft 中 文  é 👩‍💻
+09:       long composer draft 中 文  é 👩‍💻
+10:       long composer draft
+11: model-m14 · session-m14

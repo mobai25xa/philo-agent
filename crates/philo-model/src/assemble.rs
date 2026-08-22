@@ -33,7 +33,7 @@ pub enum ModelContinuationPolicy {
 /// extra protocol variants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProtocol {
-    /// OpenAI Chat Completions (`openai-chat/v2`).
+    /// OpenAI Chat Completions (`openai-completions/v3`).
     OpenAiChat,
     /// OpenAI Responses (`openai-responses/v2`).
     OpenAiResponses,
@@ -76,7 +76,7 @@ impl ModelProtocol {
 
     fn protocol_id(self) -> sdk::ProtocolId {
         let id = match self {
-            Self::OpenAiChat => sdk::ProtocolId::OPENAI_CHAT_V2,
+            Self::OpenAiChat => sdk::ProtocolId::OPENAI_COMPLETIONS_V3,
             Self::OpenAiResponses => sdk::ProtocolId::OPENAI_RESPONSES_V2,
         };
         sdk::ProtocolId::new(id).expect("built-in protocol id is valid")
@@ -300,48 +300,68 @@ impl PhiloModelBuilder {
         }
 
         let client_builder = sdk::PhiloClient::builder().transport(transport);
-        let (client_builder, envelope, model_compat) = match self.protocol {
+        let (client_builder, protocol_envelope, composition, format) = match self.protocol {
             ModelProtocol::OpenAiChat => {
-                let compat = chat_compat(self.compat, self.chat_reasoning_format);
-                let adapter = ext::OpenAiChatAdapter::with_compat(compat.clone());
+                // The completions family materializes its adapter per target
+                // from the binding-attached frozen FormatSpec; deployment
+                // differences live on the model composition instead.
+                let spec = match self.compat {
+                    ModelCompat::Official => ext::FormatSpec::openai_official(),
+                    ModelCompat::Compatible => ext::FormatSpec::fallback(),
+                };
+                let adapter = ext::OpenAiChatAdapter::with_spec(spec);
                 let envelope = adapter.capabilities().envelope().clone();
+                let composition = chat_composition(self.chat_reasoning_format)?;
+                let format = match self.compat {
+                    ModelCompat::Official => Some(ext::FormatSpecRef::OpenAiOfficial),
+                    // Fallback is the resolver's miss-path default.
+                    ModelCompat::Compatible => None,
+                };
                 (
                     client_builder.register_protocol(adapter),
                     envelope,
-                    ext::ProtocolCompat::from(compat),
+                    Some(composition),
+                    format,
                 )
             }
             ModelProtocol::OpenAiResponses => {
                 let compat = responses_compat(self.compat, prefers_continuation);
-                let adapter = ext::OpenAiResponsesAdapter::with_compat(compat.clone());
+                let adapter = ext::OpenAiResponsesAdapter::with_compat(compat);
                 let envelope = adapter.capabilities().envelope().clone();
                 (
                     client_builder.register_protocol(adapter),
                     envelope,
-                    ext::ProtocolCompat::from(compat),
+                    None,
+                    None,
                 )
             }
         };
 
-        let mut constraints = ext::CapabilityConstraints::default();
-        if !prefers_continuation {
-            constraints
-                .disabled
-                .insert(sdk::Capability::ResponseContinuation);
+        // Declared model facts replace the raw skeleton envelope so the
+        // profile never claims more than this deployment measured.
+        let (model_envelope, knowledge) = match &composition {
+            Some(composition) => (composition.envelope().clone(), composition.knowledge()),
+            None => (protocol_envelope, sdk::CapabilityKnowledge::Complete),
+        };
+        let mut binding =
+            ext::ProviderBinding::new(protocol_id.clone(), endpoint).map_err(|error| {
+                AdapterBuildError::new(format!("provider binding invalid: {error}"))
+            })?;
+        if let Some(format) = format {
+            binding = binding.with_format(format);
         }
-        let binding = ext::ProviderBinding::new(protocol_id.clone(), endpoint, constraints)
-            .map_err(|error| AdapterBuildError::new(format!("provider binding invalid: {error}")))?
-            .with_headers(self.request_headers.provider_headers());
-        let model_profile = ext::ModelProfile::new(
+        let binding = binding.with_headers(self.request_headers.provider_headers());
+        let mut model_profile = ext::ModelProfile::new(
             protocol_id.clone(),
             model_name.clone(),
-            ext::ModelCapabilities::new(envelope),
-            ext::CapabilityConstraints::default(),
-            sdk::CapabilityKnowledge::Complete,
+            ext::ModelCapabilities::new(model_envelope),
+            knowledge,
             sdk::CapabilitySource::new("philo-model assembly").expect("static source is valid"),
             ext::ModelMetadata::default(),
-        )
-        .with_compat(model_compat);
+        );
+        if let Some(composition) = composition {
+            model_profile = model_profile.with_composition(composition);
+        }
         let mut provider = ext::ProviderProfile::new(provider_id.clone())
             .with_default_headers(default_provider_headers())
             .add_binding(binding)
@@ -383,39 +403,48 @@ const fn effective_chat_reasoning_format(
 ) -> ChatReasoningFormat {
     match chat_reasoning_format {
         Some(format) => format,
-        // Both `OpenAiChatCompat::default()` and `compatible()` use EffortAndContent.
+        // The unmodified family baseline pairs with both FormatSpec instances.
         None => ChatReasoningFormat::EffortAndContent,
     }
 }
 
-fn chat_compat(compat: ModelCompat, format: Option<ChatReasoningFormat>) -> ext::OpenAiChatCompat {
-    let preset = match compat {
-        ModelCompat::Official => ext::OpenAiChatCompat::default(),
-        // SDK `compatible()` stays conservative (no cache identity) so unknown
-        // gateways do not 400. The agent opts in: newapi-class endpoints need
-        // a stable session key plus OpenAI-format affinity headers to pin the
-        // prefix to one cache replica. `include_usage` is required to observe
-        // `cached_tokens` on OpenAI-shaped streams.
-        ModelCompat::Compatible => ext::OpenAiChatCompat::compatible()
-            .with_cache_key(ext::OpenAiChatCacheKey::PromptCacheKey)
-            .with_session_affinity(ext::OpenAiChatSessionAffinity::OpenAi)
-            .with_sends_stream_usage(true),
+/// Maps the Chat reasoning-format configuration onto the v3 model
+/// composition: legacy wire dialects survive as subtraction-only model
+/// facts over the family baseline.
+fn chat_composition(
+    chat_reasoning_format: Option<ChatReasoningFormat>,
+) -> Result<ext::ModelComposition, AdapterBuildError> {
+    let baseline = ext::ModelComposition::baseline();
+    let composed = match effective_chat_reasoning_format(chat_reasoning_format) {
+        // Effort control plus visible reasoning: untouched baseline.
+        ChatReasoningFormat::EffortAndContent => baseline,
+        // Legacy `EffortOnly`: effort control intact, no visible reasoning.
+        ChatReasoningFormat::EffortOnly => baseline
+            .disabled([
+                sdk::Capability::AssistantHistoryReasoning,
+                sdk::Capability::OutputReasoning,
+            ])
+            .map_err(|error| {
+                AdapterBuildError::new(format!("chat composition invalid: {error}"))
+            })?,
+        // Legacy `ContentOnly`: visible reasoning intact, no effort control.
+        ChatReasoningFormat::ContentOnly => baseline
+            .disabled([sdk::Capability::ReasoningControl])
+            .map_err(|error| {
+                AdapterBuildError::new(format!("chat composition invalid: {error}"))
+            })?,
+        // Reasoning absent from the deployment entirely.
+        ChatReasoningFormat::None => baseline
+            .disabled([
+                sdk::Capability::ReasoningControl,
+                sdk::Capability::AssistantHistoryReasoning,
+                sdk::Capability::OutputReasoning,
+            ])
+            .map_err(|error| {
+                AdapterBuildError::new(format!("chat composition invalid: {error}"))
+            })?,
     };
-    match format {
-        None => preset,
-        Some(ChatReasoningFormat::None) => {
-            preset.with_reasoning_format(ext::OpenAiChatReasoningFormat::None)
-        }
-        Some(ChatReasoningFormat::EffortOnly) => {
-            preset.with_reasoning_format(ext::OpenAiChatReasoningFormat::EffortOnly)
-        }
-        Some(ChatReasoningFormat::ContentOnly) => preset
-            .with_reasoning_format(ext::OpenAiChatReasoningFormat::ContentOnly)
-            .with_unknown_fields(ext::OpenAiChatUnknownFieldPolicy::Reject),
-        Some(ChatReasoningFormat::EffortAndContent) => {
-            preset.with_reasoning_format(ext::OpenAiChatReasoningFormat::EffortAndContent)
-        }
-    }
+    Ok(composed.with_knowledge(sdk::CapabilityKnowledge::Complete))
 }
 
 fn responses_compat(compat: ModelCompat, prefers_continuation: bool) -> ext::OpenAiResponsesCompat {

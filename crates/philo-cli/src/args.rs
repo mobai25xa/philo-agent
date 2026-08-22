@@ -37,7 +37,7 @@ pub struct Cli {
     #[arg(long)]
     pub max_tool_rounds: Option<u32>,
 
-    /// Reasoning effort: minimal|low|medium|high|very-high|maximum.
+    /// Reasoning effort: minimal|low|medium|high|xhigh|max.
     #[arg(long)]
     pub reasoning_effort: Option<String>,
 

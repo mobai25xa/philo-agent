@@ -76,7 +76,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 ];
 
 /// The reasoning levels `/reasoning` accepts, for error messages.
-pub const REASONING_LEVELS: &str = "minimal | low | medium | high | very-high | maximum";
+pub const REASONING_LEVELS: &str = "minimal | low | medium | high | xhigh | max";
 
 /// One parsed command. Argument-taking commands keep the raw argument so
 /// the state machine can report a usage error itself.
@@ -170,8 +170,8 @@ pub fn parse_reasoning(level: &str) -> Option<FrontendReasoningEffort> {
         "low" => Some(FrontendReasoningEffort::Low),
         "medium" => Some(FrontendReasoningEffort::Medium),
         "high" => Some(FrontendReasoningEffort::High),
-        "very-high" => Some(FrontendReasoningEffort::VeryHigh),
-        "maximum" => Some(FrontendReasoningEffort::Maximum),
+        "xhigh" => Some(FrontendReasoningEffort::Xhigh),
+        "max" => Some(FrontendReasoningEffort::Max),
         _ => None,
     }
 }
@@ -183,8 +183,8 @@ pub fn reasoning_name(effort: FrontendReasoningEffort) -> &'static str {
         FrontendReasoningEffort::Low => "low",
         FrontendReasoningEffort::Medium => "medium",
         FrontendReasoningEffort::High => "high",
-        FrontendReasoningEffort::VeryHigh => "very-high",
-        FrontendReasoningEffort::Maximum => "maximum",
+        FrontendReasoningEffort::Xhigh => "xhigh",
+        FrontendReasoningEffort::Max => "max",
     }
 }
 
@@ -307,17 +307,14 @@ mod tests {
     fn reasoning_levels_map_onto_the_frontend_vocabulary() {
         assert_eq!(parse_reasoning("HIGH"), Some(FrontendReasoningEffort::High));
         assert_eq!(
-            parse_reasoning("very_high"),
-            Some(FrontendReasoningEffort::VeryHigh)
+            parse_reasoning("XHIGH"),
+            Some(FrontendReasoningEffort::Xhigh)
         );
         assert_eq!(
-            parse_reasoning(" maximum "),
-            Some(FrontendReasoningEffort::Maximum)
+            parse_reasoning(" max "),
+            Some(FrontendReasoningEffort::Max)
         );
         assert_eq!(parse_reasoning("turbo"), None);
-        assert_eq!(
-            reasoning_name(FrontendReasoningEffort::VeryHigh),
-            "very-high"
-        );
+        assert_eq!(reasoning_name(FrontendReasoningEffort::Xhigh), "xhigh");
     }
 }

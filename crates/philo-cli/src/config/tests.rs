@@ -377,8 +377,8 @@ fn value_parsers_cover_the_supported_vocabulary() {
         ("low", ReasoningEffort::Low),
         ("medium", ReasoningEffort::Medium),
         ("high", ReasoningEffort::High),
-        ("very-high", ReasoningEffort::VeryHigh),
-        ("maximum", ReasoningEffort::Maximum),
+        ("xhigh", ReasoningEffort::Xhigh),
+        ("max", ReasoningEffort::Max),
     ] {
         assert_eq!(parse_reasoning_effort(text).unwrap(), expected);
     }
@@ -676,7 +676,7 @@ fn reasoning_effort_is_validated_against_compat_and_format() {
             ModelProtocol::OpenAiResponses,
             ModelCompat::Official,
             None,
-            ReasoningEffort::VeryHigh,
+            ReasoningEffort::Xhigh,
         )
         .is_ok()
     );

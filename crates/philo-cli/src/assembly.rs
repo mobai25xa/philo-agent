@@ -636,8 +636,8 @@ fn frontend_effort(effort: ReasoningEffort) -> FrontendReasoningEffort {
         ReasoningEffort::Low => FrontendReasoningEffort::Low,
         ReasoningEffort::Medium => FrontendReasoningEffort::Medium,
         ReasoningEffort::High => FrontendReasoningEffort::High,
-        ReasoningEffort::VeryHigh => FrontendReasoningEffort::VeryHigh,
-        ReasoningEffort::Maximum => FrontendReasoningEffort::Maximum,
+        ReasoningEffort::Xhigh => FrontendReasoningEffort::Xhigh,
+        ReasoningEffort::Max => FrontendReasoningEffort::Max,
     }
 }
 

@@ -8,8 +8,8 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
-    VeryHigh,
-    Maximum,
+    Xhigh,
+    Max,
 }
 
 /// Requested tool-choice mode (M10). Runtime-owned vocabulary aligned with

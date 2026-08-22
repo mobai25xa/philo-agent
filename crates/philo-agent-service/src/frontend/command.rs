@@ -23,10 +23,10 @@ pub enum FrontendReasoningEffort {
     Medium,
     /// High effort.
     High,
-    /// Very high effort.
-    VeryHigh,
+    /// Extra-high effort.
+    Xhigh,
     /// Maximum effort.
-    Maximum,
+    Max,
 }
 
 /// One image (or other binary) attachment on submit.

@@ -342,8 +342,8 @@ pub fn reasoning_effort(effort: FrontendReasoningEffort) -> ReasoningEffort {
         FrontendReasoningEffort::Low => ReasoningEffort::Low,
         FrontendReasoningEffort::Medium => ReasoningEffort::Medium,
         FrontendReasoningEffort::High => ReasoningEffort::High,
-        FrontendReasoningEffort::VeryHigh => ReasoningEffort::VeryHigh,
-        FrontendReasoningEffort::Maximum => ReasoningEffort::Maximum,
+        FrontendReasoningEffort::Xhigh => ReasoningEffort::Xhigh,
+        FrontendReasoningEffort::Max => ReasoningEffort::Max,
     }
 }
 

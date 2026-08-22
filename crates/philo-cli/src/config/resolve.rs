@@ -735,11 +735,10 @@ pub(super) fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, Usa
         "low" => Ok(ReasoningEffort::Low),
         "medium" => Ok(ReasoningEffort::Medium),
         "high" => Ok(ReasoningEffort::High),
-        "very-high" => Ok(ReasoningEffort::VeryHigh),
-        "maximum" => Ok(ReasoningEffort::Maximum),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        "max" => Ok(ReasoningEffort::Max),
         other => Err(UsageError::new(format!(
-            "invalid reasoning effort '{other}': expected minimal | low | medium | high | \
-             very-high | maximum"
+            "invalid reasoning effort '{other}': expected minimal | low | medium | high | xhigh | max"
         ))),
     }
 }

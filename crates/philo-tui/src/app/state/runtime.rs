@@ -662,8 +662,8 @@ fn effort_label(effort: &str) -> String {
         "Low" => crate::app::command::reasoning_name(FrontendReasoningEffort::Low),
         "Medium" => crate::app::command::reasoning_name(FrontendReasoningEffort::Medium),
         "High" => crate::app::command::reasoning_name(FrontendReasoningEffort::High),
-        "VeryHigh" => crate::app::command::reasoning_name(FrontendReasoningEffort::VeryHigh),
-        "Maximum" => crate::app::command::reasoning_name(FrontendReasoningEffort::Maximum),
+        "Xhigh" => crate::app::command::reasoning_name(FrontendReasoningEffort::Xhigh),
+        "Max" => crate::app::command::reasoning_name(FrontendReasoningEffort::Max),
         other => other,
     }
     .to_owned()

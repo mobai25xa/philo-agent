@@ -263,8 +263,8 @@ fn protocol_capabilities_cover_each_reasoning_effort_level() {
         ReasoningEffort::Low,
         ReasoningEffort::Medium,
         ReasoningEffort::High,
-        ReasoningEffort::VeryHigh,
-        ReasoningEffort::Maximum,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
     ];
     for effort in all_efforts {
         assert!(ModelProtocol::OpenAiChat.supports_reasoning_effort(

@@ -61,19 +61,20 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
     let quiet = request.verbosity == Verbosity::Quiet;
 
     // Presentation-only heuristic over the public context view.
-    if request.continues_existing && !quiet {
-        if let Some(sessions) = &request.sessions {
-            let stored_id = philo_session::SessionId::new(request.session_id.as_str());
-            if let Ok(view) = sessions.context_view(&stored_id).await {
-                let unfinished = view.messages().last().is_some_and(|message| {
-                    !matches!(message, philo_session::ContextMessage::Assistant { .. })
-                });
-                if unfinished {
-                    eprintln!(
-                        "note: the previous turn did not finish normally; its partial \
-                         trajectory remains in the context"
-                    );
-                }
+    if request.continues_existing
+        && !quiet
+        && let Some(sessions) = &request.sessions
+    {
+        let stored_id = philo_session::SessionId::new(request.session_id.as_str());
+        if let Ok(view) = sessions.context_view(&stored_id).await {
+            let unfinished = view.messages().last().is_some_and(|message| {
+                !matches!(message, philo_session::ContextMessage::Assistant { .. })
+            });
+            if unfinished {
+                eprintln!(
+                    "note: the previous turn did not finish normally; its partial \
+                     trajectory remains in the context"
+                );
             }
         }
     }
@@ -108,13 +109,14 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
     let mut fallback_idle = false;
     let mut cancel_notice = false;
 
+    enum Step {
+        Outcome(Box<RecvOutcome>),
+        Interrupt,
+    }
+
     loop {
         if settled.is_some() || rejected.is_some() || fallback_idle {
             break;
-        }
-        enum Step {
-            Outcome(RecvOutcome),
-            Interrupt,
         }
         let interrupt_wait = async {
             if interrupt_open {
@@ -125,7 +127,7 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
         };
         let step = tokio::select! {
             outcome = request.client.recv_until_async(Instant::now() + Duration::from_secs(3600)) => {
-                Step::Outcome(outcome)
+                Step::Outcome(Box::new(outcome))
             }
             changed = interrupt_wait => {
                 if changed.is_err() {
@@ -136,15 +138,16 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
             }
         };
         match step {
-            Step::Outcome(RecvOutcome::Update(update)) => match &update.kind {
-                FrontendUpdateKind::OperationAccepted {
-                    operation_id: id, ..
-                } => {
-                    operation_id = Some(id.clone());
-                    let waiting = matches!(phase, CtrlCPhase::Cancelling { operation_id: None });
-                    phase.observe_busy(id.clone());
-                    if waiting {
-                        if let Some(pending) = phase.pending_cancel_id() {
+            Step::Outcome(outcome) => match *outcome {
+                RecvOutcome::Update(update) => match &update.kind {
+                    FrontendUpdateKind::OperationAccepted {
+                        operation_id: id, ..
+                    } => {
+                        operation_id = Some(id.clone());
+                        let waiting =
+                            matches!(phase, CtrlCPhase::Cancelling { operation_id: None });
+                        phase.observe_busy(id.clone());
+                        if waiting && let Some(pending) = phase.pending_cancel_id() {
                             let _ = enqueue(
                                 &request.client,
                                 FrontendCommand::CancelOperation {
@@ -154,7 +157,6 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
                             .await;
                         }
                     }
-                }
                 FrontendUpdateKind::CommandRejected { reason } => {
                     rejected = Some(reason.to_string());
                     render::write_outputs(&renderer.render_update(&update.kind));
@@ -206,12 +208,13 @@ pub(crate) async fn run(mut request: Request) -> DriveReport {
                     render::write_outputs(&renderer.render_update(&update.kind));
                 }
                 _ => render::write_outputs(&renderer.render_update(&update.kind)),
+                },
+                RecvOutcome::Disconnected => {
+                    eprintln!("error: the service disconnected before the operation settled");
+                    return DriveReport::graceful(1);
+                }
+                RecvOutcome::Timeout => {}
             },
-            Step::Outcome(RecvOutcome::Disconnected) => {
-                eprintln!("error: the service disconnected before the operation settled");
-                return DriveReport::graceful(1);
-            }
-            Step::Outcome(RecvOutcome::Timeout) => {}
             Step::Interrupt => {
                 let delta = ctrl_c::take_pulses(&mut request.interrupt, &mut interrupt_seen);
                 for _ in 0..delta {

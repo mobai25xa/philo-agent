@@ -20,8 +20,9 @@ use crate::mapping::parts::kernel_user_parts;
 use crate::mapping::tool::kernel_result;
 use crate::operation::{MaintenanceCancel, OperationPublisher, OperationShared};
 use crate::{
-    AgentEvent, AgentFailure, AssistantMessage, DriverExit, ModelPort, OperationPhase,
-    RunningToolBatchPhase, RuntimeConfig, RuntimeGeneration, SessionId, TurnSnapshot, UserMessage,
+    AgentEvent, AgentFailure, AssistantMessage, DriverExit, ModelAssistantBlock, ModelPort,
+    OperationPhase, RunningToolBatchPhase, RuntimeConfig, RuntimeGeneration, SessionId,
+    TurnSnapshot, UserMessage,
 };
 use philo_agent_kernel as kernel;
 use philo_session as session;
@@ -30,6 +31,33 @@ use settlement::TurnCx;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// Upper bound of the retry diagnostic carried on `ModelRetryScheduled`;
+/// full details remain on the eventual terminal failure if retries exhaust.
+const RETRY_REASON_MAX_CHARS: usize = 200;
+
+fn bounded_retry_reason(failure: &AgentFailure) -> String {
+    let mut reason: String = failure
+        .message()
+        .chars()
+        .take(RETRY_REASON_MAX_CHARS)
+        .collect();
+    if reason.chars().count() == RETRY_REASON_MAX_CHARS {
+        reason.push('…');
+    }
+    reason.replace('\n', " ")
+}
+
+/// Waits out the backoff delay while observing cancellation. Returns
+/// `false` when a cancel request cut the wait short.
+async fn backoff_or_cancel(shared: Arc<OperationShared>, delay: Duration) -> bool {
+    tokio::select! {
+        biased;
+        _ = shared.wait_until_cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
 
 /// Owned dependencies threaded into an operation or maintenance driver.
 pub(crate) struct EngineContext {
@@ -240,18 +268,21 @@ async fn drive_turn(
                 tools_allowed,
             } => {
                 model_call_index += 1;
-                let step = model_call::run(
+                let step = drive_model_call_with_recovery(
                     cx,
                     &turn,
                     &effect_id,
                     &model_call_id,
                     model_call_index,
-                    messages,
+                    &messages,
                     tools_allowed,
                 )
                 .await;
-                let Some((next_cx, blocks)) = step else {
-                    return;
+                let (next_cx, blocks) = match step {
+                    Ok(value) => value,
+                    // The operation settled (terminal failure or cancellation)
+                    // inside the recovery loop; stop driving.
+                    Err(()) => return,
                 };
                 cx = next_cx;
                 let output =
@@ -400,6 +431,79 @@ async fn drive_turn(
                     ))
                     .await;
                 return;
+            }
+        }
+    }
+}
+
+/// Drives one logical model call under the configured recovery policy:
+/// recoverable delivery faults re-issue the identical call (same kernel
+/// effect, nothing durable committed by failed attempts) after a bounded
+/// cancellable backoff. `Err` marks an operation that already settled —
+/// either the retry budget exhausted into a terminal failure or a
+/// cancellation won at any injection point.
+async fn drive_model_call_with_recovery<'a>(
+    mut cx: TurnCx<'a>,
+    turn: &TurnSnapshot,
+    effect_id: &kernel::EffectId,
+    model_call_id: &kernel::ModelCallId,
+    model_call_index: u32,
+    messages: &[kernel::TurnMessage],
+    tools_allowed: bool,
+) -> Result<(TurnCx<'a>, Vec<ModelAssistantBlock>), ()> {
+    let recovery = cx.ctx.config().recovery;
+    let mut attempt: u32 = 0;
+    loop {
+        let outcome = model_call::run(
+            cx,
+            turn,
+            effect_id,
+            model_call_id,
+            model_call_index,
+            messages.to_vec(),
+            tools_allowed,
+        )
+        .await;
+        match outcome {
+            model_call::ModelCallOutcome::Completed(cx, blocks) => return Ok((cx, blocks)),
+            // Cancellation settled inside; stop driving.
+            model_call::ModelCallOutcome::Settled => return Err(()),
+            model_call::ModelCallOutcome::Failed(next_cx, attempt_failure) => {
+                let exhausted = !recovery.enabled
+                    || !attempt_failure.recoverable
+                    || attempt >= recovery.max_retries;
+                let cancelled = !exhausted && next_cx.operation.is_cancel_requested();
+                if exhausted || cancelled {
+                    if cancelled {
+                        next_cx.operation.cancellation_observed().await;
+                        next_cx
+                            .cancel(effect_id.clone(), Vec::new(), Vec::new())
+                            .await;
+                    } else {
+                        next_cx.fail(effect_id.clone(), attempt_failure.failure).await;
+                    }
+                    return Err(());
+                }
+                attempt += 1;
+                let delay = recovery.backoff_delay(attempt);
+                next_cx
+                    .operation
+                    .push(AgentEvent::ModelRetryScheduled {
+                        model_call_id: crate::ModelCallId::new(model_call_id.as_str()),
+                        attempt,
+                        max_retries: recovery.max_retries,
+                        delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        reason: bounded_retry_reason(&attempt_failure.failure),
+                    })
+                    .await;
+                if !backoff_or_cancel(next_cx.operation.shared_arc(), delay).await {
+                    next_cx.operation.cancellation_observed().await;
+                    next_cx
+                        .cancel(effect_id.clone(), Vec::new(), Vec::new())
+                        .await;
+                    return Err(());
+                }
+                cx = next_cx;
             }
         }
     }

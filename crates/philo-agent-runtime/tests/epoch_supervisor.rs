@@ -30,6 +30,7 @@ fn config() -> RuntimeConfig {
         operation_timeout: None,
         tool_cancel_grace: Duration::from_millis(300),
         compaction: CompactionConfig::default(),
+        recovery: Default::default(),
     }
 }
 

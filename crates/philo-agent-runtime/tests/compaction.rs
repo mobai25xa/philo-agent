@@ -28,6 +28,7 @@ fn config(compaction: CompactionConfig) -> RuntimeConfig {
         operation_timeout: None,
         tool_cancel_grace: std::time::Duration::from_millis(300),
         compaction,
+        recovery: Default::default(),
     }
 }
 

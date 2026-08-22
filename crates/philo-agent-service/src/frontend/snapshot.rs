@@ -446,6 +446,20 @@ pub enum FrontendOperationEvent {
         /// Reason label.
         reason: String,
     },
+    /// A model call failed with a recoverable fault and will be retried
+    /// after the delay. The failed attempt's streamed deltas are discarded.
+    ModelRetryScheduled {
+        /// Model call id.
+        model_call_id: String,
+        /// Retry ordinal about to run (1-based).
+        attempt: u32,
+        /// Configured additional attempts per model call.
+        max_retries: u32,
+        /// Backoff before the retry, milliseconds.
+        delay_ms: u64,
+        /// Bounded diagnostic summary of why the attempt failed.
+        reason: String,
+    },
     /// Turn cancelled durably.
     TurnCancelled {
         /// Turn id.

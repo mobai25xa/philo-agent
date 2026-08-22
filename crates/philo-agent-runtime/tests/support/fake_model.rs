@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use philo_agent_runtime::{
-    ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream, ModelPort,
-    ModelToolCall, RuntimeFuture, TokenUsage, ToolCallId,
+    ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream,
+    ModelFailureClass, ModelPort, ModelToolCall, RuntimeFuture, TokenUsage, ToolCallId,
 };
 
 use super::gate::Gate;
@@ -13,6 +13,8 @@ use super::gate::Gate;
 pub enum ModelScript {
     Events(Vec<Result<ModelEvent, ModelError>>),
     StartError(String),
+    /// `start` itself fails with a recoverable delivery fault.
+    RecoverableStartError(String),
     /// Emits `head`, then suspends the stream until the gate opens, then
     /// emits `tail`. Creates a deterministic mid-stream cancellation window.
     SuspendedEvents {
@@ -133,6 +135,20 @@ impl ModelScript {
         Self::Events(vec![Err(ModelError::new(message))])
     }
 
+    /// Stream that dies mid-flight with a recoverable delivery fault —
+    /// the runtime-level shape of an `incomplete_response` truncation.
+    pub fn stream_truncated_after(deltas: &[&str], message: &str) -> Self {
+        let mut events = deltas
+            .iter()
+            .map(|delta| Ok(ModelEvent::TextDelta((*delta).to_owned())))
+            .collect::<Vec<_>>();
+        events.push(Err(ModelError::with_class(
+            message,
+            ModelFailureClass::Recoverable,
+        )));
+        Self::Events(events)
+    }
+
     /// Text stream that suspends after `head` deltas until the gate opens,
     /// then finishes with `tail` deltas and `Completed`.
     pub fn text_suspending(head: &[&str], gate: &Gate, tail: &[&str]) -> Self {
@@ -190,6 +206,7 @@ impl ModelScript {
                 Self::Events(head)
             }
             Self::StartError(message) => Self::StartError(message),
+            Self::RecoverableStartError(message) => Self::RecoverableStartError(message),
             Self::Panic(message) => Self::Panic(message),
             Self::SuspendedEvents {
                 head: suspended_head,
@@ -219,6 +236,7 @@ impl ModelScript {
                 Self::Events(with_started)
             }
             Self::StartError(message) => Self::StartError(message),
+            Self::RecoverableStartError(message) => Self::RecoverableStartError(message),
             Self::Panic(message) => Self::Panic(message),
             Self::SuspendedEvents { head, gate, tail } => {
                 let mut with_started = vec![started];
@@ -312,6 +330,10 @@ impl FakeModel {
         Self::new([ModelScript::StartError(message.to_owned())])
     }
 
+    pub fn start_fails_recoverable(message: &str) -> Self {
+        Self::new([ModelScript::RecoverableStartError(message.to_owned())])
+    }
+
     pub fn panics(message: &str) -> Self {
         Self::new([ModelScript::Panic(message.to_owned())])
     }
@@ -352,6 +374,10 @@ impl ModelPort for FakeModel {
                 .expect("fake model called more times than scripted");
             match script {
                 ModelScript::StartError(message) => Err(ModelError::new(message)),
+                ModelScript::RecoverableStartError(message) => Err(ModelError::with_class(
+                    message,
+                    ModelFailureClass::Recoverable,
+                )),
                 ModelScript::Panic(message) => {
                     tokio::task::yield_now().await;
                     panic!("{message}");

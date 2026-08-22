@@ -77,6 +77,7 @@ fn compose_generation(
             operation_timeout: None,
             tool_cancel_grace: std::time::Duration::from_millis(300),
             compaction: Default::default(),
+            recovery: Default::default(),
         },
     )
 }
@@ -264,11 +265,18 @@ async fn multi_round_tool_loop_with_real_adapter_and_registry() {
 }
 
 /// M4-003: infrastructure failures normalize to ModelError and settle the
-/// operation through the existing confirmed failure path.
+/// operation through the existing confirmed failure path. The default
+/// recovery policy retries the connect fault until its budget exhausts, so
+/// every attempt is scripted.
 #[tokio::test(flavor = "multi_thread")]
 async fn transport_failure_settles_failed_with_durable_facts() {
     let root = TempRoot::new();
-    let transport = StubTransport::new([StubResponse::ConnectError]);
+    let transport = StubTransport::new([
+        StubResponse::ConnectError,
+        StubResponse::ConnectError,
+        StubResponse::ConnectError,
+        StubResponse::ConnectError,
+    ]);
     let sessions = Arc::new(MemorySessionStore::new());
     let generation = compose_generation(transport, &root, 2);
     let parts = AgentRuntime::start(RuntimeDeps {

@@ -140,18 +140,44 @@ pub enum ModelEvent {
     },
 }
 
+/// Whether one failed model call is worth a fresh identical attempt.
+///
+/// The classification is advisory vocabulary for the turn engine's bounded
+/// recovery loop; it never overrides cancellation or settlement rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelFailureClass {
+    /// Transient delivery fault (truncated stream, dropped connection,
+    /// throttling, provider abort): nothing durable committed, so an
+    /// identical re-attempt is safe.
+    Recoverable,
+    /// Permanent for this request shape (auth, invalid request, structural
+    /// protocol misuse): re-attempts cannot succeed.
+    Fatal,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelError {
     message: String,
+    class: ModelFailureClass,
 }
 impl ModelError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            class: ModelFailureClass::Fatal,
+        }
+    }
+    pub fn with_class(message: impl Into<String>, class: ModelFailureClass) -> Self {
+        Self {
+            message: message.into(),
+            class,
         }
     }
     pub fn message(&self) -> &str {
         &self.message
+    }
+    pub fn class(&self) -> ModelFailureClass {
+        self.class
     }
 }
 

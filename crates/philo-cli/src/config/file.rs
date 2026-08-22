@@ -78,6 +78,13 @@ pub(super) struct FileConfig {
     pub(super) operation_timeout_secs: Option<Sourced<i64>>,
     // [tools]
     pub(super) shell_timeout_secs: Option<Sourced<i64>>,
+    // [recovery]
+    pub(super) recovery_enabled: Option<Sourced<bool>>,
+    pub(super) recovery_max_retries: Option<Sourced<i64>>,
+    pub(super) recovery_backoff_base_ms: Option<Sourced<i64>>,
+    pub(super) recovery_backoff_max_ms: Option<Sourced<i64>>,
+    pub(super) recovery_response_head_timeout_secs: Option<Sourced<i64>>,
+    pub(super) recovery_stream_idle_timeout_secs: Option<Sourced<i64>>,
     // [ui]
     pub(super) verbosity: Option<Sourced<String>>,
     pub(super) show_reasoning: Option<Sourced<bool>>,
@@ -170,7 +177,7 @@ fn apply(
         }
         if !matches!(
             section.as_str(),
-            "deployment" | "defaults" | "tools" | "ui" | "compaction"
+            "deployment" | "defaults" | "tools" | "ui" | "compaction" | "recovery"
         ) {
             config.warnings.push(format!(
                 "{}: unknown section [{section}]; ignored",
@@ -238,6 +245,24 @@ fn apply(
                 }
                 ("tools", "shell_timeout_secs") => {
                     config.shell_timeout_secs = Some(reader.integer()?);
+                }
+                ("recovery", "enabled") => config.recovery_enabled = Some(reader.boolean()?),
+                ("recovery", "max_retries") => {
+                    config.recovery_max_retries = Some(reader.non_negative_integer()?);
+                }
+                ("recovery", "backoff_base_ms") => {
+                    config.recovery_backoff_base_ms = Some(reader.integer()?);
+                }
+                ("recovery", "backoff_max_ms") => {
+                    config.recovery_backoff_max_ms = Some(reader.integer()?);
+                }
+                ("recovery", "response_head_timeout_secs") => {
+                    config.recovery_response_head_timeout_secs =
+                        Some(reader.non_negative_integer()?);
+                }
+                ("recovery", "stream_idle_timeout_secs") => {
+                    config.recovery_stream_idle_timeout_secs =
+                        Some(reader.non_negative_integer()?);
                 }
                 ("ui", "verbosity") => config.verbosity = Some(reader.string()?),
                 ("ui", "show_reasoning") => config.show_reasoning = Some(reader.boolean()?),
@@ -366,7 +391,28 @@ impl Reader<'_> {
                 "{}: [{}].{} must be a positive integer, found {value}",
                 self.path.display(),
                 self.section,
-                self.key
+                self.key,
+            )));
+        }
+        Ok(Sourced {
+            value,
+            layer: self.layer,
+        })
+    }
+
+    /// Like [`Reader::integer`] but accepts `0` (used where zero disables a
+    /// bound).
+    fn non_negative_integer(&self) -> Result<Sourced<i64>, UsageError> {
+        let value = self
+            .value
+            .as_integer()
+            .ok_or_else(|| self.wrong_type("a non-negative integer"))?;
+        if value < 0 {
+            return Err(UsageError::new(format!(
+                "{}: [{}].{} must be a non-negative integer, found {value}",
+                self.path.display(),
+                self.section,
+                self.key,
             )));
         }
         Ok(Sourced {

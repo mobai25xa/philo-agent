@@ -23,7 +23,10 @@ use philo_agent_service::{
     FrontendCommand, FrontendReasoningEffort, GenerationAssembler, ServiceDeps,
 };
 use philo_coding_profile::CodingProfile;
-use philo_model::{AdapterBuildError, FileModelReplayStore, ModelReplayStore, PhiloModelAdapter};
+use philo_model::{
+    AdapterBuildError, FileModelReplayStore, ModelReplayStore, PhiloModelAdapter, RetryPolicy,
+    TimeoutPolicy,
+};
 use philo_session::SessionStore;
 use philo_session_jsonl::JsonlSessionStore;
 use philo_tools_std::BlockingToolExecutor;
@@ -669,6 +672,8 @@ fn generation_fields_changed(left: &Settings, right: &Settings) -> bool {
         || left.deployment.compat != right.deployment.compat
         || left.deployment.chat_reasoning_format != right.deployment.chat_reasoning_format
         || left.deployment.continuation_policy != right.deployment.continuation_policy
+        || left.deployment.response_head_timeout != right.deployment.response_head_timeout
+        || left.deployment.stream_idle_timeout != right.deployment.stream_idle_timeout
         || header_names(left) != header_names(right)
         || left.compaction != right.compaction
         || left.reasoning_effort != right.reasoning_effort
@@ -676,6 +681,7 @@ fn generation_fields_changed(left: &Settings, right: &Settings) -> bool {
         || left.max_parallel_tool_calls != right.max_parallel_tool_calls
         || left.operation_timeout != right.operation_timeout
         || left.shell_timeout_secs != right.shell_timeout_secs
+        || left.recovery != right.recovery
         || non_ui_entries(left) != non_ui_entries(right)
 }
 
@@ -690,6 +696,13 @@ fn only_reasoning_changed(left: &Settings, right: &Settings) -> bool {
 
 /// One model construction path shared by startup and interactive generation
 /// install, so deployment headers and credentials cannot drift.
+///
+/// Transport hardening is wired here, inside the SDK's frozen pre-2xx scope:
+/// `RetryPolicy::transient` bounds connect/DNS/write failures and throttling
+/// before a response starts, and the timeout policy turns hung response
+/// heads and stalled streams into fast recoverable failures instead of
+/// waiting on the operation deadline. Mid-stream recovery stays with the
+/// turn engine (`RuntimeConfig.recovery`).
 pub(crate) fn build_model(
     deployment: &crate::config::Deployment,
     model: &str,
@@ -705,12 +718,24 @@ pub(crate) fn build_model(
     .request_headers(deployment.request_headers.clone())
     .replay_store(replay_store)
     .compat(deployment.compat)
-    .continuation_policy(deployment.continuation_policy);
+    .continuation_policy(deployment.continuation_policy)
+    .retry_policy(TRANSPORT_RETRY_POLICY)
+    .timeout_policy(TimeoutPolicy {
+        total: None,
+        response_head: deployment.response_head_timeout,
+        stream_idle: deployment.stream_idle_timeout,
+    });
     if let Some(format) = deployment.chat_reasoning_format {
         builder = builder.chat_reasoning_format(format);
     }
     builder.build()
 }
+
+/// Bounded SDK attempt-level retries for transient faults before a 2xx
+/// response (connect, TLS, request write, throttling). Full jitter and caps
+/// come from the policy defaults; mid-stream faults are never retried here.
+const TRANSPORT_RETRY_POLICY: RetryPolicy = RetryPolicy::transient(std::num::NonZeroU32::new(3)
+    .expect("three is non-zero"));
 
 /// Maps resolved settings onto a RuntimeConfig the same way bootstrap does.
 pub(crate) fn runtime_config_for(
@@ -734,6 +759,7 @@ pub(crate) fn runtime_config_for(
     }
     runtime_config.operation_timeout = settings.operation_timeout;
     runtime_config.compaction = settings.compaction.clone();
+    runtime_config.recovery = settings.recovery;
     Ok(runtime_config)
 }
 
@@ -805,6 +831,8 @@ mod tests {
                 compat: ModelCompat::Compatible,
                 chat_reasoning_format: None,
                 continuation_policy: ModelContinuationPolicy::StatelessLocalReplay,
+                response_head_timeout: None,
+                stream_idle_timeout: None,
             },
             data_dir: dir.to_path_buf(),
             context_window: None,
@@ -814,6 +842,7 @@ mod tests {
             max_parallel_tool_calls: Some(2),
             operation_timeout: Some(Duration::from_secs(30)),
             shell_timeout_secs: None,
+            recovery: Default::default(),
             verbosity: Verbosity::Default,
             show_reasoning: true,
             screen: TuiScreen::Alternate,

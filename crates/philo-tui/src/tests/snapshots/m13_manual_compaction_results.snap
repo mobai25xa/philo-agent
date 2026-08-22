@@ -1,15 +1,14 @@
 ---
 source: crates/philo-tui/src/tests/compaction.rs
-assertion_line: 89
 expression: "format!(\"FIRST\\n{}\\nSTATUS {waiting}\\n{}\\nSTATUS {}\\n\\nSECOND\\n{}\\n{}\\nSTATUS {}\",\nappended(&first).join(\"\\n\"), appended(&completed).join(\"\\n\"),\ncompleted_status, appended(&second).join(\"\\n\"), appended(&nothing).join(\"\\n\"),\napp.status.line(),)"
 ---
 FIRST
 Meta: /compact
-STATUS model-a  s-1  compact |  in 8.0k
+STATUS model-a · s-1 · compact | · in 8.0k
 Meta: context compacted through entry-42
-STATUS model-a  s-1
+STATUS model-a · s-1
 
 SECOND
 Meta: /compact
 Notice: nothing to compact: no older completed turns are available
-STATUS model-a  s-1
+STATUS model-a · s-1

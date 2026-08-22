@@ -121,7 +121,7 @@ impl StatusData {
                 .map(|(_, value)| text::width(value))
                 .sum::<usize>()
                 + text::width(&candidate)
-                + admitted.len() * 2;
+                + admitted.len() * SEPARATOR_CELLS;
             if projected_width <= max_width {
                 admitted.push((order, candidate));
             }
@@ -131,7 +131,7 @@ impl StatusData {
             .into_iter()
             .map(|(_, value)| value)
             .collect::<Vec<_>>()
-            .join("  ");
+            .join(SEPARATOR);
         if line.is_empty() {
             text::truncate(&self.model, max_width)
         } else {
@@ -139,6 +139,9 @@ impl StatusData {
         }
     }
 }
+
+const SEPARATOR: &str = " · ";
+const SEPARATOR_CELLS: usize = 3;
 
 fn cache_suffix(cache_read: Option<u64>) -> String {
     match cache_read {
@@ -164,7 +167,7 @@ mod tests {
     #[test]
     fn status_line_shows_model_session_and_state() {
         let mut status = StatusData::new("gpt-test", "s-1", InfoLevel::Default);
-        assert_eq!(status.line(), "gpt-test  s-1");
+        assert_eq!(status.line(), "gpt-test · s-1");
 
         status.busy = true;
         status.queued = 2;
@@ -177,7 +180,7 @@ mod tests {
         status.level = InfoLevel::Verbose;
         assert_eq!(
             status.line(),
-            "gpt-test  s-1  queued 2  1.2k/128.0k  verbose"
+            "gpt-test · s-1 · queued 2 · 1.2k/128.0k · verbose"
         );
 
         status.usage = Some(FrontendTokenUsage {
@@ -188,7 +191,7 @@ mod tests {
         });
         assert_eq!(
             status.line(),
-            "gpt-test  s-1  queued 2  1.2k/128.0k cache 900  verbose"
+            "gpt-test · s-1 · queued 2 · 1.2k/128.0k cache 900 · verbose"
         );
     }
 
@@ -198,7 +201,7 @@ mod tests {
         status.busy = true;
         status.queued = 3;
         let line = status.line_for_width(40);
-        assert_eq!(line, "session-123  queued 3  verbose");
+        assert_eq!(line, "session-123 · queued 3 · verbose");
         assert!(text::width(&line) <= 40);
     }
 

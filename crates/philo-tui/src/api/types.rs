@@ -105,6 +105,11 @@ pub struct TuiLaunchConfig {
     pub context_window: Option<u64>,
     /// Screen mode for this session. Hot reload must not change it.
     pub screen: TuiScreen,
+    /// Terminal background RGB detected by the composition root (OSC 11),
+    /// used to derive band and diff surface colors relative to the theme.
+    /// `None` keeps stable fallback surfaces; the TUI never queries the
+    /// terminal itself.
+    pub terminal_palette: Option<(u8, u8, u8)>,
     /// Supervisor-owned Ctrl+C pulse counter. `None` in tests that do not
     /// inject signals. The TUI never writes the terminal or exits the process.
     pub interrupt: Option<tokio::sync::watch::Receiver<u64>>,

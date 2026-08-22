@@ -1419,6 +1419,137 @@ fn begin_session_clears_selection() {
     assert!(app.follow_bottom());
 }
 
+fn slice_texts(app: &App, width: usize, height: usize) -> Vec<String> {
+    app.history_slice(width, height)
+        .rows
+        .iter()
+        .map(|row| row.text.clone())
+        .collect()
+}
+
+fn think_run() -> Vec<TranscriptLine> {
+    vec![
+        TranscriptLine {
+            kind: LineKind::Meta,
+            text: "before".to_owned(),
+        },
+        TranscriptLine {
+            kind: LineKind::Reasoning,
+            text: "think".to_owned(),
+        },
+        TranscriptLine {
+            kind: LineKind::Reasoning,
+            text: "  hidden thought".to_owned(),
+        },
+        TranscriptLine {
+            kind: LineKind::Meta,
+            text: "after".to_owned(),
+        },
+    ]
+}
+
+#[test]
+fn sealed_think_blocks_fold_and_toggle_reopens() {
+    let mut app = app();
+    app.cells.push_closed(think_run());
+    app.note_history_layout(80, 10);
+    assert_eq!(
+        slice_texts(&app, 80, 10),
+        ["before", "think · 1 行", "after"],
+        "sealed think blocks fold their body"
+    );
+
+    assert!(app.toggle_reasoning_block(1, 0));
+    let texts = slice_texts(&app, 80, 10);
+    assert!(texts.iter().any(|text| text.contains("hidden thought")));
+    assert!(!texts.iter().any(|text| text.contains("think ·")));
+
+    assert!(app.toggle_reasoning_block(1, 0));
+    assert!(slice_texts(&app, 80, 10).contains(&"think · 1 行".to_owned()));
+}
+
+#[test]
+fn toggle_ignores_body_rows_and_non_reasoning_heads() {
+    let mut app = app();
+    app.cells.push_closed(think_run());
+    app.note_history_layout(80, 10);
+    assert!(!app.toggle_reasoning_block(2, 0), "run tail is not a head");
+    assert!(!app.toggle_reasoning_block(0, 0), "meta cell is not think");
+    assert!(!app.toggle_reasoning_block(3, 1), "only header rows toggle");
+    assert_eq!(slice_texts(&app, 80, 10).len(), 3);
+}
+
+#[test]
+fn streaming_think_stays_open_then_folds_and_seals_folded() {
+    let mut fresh = app();
+    let mut app = app();
+    app.cells.begin(LineKind::Reasoning, "think");
+    app.cells.write_open("\n  partial thought");
+    let texts = slice_texts(&app, 80, 10);
+    assert!(texts.iter().any(|text| text.contains("partial thought")));
+
+    app.toggle_reasoning_block(0, 0);
+    assert_eq!(slice_texts(&app, 80, 10), ["think · 1 行"]);
+
+    app.cells.close_open();
+    assert_eq!(
+        slice_texts(&app, 80, 10),
+        ["think · 1 行"],
+        "manual fold survives the seal"
+    );
+
+    fresh.cells.begin(LineKind::Reasoning, "think");
+    fresh.cells.write_open("\n  partial thought");
+    fresh.cells.close_open();
+    assert_eq!(
+        slice_texts(&fresh, 80, 10),
+        ["think · 1 行"],
+        "sealing folds an untouched stream"
+    );
+}
+
+#[test]
+fn plain_click_on_a_think_header_toggles_it() {
+    let mut app = app();
+    app.cells.push_closed(vec![
+        TranscriptLine {
+            kind: LineKind::Meta,
+            text: "row-0".to_owned(),
+        },
+        TranscriptLine {
+            kind: LineKind::Reasoning,
+            text: "think".to_owned(),
+        },
+        TranscriptLine {
+            kind: LineKind::Reasoning,
+            text: "  body".to_owned(),
+        },
+    ]);
+    app.note_history_layout(80, 4);
+    app.on_action(Action::SelectStart { x: 5, y: 1 });
+    app.on_action(Action::SelectEnd { x: 5, y: 1 });
+    assert!(!app.has_selection(), "the click toggled instead");
+    let texts = slice_texts(&app, 80, 4);
+    assert!(texts.iter().any(|text| text.contains("│ body")));
+}
+
+#[test]
+fn begin_session_forgets_manual_think_folds() {
+    let mut app = app();
+    app.cells.push_closed(think_run());
+    app.note_history_layout(80, 10);
+    app.toggle_reasoning_block(1, 0);
+    assert!(slice_texts(&app, 80, 10).len() > 3);
+
+    app.begin_session("other");
+    app.cells.push_closed(think_run());
+    assert_eq!(
+        slice_texts(&app, 80, 10).len(),
+        3,
+        "the new session starts with fresh fold state"
+    );
+}
+
 #[test]
 fn text_delta_without_close_stays_open() {
     let mut app = app();

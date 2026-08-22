@@ -150,12 +150,7 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, markdown: &MarkdownRende
         .saturating_sub(hint_height)
         .saturating_sub(menu_height);
     let remaining_area = Rect::new(area.x, area.y, area.width, remaining);
-    let menu_area = inset_h(Rect::new(
-        area.x,
-        remaining_area.bottom(),
-        area.width,
-        menu_height,
-    ));
+    let menu_area = Rect::new(area.x, remaining_area.bottom(), area.width, menu_height);
     let hint_area = inset_h(Rect::new(
         area.x,
         menu_area.bottom(),
@@ -188,18 +183,28 @@ fn draw_command_menu(
     if area.is_empty() {
         return;
     }
+    frame.render_widget(Block::default().style(theme::menu_panel()), area);
+    let width = usize::from(area.width);
     for (index, row) in menu.rows.iter().enumerate() {
         let row_area = Rect::new(area.x, area.y + index as u16, area.width, 1);
-        let (usage_style, summary_style) = if index == menu.selected {
-            (theme::menu_selected(), theme::menu_selected())
+        if index == menu.selected {
+            let style = theme::menu_selected_row();
+            let mut spans = vec![
+                Span::styled(row.usage.to_owned(), style),
+                Span::styled(row.summary.to_owned(), style),
+            ];
+            let used = text::width(&row.usage) + text::width(&row.summary);
+            if used < width {
+                spans.push(Span::styled(" ".repeat(width - used), style));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
         } else {
-            (theme::menu_usage(), theme::meta())
-        };
-        let line = Line::from(vec![
-            Span::styled(row.usage.to_owned(), usage_style),
-            Span::styled(row.summary.to_owned(), summary_style),
-        ]);
-        frame.render_widget(Paragraph::new(line), row_area);
+            let line = Line::from(vec![
+                Span::styled(row.usage.to_owned(), theme::menu_usage()),
+                Span::styled(row.summary.to_owned(), theme::meta()),
+            ]);
+            frame.render_widget(Paragraph::new(line), row_area);
+        }
     }
 }
 
@@ -252,9 +257,7 @@ fn draw_remaining_band(
     }
     if !chrome_area.is_empty() {
         let details = app.activity_detail_rows(width, usize::from(chrome_h));
-        if details.is_empty() {
-            draw_idle_chrome(frame, app, chrome_area);
-        } else {
+        if !details.is_empty() {
             let lines = details
                 .into_iter()
                 .map(|row| Line::styled(row, theme::meta()))
@@ -294,19 +297,6 @@ fn draw_overlay(
     }
     lines.truncate(usize::from(area.height));
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn draw_idle_chrome(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    if app.status.busy || app.activity_view(1).is_some() {
-        return;
-    }
-    let width = usize::from(area.width);
-    if area.height >= 1 {
-        frame.render_widget(
-            Paragraph::new(Line::styled("─".repeat(width), theme::rule())),
-            area,
-        );
-    }
 }
 
 fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -366,7 +356,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         theme::status_idle()
     };
     let spans = raw
-        .split("  ")
+        .split(" · ")
         .enumerate()
         .flat_map(|(index, field)| {
             let style = if index == 0 {
@@ -378,7 +368,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
             };
             let mut parts = Vec::new();
             if index > 0 {
-                parts.push(Span::styled("  ", theme::rule()));
+                parts.push(Span::styled(" · ", theme::rule()));
             }
             parts.push(Span::styled(field.to_owned(), style));
             parts
@@ -649,7 +639,7 @@ mod tests {
             .find(|line| line.contains("hello"))
             .expect("answer");
         assert!(
-            answer.starts_with("  • hello"),
+            answer.starts_with("    • hello"),
             "answer sits in the content column: {answer:?}"
         );
         let prompt = rendered
@@ -657,7 +647,7 @@ mod tests {
             .find(|line| line.contains("Ask anything"))
             .expect("composer");
         assert!(
-            prompt.starts_with("  ›"),
+            prompt.starts_with("    ›"),
             "composer text shares the column: {prompt:?}"
         );
     }

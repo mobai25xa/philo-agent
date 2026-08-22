@@ -817,6 +817,7 @@ mod tests {
             verbosity: Verbosity::Default,
             show_reasoning: true,
             screen: TuiScreen::Alternate,
+            terminal_bg: None,
             entries: vec![],
         }
     }

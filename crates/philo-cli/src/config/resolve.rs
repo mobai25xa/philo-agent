@@ -65,6 +65,9 @@ pub struct Settings {
     /// Mapped screen for `TuiLaunchConfig`. `/config` shows the configured token
     /// from `entries`, not this mapped value.
     pub screen: TuiScreen,
+    /// Terminal background override injected as the TUI palette. `None` keeps
+    /// the TUI's stable fallback surfaces.
+    pub terminal_bg: Option<(u8, u8, u8)>,
     pub entries: Vec<EffectiveSetting>,
 }
 
@@ -449,6 +452,21 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         }
     };
 
+    let terminal_bg = match from_file(file.terminal_bg.as_ref()) {
+        Some(picked) => {
+            let color = parse_hex_color(&picked.value).map_err(|error| {
+                error.at(&origin(picked.source, None, None, "[ui].terminal_bg"))
+            })?;
+            record(
+                "terminal_bg",
+                format!("#{:02x}{:02x}{:02x}", color.0, color.1, color.2),
+                picked.source,
+            );
+            Some(color)
+        }
+        None => None,
+    };
+
     entries.extend(header_entries);
 
     Ok(Settings {
@@ -479,6 +497,7 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> Result<Settings, UsageErr
         verbosity,
         show_reasoning,
         screen,
+        terminal_bg,
         entries,
     })
 }
@@ -674,6 +693,23 @@ pub(super) fn map_ui_screen(value: &str, zellij_set: bool) -> Result<TuiScreen, 
         }),
         other => Err(UsageError::new(format!(
             "invalid [ui].screen '{other}': expected auto | alternate | inline"
+        ))),
+    }
+}
+
+/// Parses `[ui].terminal_bg` as `#RRGGBB` or `RRGGBB`.
+pub(super) fn parse_hex_color(value: &str) -> Result<(u8, u8, u8), UsageError> {
+    let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(UsageError::new(format!(
+            "invalid [ui].terminal_bg '{value}': expected #RRGGBB"
+        )));
+    }
+    let channel = |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).ok();
+    match (channel(0..2), channel(2..4), channel(4..6)) {
+        (Some(r), Some(g), Some(b)) => Ok((r, g, b)),
+        _ => Err(UsageError::new(format!(
+            "invalid [ui].terminal_bg '{value}': expected #RRGGBB"
         ))),
     }
 }

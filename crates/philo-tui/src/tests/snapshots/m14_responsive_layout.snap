@@ -3,43 +3,43 @@ source: crates/philo-tui/src/render/frame.rs
 expression: snapshot
 ---
 40 columns
-  path: src/中 文 .rs
+    path: src/中 文 .rs
 
 
 
 
 
-  read_file  path: src/中 文 .rs
-  | tool  read_file
+    read_file  path: src/中 文 .rs
+    | tool  read_file
 
-  › 中 文  é 👩‍💻  and a long draft that wr
-    aps inside the composer
-gpt-test  session-中 文
+    › 中 文  é 👩‍💻  and a long draft tha
+      t wraps inside the composer
+gpt-test · session-中 文
 
 80 columns
-  path: src/中 文 .rs
+    path: src/中 文 .rs
 
 
 
 
 
-  read_file  path: src/中 文 .rs
-  | tool  read_file
+    read_file  path: src/中 文 .rs
+    | tool  read_file
 
-  › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
+    › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
 
-gpt-test  session-中 文
+gpt-test · session-中 文
 
 120 columns
-  path: src/中 文 .rs
+    path: src/中 文 .rs
 
 
 
 
 
-  read_file  path: src/中 文 .rs
-  | tool  read_file
+    read_file  path: src/中 文 .rs
+    | tool  read_file
 
-  › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
+    › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
 
-gpt-test  session-中 文
+gpt-test · session-中 文

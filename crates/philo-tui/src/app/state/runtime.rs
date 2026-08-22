@@ -61,6 +61,8 @@ impl App {
         self.transcript = crate::app::transcript::Transcript::new(self.show_reasoning);
         self.activity.clear();
         self.cells.clear();
+        self.reasoning_manually_expanded.clear();
+        self.reasoning_manually_collapsed.clear();
         self.scroll = crate::app::cells::ScrollState::follow();
         self.clear_selection();
     }

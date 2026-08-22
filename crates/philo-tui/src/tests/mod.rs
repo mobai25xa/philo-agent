@@ -4,6 +4,7 @@ mod attachments;
 mod compaction;
 mod flow;
 mod integration;
+mod style_baseline;
 pub(crate) mod support;
 
 macro_rules! assert_tui_snapshot {

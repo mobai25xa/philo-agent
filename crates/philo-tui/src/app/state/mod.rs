@@ -12,6 +12,7 @@ mod select;
 mod tests;
 
 use std::cell::Cell;
+use std::collections::HashSet;
 
 use super::action::Action;
 use super::activity::{ActivityState, ActivityTone, ActivityView};
@@ -74,6 +75,10 @@ pub(crate) struct App {
     /// Transcript cells for the TUI-owned viewport.
     pub(crate) cells: TranscriptStore,
     scroll: ScrollState,
+    /// Think blocks the user manually expanded. Sealed blocks start folded.
+    reasoning_manually_expanded: HashSet<usize>,
+    /// Streaming think blocks the user manually folded before their seal.
+    reasoning_manually_collapsed: HashSet<usize>,
     layout_width: Cell<usize>,
     layout_history_height: Cell<usize>,
     history_band: Cell<BandLayout>,
@@ -107,6 +112,8 @@ impl App {
             activity: ActivityState::default(),
             cells: TranscriptStore::new(),
             scroll: ScrollState::follow(),
+            reasoning_manually_expanded: HashSet::new(),
+            reasoning_manually_collapsed: HashSet::new(),
             layout_width: Cell::new(80),
             layout_history_height: Cell::new(0),
             history_band: Cell::new(BandLayout::default()),
@@ -115,7 +122,48 @@ impl App {
     }
 
     pub(crate) fn history_slice(&self, width: usize, height: usize) -> VisibleSlice {
-        self.cells.visible_slice(width, height, &self.scroll)
+        self.cells
+            .visible_slice(width, height, &self.scroll, &|index| {
+                self.reasoning_collapsed(index)
+            })
+    }
+
+    /// Fold state of the reasoning run starting at `head`: a streaming run
+    /// stays open unless the user folded it; sealed runs start folded.
+    fn reasoning_collapsed(&self, head: usize) -> bool {
+        let open = self.cells.open_cell();
+        let streaming_run = open.is_some_and(|open| {
+            open >= head
+                && self.cells.display_kind(head) == LineKind::Reasoning
+                && (head..=open).all(|index| self.cells.display_kind(index) == LineKind::Reasoning)
+        });
+        if streaming_run {
+            self.reasoning_manually_collapsed.contains(&head)
+        } else {
+            !self.reasoning_manually_expanded.contains(&head)
+        }
+    }
+
+    /// Click on a think header row: fold/unfold that block. Returns whether
+    /// the position actually was a reasoning-run head.
+    pub(crate) fn toggle_reasoning_block(&mut self, cell: usize, row: usize) -> bool {
+        if row != 0 || self.cells.display_kind(cell) != LineKind::Reasoning {
+            return false;
+        }
+        let is_head = cell == 0 || self.cells.display_kind(cell - 1) != LineKind::Reasoning;
+        if !is_head {
+            return false;
+        }
+        let collapsed_now = self.reasoning_collapsed(cell);
+        self.reasoning_manually_expanded.remove(&cell);
+        self.reasoning_manually_collapsed.remove(&cell);
+        if collapsed_now {
+            self.reasoning_manually_expanded.insert(cell);
+        } else {
+            self.reasoning_manually_collapsed.insert(cell);
+        }
+        self.cells.bump_wrap_revision();
+        true
     }
 
     /// Copies every `Effect::Append` into the store as closed cells.
@@ -143,7 +191,8 @@ impl App {
         if height == 0 || delta == 0 {
             return;
         }
-        self.cells.refresh_wraps(width);
+        self.cells
+            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
         self.scroll
             .scroll_wrapped(&self.cells.wrap_rows(), height, delta);
     }
@@ -151,7 +200,8 @@ impl App {
     pub(crate) fn jump_transcript_top(&mut self) {
         let width = self.layout_width.get();
         let height = self.layout_history_height.get();
-        self.cells.refresh_wraps(width);
+        self.cells
+            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
         self.scroll.jump_top(&self.cells.wrap_rows(), height);
     }
 

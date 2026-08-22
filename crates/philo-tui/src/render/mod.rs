@@ -12,7 +12,7 @@ pub(crate) mod theme;
 
 /// Horizontal inset for the transcript / Activity column. Composer and
 /// status chrome stay full-width; composer text uses the same column.
-pub(crate) const CONTENT_INSET: u16 = 2;
+pub(crate) const CONTENT_INSET: u16 = 4;
 
 pub(crate) fn inset_h(area: Rect) -> Rect {
     if area.width == 0 {

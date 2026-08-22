@@ -396,6 +396,7 @@ fn launch_config(
         show_reasoning: bootstrap.settings.show_reasoning,
         context_window: bootstrap.settings.context_window,
         screen: bootstrap.settings.screen,
+        terminal_palette: bootstrap.settings.terminal_bg,
         interrupt: Some(interrupt),
         recovery,
     }

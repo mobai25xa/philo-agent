@@ -4,8 +4,8 @@
 mod tests {
     use philo_agent_service::{
         ConfirmationDecision, FrontendAvailability, FrontendConfigEntry, FrontendGeneration,
-        FrontendReasoningEffort, FrontendStatus, FrontendTokenUsage, FrontendToolListing,
-        FrontendUpdateKind,
+        FrontendReasoningEffort, FrontendSessionSummary, FrontendStatus, FrontendTokenUsage,
+        FrontendToolListing, FrontendUpdateKind,
     };
 
     use crate::app::action::Action;
@@ -72,7 +72,16 @@ mod tests {
                 view: empty_session_view("fresh"),
             },
             HostRequest::OpenSessions => FrontendUpdateKind::SessionListLoaded {
-                session_ids: vec!["s-1".to_owned(), "s-2".to_owned()],
+                sessions: vec![
+                    FrontendSessionSummary {
+                        session_id: "s-1".to_owned(),
+                        title: Some("first session".to_owned()),
+                    },
+                    FrontendSessionSummary {
+                        session_id: "s-2".to_owned(),
+                        title: None,
+                    },
+                ],
             },
             HostRequest::LoadPreview(id) => FrontendUpdateKind::SessionPreviewed {
                 session_id: id.clone(),
@@ -82,6 +91,7 @@ mod tests {
                 session_id: id.clone(),
                 view: session_view(&id),
             },
+            HostRequest::RenameSession { .. } => FrontendUpdateKind::CommandAccepted,
             HostRequest::RebuildModel(name) => FrontendUpdateKind::GenerationInstalled {
                 display: FrontendGeneration {
                     generation_id: "g-1".to_owned(),

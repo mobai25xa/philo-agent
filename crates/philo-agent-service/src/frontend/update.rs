@@ -5,7 +5,8 @@ use crate::frontend::command::ConfirmationDecision;
 use crate::frontend::snapshot::FrontendGeneration;
 use crate::frontend::snapshot::{
     DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendMaintenance,
-    FrontendOperationEvent, FrontendSnapshot, FrontendStatus, ServiceHealth,
+    FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot, FrontendStatus,
+    ServiceHealth,
 };
 use crate::ids::{FrontendEpoch, FrontendRequestId, FrontendRevision};
 
@@ -78,10 +79,11 @@ pub enum FrontendUpdateKind {
         /// Durable view.
         view: DurableSessionView,
     },
-    /// Durable session ids, plus the uncommitted current session when needed.
+    /// Durable session summaries, plus the uncommitted current session when
+    /// needed. Service-stable order.
     SessionListLoaded {
-        /// Session ids in service-stable order.
-        session_ids: Vec<String>,
+        /// Session ids with advisory display titles.
+        sessions: Vec<FrontendSessionSummary>,
     },
     /// Current generation was replaced.
     GenerationInstalled {

@@ -49,6 +49,9 @@ pub enum SessionValidationError {
     },
     /// A transaction containing a compaction must contain only that entry.
     InvalidCompactionTransaction,
+    /// A title is structurally malformed: empty after trimming, longer than
+    /// the override cap, or carrying control characters.
+    InvalidTitle,
 }
 
 /// Session read or commit failure.

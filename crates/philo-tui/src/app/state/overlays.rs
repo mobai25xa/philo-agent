@@ -6,7 +6,7 @@ use super::App;
 use super::line;
 use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
-use crate::app::overlay::{ConfirmPrompt, Preview, SessionPicker};
+use crate::app::overlay::{ConfirmPrompt, PickerEntry, Preview, SessionPicker};
 use crate::app::transcript::LineKind;
 
 impl App {
@@ -25,7 +25,7 @@ impl App {
         previous != self.confirm.as_ref().map(|prompt| prompt.id)
     }
 
-    pub(crate) fn open_picker(&mut self, sessions: Vec<String>) {
+    pub(crate) fn open_picker(&mut self, sessions: Vec<PickerEntry>) {
         self.picker = Some(SessionPicker::new(sessions));
     }
 

@@ -107,7 +107,7 @@ fn the_data_dir_follows_the_five_layer_chain() {
                 .args(["sessions", "--data-dir"])
                 .arg(&flag_store)
         ),
-        "from-flag\n",
+        "from-flag  hi\n",
         "the flag outranks every other layer"
     );
     assert_eq!(
@@ -117,17 +117,17 @@ fn the_data_dir_follows_the_five_layer_chain() {
                 .env("PHILO_DATA_DIR", &env_store)
                 .arg("sessions")
         ),
-        "from-env\n",
+        "from-env  hi\n",
         "the environment outranks both files"
     );
     assert_eq!(
         listed(philo(&config_home).current_dir(&project).arg("sessions")),
-        "from-project\n",
+        "from-project  hi\n",
         "the project file outranks the global one"
     );
     assert_eq!(
         listed(philo(&config_home).current_dir(&root.path).arg("sessions")),
-        "from-global\n",
+        "from-global  hi\n",
         "without a project file the global one applies"
     );
 
@@ -164,7 +164,7 @@ fn unknown_keys_warn_and_keep_running() {
         .expect("run");
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr_text(&output));
-    assert_eq!(stdout_text(&output), "alpha\n");
+    assert_eq!(stdout_text(&output), "alpha  hi\n");
     let stderr = stderr_text(&output);
     assert!(
         stderr.contains("unknown key [deployment].from_the_future"),
@@ -556,3 +556,4 @@ fn seed_session(root: &Path, id: &str) {
     )))
     .expect("seed commit");
 }
+

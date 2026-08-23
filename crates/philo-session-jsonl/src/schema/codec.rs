@@ -217,6 +217,9 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
             summary: summary.clone(),
             covers_up_to: covers_up_to.as_str().to_owned(),
         },
+        SessionEntryKind::TitleSet { title } => KindRecord::TitleSet {
+            title: title.clone(),
+        },
     }
 }
 
@@ -341,5 +344,6 @@ fn decode_kind(
             summary,
             covers_up_to: EntryId::new(covers_up_to),
         },
+        KindRecord::TitleSet { title } => SessionEntryKind::TitleSet { title },
     })
 }

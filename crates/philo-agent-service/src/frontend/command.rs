@@ -65,6 +65,14 @@ pub enum FrontendCommand {
     },
     /// List durable sessions from the session store.
     ListSessions,
+    /// Append a `TitleSet` entry to one session (a manual rename). Does not
+    /// touch the current session or the Runtime.
+    RenameSession {
+        /// Session to rename.
+        session_id: String,
+        /// New title. Trimmed and validated by the shared session core.
+        title: String,
+    },
     /// Make `session_id` current and load its durable view.
     LoadSession {
         /// Session to load.

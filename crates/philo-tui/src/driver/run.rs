@@ -1150,6 +1150,10 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
             }
         }
         HostRequest::SwitchSession(session_id) => FrontendCommand::LoadSession { session_id },
+        HostRequest::RenameSession { title } => FrontendCommand::RenameSession {
+            session_id: app.status.session.clone(),
+            title,
+        },
         HostRequest::RebuildModel(name) => FrontendCommand::InstallModel { name },
         HostRequest::SetReasoning(effort) => FrontendCommand::SetReasoning { effort },
         HostRequest::ShowConfig => FrontendCommand::ReadConfig,

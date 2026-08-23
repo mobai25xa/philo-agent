@@ -5,6 +5,7 @@ expression: "rows.join(\"\\n\")"
 > /help               commands and key bindings
   /new                start a new session
   /sessions           pick a session to continue
+  /rename <title>     rename the current session
   /model <name>       switch the model for later operations
   /reasoning <level>  reasoning effort, from the next turn on
   /compact            summarize older context (idle only)

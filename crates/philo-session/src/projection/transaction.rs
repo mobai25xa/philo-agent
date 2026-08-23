@@ -85,6 +85,15 @@ impl SessionProjection {
             if entry.parent() != expected_parent {
                 return validation(SessionValidationError::InvalidParent { entry_index: index });
             }
+            match entry.kind() {
+                SessionEntryKind::TitleSet { title } if !super::title_is_valid(title) => {
+                    return validation(SessionValidationError::InvalidTitle);
+                }
+                SessionEntryKind::TitleSet { title } => {
+                    self.title_override = Some(title.trim().to_owned());
+                }
+                _ => {}
+            }
             self.lifecycle.accept(entry.kind())?;
             self.context.accept(entry, self.entry_count)?;
             self.entry_count += 1;

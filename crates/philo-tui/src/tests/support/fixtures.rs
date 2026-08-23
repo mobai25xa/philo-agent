@@ -9,6 +9,7 @@ use philo_agent_service::{
 pub(crate) fn session_view(id: &str) -> DurableSessionView {
     DurableSessionView {
         session_id: id.to_owned(),
+        title: None,
         revision: 3,
         messages: vec![
             FrontendContextMessage::User {
@@ -43,6 +44,7 @@ pub(crate) fn session_view(id: &str) -> DurableSessionView {
 pub(crate) fn image_session_view(id: &str) -> DurableSessionView {
     DurableSessionView {
         session_id: id.to_owned(),
+        title: None,
         revision: 1,
         messages: vec![FrontendContextMessage::User {
             parts: vec![
@@ -62,6 +64,7 @@ pub(crate) fn image_session_view(id: &str) -> DurableSessionView {
 pub(crate) fn empty_session_view(id: &str) -> DurableSessionView {
     DurableSessionView {
         session_id: id.to_owned(),
+        title: None,
         revision: 0,
         messages: Vec::new(),
         open_turns: Vec::new(),

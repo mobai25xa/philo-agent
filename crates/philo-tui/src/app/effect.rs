@@ -13,6 +13,7 @@ pub(crate) enum HostRequest {
     OpenSessions,
     LoadPreview(String),
     SwitchSession(String),
+    RenameSession { title: String },
     RebuildModel(String),
     SetReasoning(FrontendReasoningEffort),
     ShowConfig,

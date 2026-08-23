@@ -17,6 +17,6 @@ pub use entry::{
 pub use error::{SessionError, SessionValidationError};
 pub use memory::MemorySessionStore;
 pub use projection::{AppliedTransaction, SessionProjection};
-pub use store::{SessionFuture, SessionStore};
+pub use store::{SessionFuture, SessionStore, SessionSummary};
 pub use tool_entry::{SessionToolCall, SessionToolResult, ToolResultOutcome};
 pub use view::{ContextMessage, OpenTurnInfo, SessionContextView, UnfilledBatch};

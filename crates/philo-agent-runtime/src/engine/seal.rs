@@ -6,6 +6,9 @@ use crate::mapping::failure::session_failure;
 use crate::operation::OperationPublisher;
 use philo_session as session;
 
+// The view variant intentionally carries the full SessionContextView by
+// value; the title field pushed it past clippy's default size threshold.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum SealOutcome {
     /// Every stale turn is sealed; carries the refreshed context view.
     Sealed(OperationPublisher, session::SessionContextView),

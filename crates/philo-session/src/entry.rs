@@ -218,6 +218,12 @@ pub enum SessionEntryKind {
         summary: String,
         covers_up_to: EntryId,
     },
+    /// Records a human-readable session title. The newest `TitleSet` wins;
+    /// sessions without one derive a display title from the first user text.
+    TitleSet {
+        /// The validated title text.
+        title: String,
+    },
 }
 
 /// Parent reference used before transaction entry IDs are allocated.

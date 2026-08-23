@@ -5,7 +5,7 @@ expression: "output.join(\"\\n\")"
 Meta: /sessions
 overlay:
 sessions  1/2
-> s-1                    | loading preview...
+> count the files        | loading preview...
   s-image                |
                          |
                          |

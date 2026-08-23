@@ -45,18 +45,41 @@ pub enum Preview {
     Failed(String),
 }
 
+/// One listed session: the durable id plus an advisory display title.
+/// The picker shows the title when present and falls back to the id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PickerEntry {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
+}
+
+impl PickerEntry {
+    #[cfg(test)]
+    pub(crate) fn untitled(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: None,
+        }
+    }
+
+    /// What the list column renders for this row.
+    fn display_name(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.id)
+    }
+}
+
 /// The `/sessions` overlay: a list, a lazily loaded preview of the
 /// highlighted session, and a selection cursor.
 #[derive(Clone, Debug)]
 pub struct SessionPicker {
-    sessions: Vec<String>,
+    sessions: Vec<PickerEntry>,
     selected: usize,
     previews: HashMap<String, Preview>,
 }
 
 impl SessionPicker {
     /// Opens a picker over a non-empty session list.
-    pub(crate) fn new(sessions: Vec<String>) -> Self {
+    pub(crate) fn new(sessions: Vec<PickerEntry>) -> Self {
         debug_assert!(
             !sessions.is_empty(),
             "the picker needs at least one session"
@@ -70,7 +93,7 @@ impl SessionPicker {
 
     /// The highlighted session.
     pub fn selected(&self) -> &str {
-        &self.sessions[self.selected]
+        &self.sessions[self.selected].id
     }
 
     /// Moves the highlight; returns whether it actually moved.
@@ -133,9 +156,9 @@ impl SessionPicker {
                 let index = start + offset;
                 let entry = self.sessions.get(index).map_or_else(
                     || " ".repeat(list_width + 2),
-                    |id| {
+                    |session| {
                         let marker = if index == self.selected { ">" } else { " " };
-                        format!("{marker} {}", cell(id, list_width))
+                        format!("{marker} {}", cell(session.display_name(), list_width))
                     },
                 );
                 if !show_preview {
@@ -221,7 +244,11 @@ mod tests {
     use super::*;
 
     fn picker() -> SessionPicker {
-        SessionPicker::new(vec!["s-1".to_owned(), "s-2".to_owned(), "s-3".to_owned()])
+        SessionPicker::new(vec![
+            PickerEntry::untitled("s-1"),
+            PickerEntry::untitled("s-2"),
+            PickerEntry::untitled("s-3"),
+        ])
     }
 
     #[test]
@@ -290,9 +317,9 @@ mod tests {
 
     #[test]
     fn long_ids_truncate_inside_the_column() {
-        let picker = SessionPicker::new(vec![
-            "session-with-a-very-long-identifier-indeed".to_owned(),
-        ]);
+        let picker = SessionPicker::new(vec![PickerEntry::untitled(
+            "session-with-a-very-long-identifier-indeed",
+        )]);
         let frame = picker.frame(1);
         assert!(
             frame.body[0].starts_with("> session-with-a-very..."),
@@ -301,8 +328,24 @@ mod tests {
     }
 
     #[test]
+    fn titled_sessions_render_the_title_in_the_column() {
+        let mut picker = SessionPicker::new(vec![
+            PickerEntry {
+                id: "sess-1982ab3-41".to_owned(),
+                title: Some("fix the login bug".to_owned()),
+            },
+            PickerEntry::untitled("sess-1982cd7-42"),
+        ]);
+        picker.move_down();
+        let frame = picker.frame(2);
+        assert!(frame.body[0].contains("fix the login bug"), "{frame:?}");
+        assert!(frame.body[1].starts_with("> sess-1982cd7-42"), "{frame:?}");
+    }
+
+    #[test]
     fn narrow_picker_omits_preview_and_respects_cell_width() {
-        let picker = SessionPicker::new(vec!["中文-session-name".to_owned()]);
+        let picker =
+            SessionPicker::new(vec![PickerEntry::untitled("中文-session-name")]);
         let frame = picker.frame_for(2, 20);
         assert!(frame.body.iter().all(|line| text::width(line) <= 20));
         assert!(!frame.body[0].contains(" | "));

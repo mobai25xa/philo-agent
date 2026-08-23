@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use philo_session::{
     SessionCommit, SessionContextView, SessionError, SessionFuture, SessionId, SessionProjection,
-    SessionStore, SessionTransaction,
+    SessionStore, SessionSummary, SessionTransaction,
 };
 use tokio::sync::oneshot;
 
@@ -33,9 +33,28 @@ pub(super) struct SessionState {
     /// when the file handle closes (including process crash).
     _lock: File,
     report: RecoveryReport,
+    /// Title bytes currently mirrored in the sidecar file. `None` means no
+    /// file content is trusted; a successful sync stores the written value.
+    sidecar_title: Option<String>,
     /// After a write/fsync failure the on-disk state is untrusted: refuse
     /// further commits until a fresh store instance re-opens and recovers.
     poisoned: Option<String>,
+}
+
+impl SessionState {
+    /// Rewrites the title sidecar when the resolved title changed. Best
+    /// effort: a failed write leaves the cache untouched so the next
+    /// commit retries; listing falls back to ids meanwhile.
+    pub(super) fn sync_title_sidecar(&mut self, dir: &Path) {
+        let resolved = self.projection.title();
+        if resolved == self.sidecar_title {
+            return;
+        }
+        layout::write_title_file(dir, resolved.as_deref());
+        if resolved.is_none() || layout::read_title_file(dir) == resolved {
+            self.sidecar_title = resolved;
+        }
+    }
 }
 
 struct CommandHandle {
@@ -142,6 +161,21 @@ impl JsonlSessionStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionId>, JsonlOpenError> {
         let (reply, rx) = mpsc::channel();
         self.try_enqueue_open(StoreCommand::ListSessions {
+            reply: Reply::Sync(reply),
+        })?;
+        rx.recv()
+            .map_err(|_| io_error_text("jsonl store actor stopped"))?
+    }
+
+    /// Enumerates sessions with their cached display titles.
+    ///
+    /// Same read-only contract as [`JsonlSessionStore::list_sessions`]:
+    /// titles come from a per-session sidecar written under lock by the
+    /// actor; sessions without one report `None` and callers fall back
+    /// to the id.
+    pub fn list_session_summaries(&self) -> Result<Vec<SessionSummary>, JsonlOpenError> {
+        let (reply, rx) = mpsc::channel();
+        self.try_enqueue_open(StoreCommand::ListSessionSummaries {
             reply: Reply::Sync(reply),
         })?;
         rx.recv()
@@ -267,6 +301,24 @@ impl SessionStore for JsonlSessionStore {
             Ok(()) => Box::pin(async move {
                 match rx.await {
                     Ok(Ok(ids)) => Ok(ids),
+                    Ok(Err(error)) => Err(SessionError::store_unavailable(error.to_string())),
+                    Err(_) => Err(SessionError::store_unavailable("jsonl store actor stopped")),
+                }
+            }),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    fn list_session_summaries(
+        &self,
+    ) -> SessionFuture<'_, Result<Vec<SessionSummary>, SessionError>> {
+        let (reply, rx) = oneshot::channel();
+        match self.try_enqueue(StoreCommand::ListSessionSummaries {
+            reply: Reply::Async(reply),
+        }) {
+            Ok(()) => Box::pin(async move {
+                match rx.await {
+                    Ok(Ok(summaries)) => Ok(summaries),
                     Ok(Err(error)) => Err(SessionError::store_unavailable(error.to_string())),
                     Err(_) => Err(SessionError::store_unavailable("jsonl store actor stopped")),
                 }

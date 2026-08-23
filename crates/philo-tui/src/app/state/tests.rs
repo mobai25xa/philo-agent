@@ -9,6 +9,7 @@ use super::*;
 use crate::app::action::Action;
 use crate::app::command;
 use crate::app::effect::{Effect, HostRequest};
+use crate::app::overlay::PickerEntry;
 use crate::app::status::StatusData;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 use crate::tests::support::{frontend_update, idle_snapshot, session_view};
@@ -868,7 +869,7 @@ fn an_empty_slash_opens_the_whole_table() {
 #[test]
 fn the_picker_moves_the_selection_and_loads_previews_lazily() {
     let mut app = app();
-    app.open_picker(vec!["s-1".to_owned(), "s-2".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1"), PickerEntry::untitled("s-2")]);
     assert_eq!(app.claim_preview(), Some("s-1".to_owned()));
 
     let effects = app.on_action(Action::MoveDown);
@@ -890,7 +891,7 @@ fn the_picker_moves_the_selection_and_loads_previews_lazily() {
 #[test]
 fn the_picker_switches_on_enter_and_closes_on_escape() {
     let mut app = app();
-    app.open_picker(vec!["s-1".to_owned(), "s-2".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1"), PickerEntry::untitled("s-2")]);
     app.on_action(Action::MoveDown);
     assert_eq!(
         host_requests(&app.on_action(Action::Submit)),
@@ -898,7 +899,7 @@ fn the_picker_switches_on_enter_and_closes_on_escape() {
     );
     assert!(app.picker().is_none(), "Enter closes the overlay");
 
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     assert!(app.on_action(Action::Escape).is_empty());
     assert!(app.picker().is_none());
 }
@@ -907,7 +908,7 @@ fn the_picker_switches_on_enter_and_closes_on_escape() {
 fn the_picker_refuses_to_switch_while_a_turn_runs() {
     let mut app = app();
     app.set_busy(true, 0);
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     let effects = app.on_action(Action::Submit);
     assert!(host_requests(&effects).is_empty());
     assert_eq!(appended(&effects)[0].kind, LineKind::Error);
@@ -917,7 +918,7 @@ fn the_picker_refuses_to_switch_while_a_turn_runs() {
 #[test]
 fn the_picker_does_not_type_into_the_input() {
     let mut app = app();
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     app.on_action(Action::InsertChar('x'));
     app.on_paste("pasted");
     assert!(app.input.is_empty());
@@ -967,7 +968,7 @@ fn an_auto_denied_request_closes_the_overlay() {
 #[test]
 fn the_approval_overlay_wins_over_the_picker() {
     let mut app = app();
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     let (title, body) = request("run_command");
     app.sync_confirmation(Some((7, title, body)));
     let frame = app.overlay_frame(4).expect("an overlay is painted");
@@ -981,7 +982,7 @@ fn the_approval_overlay_wins_over_the_picker() {
 #[test]
 fn overlays_never_swallow_agent_events() {
     let mut app = app();
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     let (title, body) = request("run_command");
     app.sync_confirmation(Some((1, title, body)));
     let effects = app.on_operation_event(&FrontendOperationEvent::OperationSettled {
@@ -1399,7 +1400,7 @@ fn overlay_does_not_start_transcript_selection() {
     let mut app = app();
     seed_rows(&mut app, 10);
     app.note_history_layout(80, 3);
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     app.on_action(Action::SelectStart { x: 0, y: 0 });
     app.on_action(Action::SelectDrag { x: 5, y: 0 });
     app.on_action(Action::SelectEnd { x: 5, y: 0 });
@@ -1720,7 +1721,7 @@ fn overlay_ignores_home_and_end() {
     let mut app = app();
     seed_rows(&mut app, 10);
     app.note_history_layout(80, 3);
-    app.open_picker(vec!["s-1".to_owned()]);
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
     app.on_action(Action::Home);
     assert!(app.follow_bottom());
     assert!(app.picker().is_some());
@@ -1728,3 +1729,4 @@ fn overlay_ignores_home_and_end() {
     assert!(app.follow_bottom());
     assert!(app.picker().is_some());
 }
+

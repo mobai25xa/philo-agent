@@ -1,10 +1,10 @@
 //! The `sessions` subcommand: read-only enumeration through the store's
-//! public interface.
+//! public interface, with advisory display titles when the store knows one.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use philo_session::SessionStore;
+use philo_session::{SessionStore, SessionSummary};
 use philo_session_jsonl::JsonlSessionStore;
 
 use crate::config::LoadedConfig;
@@ -37,13 +37,13 @@ pub fn run(data_dir_flag: Option<PathBuf>) -> Result<ExitCode, UsageError> {
             return Ok(ExitCode::from(1));
         }
     };
-    let listed = runtime.block_on(SessionStore::list_sessions(&store));
+    let listed = runtime.block_on(SessionStore::list_session_summaries(&store));
     let _ = store.shutdown();
     match listed {
         Ok(mut sessions) => {
-            sessions.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            sessions.sort_by(|a, b| a.session_id.as_str().cmp(b.session_id.as_str()));
             for session in sessions {
-                println!("{}", session.as_str());
+                println!("{}", summary_line(&session));
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -52,4 +52,13 @@ pub fn run(data_dir_flag: Option<PathBuf>) -> Result<ExitCode, UsageError> {
             Ok(ExitCode::from(1))
         }
     }
+}
+
+/// `{id}` alone, or `{id}  {title}` when a title exists. Titles are
+/// advisory; the id always leads so output stays machine-greppable.
+fn summary_line(summary: &SessionSummary) -> String {
+    let Some(title) = &summary.title else {
+        return summary.session_id.as_str().to_owned();
+    };
+    format!("{}  {}", summary.session_id.as_str(), title)
 }

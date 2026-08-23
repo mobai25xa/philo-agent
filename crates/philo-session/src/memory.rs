@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use crate::entry::{SessionCommit, SessionId, SessionTransaction};
 use crate::error::SessionError;
 use crate::projection::SessionProjection;
-use crate::store::{SessionFuture, SessionStore};
+use crate::store::{SessionFuture, SessionStore, SessionSummary};
 use crate::view::SessionContextView;
 
 /// Thread-safe in-memory implementation of [`SessionStore`].
@@ -71,6 +71,21 @@ impl SessionStore for MemorySessionStore {
         Box::pin(async move {
             let sessions = self.sessions.lock().map_err(|_| unavailable())?;
             Ok(sessions.keys().cloned().collect())
+        })
+    }
+
+    fn list_session_summaries(
+        &self,
+    ) -> SessionFuture<'_, Result<Vec<SessionSummary>, SessionError>> {
+        Box::pin(async move {
+            let sessions = self.sessions.lock().map_err(|_| unavailable())?;
+            Ok(sessions
+                .iter()
+                .map(|(session_id, projection)| SessionSummary {
+                    session_id: session_id.clone(),
+                    title: projection.title(),
+                })
+                .collect())
         })
     }
 }

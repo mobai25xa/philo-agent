@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use philo_agent_runtime::AgentEvent;
-use philo_session::{SessionError, SessionId, SessionStore};
+use philo_session::{SessionError, SessionStore};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{Id as TaskId, JoinSet};
 
@@ -106,7 +106,12 @@ pub(crate) enum ServiceTaskResult {
     ListSessions {
         request_id: FrontendRequestId,
         epoch: FrontendEpoch,
-        result: Result<Vec<SessionId>, SessionError>,
+        result: Result<Vec<philo_session::SessionSummary>, SessionError>,
+    },
+    RenameSession {
+        request_id: FrontendRequestId,
+        epoch: FrontendEpoch,
+        result: Result<(), String>,
     },
 }
 
@@ -317,6 +322,9 @@ where
                 self.spawn_cancel_maintenance(request_id, maintenance_id);
             }
             FrontendCommand::ListSessions => self.handle_list_sessions(request_id),
+            FrontendCommand::RenameSession { session_id, title } => {
+                self.handle_rename_session(request_id, session_id, title);
+            }
             FrontendCommand::LoadSession { session_id } => {
                 self.handle_load_session(request_id, session_id);
             }
@@ -607,6 +615,27 @@ where
                 epoch,
                 result,
             } => self.handle_list_sessions_result(request_id, epoch, result),
+            ServiceTaskResult::RenameSession {
+                request_id,
+                epoch,
+                result,
+            } => {
+                if epoch != self.epoch {
+                    self.feed.cancel_request(request_id);
+                } else {
+                    match result {
+                        Ok(()) => {
+                            self.emit(Some(request_id), FrontendUpdateKind::CommandAccepted)
+                        }
+                        Err(reason) => self.emit(
+                            Some(request_id),
+                            FrontendUpdateKind::CommandRejected {
+                                reason: CommandReject::InvalidInput { reason },
+                            },
+                        ),
+                    }
+                }
+            }
         }
         self.finish_if_children_idle();
     }

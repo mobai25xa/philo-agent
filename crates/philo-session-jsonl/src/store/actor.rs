@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use philo_session::{
-    SessionCommit, SessionContextView, SessionError, SessionId, SessionProjection,
+    SessionCommit, SessionContextView, SessionError, SessionId, SessionProjection, SessionSummary,
     SessionTransaction,
 };
 use tokio::sync::oneshot;
@@ -17,7 +17,9 @@ use crate::error::{JsonlOpenError, io_error, io_error_text};
 use crate::schema::{PendingArtifact, SCHEMA_VERSION, TransactionRecord, encode_entry};
 
 use super::SessionState;
-use super::layout::{LOG_FILE, acquire_lock, decode_session_dir_name, fsync_dir, session_dir_name};
+use super::layout::{
+    LOG_FILE, acquire_lock, decode_session_dir_name, fsync_dir, read_title_file, session_dir_name,
+};
 use super::recovery::{self, RecoveryReport};
 
 pub(super) enum Reply<T> {
@@ -49,6 +51,9 @@ pub(super) enum StoreCommand {
     },
     ListSessions {
         reply: Reply<Result<Vec<SessionId>, JsonlOpenError>>,
+    },
+    ListSessionSummaries {
+        reply: Reply<Result<Vec<SessionSummary>, JsonlOpenError>>,
     },
     RecoverSession {
         session_id: SessionId,
@@ -111,6 +116,10 @@ impl StoreActor {
                 reply.send(self.list_sessions());
                 false
             }
+            StoreCommand::ListSessionSummaries { reply } => {
+                reply.send(self.list_session_summaries());
+                false
+            }
             StoreCommand::RecoverSession { session_id, reply } => {
                 let _ = reply.send(self.recover_session(&session_id));
                 false
@@ -150,6 +159,9 @@ impl StoreActor {
                     )));
                 }
                 Ok(StoreCommand::ListSessions { reply }) => {
+                    reply.send(Err(io_error_text("jsonl store shutting down")));
+                }
+                Ok(StoreCommand::ListSessionSummaries { reply }) => {
                     reply.send(Err(io_error_text("jsonl store shutting down")));
                 }
                 Ok(StoreCommand::RecoverSession { reply, .. }) => {
@@ -208,6 +220,29 @@ impl StoreActor {
     /// Read-only: takes no session locks, triggers no recovery, and neither
     /// creates nor modifies any file.
     fn list_sessions(&self) -> Result<Vec<SessionId>, JsonlOpenError> {
+        Ok(self
+            .scan_session_dirs()?
+            .into_iter()
+            .map(|(session_id, _)| session_id)
+            .collect())
+    }
+
+    /// Read-only like [`StoreActor::list_sessions`]; titles come from the
+    /// per-session sidecar written under lock by the actor.
+    fn list_session_summaries(&self) -> Result<Vec<SessionSummary>, JsonlOpenError> {
+        Ok(self
+            .scan_session_dirs()?
+            .into_iter()
+            .map(|(session_id, dir)| SessionSummary {
+                session_id,
+                title: read_title_file(&dir),
+            })
+            .collect())
+    }
+
+    /// Walks the store root once, yielding canonical session ids with their
+    /// decoded directories. Non-directory or non-canonical entries are skipped.
+    fn scan_session_dirs(&self) -> Result<Vec<(SessionId, PathBuf)>, JsonlOpenError> {
         let listing =
             fs::read_dir(&self.root).map_err(|error| io_error("listing store root", &error))?;
         let mut sessions = Vec::new();
@@ -225,7 +260,7 @@ impl StoreActor {
                 continue;
             };
             if let Some(session_id) = decode_session_dir_name(name) {
-                sessions.push(session_id);
+                sessions.push((session_id, self.root.join(name)));
             }
         }
         Ok(sessions)
@@ -249,6 +284,7 @@ impl StoreActor {
             log,
             _lock: lock,
             report: RecoveryReport::empty(),
+            sidecar_title: None,
             poisoned: None,
         })
     }
@@ -277,7 +313,8 @@ impl StoreActor {
 
     fn commit(&mut self, transaction: SessionTransaction) -> Result<SessionCommit, SessionError> {
         let session_id = transaction.session_id().clone();
-        let artifacts_dir = self.session_dir(&session_id).join(ARTIFACTS_DIR);
+        let session_dir = self.session_dir(&session_id);
+        let artifacts_dir = session_dir.join(ARTIFACTS_DIR);
         let state = self
             .touch(&session_id, true)
             .map_err(|error| SessionError::store_unavailable(error.to_string()))?
@@ -340,6 +377,9 @@ impl StoreActor {
 
         let commit = applied.commit();
         state.projection = applied.into_projection();
+        // Mirror the resolved title into the listing sidecar. Best effort:
+        // the durable fact already lives in the log line above.
+        state.sync_title_sidecar(&session_dir);
         Ok(commit)
     }
 }

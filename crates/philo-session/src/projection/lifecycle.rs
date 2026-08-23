@@ -324,6 +324,9 @@ impl LifecycleProjection {
                     .outcome = Some(*outcome);
             }
             SessionEntryKind::Compaction { .. } => {}
+            // Title validation and override tracking happen in the shared
+            // transaction fold; titles touch no turn or operation state.
+            SessionEntryKind::TitleSet { .. } => {}
         }
         Ok(())
     }

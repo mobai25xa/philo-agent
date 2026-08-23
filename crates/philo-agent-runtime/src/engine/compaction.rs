@@ -14,6 +14,9 @@ use philo_session as session;
 
 const SUMMARY_INSTRUCTION: &str = "Summarize the earlier conversation for a continuation. Preserve decisions, constraints, unresolved work, and concrete identifiers. Return only the summary text.";
 
+// The view variant intentionally carries the full SessionContextView by
+// value; the title field pushed it past clippy's default size threshold.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum AutoCompactionOutcome {
     Ready(OperationPublisher, session::SessionContextView),
     Settled,

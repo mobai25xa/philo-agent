@@ -63,6 +63,10 @@ pub(crate) enum KindRecord {
         summary: String,
         covers_up_to: String,
     },
+    /// Additive v2 record (session titles). Readers older than this variant
+    /// reject such logs as corrupt; no envelope version bump was needed
+    /// because the shape of existing records is untouched.
+    TitleSet { title: String },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

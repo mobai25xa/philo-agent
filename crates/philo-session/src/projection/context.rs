@@ -8,7 +8,7 @@ use crate::view::ContextMessage;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ContextProjection {
-    source_messages: Vec<ContextMessage>,
+    pub(super) source_messages: Vec<ContextMessage>,
     settled_boundaries: HashMap<EntryId, SettledBoundary>,
     latest_compaction: Option<CompactionState>,
 }

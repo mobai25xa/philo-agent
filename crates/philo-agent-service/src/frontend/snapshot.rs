@@ -57,6 +57,8 @@ pub struct DurableSessionView {
     pub session_id: String,
     /// Session store revision.
     pub revision: u64,
+    /// Resolved display title, when the store knows one.
+    pub title: Option<String>,
     /// Model-visible messages on the active path. Structured, unwrapped.
     pub messages: Vec<FrontendContextMessage>,
     /// Turns without a durable terminal outcome.
@@ -65,6 +67,16 @@ pub struct DurableSessionView {
     pub settled_turn_boundaries: Vec<String>,
     /// Newest compaction boundary, if any.
     pub latest_compaction_boundary: Option<String>,
+}
+
+/// One entry of the session catalog: identity plus an advisory display
+/// title. Frontends fall back to the id when the title is `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendSessionSummary {
+    /// Durable session id.
+    pub session_id: String,
+    /// Best-effort display title.
+    pub title: Option<String>,
 }
 
 /// One model-visible context message.

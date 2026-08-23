@@ -10,6 +10,10 @@ use crate::error::{JsonlOpenError, io_error};
 
 pub(super) const LOG_FILE: &str = "log.jsonl";
 const LOCK_FILE: &str = "lock";
+/// Sidecar cache of the session's resolved display title. Written by the
+/// actor under the session lock; a missing or stale file only costs the
+/// listing its title (readers fall back to the id), never correctness.
+pub(super) const TITLE_FILE: &str = "title";
 
 /// Deterministic, reversible, collision-free directory encoding for a
 /// session id. Pinned by the golden format tests.
@@ -73,6 +77,35 @@ pub(super) fn acquire_lock(dir: &Path) -> Result<File, JsonlOpenError> {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(JsonlOpenError::Locked { path }),
         Err(TryLockError::Error(error)) => Err(io_error("acquiring session lock", &error)),
+    }
+}
+
+/// Reads the title sidecar, if present and usable.
+pub(super) fn read_title_file(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(TITLE_FILE)).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Atomically rewrites (or clears) the title sidecar. Failures are
+/// non-fatal: the sidecar is a listing cache, not a durable fact.
+pub(super) fn write_title_file(dir: &Path, title: Option<&str>) {
+    let target = dir.join(TITLE_FILE);
+    match title {
+        Some(title) => {
+            let temp = dir.join(format!("{TITLE_FILE}.tmp"));
+            if std::fs::write(&temp, title.as_bytes())
+                .and_then(|()| std::fs::rename(&temp, &target))
+                .is_err()
+            {
+                let _ = std::fs::remove_file(&temp);
+            }
+        }
+        None => {
+            if target.exists() {
+                let _ = std::fs::remove_file(&target);
+            }
+        }
     }
 }
 

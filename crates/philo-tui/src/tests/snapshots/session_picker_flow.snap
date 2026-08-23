@@ -1,10 +1,10 @@
 ---
 source: crates/philo-tui/src/driver/host_effects.rs
-expression: "format!(\"FIRST\\n{first}\\n\\nSECOND\\n{second}\\n\\nSWITCHED\\n{}\",\nhistory.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join(\"\\n\"))"
+expression: "format!(\"FIRST\\n{first}\\n\\nSECOND\\n{second}\\n\\nSWITCHED\\n{}\",\nhistory.join(\"\\n\"))"
 ---
 FIRST
 sessions  1/2
-> s-1                    | › count the files
+> first session          | › count the files
   s-2                    | ▸ read_file  path: src/main.rs
                          | └ ok · fn main() {}
                          | one file
@@ -13,7 +13,7 @@ enter switch  ·  ↑↓ select  ·  esc close
 
 SECOND
 sessions  2/2
-  s-1                    | › count the files
+  first session          | › count the files
 > s-2                    | ▸ read_file  path: src/main.rs
                          | └ ok · fn main() {}
                          | one file

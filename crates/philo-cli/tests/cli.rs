@@ -240,8 +240,8 @@ fn sessions_lists_ids_written_by_the_real_store() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr_text(&output));
     assert_eq!(
         stdout_text(&output),
-        "alpha\nbeta-2\n",
-        "sorted ids on stdout"
+        "alpha  hi\nbeta-2  hi\n",
+        "sorted ids with derived titles on stdout"
     );
 }
 

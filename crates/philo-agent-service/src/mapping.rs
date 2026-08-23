@@ -23,6 +23,7 @@ pub fn durable_session_view(view: &SessionContextView) -> DurableSessionView {
     DurableSessionView {
         session_id: view.session_id().as_str().to_owned(),
         revision: view.revision().get(),
+        title: view.title().map(str::to_owned),
         messages: view.messages().iter().map(context_message).collect(),
         open_turns: view
             .open_turns()

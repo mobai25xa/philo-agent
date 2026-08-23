@@ -15,8 +15,42 @@ mod transaction;
 use context::ContextProjection;
 use lifecycle::LifecycleProjection;
 
-use crate::entry::{EntryId, SessionCommit, SessionEntry, SessionId, SessionRevision};
+use crate::entry::{
+    EntryId, SessionCommit, SessionEntry, SessionId, SessionRevision, SessionUserPart,
+};
 use crate::view::SessionContextView;
+
+/// Longest title a `TitleSet` entry may carry. Derived titles are shorter.
+pub const TITLE_OVERRIDE_MAX_CHARS: usize = 200;
+
+/// Longest derived title taken from the first user text part.
+const DERIVED_TITLE_MAX_CHARS: usize = 48;
+
+/// Normalizes one user text part into a candidate display title: whitespace
+/// runs collapse to single spaces and long texts truncate at a char boundary
+/// with an ellipsis. Empty results yield `None`.
+pub fn derive_title(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= DERIVED_TITLE_MAX_CHARS {
+        return Some(normalized);
+    }
+    let truncated = normalized
+        .chars()
+        .take(DERIVED_TITLE_MAX_CHARS)
+        .collect::<String>();
+    Some(format!("{truncated}…"))
+}
+
+/// Whether a `TitleSet` payload is structurally valid.
+pub(crate) fn title_is_valid(title: &str) -> bool {
+    let trimmed = title.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= TITLE_OVERRIDE_MAX_CHARS
+        && !trimmed.chars().any(char::is_control)
+}
 
 /// Validated, replayable state of one session's linear active path.
 #[derive(Clone, Debug, Default)]
@@ -26,6 +60,8 @@ pub struct SessionProjection {
     entry_count: usize,
     lifecycle: LifecycleProjection,
     context: ContextProjection,
+    /// The newest valid `TitleSet` payload. Absent until an explicit rename.
+    title_override: Option<String>,
 }
 
 /// Output of a validated [`SessionProjection::apply`]: the committed facts and
@@ -88,11 +124,30 @@ impl SessionProjection {
             session_id: session_id.clone(),
             revision: self.revision,
             current_leaf: self.current_leaf.clone(),
+            title: self.title(),
             messages: self.context.messages(),
             open_turns: self.lifecycle.open_turns(),
             settled_turns: self.lifecycle.settled_turns(),
             settled_turn_boundaries: self.context.settled_boundary_ids(),
             latest_compaction_boundary: self.context.latest_compaction_boundary(),
+        }
+    }
+
+    /// Resolves the display title: the newest `TitleSet` override, else a
+    /// title derived from the first user text part, else `None`.
+    pub fn title(&self) -> Option<String> {
+        if let Some(title) = &self.title_override {
+            return Some(title.clone());
+        }
+        let first = self.context.source_messages.first()?;
+        match first {
+            crate::view::ContextMessage::User { parts } => parts.iter().find_map(|part| {
+                match part {
+                    SessionUserPart::Text(text) => derive_title(text),
+                    SessionUserPart::Image { .. } => None,
+                }
+            }),
+            _ => None,
         }
     }
 

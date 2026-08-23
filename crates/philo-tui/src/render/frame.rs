@@ -384,6 +384,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use crate::app::action::Action;
+    use crate::app::overlay::PickerEntry;
     use crate::app::status::StatusData;
     use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
     use crate::render::{CONTENT_INSET, inset_h};
@@ -461,7 +462,10 @@ mod tests {
         assert_eq!(composer_row(&attachments), expected);
 
         let mut picker = app();
-        picker.open_picker(vec!["one".to_owned(), "two".to_owned()]);
+        picker.open_picker(vec![
+            PickerEntry::untitled("one"),
+            PickerEntry::untitled("two"),
+        ]);
         assert_eq!(composer_row(&picker), expected);
 
         let mut approval = app();

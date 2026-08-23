@@ -83,6 +83,7 @@ pub struct SessionContextView {
     pub(crate) session_id: SessionId,
     pub(crate) revision: SessionRevision,
     pub(crate) current_leaf: Option<EntryId>,
+    pub(crate) title: Option<String>,
     pub(crate) messages: Vec<ContextMessage>,
     pub(crate) open_turns: Vec<OpenTurnInfo>,
     pub(crate) settled_turns: Vec<(OperationId, TurnId)>,
@@ -94,6 +95,11 @@ impl SessionContextView {
     /// Returns the viewed session.
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// Returns the resolved display title, if any.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// Returns the revision captured with this view.

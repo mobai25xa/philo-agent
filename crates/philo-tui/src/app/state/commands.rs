@@ -203,6 +203,20 @@ impl App {
                 }
             }
             Ok(Command::Sessions) => effects.push(Effect::Host(HostRequest::OpenSessions)),
+            Ok(Command::Rename { title: None }) => {
+                lines.push(line(LineKind::Error, "usage: /rename <title>"));
+            }
+            Ok(Command::Rename { title: Some(title) }) => {
+                if self.status.session.is_empty() {
+                    lines.push(line(
+                        LineKind::Error,
+                        "error: no active session to rename yet",
+                    ));
+                } else {
+                    effects.push(Effect::Host(HostRequest::RenameSession { title }));
+                    lines.push(line(LineKind::Meta, "renaming the current session..."));
+                }
+            }
             Ok(Command::Model { name: None }) => {
                 lines.push(line(LineKind::Error, "usage: /model <name>"));
             }

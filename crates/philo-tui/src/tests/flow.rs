@@ -2,8 +2,8 @@
 //! queueing through the same pure state the terminal driver uses.
 
 use philo_agent_service::{
-    ConfirmationDecision, FrontendOperationEvent, FrontendToolDisplay, FrontendToolResult,
-    FrontendUpdateKind,
+    ConfirmationDecision, FrontendOperationEvent, FrontendSessionSummary, FrontendToolDisplay,
+    FrontendToolResult, FrontendUpdateKind,
 };
 
 use crate::app::action::Action;
@@ -53,7 +53,16 @@ fn frontend_complete_interaction_snapshot() {
             Effect::Host(_) => apply_kind(
                 &mut app,
                 FrontendUpdateKind::SessionListLoaded {
-                    session_ids: vec!["s-1".to_owned(), "s-image".to_owned()],
+                    sessions: vec![
+                        FrontendSessionSummary {
+                            session_id: "s-1".to_owned(),
+                            title: Some("count the files".to_owned()),
+                        },
+                        FrontendSessionSummary {
+                            session_id: "s-image".to_owned(),
+                            title: None,
+                        },
+                    ],
                 },
                 &mut output,
             ),

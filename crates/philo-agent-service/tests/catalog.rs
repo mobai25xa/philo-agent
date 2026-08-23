@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 
 use philo_agent_service::testing::{FakeAssembler, start_test_service_with};
 use philo_agent_service::{
-    CommandDispatch, FrontendCommand, FrontendUpdate, FrontendUpdateKind, RecvOutcome,
+    CommandDispatch, FrontendCommand, FrontendSessionSummary, FrontendUpdate,
+    FrontendUpdateKind, RecvOutcome,
 };
 use philo_session::{
     MemorySessionStore, OperationOutcome, SessionAssistantBlock, SessionEntryKind, SessionError,
-    SessionFuture, SessionId, SessionRevision, SessionStore, SessionTransaction, SessionUserPart,
-    TurnId, TurnOutcome,
+    SessionFuture, SessionId, SessionRevision, SessionStore, SessionSummary, SessionTransaction,
+    SessionUserPart, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::JsonlSessionStore;
 
@@ -60,6 +61,20 @@ impl SessionStore for ControllableSessionStore {
     fn list_sessions(&self) -> SessionFuture<'_, Result<Vec<SessionId>, SessionError>> {
         match *self.fault.lock().expect("catalog fault") {
             CatalogFault::None => self.inner.list_sessions(),
+            CatalogFault::Busy => {
+                Box::pin(async { Err(SessionError::store_busy("catalog paused")) })
+            }
+            CatalogFault::Unavailable => {
+                Box::pin(async { Err(SessionError::store_unavailable("catalog paused")) })
+            }
+        }
+    }
+
+    fn list_session_summaries(
+        &self,
+    ) -> SessionFuture<'_, Result<Vec<SessionSummary>, SessionError>> {
+        match *self.fault.lock().expect("catalog fault") {
+            CatalogFault::None => self.inner.list_session_summaries(),
             CatalogFault::Busy => {
                 Box::pin(async { Err(SessionError::store_busy("catalog paused")) })
             }
@@ -180,7 +195,7 @@ fn list_sessions(
 async fn recv_session_list(
     client: &philo_agent_service::FrontendClient,
     request_id: philo_agent_service::FrontendRequestId,
-) -> Vec<String> {
+) -> Vec<FrontendSessionSummary> {
     let update = recv_matching(client, |update| {
         update.request_id == Some(request_id)
             && matches!(
@@ -191,9 +206,16 @@ async fn recv_session_list(
     })
     .await;
     match update.kind {
-        FrontendUpdateKind::SessionListLoaded { session_ids } => session_ids,
+        FrontendUpdateKind::SessionListLoaded { sessions } => sessions,
         other => panic!("expected SessionListLoaded, got {other:?}"),
     }
+}
+
+fn listed_ids(sessions: &[FrontendSessionSummary]) -> Vec<String> {
+    sessions
+        .iter()
+        .map(|summary| summary.session_id.clone())
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -201,8 +223,8 @@ async fn empty_store_lists_empty_without_creating_a_session() {
     let (service, client, _runtime) =
         start_test_service_with(FakeAssembler::new(), MemorySessionStore::new());
     let request_id = list_sessions(&client);
-    let session_ids = recv_session_list(&client, request_id).await;
-    assert!(session_ids.is_empty());
+    let sessions = recv_session_list(&client, request_id).await;
+    assert!(sessions.is_empty());
     drop(service);
 }
 
@@ -215,8 +237,18 @@ async fn list_sessions_reads_durable_store_in_stable_order() {
 
     let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
     let request_id = list_sessions(&client);
-    let session_ids = recv_session_list(&client, request_id).await;
-    assert_eq!(session_ids, ["sess-a", "sess-m", "sess-z"]);
+    let sessions = recv_session_list(&client, request_id).await;
+    assert_eq!(
+        listed_ids(&sessions),
+        ["sess-a", "sess-m", "sess-z"],
+        "ids in stable order"
+    );
+    assert!(
+        sessions
+            .iter()
+            .all(|summary| summary.title.as_deref() == Some("hello from store")),
+        "derived titles ride along: {sessions:?}"
+    );
     drop(service);
 }
 
@@ -245,7 +277,7 @@ async fn uncommitted_current_session_appears_at_most_once() {
     };
 
     let listed = recv_session_list(&client, list_sessions(&client)).await;
-    assert_eq!(listed, ["sess-a", first_id.as_str(), "sess-z"]);
+    assert_eq!(listed_ids(&listed), ["sess-a", first_id.as_str(), "sess-z"]);
 
     let second = match client.try_command(FrontendCommand::CreateSession) {
         CommandDispatch::Enqueued(id) => id,
@@ -266,9 +298,21 @@ async fn uncommitted_current_session_appears_at_most_once() {
     assert_ne!(first_id, second_id);
 
     let listed = recv_session_list(&client, list_sessions(&client)).await;
-    assert_eq!(listed, ["sess-a", second_id.as_str(), "sess-z"]);
-    assert_eq!(listed.iter().filter(|id| *id == &first_id).count(), 0);
-    assert_eq!(listed.iter().filter(|id| *id == &second_id).count(), 1);
+    assert_eq!(listed_ids(&listed), ["sess-a", second_id.as_str(), "sess-z"]);
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|summary| summary.session_id == first_id)
+            .count(),
+        0
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|summary| summary.session_id == second_id)
+            .count(),
+        1
+    );
     drop(service);
 }
 
@@ -302,8 +346,8 @@ async fn store_busy_rejects_instead_of_empty_success() {
     );
 
     store.set_fault(CatalogFault::None);
-    let session_ids = recv_session_list(&client, list_sessions(&client)).await;
-    assert_eq!(session_ids, ["sess-a", "sess-b"]);
+    let sessions = recv_session_list(&client, list_sessions(&client)).await;
+    assert_eq!(listed_ids(&sessions), ["sess-a", "sess-b"]);
     drop(service);
 }
 
@@ -348,7 +392,7 @@ async fn jsonl_restart_lists_all_durable_sessions() {
 
     let store = JsonlSessionStore::open(&root.path).expect("reopen after restart");
     let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
-    let session_ids = recv_session_list(&client, list_sessions(&client)).await;
-    assert_eq!(session_ids, ["sess-a", "sess-m", "sess-z"]);
+    let sessions = recv_session_list(&client, list_sessions(&client)).await;
+    assert_eq!(listed_ids(&sessions), ["sess-a", "sess-m", "sess-z"]);
     drop(service);
 }

@@ -3,8 +3,8 @@
 use philo_agent_service::{
     DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendContextMessage,
     FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase, FrontendOperationEvent,
-    FrontendSnapshot, FrontendUpdate, FrontendUpdateKind as Kind, FrontendUserPart,
-    LiveOperationSnapshot, ServiceHealth,
+    FrontendSessionSummary, FrontendSnapshot, FrontendUpdate, FrontendUpdateKind as Kind,
+    FrontendUserPart, LiveOperationSnapshot, ServiceHealth,
 };
 
 use super::App;
@@ -12,7 +12,7 @@ use super::line;
 use super::overlays::SessionLoadIntent;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::listings;
-use crate::app::overlay::Preview;
+use crate::app::overlay::{PickerEntry, Preview};
 use crate::app::session;
 use crate::app::submit::{CancelDispatchResult, PendingSubmission};
 use crate::app::transcript::{InfoLevel, LineKind};
@@ -126,7 +126,7 @@ impl App {
                 );
                 Vec::new()
             }
-            Kind::SessionListLoaded { session_ids } => self.apply_session_list(session_ids),
+            Kind::SessionListLoaded { sessions } => self.apply_session_list(sessions),
             Kind::GenerationInstalled { display } => self.apply_generation_installed(display),
             Kind::GenerationInstallFailed { message, .. } => {
                 self.pending_model_switch = false;
@@ -258,14 +258,21 @@ impl App {
         }
     }
 
-    fn apply_session_list(&mut self, session_ids: &[String]) -> Vec<Effect> {
-        if session_ids.is_empty() {
+    fn apply_session_list(&mut self, summaries: &[FrontendSessionSummary]) -> Vec<Effect> {
+        if summaries.is_empty() {
             return self.ingest_appends(vec![Effect::Append(vec![line(
                 LineKind::Notice,
                 "no sessions recorded yet; this one starts with the first message",
             )])]);
         }
-        self.open_picker(session_ids.to_vec());
+        let entries = summaries
+            .iter()
+            .map(|summary| PickerEntry {
+                id: summary.session_id.clone(),
+                title: summary.title.clone(),
+            })
+            .collect();
+        self.open_picker(entries);
         self.claim_preview()
             .map(|id| vec![Effect::Host(HostRequest::LoadPreview(id))])
             .unwrap_or_default()

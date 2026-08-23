@@ -12,7 +12,7 @@ use crate::error::{JsonlOpenError, io_error};
 use crate::schema::{SCHEMA_VERSION, TransactionRecord, decode_entry};
 
 use super::SessionState;
-use super::layout::{LOG_FILE, acquire_lock};
+use super::layout::{LOG_FILE, acquire_lock, read_title_file, write_title_file};
 
 /// What recovery observed when a session was first touched.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +181,12 @@ pub(super) fn recover_locked(dir: &Path) -> Result<SessionState, JsonlOpenError>
         .append(true)
         .open(&log_path)
         .map_err(|error| io_error("opening log for append", &error))?;
+    // Refresh the listing sidecar while the lock is held. Best effort: the
+    // sidecar is a cache; a failed write only costs the title in listings.
+    let resolved = projection.title();
+    if read_title_file(dir) != resolved {
+        write_title_file(dir, resolved.as_deref());
+    }
     Ok(SessionState {
         report: RecoveryReport {
             transactions: projection.revision().get(),
@@ -190,6 +196,7 @@ pub(super) fn recover_locked(dir: &Path) -> Result<SessionState, JsonlOpenError>
         projection,
         log,
         _lock: lock,
+        sidecar_title: resolved,
         poisoned: None,
     })
 }

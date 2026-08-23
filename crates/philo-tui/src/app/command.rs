@@ -34,6 +34,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "pick a session to continue",
     },
     CommandSpec {
+        name: "rename",
+        usage: "/rename <title>",
+        summary: "rename the current session",
+    },
+    CommandSpec {
         name: "model",
         usage: "/model <name>",
         summary: "switch the model for later operations",
@@ -85,6 +90,7 @@ pub enum Command {
     Help,
     New,
     Sessions,
+    Rename { title: Option<String> },
     Model { name: Option<String> },
     Reasoning { level: Option<String> },
     Compact,
@@ -124,6 +130,7 @@ pub fn parse(input: &str) -> Result<Command, UnknownCommand> {
         "help" => Ok(Command::Help),
         "new" => Ok(Command::New),
         "sessions" => Ok(Command::Sessions),
+        "rename" => Ok(Command::Rename { title: argument }),
         "model" => Ok(Command::Model { name: argument }),
         "reasoning" => Ok(Command::Reasoning { level: argument }),
         "compact" => Ok(Command::Compact),
@@ -233,6 +240,7 @@ mod tests {
                 "help",
                 "new",
                 "sessions",
+                "rename",
                 "model",
                 "reasoning",
                 "compact",
@@ -251,6 +259,13 @@ mod tests {
         assert_eq!(parse("/help"), Ok(Command::Help));
         assert_eq!(parse("/new"), Ok(Command::New));
         assert_eq!(parse("/sessions"), Ok(Command::Sessions));
+        assert_eq!(
+            parse("/rename auth deep dive"),
+            Ok(Command::Rename {
+                title: Some("auth deep dive".to_owned())
+            })
+        );
+        assert_eq!(parse("/rename"), Ok(Command::Rename { title: None }));
         assert_eq!(
             parse("/model gpt-test"),
             Ok(Command::Model {

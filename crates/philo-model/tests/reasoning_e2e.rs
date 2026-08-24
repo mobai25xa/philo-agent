@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, ChannelBounds, GenerationConfig, ModelCallId,
+    AgentEvent, AgentRuntime, ChannelBounds, DurableFailureKind, GenerationConfig, ModelCallId,
     OperationOutcome, OperationSpec, ReasoningEffort, RuntimeConfig, RuntimeDeps,
     SequentialIdSource, SessionId, SettlementDurability, ToolRegistry, UserMessage,
 };
@@ -332,7 +332,7 @@ async fn unsupported_effort_settles_the_operation_failed() {
     assert!(matches!(
         outcome,
         OperationOutcome::Failed { failure, durability }
-            if failure.kind() == AgentFailureKind::ModelCall
+            if failure.durable_kind() == DurableFailureKind::ModelCall
                 && failure.message().contains("Capability")
                 && durability == SettlementDurability::Confirmed
     ));

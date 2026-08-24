@@ -5,7 +5,7 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, ModelAssistantBlock,
+    AgentEvent, DEFAULT_MAX_TOOL_ROUNDS, DurableFailureKind, GenerationConfig, ModelAssistantBlock,
     ModelMessage, OperationOutcome, OperationStatus, RuntimeConfig, SettlementDurability,
     SettlementRevision, UserPart,
 };
@@ -121,7 +121,7 @@ async fn model_error_settles_failed() {
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
-        } if failure.kind() == AgentFailureKind::ModelCall
+        } if failure.durable_kind() == DurableFailureKind::ModelCall
     ));
 }
 
@@ -136,7 +136,7 @@ async fn final_commit_failure_prevents_success() {
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Unconfirmed,
-        } if failure.kind() == AgentFailureKind::Persistence
+        } if failure.durable_kind() == DurableFailureKind::Persistence
     ));
     assert!(
         !events

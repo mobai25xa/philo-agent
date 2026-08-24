@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, GenerationConfig, OperationOutcome, RuntimeConfig,
+    AgentEvent, DurableFailureKind, GenerationConfig, OperationOutcome, RuntimeConfig,
     SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore, ToolResultOutcome};
@@ -304,8 +304,8 @@ async fn tool_port_error_awaits_other_in_flight_and_fails_the_turn() {
     second.release();
     match handle.wait().await {
         OperationOutcome::Failed { failure, .. } => {
-            assert_eq!(failure.kind(), AgentFailureKind::ToolExecution);
-            assert!(failure.message().contains("worker down"));
+            assert_eq!(failure.durable_kind(), DurableFailureKind::ToolExecution);
+            assert!(failure.diagnostic().contains("worker down"));
         }
         other => panic!("expected a tool-port failure, got {other:?}"),
     }

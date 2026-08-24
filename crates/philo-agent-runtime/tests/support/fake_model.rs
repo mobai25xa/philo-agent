@@ -2,11 +2,61 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use philo_agent_runtime::{
-    ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream,
-    ModelFailureClass, ModelPort, ModelToolCall, RuntimeFuture, TokenUsage, ToolCallId,
+    FailureDomain, ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelEvent,
+    ModelEventStream, ModelPort, ModelToolCall, RetryDisposition, RuntimeFuture, TokenUsage,
+    ToolCallId,
 };
 
 use super::gate::Gate;
+
+/// Fatal scripted failure (`Never` advice: no re-issue).
+pub(crate) fn fatal_error(message: &str) -> ModelError {
+    ModelError::new(
+        "model.invalid_sequence".to_owned(),
+        FailureDomain::Provider,
+        RetryDisposition::Never,
+        format!("the provider sent non-conforming data: {message}"),
+        message.to_owned(),
+    )
+}
+
+/// Recoverable scripted delivery fault (`MayDuplicate` advice), the
+/// runtime-level shape of a truncated stream or dropped connection.
+pub(crate) fn recoverable_error(message: &str) -> ModelError {
+    ModelError::new(
+        "model.incomplete_response".to_owned(),
+        FailureDomain::Provider,
+        RetryDisposition::MayDuplicate { retry_after_ms: None },
+        format!("the stream ended before the response finished: {message}"),
+        message.to_owned(),
+    )
+}
+
+/// Scripted mid-stream protocol-decode failure (`invalid_sequence`,
+/// `MayDuplicate`): previously legacy-fatal, now retried by the engine —
+/// the exact shape of compatible-gateway SSE disorder.
+pub(crate) fn protocol_decode_error(message: &str) -> ModelError {
+    ModelError::new(
+        "model.invalid_sequence".to_owned(),
+        FailureDomain::Provider,
+        RetryDisposition::MayDuplicate { retry_after_ms: None },
+        format!("the event sequence violated the state machine: {message}"),
+        message.to_owned(),
+    )
+}
+
+/// Scripted TLS handshake failure (`transport_tls`, `Never`): previously
+/// legacy-recoverable, now not retried — an identical attempt cannot fix
+/// a handshake.
+pub(crate) fn tls_error(message: &str) -> ModelError {
+    ModelError::new(
+        "model.transport_tls".to_owned(),
+        FailureDomain::Network,
+        RetryDisposition::Never,
+        format!("the TLS handshake failed: {message}"),
+        message.to_owned(),
+    )
+}
 
 /// One scripted model call. Events are replayed exactly in the supplied order.
 #[derive(Clone, Debug)]
@@ -132,7 +182,7 @@ impl ModelScript {
     }
 
     pub fn error(message: &str) -> Self {
-        Self::Events(vec![Err(ModelError::new(message))])
+        Self::Events(vec![Err(fatal_error(message))])
     }
 
     /// Stream that dies mid-flight with a recoverable delivery fault —
@@ -142,10 +192,7 @@ impl ModelScript {
             .iter()
             .map(|delta| Ok(ModelEvent::TextDelta((*delta).to_owned())))
             .collect::<Vec<_>>();
-        events.push(Err(ModelError::with_class(
-            message,
-            ModelFailureClass::Recoverable,
-        )));
+        events.push(Err(recoverable_error(message)));
         Self::Events(events)
     }
 
@@ -343,7 +390,7 @@ impl FakeModel {
             .iter()
             .map(|delta| Ok(ModelEvent::TextDelta((*delta).to_owned())))
             .collect::<Vec<_>>();
-        events.push(Err(ModelError::new(message)));
+        events.push(Err(fatal_error(message)));
         Self::new([ModelScript::Events(events)])
     }
 
@@ -373,11 +420,8 @@ impl ModelPort for FakeModel {
                 .pop_front()
                 .expect("fake model called more times than scripted");
             match script {
-                ModelScript::StartError(message) => Err(ModelError::new(message)),
-                ModelScript::RecoverableStartError(message) => Err(ModelError::with_class(
-                    message,
-                    ModelFailureClass::Recoverable,
-                )),
+                ModelScript::StartError(message) => Err(fatal_error(&message)),
+                ModelScript::RecoverableStartError(message) => Err(recoverable_error(&message)),
                 ModelScript::Panic(message) => {
                     tokio::task::yield_now().await;
                     panic!("{message}");

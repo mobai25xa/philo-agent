@@ -1,60 +1,66 @@
 use std::fmt::Write as _;
 
 use philo::api::stable::PhiloError;
-use philo_agent_runtime::{ModelFailureClass, ModelError};
+use philo_agent_runtime::{FailureDomain, ModelError, RetryDisposition};
 
-/// Normalizes any SDK failure into the runtime `ModelError`, carrying a
-/// redacted diagnostic summary. Every `PhiloErrorKind` takes this single path;
-/// no new runtime failure path is introduced.
+/// Normalizes any SDK failure into the runtime's structured `ModelError`.
+/// Every `PhiloErrorKind` takes this single path; no new runtime failure
+/// path is introduced.
+///
+/// The four-question facts come straight from the SDK's frozen code table:
+/// the stable code passes through, `fault_domain()` names who is
+/// responsible (SDK `Sdk` is absorbed into [`FailureDomain::Internal`]),
+/// `retry_advice()` records intrinsic re-issue advice, and
+/// `semantic_summary()` supplies the human one-liner. The bounded redacted
+/// Debug surface stays available as `diagnostic` for developers.
 pub(crate) fn model_error(error: &PhiloError) -> ModelError {
-    let class = failure_class(error);
-    let mut message = format!(
+    let mut diagnostic = format!(
         "philo model call failed: kind={:?} stage={:?} code={} class={:?}",
         error.kind(),
         error.context().stage(),
         error.code(),
-        class
+        sdk_retry_word(error),
     );
 
     // ErrorDetails, ErrorContext, and RetryReport are the SDK's explicitly
     // redacted diagnostic surface. Preserve them so callers can distinguish
     // connection, delivery, provider, protocol, and retry failures.
-    write!(message, " details={:?}", error.details()).expect("writing to String cannot fail");
-    write!(message, " context={:?}", error.context()).expect("writing to String cannot fail");
+    write!(diagnostic, " details={:?}", error.details()).expect("writing to String cannot fail");
+    write!(diagnostic, " context={:?}", error.context()).expect("writing to String cannot fail");
     if let Some(retry) = error.retry_report() {
-        write!(message, " retry={retry:?}").expect("writing to String cannot fail");
+        write!(diagnostic, " retry={retry:?}").expect("writing to String cannot fail");
     }
     if let Some(summary) = error.provider_summary() {
         if let Some(value) = summary.message() {
             write!(
-                message,
+                diagnostic,
                 " provider_message={:?}",
                 bounded_single_line(value)
             )
             .expect("writing to String cannot fail");
         }
         if let Some(value) = summary.code() {
-            write!(message, " provider_code={:?}", bounded_single_line(value))
+            write!(diagnostic, " provider_code={:?}", bounded_single_line(value))
                 .expect("writing to String cannot fail");
         }
         if let Some(value) = summary.kind() {
-            write!(message, " provider_kind={:?}", bounded_single_line(value))
+            write!(diagnostic, " provider_kind={:?}", bounded_single_line(value))
                 .expect("writing to String cannot fail");
         }
         if let Some(value) = summary.param() {
-            write!(message, " provider_param={:?}", bounded_single_line(value))
+            write!(diagnostic, " provider_param={:?}", bounded_single_line(value))
                 .expect("writing to String cannot fail");
         }
         if let Some(value) = summary.request_id() {
             write!(
-                message,
+                diagnostic,
                 " provider_request_id={:?}",
                 bounded_single_line(value)
             )
             .expect("writing to String cannot fail");
         }
         if summary.body_truncated() {
-            message.push_str(" provider_body_truncated=true");
+            diagnostic.push_str(" provider_body_truncated=true");
         }
     }
 
@@ -64,54 +70,84 @@ pub(crate) fn model_error(error: &PhiloError) -> ModelError {
     if matches!(error.kind(), philo::api::stable::PhiloErrorKind::Transport)
         && let Some(cause) = deepest_cause(error)
     {
-        write!(message, " cause={cause:?}").expect("writing to String cannot fail");
+        write!(diagnostic, " cause={cause:?}").expect("writing to String cannot fail");
     }
 
-    ModelError::with_class(message, class)
+    ModelError::new(
+        format!("model.{}", error.code()),
+        map_domain(error.fault_domain()),
+        map_disposition(error.retry_advice()),
+        error.semantic_summary(),
+        diagnostic,
+    )
 }
 
-/// Maps the SDK's redacted classification onto the runtime's recovery
-/// vocabulary. The SDK owns attempt-level retries for everything before a
-/// 2xx response; anything surfacing here either exhausted that policy or
-/// happened mid-stream, where only delivery faults are worth one fresh
-/// identical attempt by the caller.
-fn failure_class(error: &PhiloError) -> ModelFailureClass {
-    use philo::api::stable::{ErrorDetails as Details, ProtocolStage as Protocol, TimeoutKind as Timeout};
+fn map_domain(domain: philo::api::stable::FaultDomain) -> FailureDomain {
+    match domain {
+        philo::api::stable::FaultDomain::Provider => FailureDomain::Provider,
+        philo::api::stable::FaultDomain::Network => FailureDomain::Network,
+        philo::api::stable::FaultDomain::Caller => FailureDomain::Caller,
+        // An SDK defect is still "our stack is at fault" from the user's
+        // point of view; the diagnostic preserves the sdk attribution for
+        // upstream reports.
+        philo::api::stable::FaultDomain::Sdk => FailureDomain::Internal,
+        _ => FailureDomain::Internal,
+    }
+}
 
-    match error.details() {
-        // Connect/DNS/TLS/write failures and mid-body drops: a fresh attempt
-        // rebuilds the whole request, so ambiguity is harmless at this layer.
-        Details::Transport { .. } => ModelFailureClass::Recoverable,
-        // Stream cut before the terminal event (e.g. `incomplete_response`).
-        Details::Protocol { stage: Protocol::Termination, .. } => ModelFailureClass::Recoverable,
-        // Provider sent malformed or contradictory events; structural.
-        Details::Protocol { .. } | Details::Configuration { .. }
-        | Details::Validation { .. } | Details::Capability { .. }
-        | Details::Credential | Details::ProtocolEncode { .. }
-        | Details::Replay { .. } => ModelFailureClass::Fatal,
-        // Provider aborted the stream remotely: transient.
-        Details::RemoteStream { .. } => ModelFailureClass::Recoverable,
-        // A stalled stream is a delivery fault regardless of which deadline
-        // expired; a fresh attempt gets its own budgets.
-        Details::Timeout { kind: Timeout::StreamIdle | Timeout::ResponseHead } => {
-            ModelFailureClass::Recoverable
+fn map_disposition(advice: philo::api::stable::RetryDisposition) -> RetryDisposition {
+    let retry_after_ms =
+        advice
+            .retry_after()
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    match advice {
+        philo::api::stable::RetryDisposition::Never => RetryDisposition::Never,
+        philo::api::stable::RetryDisposition::Safe { .. } => {
+            RetryDisposition::Safe { retry_after_ms }
         }
-        // Whole-call budget exhausted: retrying here would fight the
-        // caller's own operation timeout.
-        Details::Timeout { kind: Timeout::Total } => ModelFailureClass::Fatal,
-        Details::Http { status, .. } => {
-            let code = status.as_u16();
-            if code == 408 || code == 409 || code == 429 || code >= 500 {
-                ModelFailureClass::Recoverable
-            } else {
-                ModelFailureClass::Fatal
-            }
+        philo::api::stable::RetryDisposition::MayDuplicate { .. } => {
+            RetryDisposition::MayDuplicate { retry_after_ms }
         }
-        // Cancellation is a decision, not a fault to retry through.
-        Details::Cancelled => ModelFailureClass::Fatal,
-        // The SDK enum is non-exhaustive: unknown future details stay fatal
-        // until classified deliberately.
-        _ => ModelFailureClass::Fatal,
+        _ => RetryDisposition::Never,
+    }
+}
+
+/// Agent-side adapter failure classified by the local code table
+/// (`docs/philo-agent/error-codes.md`, `model.` prefix): deterministic,
+/// never retryable. The message doubles as the bounded summary and
+/// diagnostic.
+pub(crate) fn caller_error(code: &'static str, message: impl Into<String>) -> ModelError {
+    let message = message.into();
+    ModelError::new(
+        code.to_owned(),
+        FailureDomain::Caller,
+        RetryDisposition::Never,
+        message.clone(),
+        message,
+    )
+}
+
+/// Agent-side adapter failure caused by non-conforming provider data
+/// observed outside the SDK decoder (Provider domain); regeneration is
+/// intrinsically safe, so the recorded advice is MayDuplicate.
+pub(crate) fn provider_stream_error(code: &'static str, message: impl Into<String>) -> ModelError {
+    let message = message.into();
+    ModelError::new(
+        code.to_owned(),
+        FailureDomain::Provider,
+        RetryDisposition::MayDuplicate { retry_after_ms: None },
+        message.clone(),
+        message,
+    )
+}
+
+/// One-word stand-in for the former two-value class inside diagnostics.
+fn sdk_retry_word(error: &PhiloError) -> &'static str {
+    match error.retry_advice() {
+        philo::api::stable::RetryDisposition::Never => "Never",
+        philo::api::stable::RetryDisposition::Safe { .. } => "Safe",
+        philo::api::stable::RetryDisposition::MayDuplicate { .. } => "MayDuplicate",
+        _ => "Never",
     }
 }
 
@@ -127,7 +163,7 @@ fn deepest_cause(error: &(dyn std::error::Error + 'static)) -> Option<String> {
     (!cause.is_empty() && !cause.starts_with("transport ")).then_some(cause)
 }
 
-fn bounded_single_line(value: &str) -> String {
+pub(crate) fn bounded_single_line(value: &str) -> String {
     const MAX_CHARS: usize = 512;
 
     let mut normalized = String::with_capacity(value.len().min(MAX_CHARS));
@@ -189,6 +225,7 @@ mod tests {
     use philo::api::stable::{DeliveryState, PhiloError, TransportStage};
 
     use super::{bounded_single_line, model_error};
+    use philo_agent_runtime::{FailureDomain, RetryDisposition};
 
     #[derive(Debug)]
     struct DiagnosticSource(&'static str);
@@ -208,17 +245,48 @@ mod tests {
 
         let normalized = model_error(&error);
 
-        assert!(normalized.message().contains("code=transport_connect"));
+        assert_eq!(normalized.code(), "model.transport_connect");
+        assert_eq!(normalized.domain(), FailureDomain::Network);
+        assert!(matches!(
+            normalized.retry(),
+            RetryDisposition::Safe { retry_after_ms: None }
+        ));
+        assert!(normalized.diagnostic().contains("code=transport_connect"));
         assert!(
             normalized
-                .message()
+                .diagnostic()
                 .contains("details=Transport { stage: Connect, delivery: NotSent }")
         );
         assert!(
             normalized
-                .message()
+                .diagnostic()
                 .contains("cause=\"connection refused (os error 10061)\"")
         );
+        assert!(!normalized.summary().is_empty());
+    }
+
+    #[test]
+    fn protocol_decode_is_provider_domain_and_retryable() {
+        let error = PhiloError::protocol(
+            philo::api::stable::ProtocolStage::State,
+            Some("choices".to_owned()),
+        );
+
+        let normalized = model_error(&error);
+
+        assert_eq!(normalized.code(), "model.invalid_sequence");
+        assert_eq!(normalized.domain(), FailureDomain::Provider);
+        assert!(matches!(
+            normalized.retry(),
+            RetryDisposition::MayDuplicate { .. }
+        ));
+        // The SDK advice is the recovery decision's single source: a
+        // non-conforming provider sequence is worth an identical re-issue.
+        assert!(matches!(
+            normalized.retry(),
+            RetryDisposition::MayDuplicate { .. } | RetryDisposition::Safe { .. }
+        ));
+        assert!(!normalized.summary().is_empty());
     }
 
     #[test]

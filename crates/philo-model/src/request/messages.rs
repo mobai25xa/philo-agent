@@ -3,6 +3,7 @@ use philo_agent_runtime::{
     ModelAssistantBlock, ModelError, ModelMessage, ModelToolCall, ModelToolResultOutcome, UserPart,
 };
 
+use crate::error::caller_error;
 use crate::replay::{CapturedContent, CapturedItem, ReplayHistory};
 
 /// Canonical instructions-channel marker for durable conversation summaries.
@@ -240,16 +241,18 @@ fn map_user_parts(parts: &[UserPart]) -> Result<Vec<sdk::UserContent>, ModelErro
             UserPart::Image { media_type, bytes } => {
                 let media_type =
                     sdk::ImageMediaType::new(media_type.as_str()).map_err(|error| {
-                        ModelError::new(format!(
-                            "model call configuration invalid: user image rejected: {error}"
-                        ))
+                        caller_error(
+                            "model.assembly.image_invalid",
+                            format!("user image rejected: {error}"),
+                        )
                     })?;
                 let image =
                     sdk::ImageInput::from_bytes(media_type, bytes::Bytes::from(bytes.clone()))
                         .map_err(|error| {
-                            ModelError::new(format!(
-                                "model call configuration invalid: user image rejected: {error}"
-                            ))
+                            caller_error(
+                                "model.assembly.image_invalid",
+                                format!("user image rejected: {error}"),
+                            )
                         })?;
                 content.push(sdk::UserContent::Image(image));
             }
@@ -259,5 +262,8 @@ fn map_user_parts(parts: &[UserPart]) -> Result<Vec<sdk::UserContent>, ModelErro
 }
 
 fn history_error(field: &str) -> ModelError {
-    ModelError::new(format!("model call history invalid: {field}"))
+    caller_error(
+        "model.assembly.request_build",
+        format!("model call history invalid: {field}"),
+    )
 }

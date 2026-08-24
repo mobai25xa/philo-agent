@@ -292,8 +292,8 @@ async fn missing_artifact_fails_the_next_prompt_as_store_unavailable() {
         panic!("a corrupt session must fail the prompt");
     };
     assert_eq!(
-        failure.kind(),
-        philo_agent_runtime::AgentFailureKind::Persistence
+        failure.stage(),
+        philo_agent_runtime::FailureStage::SessionStore
     );
     assert!(model.calls().is_empty(), "no model call over corrupt state");
 }

@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use philo_agent_service::FrontendOperationEvent;
+use philo_agent_service::{
+    FailureLineStyle, FrontendOperationEvent, retry_scheduled_lines, turn_failed_lines,
+};
 
 use super::cells::TranscriptStore;
 use super::text;
@@ -252,23 +254,29 @@ impl Transcript {
                 attempt,
                 max_retries,
                 delay_ms,
-                reason,
+                failure,
                 ..
             } => {
                 // The failed attempt's streamed text is discarded; close the
                 // open view and reset per-call flags so the retry renders
-                // cleanly.
+                // cleanly. Wording comes from the service's shared template.
                 store.close_open();
                 self.wrote_answer_this_call = false;
                 self.think_header_written = false;
-                let seconds = format!("{:.1}", *delay_ms as f64 / 1000.0);
-                store.push_closed([line(
-                    LineKind::Error,
-                    format!(
-                        "model call interrupted; retrying (attempt {attempt}/{max_retries}, \
-                         waiting {seconds}s): {reason}"
-                    ),
-                )]);
+                let lines = retry_scheduled_lines(failure, *attempt, *max_retries, *delay_ms);
+                let rendered: Vec<TranscriptLine> = lines
+                    .iter()
+                    .map(|rendered| {
+                        line(
+                            match rendered.style {
+                                FailureLineStyle::Error => LineKind::Error,
+                                FailureLineStyle::Meta => LineKind::Meta,
+                            },
+                            rendered.text.clone(),
+                        )
+                    })
+                    .collect();
+                store.push_closed(rendered);
             }
             FrontendOperationEvent::CancellationRequested { reason, .. } => {
                 store.close_open();
@@ -286,12 +294,24 @@ impl Transcript {
                     format!("turn cancelled ({})", reason_text(reason)),
                 )]);
             }
-            FrontendOperationEvent::TurnFailed { kind, message, .. } => {
+            FrontendOperationEvent::TurnFailed { failure, .. } => {
                 store.close_open();
-                store.push_closed([line(
-                    LineKind::Error,
-                    format!("turn failed ({kind}): {message}"),
-                )]);
+                // Three-tier rendering (summary / tags / detail) with
+                // wording supplied by the service's shared template.
+                let lines = turn_failed_lines(failure);
+                let rendered: Vec<TranscriptLine> = lines
+                    .iter()
+                    .map(|rendered| {
+                        line(
+                            match rendered.style {
+                                FailureLineStyle::Error => LineKind::Error,
+                                FailureLineStyle::Meta => LineKind::Meta,
+                            },
+                            rendered.text.clone(),
+                        )
+                    })
+                    .collect();
+                store.push_closed(rendered);
             }
             FrontendOperationEvent::OperationSettled {
                 status, durability, ..

@@ -7,7 +7,7 @@ use philo_agent_runtime::{
     ModelCallSnapshot, ModelError, ModelEvent, ModelEventStream, RuntimeFuture, TokenUsage,
 };
 
-use crate::error::model_error;
+use crate::error::{model_error, provider_stream_error};
 use crate::replay::{
     CapturedContent, CapturedItem, ReplayCoordinator, assistant_blocks_from_captured,
 };
@@ -97,8 +97,9 @@ impl NormalizedStream {
         arguments: String,
     ) -> Result<ModelEvent, ModelError> {
         let Some(entry) = self.tools.get_mut(&block_id) else {
-            return Err(ModelError::new(
-                "philo model stream violated protocol: tool delta before ToolCallStarted",
+            return Err(provider_stream_error(
+                "model.output.delta_before_start",
+                "tool delta before ToolCallStarted",
             ));
         };
         if let Some(delta) = name.as_deref() {

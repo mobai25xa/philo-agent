@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use philo_agent_runtime::{
-    AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelMessage, ModelToolResultOutcome,
+    DurableFailureKind, GenerationConfig, ModelAssistantBlock, ModelMessage, ModelToolResultOutcome,
     OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
     ToolDefinition, UserMessage, UserPart,
 };
@@ -162,7 +162,7 @@ async fn model_failure_settles_confirmed_on_the_jsonl_backend() {
     assert!(matches!(
         handle.wait().await,
         OperationOutcome::Failed { failure, durability }
-            if failure.kind() == AgentFailureKind::ModelCall
+            if failure.durable_kind() == DurableFailureKind::ModelCall
                 && durability == SettlementDurability::Confirmed
     ));
 

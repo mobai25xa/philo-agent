@@ -9,7 +9,7 @@ license.workspace = true
 # For local iteration against an unpublished SDK state, temporarily add:
 #   [patch.crates-io]
 #   philo = { path = "../../../philo/crates/philo" }
-philo = "=0.9.0"
+philo = "=0.10.0"
 philo-agent-runtime = { path = "../philo-agent-runtime" }
 # Image bytes hand off to the SDK as `bytes::Bytes` (the SDK's public input type).
 bytes = "1.10"

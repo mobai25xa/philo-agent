@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentEvent, AgentFailure, AgentFailureKind, CancelResult, ChannelBounds,
+    AgentAvailability, AgentEvent, AgentFailure, CancelResult, ChannelBounds,
     CompactionError, CompactionReport, CompactionSpec, GenerationDisplay, GenerationId, IdSource,
     MaintenanceAccepted, MaintenanceError, MaintenanceId, MaintenanceResult, OperationAccepted,
     OperationId, OperationOutcome, OperationPhase, OperationSpec, OperationStatus, RuntimeConfig,
@@ -426,6 +426,7 @@ fn outcome_from(
     assistant: Option<philo_agent_runtime::AssistantMessage>,
     failure: Option<AgentFailure>,
 ) -> OperationOutcome {
+    use philo_agent_runtime::{FailureDomain, FailureStage, RetryDisposition};
     match status {
         OperationStatus::Succeeded => OperationOutcome::Succeeded {
             assistant: assistant.expect("succeeded operation published assistant message"),
@@ -434,7 +435,11 @@ fn outcome_from(
         OperationStatus::Failed => OperationOutcome::Failed {
             failure: failure.unwrap_or_else(|| {
                 AgentFailure::new(
-                    AgentFailureKind::RuntimeDriver,
+                    "engine.invariant_violation",
+                    FailureDomain::Internal,
+                    FailureStage::TurnEngine,
+                    RetryDisposition::Never,
+                    "an internal driver invariant was violated",
                     match durability {
                         SettlementDurability::Unconfirmed => "unconfirmed failure",
                         SettlementDurability::Confirmed => "failed without TurnFailed",
@@ -479,7 +484,7 @@ fn apply_snapshot_failure(
                 failure,
             },
             Some(real),
-        ) if failure.kind() == AgentFailureKind::RuntimeDriver => OperationOutcome::Failed {
+        ) if failure.code() == "engine.invariant_violation" => OperationOutcome::Failed {
             failure: real,
             durability,
         },

@@ -21,12 +21,10 @@ pub(crate) fn start_entries(
             _ => None,
         })
     else {
-        return Err(AgentFailure::runtime_driver(
-            "missing TurnBegan observation",
-        ));
+        return Err(crate::engine::invariant_failure("missing TurnBegan observation"));
     };
     if observed.as_str() != turn_id.as_str() {
-        return Err(AgentFailure::runtime_driver("unexpected TurnBegan turn id"));
+        return Err(crate::engine::invariant_failure("unexpected TurnBegan turn id"));
     }
     Ok(vec![
         session::SessionEntryKind::OperationStarted {
@@ -55,9 +53,7 @@ pub(crate) fn success_entries(
             _ => None,
         })
     else {
-        return Err(AgentFailure::runtime_driver(
-            "missing accepted assistant output",
-        ));
+        return Err(crate::engine::invariant_failure("missing accepted assistant output"));
     };
     if !observations.iter().any(|observation| {
         matches!(
@@ -67,9 +63,7 @@ pub(crate) fn success_entries(
             }
         )
     }) {
-        return Err(AgentFailure::runtime_driver(
-            "missing successful termination",
-        ));
+        return Err(crate::engine::invariant_failure("missing successful termination"));
     }
     Ok(vec![
         session::SessionEntryKind::AssistantMessage {
@@ -108,7 +102,7 @@ pub(crate) fn failure_entries(
             _ => None,
         })
     else {
-        return Err(AgentFailure::runtime_driver("missing accepted failure"));
+        return Err(crate::engine::invariant_failure("missing accepted failure"));
     };
     Ok(vec![
         session::SessionEntryKind::TurnFailure {

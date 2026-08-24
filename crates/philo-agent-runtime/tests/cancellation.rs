@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentEvent, AgentFailureKind, CancelReason, GenerationConfig, ModelCallId,
+    AgentAvailability, AgentEvent, CancelReason, DurableFailureKind, GenerationConfig, ModelCallId,
     ModelCallPhase, OperationId, OperationOutcome, OperationPhase, OperationStatus,
     RunningToolBatchPhase, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
     SettlementRevision, ToolBatchId, ToolCallId, ToolDefinition, TurnId, UserMessage,
@@ -718,8 +718,8 @@ async fn cancel_commit_failure_settles_failed_confirmed() {
     else {
         panic!("cancel commit failure must settle Failed, got {outcome:?}");
     };
-    assert_eq!(failure.kind(), AgentFailureKind::Persistence);
-    assert!(failure.message().contains("committing cancellation"));
+    assert_eq!(failure.durable_kind(), DurableFailureKind::Persistence);
+    assert!(failure.diagnostic().contains("committing cancellation"));
     assert_eq!(durability, SettlementDurability::Confirmed);
 
     let events = collect_events(&victim).await;
@@ -777,7 +777,7 @@ async fn cancel_commit_persistent_failure_settles_unconfirmed() {
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Unconfirmed,
-        } if failure.kind() == AgentFailureKind::Persistence
+        } if failure.durable_kind() == DurableFailureKind::Persistence
     ));
 }
 

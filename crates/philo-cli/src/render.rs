@@ -306,17 +306,16 @@ impl Renderer {
             }
             AgentEvent::TurnFailed { failure, .. } => {
                 self.close_reasoning(&mut outputs);
-                outputs.push(err(format!(
-                    "error: turn failed ({:?}): {}\n",
-                    failure.kind(),
-                    failure.message(),
-                )));
+                let dto = philo_agent_service::failure_dto(failure);
+                for rendered in philo_agent_service::turn_failed_lines(&dto) {
+                    outputs.push(err(format!("{}\n", rendered.text)));
+                }
             }
             AgentEvent::ModelRetryScheduled {
                 attempt,
                 max_retries,
                 delay_ms,
-                reason,
+                failure,
                 ..
             } => {
                 self.close_reasoning(&mut outputs);
@@ -325,11 +324,12 @@ impl Renderer {
                     self.stdout_open = false;
                 }
                 if !self.quiet() {
-                    let seconds = format!("{:.1}", *delay_ms as f64 / 1000.0);
-                    outputs.push(err(format!(
-                        "warning: model call interrupted; retrying \
-                         (attempt {attempt}/{max_retries}, waiting {seconds}s): {reason}\n"
-                    )));
+                    let dto = philo_agent_service::failure_dto(failure);
+                    for rendered in
+                        philo_agent_service::retry_scheduled_lines(&dto, *attempt, *max_retries, *delay_ms)
+                    {
+                        outputs.push(err(format!("warning: {}\n", rendered.text)));
+                    }
                 }
             }
             AgentEvent::OperationSettled {
@@ -425,7 +425,7 @@ impl Renderer {
                 attempt,
                 max_retries,
                 delay_ms,
-                reason,
+                failure,
                 ..
             } => {
                 self.close_reasoning(&mut outputs);
@@ -434,11 +434,11 @@ impl Renderer {
                     self.stdout_open = false;
                 }
                 if !self.quiet() {
-                    let seconds = format!("{:.1}", *delay_ms as f64 / 1000.0);
-                    outputs.push(err(format!(
-                        "warning: model call interrupted; retrying \
-                         (attempt {attempt}/{max_retries}, waiting {seconds}s): {reason}\n"
-                    )));
+                    for rendered in
+                        philo_agent_service::retry_scheduled_lines(failure, *attempt, *max_retries, *delay_ms)
+                    {
+                        outputs.push(err(format!("warning: {}\n", rendered.text)));
+                    }
                 }
             }
             FrontendOperationEvent::ModelResponseStarted {
@@ -585,9 +585,11 @@ impl Renderer {
                     reason_text(self.cancel_reason.expect("just set"))
                 )));
             }
-            FrontendOperationEvent::TurnFailed { kind, message, .. } => {
+            FrontendOperationEvent::TurnFailed { failure, .. } => {
                 self.close_reasoning(&mut outputs);
-                outputs.push(err(format!("error: turn failed ({kind}): {message}\n")));
+                for rendered in philo_agent_service::turn_failed_lines(failure) {
+                    outputs.push(err(format!("{}\n", rendered.text)));
+                }
             }
             FrontendOperationEvent::OperationSettled {
                 status, durability, ..
@@ -760,8 +762,8 @@ fn usage_line(usage: &TokenUsage) -> String {
 mod tests {
     use super::*;
     use philo_agent_runtime::{
-        AgentEvent, AgentFailure, AgentFailureKind, ModelCallId, OperationId, ToolBatchId,
-        ToolCallId, TurnId,
+        AgentEvent, AgentFailure, FailureDomain, FailureStage, ModelCallId, OperationId,
+        RetryDisposition, ToolBatchId, ToolCallId, TurnId,
     };
 
     fn text(delta: &str) -> AgentEvent {
@@ -964,7 +966,14 @@ mod tests {
             &[
                 AgentEvent::TurnFailed {
                     turn_id: TurnId::new("turn-1"),
-                    failure: AgentFailure::new(AgentFailureKind::ModelCall, "offline"),
+                    failure: AgentFailure::new(
+                        "model.transport_connect",
+                        FailureDomain::Network,
+                        FailureStage::ModelPort,
+                        RetryDisposition::Safe { retry_after_ms: None },
+                        "the connection failed during connect",
+                        "offline",
+                    ),
                 },
                 settled(OperationStatus::Failed, SettlementDurability::Confirmed),
             ],

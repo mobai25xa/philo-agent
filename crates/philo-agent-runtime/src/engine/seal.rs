@@ -2,8 +2,9 @@
 
 use super::EngineContext;
 use crate::TurnId;
-use crate::mapping::failure::session_failure;
+use crate::mapping::failure::{commit_failure, session_failure};
 use crate::operation::OperationPublisher;
+use crate::RetryDisposition;
 use philo_session as session;
 
 // The view variant intentionally carries the full SessionContextView by
@@ -45,7 +46,12 @@ pub(super) async fn seal_stale_turns(
         }
         Err(SealFailure::Commit(error)) => {
             operation
-                .fail_unconfirmed(session_failure("sealing stale turn", &error))
+                .fail_unconfirmed(commit_failure(
+                    "engine.seal_commit_failed",
+                    RetryDisposition::Safe { retry_after_ms: None },
+                    "sealing stale turn",
+                    &error,
+                ))
                 .await;
             SealOutcome::Settled
         }

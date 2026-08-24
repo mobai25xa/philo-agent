@@ -50,13 +50,13 @@ pub use ids::{
 };
 pub use message::{AssistantMessage, InvalidUserMessage, UserMessage, UserPart};
 pub use model::{
-    ModelAssistantBlock, ModelError, ModelEvent, ModelEventStream, ModelFailureClass, ModelMessage,
-    ModelPort, ModelToolCall, ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
+    ModelAssistantBlock, ModelError, ModelEvent, ModelEventStream, ModelMessage, ModelPort,
+    ModelToolCall, ModelToolResultOutcome, RuntimeFuture, TokenUsage, ToolCallDelta,
 };
 pub use outcome::{
-    AgentAvailability, AgentError, AgentFailure, AgentFailureKind, ModelCallPhase,
-    OperationOutcome, OperationPhase, OperationStatus, RunningToolBatchPhase, SettlementDurability,
-    SettlementRevision,
+    AgentAvailability, AgentError, AgentFailure, DurableFailureKind, FailureDomain, FailureStage,
+    ModelCallPhase, OperationOutcome, OperationPhase, OperationStatus, RetryDisposition,
+    RunningToolBatchPhase, SettlementDurability, SettlementRevision, AGENT_OWNED_CODES,
 };
 pub use philo_session::CancelReason;
 pub use philo_tools::{

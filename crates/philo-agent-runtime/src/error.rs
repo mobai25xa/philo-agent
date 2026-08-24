@@ -89,7 +89,15 @@ impl DriverInvariantError {
     }
 
     pub(crate) fn into_failure(self) -> crate::AgentFailure {
-        crate::AgentFailure::runtime_driver(self.message)
+        use crate::{FailureDomain, FailureStage, RetryDisposition};
+        crate::AgentFailure::new(
+            "engine.invariant_violation",
+            FailureDomain::Internal,
+            FailureStage::TurnEngine,
+            RetryDisposition::Never,
+            "an internal driver invariant was violated",
+            self.message,
+        )
     }
 }
 

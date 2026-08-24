@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelError, ModelEvent,
+    AgentEvent, FailureDomain, FailureStage, GenerationConfig, ModelAssistantBlock, ModelEvent,
     OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, ToolDefinition, UserMessage,
 };
 use philo_session::MemorySessionStore;
@@ -229,7 +229,8 @@ async fn duplicate_response_started_fails_the_operation() {
     assert!(matches!(
         handle.wait().await,
         OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::InvalidModelOutput
+            if failure.domain() == FailureDomain::Internal
+            && failure.stage() == FailureStage::ModelPort
     ));
 }
 
@@ -254,7 +255,8 @@ async fn response_started_after_completed_fails_the_operation() {
     assert!(matches!(
         handle.wait().await,
         OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::InvalidModelOutput
+            if failure.domain() == FailureDomain::Internal
+            && failure.stage() == FailureStage::ModelPort
     ));
 }
 
@@ -265,7 +267,7 @@ async fn failing_stream_after_response_started_still_fails_normally() {
             response_model: Some("m".to_owned()),
             response_id: None,
         }),
-        Err(ModelError::new("stream broke")),
+        Err(support::fake_model::fatal_error("stream broke")),
     ])]));
     let handle = direct_runtime(model)
         .await
@@ -274,7 +276,7 @@ async fn failing_stream_after_response_started_still_fails_normally() {
     assert!(matches!(
         handle.wait().await,
         OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::ModelCall && failure.message() == "stream broke"
+            if failure.stage() == FailureStage::ModelPort && failure.diagnostic() == "stream broke"
     ));
     let events = collect_events(&handle).await;
     assert!(

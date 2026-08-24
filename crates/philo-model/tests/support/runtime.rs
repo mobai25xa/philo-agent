@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailure, AgentFailureKind, AgentRuntime, ChannelBounds, GenerationDisplay,
+    AgentEvent, AgentFailure, AgentRuntime, ChannelBounds, FailureDomain, FailureStage, GenerationDisplay,
     GenerationId, IdSource, ModelPort, OperationId, OperationOutcome, OperationSpec,
     OperationStatus, RuntimeConfig, RuntimeDeps, RuntimeEvent, RuntimeEventReceiver,
     RuntimeGeneration, RuntimeHandle, SequentialIdSource, SessionId, SettlementDurability,
@@ -184,7 +184,11 @@ fn outcome_from(
         OperationStatus::Failed => OperationOutcome::Failed {
             failure: failure.unwrap_or_else(|| {
                 AgentFailure::new(
-                    AgentFailureKind::RuntimeDriver,
+                    "engine.invariant_violation",
+                    FailureDomain::Internal,
+                    FailureStage::TurnEngine,
+                    philo_agent_runtime::RetryDisposition::Never,
+                    "an internal driver invariant was violated",
                     match durability {
                         SettlementDurability::Unconfirmed => "unconfirmed failure",
                         SettlementDurability::Confirmed => "failed without TurnFailed",

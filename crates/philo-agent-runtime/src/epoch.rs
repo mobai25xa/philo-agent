@@ -345,7 +345,12 @@ async fn apply_epoch_exit(
             session_id: settlement.session_id.clone(),
             status: settlement.status,
             durability: settlement.durability,
-            failure: Some(crate::AgentFailure::runtime_driver(
+            failure: Some(crate::AgentFailure::new(
+                "epoch.forced_settlement",
+                crate::FailureDomain::Internal,
+                crate::FailureStage::EpochSupervisor,
+                crate::RetryDisposition::Never,
+                "the runtime epoch ended before the operation settled",
                 "runtime epoch ended before the operation settled",
             )),
         });

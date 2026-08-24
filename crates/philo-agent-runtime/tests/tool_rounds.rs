@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelMessage,
+    AgentEvent, DurableFailureKind, GenerationConfig, ModelAssistantBlock, ModelMessage,
     OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId, SettlementDurability,
     ToolDefinition, UserMessage,
 };
@@ -159,7 +159,7 @@ async fn exhausted_call_with_tool_calls_fails_invalid_output() {
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
-        } if failure.kind() == AgentFailureKind::InvalidModelOutput
+        } if failure.durable_kind() == DurableFailureKind::InvalidModelOutput
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);
@@ -265,7 +265,7 @@ async fn round_two_infrastructure_failure_settles_failed() {
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
-        } if failure.kind() == AgentFailureKind::ToolExecution
+        } if failure.durable_kind() == DurableFailureKind::ToolExecution
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 2);
@@ -423,7 +423,7 @@ async fn tool_calls_after_exhaustion_fail_invalid_output() {
         OperationOutcome::Failed {
             failure,
             durability: SettlementDurability::Confirmed,
-        } if failure.kind() == AgentFailureKind::InvalidModelOutput
+        } if failure.durable_kind() == DurableFailureKind::InvalidModelOutput
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);

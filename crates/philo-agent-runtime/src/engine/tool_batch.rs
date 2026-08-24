@@ -3,9 +3,12 @@
 
 use super::settlement::{BatchSlot, TurnCx, cancellation_batch};
 use super::tool_progress::ToolProgressBridge;
-use crate::mapping::failure::session_failure;
+use crate::mapping::failure::commit_failure;
 use crate::mapping::tool::session_result;
-use crate::{AgentEvent, AgentFailure, AgentFailureKind, OperationPhase, RunningToolBatchPhase};
+use crate::{
+    AgentEvent, AgentFailure, FailureDomain, FailureStage, OperationPhase, RetryDisposition,
+    RunningToolBatchPhase,
+};
 use philo_agent_kernel as kernel;
 use philo_session as session;
 use philo_tools::{
@@ -13,6 +16,19 @@ use philo_tools::{
 };
 use std::task::Poll;
 use std::time::{Duration, Instant};
+
+/// ToolPort infrastructure failure (`tool.port_failed`): side effects are
+/// not provably absent, so the recorded advice is MayDuplicate.
+fn port_failure(error: &ToolPortError) -> AgentFailure {
+    AgentFailure::new(
+        "tool.port_failed",
+        FailureDomain::Internal,
+        FailureStage::ToolPort,
+        RetryDisposition::MayDuplicate { retry_after_ms: None },
+        "a tool execution infrastructure fault occurred",
+        error.message(),
+    )
+}
 
 /// Executes and commits one tool batch. Returns the advanced context and
 /// real results; `None` when a failure or cancellation already settled the
@@ -61,10 +77,17 @@ async fn run_serial<'a>(
             }
             InvokeWait::Finished(ToolInvokeEnd::Stopped) | InvokeWait::Dropped => {
                 if !cx.operation.is_cancel_requested() {
+                    use FailureDomain as D;
+                    use FailureStage as S;
+                    use RetryDisposition as R;
                     cx.fail(
                         effect_id.clone(),
                         AgentFailure::new(
-                            AgentFailureKind::ToolExecution,
+                            "tool.stopped_without_cancel",
+                            D::Internal,
+                            S::ToolPort,
+                            R::Never,
+                            "a tool stopped on its own without a cancel request",
                             "tool stopped without a cancel request",
                         ),
                     )
@@ -87,11 +110,7 @@ async fn run_serial<'a>(
                     cx.cancel(effect_id.clone(), marks, executed_events).await;
                     return None;
                 }
-                cx.fail(
-                    effect_id.clone(),
-                    AgentFailure::new(AgentFailureKind::ToolExecution, error.message()),
-                )
-                .await;
+                cx.fail(effect_id.clone(), port_failure(&error)).await;
                 return None;
             }
         }
@@ -180,11 +199,7 @@ async fn run_parallel<'a>(
     }
 
     if let Some(error) = port_error {
-        cx.fail(
-            effect_id.clone(),
-            AgentFailure::new(AgentFailureKind::ToolExecution, error.message()),
-        )
-        .await;
+        cx.fail(effect_id.clone(), port_failure(&error)).await;
         return None;
     }
 
@@ -244,7 +259,12 @@ async fn commit_results<'a>(
         Err(error) => {
             cx.fail(
                 effect_id.clone(),
-                session_failure("committing tool results", &error),
+                commit_failure(
+                    "engine.barrier_c_commit_failed",
+                    RetryDisposition::MayDuplicate { retry_after_ms: None },
+                    "committing tool results",
+                    &error,
+                ),
             )
             .await;
             return None;

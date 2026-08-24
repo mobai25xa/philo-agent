@@ -241,7 +241,7 @@ async fn generate_summary(
     };
     let mut stream = ctx.model().start(request).await.map_err(|error| {
         SummaryFailure::Failed(CompactionError::Model {
-            message: error.message().to_owned(),
+            message: error.diagnostic().to_owned(),
         })
     })?;
     let mut completed_blocks = None;
@@ -258,7 +258,7 @@ async fn generate_summary(
             }
             StreamStep::Event(Some(Err(error))) => {
                 return Err(SummaryFailure::Failed(CompactionError::Model {
-                    message: error.message().to_owned(),
+                    message: error.diagnostic().to_owned(),
                 }));
             }
             StreamStep::Event(Some(Ok(event))) if completed_blocks.is_some() => {

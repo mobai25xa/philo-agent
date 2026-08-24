@@ -78,11 +78,11 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Turn-engine model-call recovery policy. When a model call fails with a
-/// [`crate::ModelFailureClass::Recoverable`] error, the engine may re-issue
-/// the identical call (same kernel effect) after a bounded full-jitter
-/// backoff. Failed attempts commit nothing durable, so recovery never
-/// duplicates tool executions or assistant output.
+/// Turn-engine model-call recovery policy. When a model call fails and the
+/// error's [`crate::RetryDisposition`] advises a re-issue, the engine may
+/// re-issue the identical call (same kernel effect) after a bounded
+/// full-jitter backoff. Failed attempts commit nothing durable, so recovery
+/// never duplicates tool executions or assistant output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryConfig {
     /// Master switch; `false` restores the fail-fast behavior.

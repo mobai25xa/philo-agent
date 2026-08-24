@@ -1,6 +1,8 @@
 use philo::api::stable as sdk;
 use philo_agent_runtime::{ModelError, ToolChoice, ToolDefinition};
 
+use crate::error::caller_error;
+
 pub(super) fn map_tools(
     request: &mut sdk::ModelRequest,
     choice: &ToolChoice,
@@ -39,16 +41,19 @@ fn map_tool_choice(
         ToolChoice::Required => sdk::ToolChoice::Required,
         ToolChoice::Specific { name } => {
             if !tools.iter().any(|tool| tool.name() == name) {
-                return Err(ModelError::new(format!(
-                    "model call configuration invalid: tool_choice requires '{name}', \
-                     which is not among the frozen tool definitions"
-                )));
+                return Err(caller_error(
+                    "model.assembly.invalid_tool_choice",
+                    format!(
+                        "tool_choice requires '{name}', which is not among the frozen tool \
+                         definitions"
+                    ),
+                ));
             }
             sdk::ToolChoice::Specific(sdk::ToolName::new(name.as_str()).map_err(|_| {
-                ModelError::new(format!(
-                    "model call configuration invalid: tool_choice name '{name}' is not a \
-                     valid tool name"
-                ))
+                caller_error(
+                    "model.assembly.invalid_tool_choice",
+                    format!("tool_choice name '{name}' is not a valid tool name"),
+                )
             })?)
         }
     })
@@ -56,11 +61,11 @@ fn map_tool_choice(
 
 fn map_tool(tool: &ToolDefinition) -> Result<sdk::ToolDefinition, ModelError> {
     let name = sdk::ToolName::new(tool.name())
-        .map_err(|_| ModelError::new("frozen tool definition has an invalid name"))?;
+        .map_err(|_| caller_error("model.assembly.request_build", "frozen tool definition has an invalid name"))?;
     let schema: serde_json::Value = serde_json::from_str(tool.parameters().as_str())
-        .map_err(|_| ModelError::new("frozen tool definition has an invalid parameter schema"))?;
+        .map_err(|_| caller_error("model.assembly.request_build", "frozen tool definition has an invalid parameter schema"))?;
     let parameters = sdk::JsonSchema::new(schema)
-        .map_err(|_| ModelError::new("frozen tool definition schema root must be an object"))?;
+        .map_err(|_| caller_error("model.assembly.request_build", "frozen tool definition schema root must be an object"))?;
     Ok(sdk::ToolDefinition {
         name,
         description: (!tool.description().is_empty()).then(|| tool.description().to_owned()),

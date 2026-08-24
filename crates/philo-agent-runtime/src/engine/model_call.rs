@@ -9,14 +9,15 @@ use super::settlement::TurnCx;
 use super::stream::{OutputAssembler, StreamStep, next_or_cancel};
 use crate::mapping::messages::build_messages;
 use crate::{
-    AgentEvent, AgentFailure, AgentFailureKind, ModelAssistantBlock, ModelCallPhase,
-    ModelCallSnapshot, ModelError, ModelEvent, OperationPhase, ToolCallDelta, TurnSnapshot,
+    AgentEvent, AgentFailure, ModelAssistantBlock, ModelCallPhase, ModelCallSnapshot, ModelError,
+    ModelEvent, OperationPhase, ToolCallDelta, TurnSnapshot,
 };
 use philo_agent_kernel as kernel;
 
 /// Why one model-call attempt failed and whether an identical re-attempt
-/// can succeed. `recoverable` mirrors [`ModelError`]'s delivery-fault
-/// classification; every structural failure is permanent by construction.
+/// can succeed. `recoverable` is the SDK's intrinsic advice carried on
+/// [`ModelError::retry`] (`Safe`/`MayDuplicate` re-issue, `Never` does
+/// not); every structural failure classified `Never` is permanent.
 pub(super) struct AttemptFailure {
     pub(super) failure: AgentFailure,
     pub(super) recoverable: bool,
@@ -25,14 +26,22 @@ pub(super) struct AttemptFailure {
 impl AttemptFailure {
     fn classify(error: &ModelError) -> Self {
         Self {
-            failure: AgentFailure::new(AgentFailureKind::ModelCall, error.message()),
-            recoverable: error.class() == crate::ModelFailureClass::Recoverable,
+            failure: AgentFailure::from_model_error(error),
+            recoverable: error.retry().is_retryable(),
         }
     }
 
-    fn permanent(failure: AgentFailure) -> Self {
+    fn port_violation(code: &'static str, diagnostic: impl Into<String>) -> Self {
+        use crate::{FailureDomain, FailureStage, RetryDisposition};
         Self {
-            failure,
+            failure: AgentFailure::new(
+                code,
+                FailureDomain::Internal,
+                FailureStage::ModelPort,
+                RetryDisposition::Never,
+                "the model stream violated its port contract",
+                diagnostic,
+            ),
             recoverable: false,
         }
     }
@@ -124,17 +133,19 @@ pub(super) async fn run<'a>(
                 (true, ModelEvent::Completed { .. }) => {
                     return ModelCallOutcome::Failed(
                         cx,
-                        AttemptFailure::permanent(AgentFailure::invalid_model_output(
+                        AttemptFailure::port_violation(
+                            "model.port.stream_after_completed",
                             "model stream emitted Completed more than once",
-                        )),
+                        ),
                     );
                 }
                 (true, _) => {
                     return ModelCallOutcome::Failed(
                         cx,
-                        AttemptFailure::permanent(AgentFailure::invalid_model_output(
+                        AttemptFailure::port_violation(
+                            "model.port.stream_after_completed",
                             "model stream emitted output after Completed",
-                        )),
+                        ),
                     );
                 }
                 (false, ModelEvent::Completed { blocks }) => {
@@ -151,9 +162,10 @@ pub(super) async fn run<'a>(
                     if response_started_seen {
                         return ModelCallOutcome::Failed(
                             cx,
-                            AttemptFailure::permanent(AgentFailure::invalid_model_output(
+                            AttemptFailure::port_violation(
+                                "model.port.response_started_twice",
                                 "model stream emitted ResponseStarted more than once",
-                            )),
+                            ),
                         );
                     }
                     response_started_seen = true;
@@ -216,9 +228,10 @@ pub(super) async fn run<'a>(
             StreamStep::Event(None) => {
                 return ModelCallOutcome::Failed(
                     cx,
-                    AttemptFailure::permanent(AgentFailure::runtime_driver(
+                    AttemptFailure::port_violation(
+                        "model.port.stream_closed_early",
                         "model stream ended before Completed",
-                    )),
+                    ),
                 );
             }
         }

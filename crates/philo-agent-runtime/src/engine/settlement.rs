@@ -1,11 +1,12 @@
 //! Terminal settlement paths of a turn whose start already persisted.
 
 use super::EngineContext;
+use super::invariant_failure;
 use crate::mapping::entries::failure_entries;
-use crate::mapping::failure::{describe_session_error, kernel_failure, session_failure};
+use crate::mapping::failure::{commit_failure, describe_session_error, kernel_failure};
 use crate::mapping::tool::session_result;
 use crate::operation::OperationPublisher;
-use crate::{AgentEvent, AgentFailure, TurnId};
+use crate::{AgentEvent, AgentFailure, RetryDisposition, TurnId};
 use philo_agent_kernel as kernel;
 use philo_session as session;
 use philo_tools::RichToolResult;
@@ -44,11 +45,8 @@ impl TurnCx<'_> {
         )
         .is_err()
         {
-            self.fail(
-                effect_id,
-                AgentFailure::runtime_driver("kernel rejected CancelRequested"),
-            )
-            .await;
+            self.fail(effect_id, invariant_failure("kernel rejected CancelRequested"))
+                .await;
             return;
         }
         // The accepted reason (user request or operation timeout) becomes
@@ -82,7 +80,12 @@ impl TurnCx<'_> {
             Err(error) => {
                 self.fail(
                     effect_id,
-                    session_failure("committing cancellation", &error),
+                    commit_failure(
+                        "engine.cancel_commit_failed",
+                        RetryDisposition::MayDuplicate { retry_after_ms: None },
+                        "committing cancellation",
+                        &error,
+                    ),
                 )
                 .await;
             }
@@ -134,14 +137,9 @@ impl TurnCx<'_> {
             }
             Err(error) => {
                 self.operation
-                    .fail_unconfirmed(AgentFailure::new(
-                        failure.kind(),
-                        format!(
-                            "{}; failure settlement unconfirmed: {}",
-                            failure.message(),
-                            describe_session_error(&error)
-                        ),
-                    ))
+                    .fail_unconfirmed(failure.with_appended_diagnostic(&describe_session_error(
+                        &error,
+                    )))
                     .await
             }
         }

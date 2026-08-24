@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, AgentRuntime, ChannelBounds, GenerationConfig, OperationOutcome,
+    AgentEvent, AgentRuntime, ChannelBounds, DurableFailureKind, GenerationConfig, OperationOutcome,
     OperationSpec, RuntimeConfig, RuntimeDeps, SequentialIdSource, SessionId, SettlementDurability,
     ToolRegistry, UserMessage,
 };
@@ -305,7 +305,7 @@ async fn transport_failure_settles_failed_with_durable_facts() {
     else {
         panic!("expected failure, got {outcome:?}");
     };
-    assert_eq!(failure.kind(), AgentFailureKind::ModelCall);
+    assert_eq!(failure.durable_kind(), DurableFailureKind::ModelCall);
     assert!(
         failure.message().contains("Transport"),
         "normalized kind summary expected: {}",

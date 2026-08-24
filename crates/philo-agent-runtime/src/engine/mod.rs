@@ -14,15 +14,15 @@ mod tool_batch;
 mod tool_progress;
 
 use crate::mapping::entries::{batch_entry, start_entries, success_entries};
-use crate::mapping::failure::session_failure;
+use crate::mapping::failure::{commit_failure, session_failure};
 use crate::mapping::messages::{context_messages, kernel_blocks_from_model};
 use crate::mapping::parts::kernel_user_parts;
 use crate::mapping::tool::kernel_result;
 use crate::operation::{MaintenanceCancel, OperationPublisher, OperationShared};
 use crate::{
-    AgentEvent, AgentFailure, AssistantMessage, DriverExit, ModelAssistantBlock, ModelPort,
-    OperationPhase, RunningToolBatchPhase, RuntimeConfig, RuntimeGeneration, SessionId,
-    TurnSnapshot, UserMessage,
+    AgentEvent, AgentFailure, AssistantMessage, DriverExit, FailureDomain, FailureStage,
+    ModelAssistantBlock, ModelPort, OperationPhase, RetryDisposition, RunningToolBatchPhase,
+    RuntimeConfig, RuntimeGeneration, SessionId, TurnSnapshot, UserMessage,
 };
 use philo_agent_kernel as kernel;
 use philo_session as session;
@@ -33,20 +33,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Upper bound of the retry diagnostic carried on `ModelRetryScheduled`;
-/// full details remain on the eventual terminal failure if retries exhaust.
-const RETRY_REASON_MAX_CHARS: usize = 200;
-
-fn bounded_retry_reason(failure: &AgentFailure) -> String {
-    let mut reason: String = failure
-        .message()
-        .chars()
-        .take(RETRY_REASON_MAX_CHARS)
-        .collect();
-    if reason.chars().count() == RETRY_REASON_MAX_CHARS {
-        reason.push('…');
-    }
-    reason.replace('\n', " ")
+/// Frozen driver-invariant failure used whenever an observation violates
+/// what the kernel protocol guarantees (`engine.invariant_violation`).
+pub(crate) fn invariant_failure(diagnostic: impl Into<String>) -> AgentFailure {
+    AgentFailure::new(
+        "engine.invariant_violation",
+        FailureDomain::Internal,
+        FailureStage::TurnEngine,
+        RetryDisposition::Never,
+        "an internal driver invariant was violated",
+        diagnostic,
+    )
 }
 
 /// Waits out the backoff delay while observing cancellation. Returns
@@ -179,9 +176,7 @@ async fn drive_turn(
         Ok(user) => user,
         Err(_) => {
             operation
-                .fail_unconfirmed(AgentFailure::runtime_driver(
-                    "kernel rejected user message parts",
-                ))
+                .fail_unconfirmed(invariant_failure("kernel rejected user message parts"))
                 .await;
             return;
         }
@@ -198,7 +193,7 @@ async fn drive_turn(
         Ok(value) => value,
         Err(_) => {
             operation
-                .fail_unconfirmed(AgentFailure::runtime_driver("kernel rejected BeginTurn"))
+                .fail_unconfirmed(invariant_failure("kernel rejected BeginTurn"))
                 .await;
             return;
         }
@@ -233,7 +228,12 @@ async fn drive_turn(
         Ok(commit) => commit,
         Err(error) => {
             operation
-                .fail_unconfirmed(session_failure("committing turn start", &error))
+                .fail_unconfirmed(commit_failure(
+                    "engine.barrier_a_commit_failed",
+                    RetryDisposition::Safe { retry_after_ms: None },
+                    "committing turn start",
+                    &error,
+                ))
                 .await;
             return;
         }
@@ -291,7 +291,12 @@ async fn drive_turn(
                         Err(_) => {
                             cx.fail(
                                 effect_id,
-                                AgentFailure::invalid_model_output(
+                                AgentFailure::new(
+                                    "model.output.invalid_block",
+                                    FailureDomain::Provider,
+                                    FailureStage::ModelPort,
+                                    RetryDisposition::MayDuplicate { retry_after_ms: None },
+                                    "the model produced an invalid assistant block",
                                     "model produced an empty text block",
                                 ),
                             )
@@ -311,7 +316,14 @@ async fn drive_turn(
                     Err(_) => {
                         cx.fail(
                             effect_id,
-                            AgentFailure::invalid_model_output("kernel rejected model output"),
+                            AgentFailure::new(
+                                "kernel.output_rejected",
+                                FailureDomain::Provider,
+                                FailureStage::Kernel,
+                                RetryDisposition::Never,
+                                "the kernel rejected the model output",
+                                "kernel rejected model output",
+                            ),
                         )
                         .await;
                         return;
@@ -330,13 +342,8 @@ async fn drive_turn(
                         calls,
                     }) => (effect_id.clone(), tool_batch_id.clone(), calls.clone()),
                     _ => {
-                        cx.fail(
-                            effect_id,
-                            AgentFailure::runtime_driver(
-                                "tool-call transition omitted tool effect",
-                            ),
-                        )
-                        .await;
+                        cx.fail(effect_id, invariant_failure("tool-call transition omitted tool effect"))
+                            .await;
                         return;
                     }
                 };
@@ -361,8 +368,16 @@ async fn drive_turn(
                 let batch_commit = match committed {
                     Ok(commit) => commit,
                     Err(error) => {
-                        cx.fail(effect_id, session_failure("committing tool calls", &error))
-                            .await;
+                        cx.fail(
+                            effect_id,
+                            commit_failure(
+                                "engine.barrier_b_commit_failed",
+                                RetryDisposition::Safe { retry_after_ms: None },
+                                "committing tool calls",
+                                &error,
+                            ),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -401,9 +416,16 @@ async fn drive_turn(
                     Ok(value) => value,
                     Err(_) => {
                         cx.operation
-                            .fail_unconfirmed(AgentFailure::invalid_model_output(
-                                "kernel rejected tool results",
-                            ))
+                            .fail_unconfirmed(
+                                AgentFailure::new(
+                                    "kernel.tool_results_rejected",
+                                    FailureDomain::Internal,
+                                    FailureStage::Kernel,
+                                    RetryDisposition::Never,
+                                    "the kernel rejected the synthesized tool results",
+                                    "kernel rejected tool results",
+                                ),
+                            )
                             .await;
                         return;
                     }
@@ -414,10 +436,7 @@ async fn drive_turn(
                     None => {
                         cx.operation
                             .fail_unconfirmed(
-                                crate::DriverInvariantError::new(
-                                    "tool completion omitted model effect",
-                                )
-                                .into_failure(),
+                                invariant_failure("tool completion omitted model effect"),
                             )
                             .await;
                         return;
@@ -426,7 +445,7 @@ async fn drive_turn(
             }
             kernel::KernelEffect::ExecuteToolBatch { .. } => {
                 cx.operation
-                    .fail_unconfirmed(AgentFailure::runtime_driver(
+                    .fail_unconfirmed(invariant_failure(
                         "runtime cannot execute uncommitted tool effect",
                     ))
                     .await;
@@ -493,7 +512,7 @@ async fn drive_model_call_with_recovery<'a>(
                         attempt,
                         max_retries: recovery.max_retries,
                         delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        reason: bounded_retry_reason(&attempt_failure.failure),
+                        failure: attempt_failure.failure.clone(),
                     })
                     .await;
                 if !backoff_or_cancel(next_cx.operation.shared_arc(), delay).await {
@@ -548,7 +567,12 @@ async fn settle_success(
         Err(error) => {
             cx.fail(
                 effect_id,
-                session_failure("committing successful settlement", &error),
+                commit_failure(
+                    "engine.settlement_commit_failed",
+                    RetryDisposition::MayDuplicate { retry_after_ms: None },
+                    "committing successful settlement",
+                    &error,
+                ),
             )
             .await;
         }

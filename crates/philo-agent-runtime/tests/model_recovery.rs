@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, DEFAULT_MAX_TOOL_ROUNDS, GenerationConfig, RecoveryConfig,
+    AgentEvent, DEFAULT_MAX_TOOL_ROUNDS, FailureStage, GenerationConfig, RecoveryConfig,
     RuntimeConfig, ToolChoice,
 };
 use philo_session::{ContextMessage, MemorySessionStore, SessionStore};
@@ -68,7 +68,7 @@ async fn recoverable_truncation_is_retried_and_the_turn_succeeds() {
         philo_agent_runtime::OperationOutcome::Succeeded { ref assistant } if assistant.content() == "hello"
     ));
 
-    // One retry notification with sane fields.
+    // One retry notification with sane fields and structured attribution.
     let retries: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -76,15 +76,28 @@ async fn recoverable_truncation_is_retried_and_the_turn_succeeds() {
                 attempt,
                 max_retries,
                 delay_ms,
-                reason,
+                failure,
                 ..
-            } => Some((*attempt, *max_retries, *delay_ms, reason.clone())),
+            } => Some((
+                *attempt,
+                *max_retries,
+                *delay_ms,
+                failure.code().to_owned(),
+                failure.domain(),
+                failure.retry(),
+            )),
             _ => None,
         })
         .collect();
     assert_eq!(retries.len(), 1);
     assert_eq!(retries[0].0, 1);
     assert_eq!(retries[0].1, 3);
+    assert_eq!(retries[0].3, "model.incomplete_response");
+    assert_eq!(retries[0].4, philo_agent_runtime::FailureDomain::Provider);
+    assert!(matches!(
+        retries[0].5,
+        philo_agent_runtime::RetryDisposition::MayDuplicate { .. }
+    ));
 
     // Exactly two attempts; both saw the identical message history and the
     // same logical model-call id.
@@ -120,7 +133,7 @@ async fn fatal_failure_never_retries() {
     assert!(matches!(
         outcome,
         philo_agent_runtime::OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::ModelCall
+            if failure.stage() == FailureStage::ModelPort
     ));
     assert_eq!(model.call_count(), 1);
     assert!(!events
@@ -167,7 +180,7 @@ async fn exhausted_budget_settles_failed_with_every_retry_notified() {
     assert!(matches!(
         outcome,
         philo_agent_runtime::OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::ModelCall
+            if failure.stage() == FailureStage::ModelPort
     ));
     // Original attempt plus exactly `max_retries` re-attempts.
     assert_eq!(model.call_count(), 4);
@@ -190,6 +203,58 @@ async fn zero_budget_keeps_single_attempt() {
     let (_, outcome) = harness.run("session", "hi").await;
     assert!(matches!(outcome, philo_agent_runtime::OperationOutcome::Failed { .. }));
     assert_eq!(model.call_count(), 1);
+}
+
+/// The user-facing scenario that motivated the retry switch: a compatible
+/// gateway emitting a non-conforming tool-call sequence (`invalid_sequence`,
+/// `MayDuplicate`) used to be legacy-fatal; the SDK advice now drives the
+/// decision, so an identical re-issue happens and a clean follow-up wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_decode_fault_is_retried_by_sdk_advice() {
+    use support::fake_model::protocol_decode_error;
+    let model = Arc::new(FakeModel::new([
+        ModelScript::Events(vec![Err(protocol_decode_error("invalid_tool_call"))]),
+        ModelScript::text(&["recovered"]),
+    ]));
+    let (mut harness, _sessions) = launch(model.clone(), fast_recovery(3)).await;
+    let (events, outcome) = harness.run("session", "hi").await;
+    assert!(matches!(
+        outcome,
+        philo_agent_runtime::OperationOutcome::Succeeded { ref assistant }
+            if assistant.content() == "recovered"
+    ));
+    assert_eq!(model.call_count(), 2);
+    let retries: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelRetryScheduled { failure, .. } => Some(failure.code().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries, vec!["model.invalid_sequence"]);
+}
+
+/// Behavior correction pinned by the SDK code table: a TLS handshake
+/// failure (`transport_tls`, `Never`) used to be legacy-recoverable; an
+/// identical re-issue cannot fix a handshake, so it fails fast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_handshake_failure_is_never_retried() {
+    use support::fake_model::tls_error;
+    let model = Arc::new(FakeModel::new([ModelScript::Events(vec![Err(tls_error(
+        "certificate verify failed",
+    ))])]));
+    let (mut harness, _sessions) = launch(model.clone(), fast_recovery(3)).await;
+    let (events, outcome) = harness.run("session", "hi").await;
+    assert!(matches!(
+        outcome,
+        philo_agent_runtime::OperationOutcome::Failed { failure, .. }
+            if failure.code() == "model.transport_tls"
+                && failure.domain() == philo_agent_runtime::FailureDomain::Network
+    ));
+    assert_eq!(model.call_count(), 1);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ModelRetryScheduled { .. })));
 }
 
 #[test]

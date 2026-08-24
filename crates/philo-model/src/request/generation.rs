@@ -3,10 +3,13 @@ use std::num::NonZeroU32;
 use philo::api::stable as sdk;
 use philo_agent_runtime::{GenerationConfig, ModelError, ReasoningEffort};
 
+use crate::error::caller_error;
+
 pub(super) fn new_request(generation: &GenerationConfig) -> Result<sdk::ModelRequest, ModelError> {
     let max_output_tokens = NonZeroU32::new(generation.max_output_tokens).ok_or_else(|| {
-        ModelError::new(
-            "model call configuration invalid: generation.max_output_tokens must be greater than zero",
+        caller_error(
+            "model.assembly.max_output_tokens",
+            "generation.max_output_tokens must be greater than zero",
         )
     })?;
     let mut request = sdk::ModelRequest::new(max_output_tokens);

@@ -1,7 +1,8 @@
 //! Maps Session / Runtime / Tools types onto frontend DTOs.
 
 use philo_agent_runtime::{
-    AgentAvailability, AgentEvent, ReasoningEffort, TokenUsage, UserMessage, UserPart,
+    AgentAvailability, AgentEvent, AgentFailure, FailureDomain, FailureStage, ReasoningEffort,
+    RetryDisposition, TokenUsage, UserMessage, UserPart,
 };
 use philo_session::{
     ContextMessage, SessionAssistantBlock, SessionContextView, SessionUserPart, ToolResultOutcome,
@@ -11,9 +12,10 @@ use philo_tools::{EffectClass, ToolDefinition, ToolDisplay, ToolResult};
 use crate::frontend::command::{FrontendAttachment, FrontendReasoningEffort};
 use crate::frontend::snapshot::{
     DurableSessionView, FrontendAssistantBlock, FrontendAvailability, FrontendConfigEntry,
-    FrontendContextMessage, FrontendGeneration, FrontendOpenTurn, FrontendOperationEvent,
-    FrontendStatus, FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing,
-    FrontendToolResult, FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUserPart,
+    FrontendContextMessage, FrontendFailure, FrontendGeneration, FrontendOpenTurn,
+    FrontendOperationEvent, FrontendStatus, FrontendTokenUsage, FrontendToolDisplay,
+    FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome, FrontendUnfilledBatch,
+    FrontendUserPart,
 };
 use crate::live::LiveOperationSnapshot;
 use philo_agent_runtime::RuntimeGeneration;
@@ -226,8 +228,7 @@ pub fn operation_event(event: &AgentEvent) -> Option<FrontendOperationEvent> {
         }
         AgentEvent::TurnFailed { turn_id, failure } => FrontendOperationEvent::TurnFailed {
             turn_id: turn_id.as_str().to_owned(),
-            kind: format!("{:?}", failure.kind()),
-            message: failure.message().to_owned(),
+            failure: failure_dto(failure),
         },
         AgentEvent::PriorTurnSealed { turn_id } => FrontendOperationEvent::PriorTurnSealed {
             turn_id: turn_id.as_str().to_owned(),
@@ -259,20 +260,19 @@ pub fn operation_event(event: &AgentEvent) -> Option<FrontendOperationEvent> {
             attempt,
             max_retries,
             delay_ms,
-            reason,
+            failure,
         } => FrontendOperationEvent::ModelRetryScheduled {
             model_call_id: model_call_id.as_str().to_owned(),
             attempt: *attempt,
             max_retries: *max_retries,
             delay_ms: *delay_ms,
-            reason: reason.clone(),
+            failure: failure_dto(failure),
         },
         _ => return None,
     })
 }
 
-fn tool_result(result: &ToolResult) -> FrontendToolResult {
-    match result {
+fn tool_result(result: &ToolResult) -> FrontendToolResult {    match result {
         ToolResult::Success { content } => FrontendToolResult::Success {
             content: content.clone(),
         },
@@ -294,7 +294,48 @@ fn tool_display(display: &ToolDisplay) -> FrontendToolDisplay {
     }
 }
 
-/// Maps runtime availability onto a frontend DTO.
+/// Maps a runtime [`AgentFailure`] onto the stable-label failure DTO.
+pub fn failure_dto(failure: &AgentFailure) -> FrontendFailure {
+    FrontendFailure {
+        code: failure.code().to_owned(),
+        domain: domain_label(failure.domain()).to_owned(),
+        stage: stage_label(failure.stage()).to_owned(),
+        retry: retry_label(failure.retry()).to_owned(),
+        summary: failure.summary().to_owned(),
+        diagnostic: failure.diagnostic().to_owned(),
+    }
+}
+
+fn domain_label(domain: FailureDomain) -> &'static str {
+    match domain {
+        FailureDomain::Provider => "provider",
+        FailureDomain::Network => "network",
+        FailureDomain::Caller => "caller",
+        FailureDomain::Storage => "storage",
+        FailureDomain::Internal => "internal",
+    }
+}
+
+fn stage_label(stage: FailureStage) -> &'static str {
+    match stage {
+        FailureStage::ModelPort => "model-port",
+        FailureStage::TurnEngine => "turn-engine",
+        FailureStage::Kernel => "kernel",
+        FailureStage::SessionStore => "session-store",
+        FailureStage::ToolPort => "tool-port",
+        FailureStage::EpochSupervisor => "epoch-supervisor",
+    }
+}
+
+fn retry_label(retry: RetryDisposition) -> String {
+    match retry {
+        RetryDisposition::Never => "never".to_owned(),
+        RetryDisposition::Safe { .. } => "safe".to_owned(),
+        RetryDisposition::MayDuplicate { .. } => "may-duplicate".to_owned(),
+    }
+}
+
+/// Maps a runtime availability onto a frontend DTO.
 pub fn availability(value: &AgentAvailability) -> FrontendAvailability {
     match value {
         AgentAvailability::Idle => FrontendAvailability::Idle,

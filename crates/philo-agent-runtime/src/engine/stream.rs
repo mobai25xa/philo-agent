@@ -69,20 +69,31 @@ impl OutputAssembler {
     }
     #[allow(dead_code)]
     pub fn finish(self) -> Result<(String, Vec<kernel::KernelToolCall>), AgentFailure> {
+        use crate::{FailureDomain, FailureStage, RetryDisposition};
         let mut ids = HashSet::new();
         let mut calls = Vec::new();
         for index in self.order {
             let parts = match self.calls.get(&index) {
                 Some(parts) => parts,
                 None => {
-                    return Err(AgentFailure::invalid_model_output(
+                    return Err(AgentFailure::new(
+                        "model.output.invalid_block",
+                        FailureDomain::Provider,
+                        FailureStage::ModelPort,
+                        RetryDisposition::MayDuplicate { retry_after_ms: None },
+                        "the model produced an invalid assistant block",
                         "assembler missing recorded call index",
                     ));
                 }
             };
             if parts.id.is_empty() || parts.name.trim().is_empty() || !ids.insert(parts.id.clone())
             {
-                return Err(AgentFailure::invalid_model_output(
+                return Err(AgentFailure::new(
+                    "model.output.invalid_block",
+                    FailureDomain::Provider,
+                    FailureStage::ModelPort,
+                    RetryDisposition::MayDuplicate { retry_after_ms: None },
+                    "the model produced an invalid assistant block",
                     "model produced incomplete or duplicate tool calls",
                 ));
             }

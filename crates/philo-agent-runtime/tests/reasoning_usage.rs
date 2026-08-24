@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelEvent,
+    AgentEvent, DurableFailureKind, GenerationConfig, ModelAssistantBlock, ModelEvent,
     OperationOutcome, RuntimeConfig, TokenUsage,
 };
 use philo_session::{MemorySessionStore, SessionStore};
@@ -175,7 +175,7 @@ async fn reasoning_after_completed_is_an_invalid_stream() {
     assert!(matches!(
         outcome,
         OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::InvalidModelOutput
+            if failure.durable_kind() == DurableFailureKind::InvalidModelOutput
     ));
 }
 
@@ -194,7 +194,7 @@ async fn usage_after_completed_is_an_invalid_stream() {
     assert!(matches!(
         outcome,
         OperationOutcome::Failed { failure, .. }
-            if failure.kind() == AgentFailureKind::InvalidModelOutput
+            if failure.durable_kind() == DurableFailureKind::InvalidModelOutput
     ));
 }
 

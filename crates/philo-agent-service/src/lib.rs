@@ -13,6 +13,7 @@ mod generation;
 mod ids;
 mod live;
 mod mapping;
+mod presentation;
 mod runtime_api;
 mod service;
 
@@ -31,23 +32,27 @@ pub use error::{CommandDispatch, CommandReject, RecvOutcome, ServiceError};
 pub use frontend::{
     AttachError, ConfirmationDecision, DetachError, DetachReport, DurableSessionView,
     FrontendAssistantBlock, FrontendAttachment, FrontendAvailability, FrontendClient,
-    FrontendCommand, FrontendConfigEntry, FrontendContextMessage, FrontendGeneration,
-    FrontendLease, FrontendLeaseGeneration, FrontendMaintenance, FrontendMaintenancePhase,
-    FrontendOpenTurn, FrontendOperationEvent, FrontendReasoningEffort, FrontendSessionSummary,
-    FrontendSnapshot, FrontendStatus, FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing,
-    FrontendToolResult, FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUpdate,
-    FrontendUpdateKind, FrontendUserPart, PendingConfirmationView, QueuedOperationSummary,
-    ResyncRequired, ServiceHealth, SupervisorCommand,
+    FrontendCommand, FrontendConfigEntry, FrontendContextMessage, FrontendFailure,
+    FrontendGeneration, FrontendLease, FrontendLeaseGeneration, FrontendMaintenance,
+    FrontendMaintenancePhase, FrontendOpenTurn, FrontendOperationEvent, FrontendReasoningEffort,
+    FrontendSessionSummary, FrontendSnapshot, FrontendStatus, FrontendTokenUsage,
+    FrontendToolDisplay, FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome,
+    FrontendUnfilledBatch, FrontendUpdate, FrontendUpdateKind, FrontendUserPart,
+    PendingConfirmationView, QueuedOperationSummary, ResyncRequired, ServiceHealth,
+    SupervisorCommand,
 };
 pub use generation::{AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler};
 pub use ids::{FrontendEpoch, FrontendInstanceId, FrontendRequestId, FrontendRevision};
 pub use live::{LiveOperationSnapshot, LiveToolProgress};
 pub use philo_agent_runtime::{
     AdmissionError, CancelResult, ChannelBounds, CompactionSpec, ForcedSettlement,
-    GenerationDisplay, GenerationId, MaintenanceAccepted, MaintenanceError, MaintenanceId,
-    MaintenanceResult, OperationAccepted, OperationSpec, QueuedOperationSnapshot, RuntimeEvent,
-    RuntimeEventReceiver, RuntimeGeneration, RuntimeHandle, RuntimeParts, RuntimeSnapshot,
-    SettlementRevision, ShutdownError, ShutdownMode, ShutdownReport, TryRecvError,
+    FailureDomain, FailureStage, GenerationDisplay, GenerationId, MaintenanceAccepted,
+    MaintenanceError, MaintenanceId, MaintenanceResult, OperationAccepted, OperationSpec,
+    QueuedOperationSnapshot, RetryDisposition, RuntimeEvent, RuntimeEventReceiver,
+    RuntimeGeneration, RuntimeHandle, RuntimeParts, RuntimeSnapshot, SettlementRevision,
+    ShutdownError, ShutdownMode, ShutdownReport, TryRecvError,
 };
+pub use mapping::{failure_dto, operation_event};
+pub use presentation::{FailureLine, FailureLineStyle, retry_scheduled_lines, turn_failed_lines};
 pub use runtime_api::{RuntimeEvents, RuntimePort};
 pub use service::{AgentService, ServiceDeps, start};

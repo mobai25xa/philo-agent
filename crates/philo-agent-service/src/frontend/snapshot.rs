@@ -429,10 +429,8 @@ pub enum FrontendOperationEvent {
     TurnFailed {
         /// Turn id.
         turn_id: String,
-        /// Failure kind label.
-        kind: String,
-        /// Message.
-        message: String,
+        /// Structured four-question failure fact.
+        failure: FrontendFailure,
     },
     /// A prior unfinished turn was sealed.
     PriorTurnSealed {
@@ -469,8 +467,8 @@ pub enum FrontendOperationEvent {
         max_retries: u32,
         /// Backoff before the retry, milliseconds.
         delay_ms: u64,
-        /// Bounded diagnostic summary of why the attempt failed.
-        reason: String,
+        /// Structured four-question failure fact.
+        failure: FrontendFailure,
     },
     /// Turn cancelled durably.
     TurnCancelled {
@@ -492,6 +490,28 @@ pub enum FrontendOperationEvent {
         /// Durable Session revision when this settlement committed.
         session_revision: philo_agent_runtime::SettlementRevision,
     },
+}
+
+/// Structured four-question failure DTO: what failed, where it was
+/// detected, who is responsible, and whether an identical re-issue could
+/// succeed. Labels are stable lowercase strings pinned by the frozen code
+/// table (`docs/philo-agent/error-codes.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendFailure {
+    /// Frozen code-table key (`model.` prefixed codes pass SDK codes through).
+    pub code: String,
+    /// Responsibility domain label: `provider` | `network` | `caller` |
+    /// `storage` | `internal`.
+    pub domain: String,
+    /// Detection-layer label: `model-port` | `turn-engine` | `kernel` |
+    /// `session-store` | `tool-port` | `epoch-supervisor`.
+    pub stage: String,
+    /// Recorded re-issue advice label: `never` | `safe` | `may-duplicate`.
+    pub retry: String,
+    /// One bounded human-readable line: what happened and whose fault it is.
+    pub summary: String,
+    /// Bounded developer-facing detail (redacted); not for model context.
+    pub diagnostic: String,
 }
 
 /// Model-channel tool result DTO.

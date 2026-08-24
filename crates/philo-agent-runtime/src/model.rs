@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{ModelCallSnapshot, ToolCallId, UserPart};
+use crate::{FailureDomain, ModelCallSnapshot, RetryDisposition, ToolCallId, UserPart};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelToolCall {
@@ -140,44 +140,82 @@ pub enum ModelEvent {
     },
 }
 
-/// Whether one failed model call is worth a fresh identical attempt.
+/// One structured model-call failure answering four questions: what failed
+/// ([`Self::summary`]/[`Self::diagnostic`]), where it was detected (always
+/// [`crate::FailureStage::ModelPort`] for this type), who is responsible
+/// ([`Self::domain`]), and whether an identical re-issue could succeed
+/// ([`Self::retry`]).
 ///
-/// The classification is advisory vocabulary for the turn engine's bounded
-/// recovery loop; it never overrides cancellation or settlement rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModelFailureClass {
-    /// Transient delivery fault (truncated stream, dropped connection,
-    /// throttling, provider abort): nothing durable committed, so an
-    /// identical re-attempt is safe.
-    Recoverable,
-    /// Permanent for this request shape (auth, invalid request, structural
-    /// protocol misuse): re-attempts cannot succeed.
-    Fatal,
-}
-
+/// Model-call failures pass the philo SDK's frozen code table through:
+/// `code` is the SDK stable code, `domain`/`retry` map from
+/// `fault_domain()` / `retry_advice()` (SDK `Sdk` becomes
+/// [`FailureDomain::Internal`]), and `summary` is the SDK's redacted
+/// semantic one-liner. Request-assembly failures rejected before any
+/// transport call use agent-owned `model.assembly.*` codes instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelError {
-    message: String,
-    class: ModelFailureClass,
+    code: String,
+    domain: FailureDomain,
+    retry: RetryDisposition,
+    summary: String,
+    diagnostic: String,
 }
+
 impl ModelError {
-    pub fn new(message: impl Into<String>) -> Self {
+    /// Full constructor used when normalizing an SDK failure.
+    pub fn new(
+        code: impl Into<String>,
+        domain: FailureDomain,
+        retry: RetryDisposition,
+        summary: impl Into<String>,
+        diagnostic: impl Into<String>,
+    ) -> Self {
         Self {
-            message: message.into(),
-            class: ModelFailureClass::Fatal,
+            code: code.into(),
+            domain,
+            retry,
+            summary: summary.into(),
+            diagnostic: diagnostic.into(),
         }
     }
-    pub fn with_class(message: impl Into<String>, class: ModelFailureClass) -> Self {
+
+    /// Agent-side request-assembly failure rejected before any transport
+    /// call: always `Caller`, never retryable.
+    pub fn assembly(
+        code: &'static str,
+        summary: impl Into<String>,
+        diagnostic: impl Into<String>,
+    ) -> Self {
         Self {
-            message: message.into(),
-            class,
+            code: code.to_owned(),
+            domain: FailureDomain::Caller,
+            retry: RetryDisposition::Never,
+            summary: summary.into(),
+            diagnostic: diagnostic.into(),
         }
     }
-    pub fn message(&self) -> &str {
-        &self.message
+
+    pub fn code(&self) -> &str {
+        &self.code
     }
-    pub fn class(&self) -> ModelFailureClass {
-        self.class
+    pub fn domain(&self) -> FailureDomain {
+        self.domain
+    }
+    pub fn retry(&self) -> RetryDisposition {
+        self.retry
+    }
+    /// One bounded human-readable line: what happened and whose fault it is.
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+    /// Bounded developer-facing detail (redacted); not for model context.
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+    /// Legacy combined one-liner (`summary — diagnostic`) for logs and
+    /// assertions; structured accessors are preferred.
+    pub fn message(&self) -> String {
+        format!("{} — {}", self.summary, self.diagnostic)
     }
 }
 

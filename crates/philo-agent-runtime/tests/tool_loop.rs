@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    AgentEvent, AgentFailureKind, GenerationConfig, ModelAssistantBlock, ModelEvent, ModelMessage,
+    AgentEvent, DurableFailureKind, GenerationConfig, ModelAssistantBlock, ModelEvent, ModelMessage,
     ModelToolCall, OperationOutcome, RuntimeConfig, SequentialIdSource, SessionId,
     SettlementDurability, ToolCallId, ToolDefinition, ToolPort, ToolRegistry, UserMessage,
 };
@@ -370,7 +370,7 @@ async fn tool_infrastructure_failure_settles_failed() {
         success_handle(model, Arc::new(MemorySessionStore::new()), tools).await;
     assert!(matches!(
         handle.wait().await,
-        OperationOutcome::Failed { failure, durability: SettlementDurability::Confirmed } if failure.kind() == AgentFailureKind::ToolExecution
+        OperationOutcome::Failed { failure, durability: SettlementDurability::Confirmed } if failure.durable_kind() == DurableFailureKind::ToolExecution
     ));
     assert_eq!(model.call_count(), 1);
     assert_eq!(tools.invocation_count(), 1);
@@ -390,7 +390,7 @@ async fn second_tool_call_is_rejected() {
         success_handle(model, Arc::new(MemorySessionStore::new()), tools).await;
     assert!(matches!(
         handle.wait().await,
-        OperationOutcome::Failed { failure, durability: SettlementDurability::Confirmed } if failure.kind() == AgentFailureKind::InvalidModelOutput
+        OperationOutcome::Failed { failure, durability: SettlementDurability::Confirmed } if failure.durable_kind() == DurableFailureKind::InvalidModelOutput
     ));
     assert_eq!(model.call_count(), 2);
     assert_eq!(tools.invocation_count(), 1);

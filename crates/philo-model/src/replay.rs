@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use philo::api::stable as sdk;
 use philo_agent_runtime::{
-    ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelMessage, ModelToolCall,
-    ModelToolResultOutcome, ToolCallId, UserPart,
+    FailureDomain, ModelAssistantBlock, ModelCallSnapshot, ModelError, ModelMessage, ModelToolCall,
+    ModelToolResultOutcome, RetryDisposition, ToolCallId, UserPart,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -940,12 +940,24 @@ impl ReplayCoordinator {
         let mut remove = Vec::new();
         for blob in blobs {
             let generation: StoredGeneration = serde_json::from_slice(blob.payload())
-                .map_err(|_| ModelError::new("model replay sidecar is corrupted"))?;
+                .map_err(|_| ModelError::new(
+                    "model.replay.corrupted".to_owned(),
+                    FailureDomain::Caller,
+                    RetryDisposition::Never,
+                    "the model replay sidecar is corrupted",
+                    "model replay sidecar is corrupted",
+                ))?;
             if ![GENERATION_SCHEMA_V1, GENERATION_SCHEMA_V2].contains(&generation.schema_version)
                 || generation.generation_id != blob.id()
                 || generation.session_id != request.session_id.as_str()
             {
-                return Err(ModelError::new("model replay sidecar is corrupted"));
+                return Err(ModelError::new(
+                    "model.replay.corrupted".to_owned(),
+                    FailureDomain::Caller,
+                    RetryDisposition::Never,
+                    "the model replay sidecar is corrupted",
+                    "model replay sidecar is corrupted",
+                ));
             }
             if generation.expires_at_unix_secs <= now {
                 remove.push(generation.generation_id);
@@ -964,7 +976,13 @@ impl ReplayCoordinator {
         let mut invalidated = self
             .invalidated_continuations
             .lock()
-            .map_err(|_| ModelError::new("model continuation state is unavailable"))?
+            .map_err(|_| ModelError::new(
+                "model.replay.unavailable".to_owned(),
+                FailureDomain::Caller,
+                RetryDisposition::Never,
+                "the model continuation state is unavailable",
+                "model continuation state is unavailable",
+            ))?
             .clone();
         for generation in &generations {
             if let Some(id) = &generation.invalidates_generation {
@@ -1012,7 +1030,13 @@ impl ReplayCoordinator {
                         let handle = client
                             .continuation_handle(target, response_id.clone())
                             .map_err(|_| {
-                                ModelError::new("stored model continuation handle is invalid")
+                                ModelError::new(
+                            "model.replay.unavailable".to_owned(),
+                            FailureDomain::Caller,
+                            RetryDisposition::Never,
+                            "the stored model continuation handle is invalid",
+                            "stored model continuation handle is invalid",
+                        )
                             })?;
                         continuation = Some(ContinuationCandidate {
                             handle,
@@ -1034,7 +1058,13 @@ impl ReplayCoordinator {
             let mut transient = self
                 .transient
                 .lock()
-                .map_err(|_| ModelError::new("transient model replay state is unavailable"))?;
+                .map_err(|_| ModelError::new(
+                "model.replay.unavailable".to_owned(),
+                FailureDomain::Caller,
+                RetryDisposition::Never,
+                "the transient model replay state is unavailable",
+                "transient model replay state is unavailable",
+            ))?;
             transient.retain(|generation| {
                 generation.session_id != request.session_id.as_str()
                     || generation.turn_id == request.turn_id.as_str()
@@ -1178,12 +1208,24 @@ impl ReplayCoordinator {
             // response ID to persist for previous_response_id.
             self.transient
                 .lock()
-                .map_err(|_| ModelError::new("transient model replay state is unavailable"))?
+                .map_err(|_| ModelError::new(
+                "model.replay.unavailable".to_owned(),
+                FailureDomain::Caller,
+                RetryDisposition::Never,
+                "the transient model replay state is unavailable",
+                "transient model replay state is unavailable",
+            ))?
                 .push(generation);
             return Ok(());
         }
         let payload = serde_json::to_vec(&generation)
-            .map_err(|_| ModelError::new("model replay snapshot serialization failed"))?;
+            .map_err(|_| ModelError::new(
+                "model.replay.persist_failed".to_owned(),
+                FailureDomain::Caller,
+                RetryDisposition::Never,
+                "the model replay snapshot could not be serialized",
+                "model replay snapshot serialization failed",
+            ))?;
         match self
             .store
             .commit(
@@ -1201,6 +1243,10 @@ impl ReplayCoordinator {
                 Ok(())
             }
             Err(_) => Err(ModelError::new(
+                "model.replay.persist_failed".to_owned(),
+                FailureDomain::Caller,
+                RetryDisposition::Never,
+                "a required model replay generation could not be persisted",
                 "required model replay generation could not be persisted",
             )),
         }
@@ -1254,7 +1300,13 @@ impl StoredGeneration {
             items: Vec::new(),
         };
         let payload = serde_json::to_vec(&tombstone)
-            .map_err(|_| ModelError::new("model continuation invalidation serialization failed"))?;
+            .map_err(|_| ModelError::new(
+                "model.replay.persist_failed".to_owned(),
+                FailureDomain::Caller,
+                RetryDisposition::Never,
+                "the continuation invalidation could not be serialized",
+                "model continuation invalidation serialization failed",
+            ))?;
         Ok(ReplayStoreBlob::new(generation_id, payload))
     }
 
@@ -1426,7 +1478,13 @@ impl StoredRequirement {
             sdk::ReplayRequirement::None => Ok(Self::None),
             sdk::ReplayRequirement::Optional => Ok(Self::Optional),
             sdk::ReplayRequirement::Required => Ok(Self::Required),
-            _ => Err(ModelError::new("unsupported replay requirement")),
+            _ => Err(ModelError::new(
+            "model.replay.unsupported".to_owned(),
+            FailureDomain::Caller,
+            RetryDisposition::Never,
+            "a replay requirement is unsupported by this assembly",
+            "unsupported replay requirement",
+        )),
         }
     }
 
@@ -1468,7 +1526,13 @@ impl StoredReasoningKind {
             sdk::ReasoningKind::Summary => Ok(Self::Summary),
             sdk::ReasoningKind::Exposed => Ok(Self::Exposed),
             sdk::ReasoningKind::Opaque => Ok(Self::Opaque),
-            _ => Err(ModelError::new("unsupported reasoning replay kind")),
+            _ => Err(ModelError::new(
+            "model.replay.unsupported".to_owned(),
+            FailureDomain::Caller,
+            RetryDisposition::Never,
+            "a reasoning replay kind is unsupported by this assembly",
+            "unsupported reasoning replay kind",
+        )),
         }
     }
 
@@ -1605,19 +1669,43 @@ fn unix_seconds() -> Result<u64, ModelError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|_| ModelError::new("system clock is before the Unix epoch"))
+        .map_err(|_| ModelError::new(
+        "model.replay.persist_failed".to_owned(),
+        FailureDomain::Caller,
+        RetryDisposition::Never,
+        "the system clock is before the Unix epoch",
+        "system clock is before the Unix epoch",
+    ))
 }
 
 fn required_snapshot_error() -> ModelError {
-    ModelError::new("required model replay snapshot is unavailable")
+    ModelError::new(
+    "model.replay.unavailable".to_owned(),
+    FailureDomain::Caller,
+    RetryDisposition::Never,
+    "the required model replay snapshot is unavailable",
+    "required model replay snapshot is unavailable",
+)
 }
 
 fn required_restore_error() -> ModelError {
-    ModelError::new("required model replay snapshot could not be restored")
+    ModelError::new(
+    "model.replay.corrupted".to_owned(),
+    FailureDomain::Caller,
+    RetryDisposition::Never,
+    "the required model replay snapshot could not be restored",
+    "required model replay snapshot could not be restored",
+)
 }
 
 fn store_model_error(error: ReplayStoreError) -> ModelError {
-    ModelError::new(error.to_string())
+    ModelError::new(
+    "model.replay.corrupted".to_owned(),
+    FailureDomain::Caller,
+    RetryDisposition::Never,
+    error.to_string(),
+    error.to_string(),
+)
 }
 
 fn store_io() -> ReplayStoreError {

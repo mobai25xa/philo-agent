@@ -34,7 +34,13 @@ impl ModelPort for UnavailableModel {
         &'a self,
         _request: ModelCallSnapshot,
     ) -> RuntimeFuture<'a, Result<Box<dyn ModelEventStream>, ModelError>> {
-        Box::pin(async { Err(ModelError::new("unavailable test model")) })
+        Box::pin(async {
+            Err(ModelError::assembly(
+                "model.assembly.request_build",
+                "unavailable test model",
+                "unavailable test model",
+            ))
+        })
     }
 }
 

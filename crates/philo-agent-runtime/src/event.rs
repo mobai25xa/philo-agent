@@ -130,8 +130,8 @@ pub enum AgentEvent {
         attempt: u32,
         max_retries: u32,
         delay_ms: u64,
-        /// Bounded diagnostic summary of why the attempt failed.
-        reason: String,
+        /// Structured four-question summary of why the attempt failed.
+        failure: AgentFailure,
     },
     /// The cancellation terminal facts committed durably; published before
     /// the matching `OperationSettled`. The reason is `User` or `Timeout`.

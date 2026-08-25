@@ -61,6 +61,18 @@ fn literal(path: &Path) -> String {
     format!("'{}'", path.display())
 }
 
+/// A minimal valid provider catalog: one provider, one model.
+fn catalog() -> String {
+    concat!(
+        "[providers.gw]\n",
+        "endpoint = \"https://example.invalid/v1/chat/completions\"\n",
+        "\n",
+        "[providers.gw.models]\n",
+        "model-a = {}\n",
+    )
+    .to_owned()
+}
+
 fn stdout_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -86,11 +98,11 @@ fn the_data_dir_follows_the_five_layer_chain() {
 
     write_config(
         &config_home,
-        &format!("[deployment]\ndata_dir = {}\n", literal(&global_store)),
+        &format!("data_dir = {}\n", literal(&global_store)),
     );
     write_config(
         &project.join(".philo"),
-        &format!("[deployment]\ndata_dir = {}\n", literal(&project_store)),
+        &format!("data_dir = {}\n", literal(&project_store)),
     );
 
     let listed = |command: &mut Command| -> String {
@@ -149,7 +161,7 @@ fn unknown_keys_warn_and_keep_running() {
     write_config(
         &config_home,
         &format!(
-            "[deployment]\ndata_dir = {}\nfrom_the_future = 1\n\
+            "data_dir = {}\nfrom_the_future = 1\n\
              [compaction]\ncontext_budget = 96000\nauto_threshold = 0.8\n\
              keep_recent_turns = 4\nestimate_bytes_per_token = 3\nfuture = true\n\
              [telemetry]\nenabled = true\n",
@@ -167,7 +179,7 @@ fn unknown_keys_warn_and_keep_running() {
     assert_eq!(stdout_text(&output), "alpha  hi\n");
     let stderr = stderr_text(&output);
     assert!(
-        stderr.contains("unknown key [deployment].from_the_future"),
+        stderr.contains("'from_the_future' is not a section"),
         "{stderr}"
     );
     assert!(
@@ -187,8 +199,7 @@ fn an_invalid_parallel_tool_cap_exits_two() {
     let config_home = root.dir("home");
     write_config(
         &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         [defaults]\nmax_parallel_tool_calls = 0\n",
+        "[defaults]\nmax_parallel_tool_calls = 0\n",
     );
 
     let output = philo(&config_home)
@@ -209,7 +220,7 @@ fn an_invalid_parallel_tool_cap_exits_two() {
 fn an_invalid_value_is_a_usage_error() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
-    write_config(&config_home, "[deployment]\ndata_dir = 42\n");
+    write_config(&config_home, "data_dir = 42\n");
 
     let output = philo(&config_home)
         .current_dir(&root.path)
@@ -231,8 +242,11 @@ fn an_invalid_enum_names_the_layer_it_came_from() {
     let config_home = root.dir("home");
     write_config(
         &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         [defaults]\nreasoning_effort = \"turbo\"\n",
+        concat!(
+            "[providers.gw]\nendpoint = \"https://e.test\"\n",
+            "protocol = \"carrier-pigeon\"\n",
+            "[providers.gw.models]\nmodel-a = {}\n",
+        ),
     );
 
     let output = philo(&config_home)
@@ -243,12 +257,9 @@ fn an_invalid_enum_names_the_layer_it_came_from() {
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = stderr_text(&output);
+    assert!(stderr.contains("carrier-pigeon"), "{stderr}");
     assert!(
-        stderr.contains("invalid reasoning effort 'turbo'"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("[defaults].reasoning_effort in the global config"),
+        stderr.contains("[providers.gw].protocol in the global config"),
         "{stderr}"
     );
 }
@@ -259,8 +270,11 @@ fn a_retired_protocol_name_is_a_usage_error() {
     let config_home = root.dir("home");
     write_config(
         &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         protocol = \"openai-chat-compatible\"\n",
+        concat!(
+            "[providers.gw]\nendpoint = \"https://e.test\"\n",
+            "protocol = \"openai-chat-compatible\"\n",
+            "[providers.gw.models]\nmodel-a = {}\n",
+        ),
     );
 
     let output = philo(&config_home)
@@ -281,7 +295,7 @@ fn a_retired_protocol_name_is_a_usage_error() {
 }
 
 #[test]
-fn response_continuation_support_is_a_usage_error_not_a_warning() {
+fn the_removed_deployment_section_is_a_usage_error_not_a_warning() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
     let store = root.dir("store");
@@ -289,7 +303,7 @@ fn response_continuation_support_is_a_usage_error_not_a_warning() {
     write_config(
         &config_home,
         &format!(
-            "[deployment]\ndata_dir = {}\nresponse_continuation_support = \"official-openai\"\n",
+            "[deployment]\ndata_dir = {}\nmodel = \"m\"\n",
             literal(&store)
         ),
     );
@@ -302,11 +316,11 @@ fn response_continuation_support_is_a_usage_error_not_a_warning() {
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = stderr_text(&output);
-    assert!(stderr.contains("removed"), "{stderr}");
-    assert!(stderr.contains("prefer-previous-response-id"), "{stderr}");
+    assert!(stderr.contains("[deployment] has been removed"), "{stderr}");
+    assert!(stderr.contains("[providers.<id>.models]"), "{stderr}");
     assert!(
-        !stderr.contains("unknown key"),
-        "the retired key must not be ignored: {stderr}"
+        !stderr.contains("unknown section"),
+        "the retired section must not be ignored: {stderr}"
     );
     assert_eq!(stdout_text(&output), "");
 }
@@ -317,8 +331,10 @@ fn an_invalid_compaction_threshold_exits_two_before_starting_an_operation() {
     let config_home = root.dir("home");
     write_config(
         &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         [compaction]\nauto_threshold = 1.1\n",
+        &format!(
+            "{}[compaction]\nauto_threshold = 1.1\n",
+            catalog()
+        ),
     );
 
     let output = philo(&config_home)
@@ -343,7 +359,7 @@ fn a_secret_in_the_config_is_refused_without_echoing_it() {
     let config_home = root.dir("home");
     write_config(
         &config_home,
-        "[deployment]\nmodel = \"m\"\napi_key = \"sk-must-never-be-used\"\n",
+        "[providers.gw]\ntoken = \"sk-must-never-be-used\"\n",
     );
 
     let output = philo(&config_home)
@@ -363,7 +379,7 @@ fn a_secret_in_the_config_is_refused_without_echoing_it() {
 
     write_config(
         &config_home,
-        "[deployment]\napi_key_env = \"sk-also-must-not-be-used\"\n",
+        "[providers.gw]\napi_key_env = \"sk-also-must-not-be-used\"\n",
     );
     let output = philo(&config_home)
         .current_dir(&root.path)
@@ -383,13 +399,51 @@ fn a_secret_in_the_config_is_refused_without_echoing_it() {
 }
 
 #[test]
+fn a_literal_api_key_is_sanctioned_and_stays_out_of_output() {
+    let root = TempRoot::new();
+    let config_home = root.dir("home");
+    let store = root.dir("store");
+    seed_session(&store, "alpha");
+    write_config(
+        &config_home,
+        &format!(
+            "data_dir = {}\n\
+             [providers.gw]\nendpoint = \"https://example.invalid/v1/chat/completions\"\n\
+             api_key = \"sk-file-literal-secret\"\n\
+             [providers.gw.models]\nmodel-a = {{}}\n",
+            literal(&store)
+        ),
+    );
+
+    // The read-only sessions command resolves the config successfully.
+    let output = philo(&config_home)
+        .current_dir(&root.path)
+        .arg("sessions")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_text(&output));
+    assert_eq!(stdout_text(&output), "alpha  hi\n");
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
+    for text in [stdout.as_str(), stderr.as_str()] {
+        assert!(
+            !text.contains("sk-file-literal-secret"),
+            "the literal key never reaches output: {text}"
+        );
+    }
+}
+
+#[test]
 fn a_credential_header_is_refused_without_echoing_its_value() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
     write_config(
         &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         [deployment.headers]\nAuthorization = \"Bearer header-secret\"\n",
+        concat!(
+            "[providers.gw]\nendpoint = \"https://e.test\"\n",
+            "[providers.gw.headers]\nAuthorization = \"Bearer header-secret\"\n",
+            "[providers.gw.models]\nmodel-a = {}\n",
+        ),
     );
 
     let output = philo(&config_home)
@@ -406,33 +460,10 @@ fn a_credential_header_is_refused_without_echoing_its_value() {
 }
 
 #[test]
-fn the_deployment_section_feeds_the_single_shot_path() {
-    let root = TempRoot::new();
-    let config_home = root.dir("home");
-    write_config(&config_home, "[deployment]\nmodel = \"configured-model\"\n");
-
-    // The model now resolves from the file, so the chain gets one step
-    // further and stops at the endpoint instead.
-    let output = philo(&config_home)
-        .current_dir(&root.path)
-        .arg("hello")
-        .output()
-        .expect("run");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = stderr_text(&output);
-    assert!(stderr.contains("no endpoint configured"), "{stderr}");
-    assert!(!stderr.contains("no model configured"), "{stderr}");
-}
-
-#[test]
 fn a_bare_command_without_a_terminal_reports_the_interactive_requirement() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
-    write_config(
-        &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n",
-    );
+    write_config(&config_home, &catalog());
 
     // Test harnesses give the child pipes, not a terminal: the interactive
     // session refuses before touching the terminal, and says how to run
@@ -454,11 +485,7 @@ fn a_bare_command_without_a_terminal_reports_the_interactive_requirement() {
 fn both_modes_validate_the_same_effective_configuration() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
-    write_config(
-        &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         [ui]\nverbosity = \"loud\"\n",
-    );
+    write_config(&config_home, &format!("{}\n[ui]\nverbosity = \"loud\"\n", catalog()));
 
     for args in [Vec::<&str>::new(), vec!["hello"]] {
         let output = philo(&config_home)
@@ -487,11 +514,7 @@ fn both_modes_validate_the_same_effective_configuration() {
 fn invalid_ui_screen_is_a_hard_error() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
-    write_config(
-        &config_home,
-        "[deployment]\nmodel = \"m\"\nendpoint = \"https://e.test\"\n\
-         [ui]\nscreen = \"fullscreen\"\n",
-    );
+    write_config(&config_home, &format!("{}\n[ui]\nscreen = \"fullscreen\"\n", catalog()));
 
     for args in [Vec::<&str>::new(), vec!["hello"]] {
         let output = philo(&config_home)
@@ -556,4 +579,3 @@ fn seed_session(root: &Path, id: &str) {
     )))
     .expect("seed commit");
 }
-

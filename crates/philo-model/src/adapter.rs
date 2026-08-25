@@ -5,7 +5,9 @@ use philo_agent_runtime::{
     ModelCallSnapshot, ModelError, ModelEventStream, ModelPort, RuntimeFuture,
 };
 
-use crate::assemble::{ModelContinuationPolicy, ModelProtocol, PhiloModelBuilder};
+use crate::assemble::{
+    ModelCachePolicy, ModelContinuationPolicy, ModelProtocol, PhiloModelBuilder,
+};
 use crate::error::model_error;
 use crate::replay::{MemoryModelReplayStore, ModelReplayStore, ReplayCoordinator};
 use crate::request::map_request;
@@ -27,6 +29,7 @@ pub struct PhiloModelAdapter {
     target: sdk::CallTarget,
     replay: Arc<ReplayCoordinator>,
     continuation_policy: ModelContinuationPolicy,
+    cache_policy: ModelCachePolicy,
 }
 
 impl PhiloModelAdapter {
@@ -46,6 +49,7 @@ impl PhiloModelAdapter {
             target,
             replay_store,
             ModelContinuationPolicy::StatelessLocalReplay,
+            ModelCachePolicy::default(),
         )
     }
 
@@ -54,12 +58,14 @@ impl PhiloModelAdapter {
         target: sdk::CallTarget,
         replay_store: Arc<dyn ModelReplayStore>,
         continuation_policy: ModelContinuationPolicy,
+        cache_policy: ModelCachePolicy,
     ) -> Self {
         Self {
             client,
             target,
             replay: Arc::new(ReplayCoordinator::new(replay_store)),
             continuation_policy,
+            cache_policy,
         }
     }
 
@@ -102,7 +108,8 @@ impl ModelPort for PhiloModelAdapter {
                 .replay
                 .load(&self.client, &self.target, &request, server_continuation)
                 .await?;
-            let mut mapped = map_request(&request, native_error_status, &replayed)?;
+            let mut mapped =
+                map_request(&request, native_error_status, &replayed, self.cache_policy)?;
             let continuing =
                 server_continuation && replayed.has_continuation() && mapped.continuation.is_some();
             if server_continuation && mapped.continuation.is_none() {

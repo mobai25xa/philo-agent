@@ -477,6 +477,7 @@ pub fn frontend_generation(generation: &RuntimeGeneration) -> FrontendGeneration
             .generation
             .reasoning_effort
             .map(|effort| format!("{effort:?}")),
+        image_input: generation.display.image_input,
         tool_names: generation
             .tools
             .definitions()

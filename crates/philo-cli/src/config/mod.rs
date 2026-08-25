@@ -5,7 +5,7 @@
 //! needed by the read-only `sessions` command.
 
 mod file;
-mod resolve;
+pub(crate) mod resolve;
 mod watch;
 
 #[cfg(test)]
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use crate::args::Cli;
 use crate::error::UsageError;
 
-pub use resolve::{Deployment, Settings, Verbosity};
+pub use resolve::{Credential, Deployment, Settings, Verbosity, deployment_for};
 pub use watch::{ResolveFlags, WatchIntervals, WatchTask, spawn};
 
 /// Loaded global/project file layers. Raw keys and source bookkeeping remain

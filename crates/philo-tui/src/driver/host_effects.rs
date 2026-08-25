@@ -76,10 +76,28 @@ mod tests {
                     FrontendSessionSummary {
                         session_id: "s-1".to_owned(),
                         title: Some("first session".to_owned()),
+                        updated_at: None,
                     },
                     FrontendSessionSummary {
                         session_id: "s-2".to_owned(),
                         title: None,
+                        updated_at: None,
+                    },
+                ],
+            },
+            HostRequest::OpenModels => FrontendUpdateKind::ModelListLoaded {
+                models: vec![
+                    philo_agent_service::FrontendModelListing {
+                        id: "test/model-a".to_owned(),
+                        provider: "test".to_owned(),
+                        model: "model-a".to_owned(),
+                        current: true,
+                    },
+                    philo_agent_service::FrontendModelListing {
+                        id: "test/model-b".to_owned(),
+                        provider: "test".to_owned(),
+                        model: "model-b".to_owned(),
+                        current: false,
                     },
                 ],
             },
@@ -97,6 +115,7 @@ mod tests {
                     generation_id: "g-1".to_owned(),
                     model_name: name,
                     reasoning_effort: None,
+                    image_input: true,
                     tool_names: Vec::new(),
                 },
             },
@@ -105,6 +124,7 @@ mod tests {
                     generation_id: "g-1".to_owned(),
                     model_name: app.status.model.clone(),
                     reasoning_effort: Some(format!("{effort:?}")),
+                    image_input: true,
                     tool_names: Vec::new(),
                 },
             },
@@ -129,6 +149,7 @@ mod tests {
                     generation_id: "g-1".to_owned(),
                     model_name: app.status.model.clone(),
                     reasoning_effort: None,
+                    image_input: true,
                     tool_names: vec![
                         "read_file".to_owned(),
                         "write_file".to_owned(),

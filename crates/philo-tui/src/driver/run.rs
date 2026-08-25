@@ -92,6 +92,7 @@ struct FrontendSync {
     preview_request: Option<FrontendRequestId>,
     preview_session_id: Option<String>,
     model_request: Option<FrontendRequestId>,
+    models_list_request: Option<FrontendRequestId>,
 }
 
 impl FrontendSync {
@@ -106,6 +107,7 @@ impl FrontendSync {
             preview_request: None,
             preview_session_id: None,
             model_request: None,
+            models_list_request: None,
         }
     }
 
@@ -145,6 +147,13 @@ impl FrontendSync {
             }
             if matches!(update.kind, FrontendUpdateKind::SnapshotReady(_))
                 && self.snapshot_request.is_some_and(|expected| expected != id)
+            {
+                return false;
+            }
+            if matches!(update.kind, FrontendUpdateKind::ModelListLoaded { .. })
+                && self
+                    .models_list_request
+                    .is_some_and(|expected| expected != id)
             {
                 return false;
             }
@@ -864,6 +873,21 @@ fn apply_updates(
             continue;
         }
         if let FrontendUpdateKind::CommandRejected { reason } = &update.kind
+            && let Some(expected) = state.sync.models_list_request
+            && update.request_id == Some(expected)
+        {
+            state.sync.models_list_request = None;
+            effects.extend(app.ingest_appends(vec![Effect::Append(vec![TranscriptLine {
+                kind: LineKind::Error,
+                text: format!("error: model list unavailable: {reason}"),
+            }])]));
+            continue;
+        }
+        if matches!(update.kind, FrontendUpdateKind::ModelListLoaded { .. }) {
+            // One-shot: a later list needs a fresh request identity.
+            state.sync.models_list_request = None;
+        }
+        if let FrontendUpdateKind::CommandRejected { reason } = &update.kind
             && let Some(expected) = state.sync.preview_request
             && update.request_id == Some(expected)
             && let Some(session_id) = state.sync.preview_session_id.take()
@@ -1141,6 +1165,7 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
     let command = match request {
         HostRequest::NewSession => FrontendCommand::CreateSession,
         HostRequest::OpenSessions => FrontendCommand::ListSessions,
+        HostRequest::OpenModels => FrontendCommand::ListModels,
         HostRequest::LoadPreview(session_id) => {
             state.preview_generation = state.preview_generation.saturating_add(1);
             state.sync.preview_session_id = Some(session_id.clone());
@@ -1167,6 +1192,7 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
         CommandDispatch::Enqueued(id) => {
             match &command {
                 FrontendCommand::PreviewSession { .. } => state.sync.preview_request = Some(id),
+                FrontendCommand::ListModels => state.sync.models_list_request = Some(id),
                 FrontendCommand::InstallModel { .. } | FrontendCommand::SetReasoning { .. } => {
                     state.sync.model_request = Some(id);
                 }

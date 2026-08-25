@@ -218,12 +218,13 @@ impl App {
                 }
             }
             Ok(Command::Model { name: None }) => {
-                lines.push(line(LineKind::Error, "usage: /model <name>"));
+                effects.push(Effect::Host(HostRequest::OpenModels))
             }
             Ok(Command::Model { name: Some(name) }) => {
                 self.pending_model_switch = true;
                 effects.push(Effect::Host(HostRequest::RebuildModel(name)));
             }
+            Ok(Command::Models) => effects.push(Effect::Host(HostRequest::OpenModels)),
             Ok(Command::Reasoning { level: None }) => {
                 lines.push(line(
                     LineKind::Error,

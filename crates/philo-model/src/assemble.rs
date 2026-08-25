@@ -114,6 +114,35 @@ pub enum ChatReasoningFormat {
     EffortAndContent,
 }
 
+/// Per-deployment prompt-cache identity policy.
+///
+/// Providers encode cache affinity differently — OpenAI Chat uses a
+/// `prompt_cache_key` field, Responses uses a dedicated session-affinity
+/// encoding, and dialects without cache support drop the identity entirely.
+/// This policy selects how eagerly the SDK encodes it, plus advisory prefix
+/// breakpoints for dialects with native cache-control support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCachePolicy {
+    /// Whether (and how long) cache identity is encoded on requests.
+    /// The default is `Short`: send the session key / affinity headers
+    /// without asking for extended retention. `None` suppresses cache
+    /// identity even when a session id is present.
+    pub retention: sdk::CacheRetention,
+    /// Advisory prefix breakpoints (instructions / tools / history).
+    /// Dialects that honor them encode native cache breakpoints; every
+    /// other dialect drops them.
+    pub hints: sdk::PromptCacheHints,
+}
+
+impl Default for ModelCachePolicy {
+    fn default() -> Self {
+        Self {
+            retention: sdk::CacheRetention::Short,
+            hints: sdk::PromptCacheHints::default(),
+        }
+    }
+}
+
 impl ChatReasoningFormat {
     /// Returns the public configuration name for this Chat reasoning format.
     #[must_use]
@@ -154,23 +183,44 @@ impl fmt::Display for AdapterBuildError {
 
 impl Error for AdapterBuildError {}
 
+/// Where the endpoint credential comes from at call time.
+#[derive(Clone)]
+enum Credential {
+    /// Resolved from the environment by the SDK credential contract.
+    Environment(String),
+    /// A literal secret supplied by the deployment configuration. It is
+    /// wrapped in the SDK's redacting type and never logged by this crate.
+    Static(String),
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Environment(name) => formatter.debug_tuple("Environment").field(name).finish(),
+            // The literal form never renders its value.
+            Self::Static(_) => formatter.write_str("Static(<redacted>)"),
+        }
+    }
+}
+
 /// Assembles a `PhiloClient` and `CallTarget` for one provider deployment.
 ///
-/// The API key is referenced by environment-variable name and resolved by the
-/// SDK credential contract at call time; the secret value is never read,
-/// stored, or logged by this crate.
+/// The credential is either an environment-variable name resolved by the SDK
+/// credential contract at call time, or a literal secret handed to the SDK in
+/// its redacting wrapper; this crate never logs either form.
 #[derive(Clone, Debug)]
 pub struct PhiloModelBuilder {
     provider: String,
     protocol: ModelProtocol,
     model: String,
     endpoint: String,
-    api_key_env: Option<String>,
+    credential: Option<Credential>,
     request_headers: ModelRequestHeaders,
     replay_store: Option<Arc<dyn ModelReplayStore>>,
     compat: ModelCompat,
     chat_reasoning_format: Option<ChatReasoningFormat>,
     continuation_policy: ModelContinuationPolicy,
+    cache_policy: ModelCachePolicy,
     retry: Option<sdk::RetryPolicy>,
     timeouts: Option<sdk::TimeoutPolicy>,
 }
@@ -189,12 +239,13 @@ impl PhiloModelBuilder {
             protocol,
             model: model.into(),
             endpoint: endpoint.into(),
-            api_key_env: None,
+            credential: None,
             request_headers: ModelRequestHeaders::new(),
             replay_store: None,
             compat: ModelCompat::default(),
             chat_reasoning_format: None,
             continuation_policy: ModelContinuationPolicy::default(),
+            cache_policy: ModelCachePolicy::default(),
             retry: None,
             timeouts: None,
         }
@@ -202,7 +253,15 @@ impl PhiloModelBuilder {
 
     /// Names the environment variable holding the API key.
     pub fn api_key_env(mut self, variable: impl Into<String>) -> Self {
-        self.api_key_env = Some(variable.into());
+        self.credential = Some(Credential::Environment(variable.into()));
+        self
+    }
+
+    /// Supplies a literal API key for deployments that keep the secret in the
+    /// configuration file. The value is handed to the SDK in its redacting
+    /// wrapper; prefer [`PhiloModelBuilder::api_key_env`] where possible.
+    pub fn api_key(mut self, secret: impl Into<String>) -> Self {
+        self.credential = Some(Credential::Static(secret.into()));
         self
     }
 
@@ -237,6 +296,14 @@ impl PhiloModelBuilder {
     /// continuation. The default is fully stateless local replay.
     pub fn continuation_policy(mut self, policy: ModelContinuationPolicy) -> Self {
         self.continuation_policy = policy;
+        self
+    }
+
+    /// Configures how cache identity and breakpoints are encoded for this
+    /// deployment. The default sends a short-retention session key and no
+    /// breakpoint hints.
+    pub fn cache_policy(mut self, policy: ModelCachePolicy) -> Self {
+        self.cache_policy = policy;
         self
     }
 
@@ -325,7 +392,11 @@ impl PhiloModelBuilder {
                 )
             }
             ModelProtocol::OpenAiResponses => {
-                let compat = responses_compat(self.compat, prefers_continuation);
+                let compat = responses_compat(
+                    self.compat,
+                    prefers_continuation,
+                    self.cache_policy.retention,
+                );
                 let adapter = ext::OpenAiResponsesAdapter::with_compat(compat);
                 let envelope = adapter.capabilities().envelope().clone();
                 (
@@ -368,11 +439,19 @@ impl PhiloModelBuilder {
             .map_err(|error| AdapterBuildError::new(format!("provider binding rejected: {error}")))?
             .add_model(model_profile)
             .map_err(|error| AdapterBuildError::new(format!("model profile rejected: {error}")))?;
-        if let Some(variable) = &self.api_key_env {
-            let name = ext::EnvVarName::new(variable.as_str()).map_err(|error| {
-                AdapterBuildError::new(format!("invalid credential variable name: {error}"))
-            })?;
-            provider = provider.with_credentials(ext::CredentialSpec::Environment(name));
+        match &self.credential {
+            Some(Credential::Environment(variable)) => {
+                let name = ext::EnvVarName::new(variable.as_str()).map_err(|error| {
+                    AdapterBuildError::new(format!("invalid credential variable name: {error}"))
+                })?;
+                provider = provider.with_credentials(ext::CredentialSpec::Environment(name));
+            }
+            Some(Credential::Static(secret)) => {
+                provider = provider.with_credentials(ext::CredentialSpec::Static(
+                    ext::SecretString::new(secret.as_str()),
+                ));
+            }
+            None => {}
         }
 
         let mut client_builder = client_builder.register_provider(provider);
@@ -394,6 +473,7 @@ impl PhiloModelBuilder {
             target,
             replay_store,
             self.continuation_policy,
+            self.cache_policy,
         ))
     }
 }
@@ -447,19 +527,35 @@ fn chat_composition(
     Ok(composed.with_knowledge(sdk::CapabilityKnowledge::Complete))
 }
 
-fn responses_compat(compat: ModelCompat, prefers_continuation: bool) -> ext::OpenAiResponsesCompat {
+fn responses_compat(
+    compat: ModelCompat,
+    prefers_continuation: bool,
+    retention: sdk::CacheRetention,
+) -> ext::OpenAiResponsesCompat {
     match (compat, prefers_continuation) {
         (ModelCompat::Official, _) => ext::OpenAiResponsesCompat::default(),
         // SDK `compatible()` stays conservative (no cache identity) so unknown
-        // gateways do not 400. The agent opts in: newapi-class endpoints need
-        // a stable session key plus OpenAI-format affinity headers to pin the
-        // prefix to one cache replica.
-        (ModelCompat::Compatible, false) => ext::OpenAiResponsesCompat::compatible()
-            .with_cache_key(ext::OpenAiResponsesCacheKey::PromptCacheKey)
-            .with_session_affinity(ext::OpenAiResponsesSessionAffinity::OpenAi),
-        (ModelCompat::Compatible, true) => ext::OpenAiResponsesCompat::compatible()
-            .with_continuation(true)
-            .with_cache_key(ext::OpenAiResponsesCacheKey::PromptCacheKey)
-            .with_session_affinity(ext::OpenAiResponsesSessionAffinity::OpenAi),
+        // gateways do not 400. The agent opts in — per the deployment's cache
+        // policy — because newapi-class endpoints need a stable session key
+        // plus OpenAI-format affinity headers to pin the prefix to one cache
+        // replica. `CacheRetention::None` keeps the conservative encoding.
+        (ModelCompat::Compatible, false) => {
+            let base = ext::OpenAiResponsesCompat::compatible();
+            if retention == sdk::CacheRetention::None {
+                base
+            } else {
+                base.with_cache_key(ext::OpenAiResponsesCacheKey::PromptCacheKey)
+                    .with_session_affinity(ext::OpenAiResponsesSessionAffinity::OpenAi)
+            }
+        }
+        (ModelCompat::Compatible, true) => {
+            let base = ext::OpenAiResponsesCompat::compatible().with_continuation(true);
+            if retention == sdk::CacheRetention::None {
+                base
+            } else {
+                base.with_cache_key(ext::OpenAiResponsesCacheKey::PromptCacheKey)
+                    .with_session_affinity(ext::OpenAiResponsesSessionAffinity::OpenAi)
+            }
+        }
     }
 }

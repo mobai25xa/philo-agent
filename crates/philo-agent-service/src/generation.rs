@@ -30,6 +30,8 @@ pub struct AssembledGeneration {
     pub runtime_config: RuntimeConfig,
     /// User-facing model name. Never a secret.
     pub model_name: String,
+    /// Whether the model accepts image input parts.
+    pub image_input: bool,
 }
 
 /// Why generation assembly failed.
@@ -48,6 +50,18 @@ impl AssembleError {
     }
 }
 
+/// One selectable model advertised by the composition root. Ids are stable
+/// install identities; the service flags the current generation match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelListingEntry {
+    /// Stable model identity passed back verbatim to `InstallModel`.
+    pub id: String,
+    /// Owning provider id (display).
+    pub provider: String,
+    /// Model name within the provider (display).
+    pub model: String,
+}
+
 /// Injected by CLI (Wave 2) or tests. The service crate does not build models.
 pub trait GenerationAssembler: Send + Sync {
     /// Constructs a candidate generation in the background.
@@ -55,6 +69,12 @@ pub trait GenerationAssembler: Send + Sync {
         &self,
         request: AssembleRequest,
     ) -> Pin<Box<dyn Future<Output = Result<AssembledGeneration, AssembleError>> + Send + '_>>;
+
+    /// The model catalog for `ListModels`. Composition roots with a static
+    /// single-model deployment may keep the default empty catalog.
+    fn list_models(&self) -> Vec<ModelListingEntry> {
+        Vec::new()
+    }
 }
 
 /// Current generation cell. Install is atomic; failures leave the previous Arc.
@@ -118,6 +138,7 @@ impl CurrentGeneration {
             runtime_config: assembled.runtime_config,
             display: GenerationDisplay {
                 model_name: assembled.model_name,
+                image_input: assembled.image_input,
             },
         });
         self.current = next.clone();
@@ -161,6 +182,7 @@ mod tests {
             tools: empty_tools(),
             runtime_config: RuntimeConfig::default(),
             model_name: name.to_owned(),
+            image_input: true,
         }
     }
 

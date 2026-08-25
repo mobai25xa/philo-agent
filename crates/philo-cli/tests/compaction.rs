@@ -60,10 +60,11 @@ fn single_shot_uses_compaction_config_and_renders_automatic_events() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[deployment]\nmodel = \"stub-model\"\nendpoint = \"{endpoint}\"\n\
-             protocol = \"openai-chat\"\ndata_dir = '{}'\n\
-             [deployment.headers]\n\"User-Agent\" = \"philo-cli-test/1\"\n\
+            "data_dir = '{}'\n\
+             [providers.stub]\nendpoint = \"{endpoint}\"\nprotocol = \"openai-chat\"\n\
+             [providers.stub.headers]\n\"User-Agent\" = \"philo-cli-test/1\"\n\
              \"X-Title\" = \"Philo CLI Test\"\n\
+             [providers.stub.models]\n\"stub-model\" = {{}}\n\
              [compaction]\ncontext_budget = 1\nauto_threshold = 0.8\n\
              keep_recent_turns = 1\nestimate_bytes_per_token = 1\n",
             sessions_dir.display()

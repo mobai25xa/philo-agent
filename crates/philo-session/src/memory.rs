@@ -84,6 +84,7 @@ impl SessionStore for MemorySessionStore {
                 .map(|(session_id, projection)| SessionSummary {
                     session_id: session_id.clone(),
                     title: projection.title(),
+                    updated_at: None,
                 })
                 .collect())
         })

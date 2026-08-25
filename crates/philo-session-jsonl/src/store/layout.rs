@@ -87,6 +87,17 @@ pub(super) fn read_title_file(dir: &Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Reads the log's last modification as unix seconds. Failures are
+/// non-fatal: the timestamp is an advisory listing hint, not a durable fact.
+pub(super) fn read_updated_at(dir: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(dir.join(LOG_FILE))
+        .ok()?
+        .modified()
+        .ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since_epoch.as_secs())
+}
+
 /// Atomically rewrites (or clears) the title sidecar. Failures are
 /// non-fatal: the sidecar is a listing cache, not a durable fact.
 pub(super) fn write_title_file(dir: &Path, title: Option<&str>) {

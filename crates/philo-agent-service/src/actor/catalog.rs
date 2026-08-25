@@ -186,8 +186,10 @@ async fn rename_session_once(
     ))
 }
 
-/// Durable summaries plus committed current and in-flight pending load,
-/// then a stable sort by id.
+/// Durable summaries plus committed current and in-flight pending load.
+/// Order is most-recent-first by the advisory timestamp, with unknown or
+/// uncommitted sessions last, then stable by id. The order is explicit so
+/// frontends never guess.
 pub(super) fn compose_session_catalog(
     durable: Vec<SessionSummary>,
     current_session: Option<&str>,
@@ -198,6 +200,7 @@ pub(super) fn compose_session_catalog(
         .map(|summary| FrontendSessionSummary {
             session_id: summary.session_id.as_str().to_owned(),
             title: summary.title,
+            updated_at: summary.updated_at,
         })
         .collect();
     for extra in [current_session, pending_load] {
@@ -207,10 +210,16 @@ pub(super) fn compose_session_catalog(
             sessions.push(FrontendSessionSummary {
                 session_id: id.to_owned(),
                 title: None,
+                updated_at: None,
             });
         }
     }
-    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
     sessions
 }
 
@@ -230,12 +239,11 @@ mod tests {
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
 
-    use super::{compose_session_catalog, rename_session_once, catalog_error_reason};
+    use super::{catalog_error_reason, compose_session_catalog, rename_session_once};
     use crate::frontend::snapshot::FrontendSessionSummary;
     use philo_session::{
         MemorySessionStore, OperationId, SessionEntryKind, SessionError, SessionId,
-        SessionRevision, SessionStore, SessionSummary, SessionTransaction, SessionUserPart,
-        TurnId,
+        SessionRevision, SessionStore, SessionSummary, SessionTransaction, SessionUserPart, TurnId,
     };
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -252,6 +260,7 @@ mod tests {
         SessionSummary {
             session_id: SessionId::new(id),
             title: title.map(str::to_owned),
+            updated_at: None,
         }
     }
 
@@ -259,7 +268,61 @@ mod tests {
         FrontendSessionSummary {
             session_id: id.to_owned(),
             title: title.map(str::to_owned),
+            updated_at: None,
         }
+    }
+
+    #[test]
+    fn compose_orders_most_recent_first_with_unknowns_last() {
+        let ids = compose_session_catalog(
+            vec![
+                {
+                    let mut old = summary("sess-old", Some("old"));
+                    old.updated_at = Some(100);
+                    old
+                },
+                {
+                    let mut new = summary("sess-new", None);
+                    new.updated_at = Some(200);
+                    new
+                },
+                summary("sess-unknown", None),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            ids.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sess-new", "sess-old", "sess-unknown"]
+        );
+    }
+
+    #[test]
+    fn compose_ties_break_by_id() {
+        let ids = compose_session_catalog(
+            vec![
+                {
+                    let mut b = summary("sess-b", None);
+                    b.updated_at = Some(100);
+                    b
+                },
+                {
+                    let mut a = summary("sess-a", None);
+                    a.updated_at = Some(100);
+                    a
+                },
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            ids.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sess-a", "sess-b"]
+        );
     }
 
     #[test]
@@ -291,7 +354,9 @@ mod tests {
             None,
         );
         assert_eq!(
-            ids.iter().map(|s| s.session_id.as_str()).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
             ["sess-a", "sess-service-1", "sess-z"]
         );
     }
@@ -304,7 +369,9 @@ mod tests {
             None,
         );
         assert_eq!(
-            ids.iter().map(|s| s.session_id.as_str()).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
             ["sess-a", "sess-b"]
         );
     }
@@ -333,7 +400,9 @@ mod tests {
             Some("sess-pending"),
         );
         assert_eq!(
-            ids.iter().map(|s| s.session_id.as_str()).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
             ["sess-a", "sess-pending"]
         );
     }

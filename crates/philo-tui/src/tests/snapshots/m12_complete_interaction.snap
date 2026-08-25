@@ -1,16 +1,15 @@
 ---
 source: crates/philo-tui/src/tests/flow.rs
+assertion_line: 244
 expression: "output.join(\"\\n\")"
 ---
 Meta: /sessions
 overlay:
 sessions  1/2
-> count the files        | loading preview...
-  s-image                |
-                         |
-                         |
-                         |
-enter switch  ·  ↑↓ select  ·  esc close
+> count the files                                                               
+loading preview...
+  s-image                                                                       
+enter select  ·  ↑↓ move  ·  type to filter  ·  esc close
 Meta: session s-image
 User: 
 User: › look at this

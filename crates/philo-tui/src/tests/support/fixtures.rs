@@ -78,6 +78,7 @@ fn test_generation() -> FrontendGeneration {
         generation_id: "g-1".to_owned(),
         model_name: "m".to_owned(),
         reasoning_effort: None,
+        image_input: true,
         tool_names: Vec::new(),
     }
 }

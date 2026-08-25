@@ -145,6 +145,53 @@ async fn compatible_chat_stays_conservative_without_cache_identity() {
     assert!(headers.get("x-session-affinity").is_none());
 }
 
+/// The cache policy reaches the wire: `CacheRetention::None` suppresses the
+/// `prompt_cache_key` identity field even though every snapshot carries a
+/// session id, while the default short policy keeps it.
+#[tokio::test]
+async fn cache_policy_none_suppresses_the_cache_identity_field() {
+    let sse_body = text_sse("resp-1", "stub-gpt", &["ok"]);
+
+    let transport = StubTransport::new([StubResponse::Sse(sse_body.clone())]);
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiChat,
+        "stub-model",
+        support::STUB_ENDPOINT,
+    )
+    .compat(ModelCompat::Official)
+    .cache_policy(philo_model::ModelCachePolicy {
+        retention: philo_model::CacheRetention::None,
+        hints: philo_model::PromptCacheHints::default(),
+    })
+    .build_with_transport(transport.clone())
+    .expect("adapter assembly");
+    let stream = adapter
+        .start(snapshot(vec![user("hello")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+    assert!(
+        transport.request_bodies()[0]
+            .get("prompt_cache_key")
+            .is_none(),
+        "retention none must suppress the cache key"
+    );
+
+    // The default policy keeps today's short-retention encoding.
+    let transport = StubTransport::new([StubResponse::Sse(sse_body)]);
+    let adapter = adapter_over(transport.clone());
+    let stream = adapter
+        .start(snapshot(vec![user("hello")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+    assert_eq!(
+        transport.request_bodies()[0]["prompt_cache_key"],
+        "session-1"
+    );
+}
+
 const STUB_RESPONSES_ENDPOINT: &str = "https://stub.invalid/v1/responses";
 const MINIMAL_RESPONSE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -734,6 +781,45 @@ async fn api_key_env_resolves_to_a_bearer_authorization_header() {
         .get(AUTHORIZATION)
         .expect("authorization header present");
     assert_eq!(authorization.to_str().unwrap(), "Bearer test-secret");
+}
+
+#[tokio::test]
+async fn literal_api_key_resolves_to_the_same_bearer_header() {
+    let transport =
+        StubTransport::new([StubResponse::Sse(text_sse("resp-1", "stub-gpt", &["ok"]))]);
+    let adapter = PhiloModelAdapter::builder(
+        "stub-provider",
+        ModelProtocol::OpenAiChat,
+        "stub-model",
+        support::STUB_ENDPOINT,
+    )
+    .api_key("file-stored-secret")
+    .build_with_transport(transport.clone())
+    .expect("adapter assembly");
+    let stream = adapter
+        .start(snapshot(vec![user("hi")], Vec::new()))
+        .await
+        .expect("call starts");
+    collect_ok(stream).await;
+
+    let requests = transport.requests();
+    let authorization = requests[0]
+        .headers
+        .get(AUTHORIZATION)
+        .expect("authorization header present");
+    assert_eq!(authorization.to_str().unwrap(), "Bearer file-stored-secret");
+    // The builder's debug output must not carry the secret either.
+    let debug = format!(
+        "{:?}",
+        PhiloModelAdapter::builder(
+            "stub-provider",
+            ModelProtocol::OpenAiChat,
+            "stub-model",
+            support::STUB_ENDPOINT,
+        )
+        .api_key("file-stored-secret")
+    );
+    assert!(!debug.contains("file-stored-secret"), "{debug}");
 }
 
 #[tokio::test]

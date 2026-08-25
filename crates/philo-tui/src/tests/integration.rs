@@ -338,7 +338,10 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         "a terminal cancellation fact cannot overtake accepted text",
     );
 
-    app.open_picker(vec![PickerEntry::untitled("session-m14"), PickerEntry::untitled("session-next")]);
+    app.open_picker(vec![
+        PickerEntry::untitled("session-m14"),
+        PickerEntry::untitled("session-next"),
+    ]);
     assert_responsive_composer(&app, &expected_rows);
     app.on_action(Action::Escape);
     app.sync_confirmation(Some((
@@ -400,4 +403,3 @@ async fn start_test_service_client_accepts_attach_and_load() {
         .await
         .expect("detach");
 }
-

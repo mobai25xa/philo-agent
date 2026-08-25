@@ -29,7 +29,7 @@ pub fn generation(
         model,
         tools,
         runtime_config: config,
-        display: GenerationDisplay { model_name },
+        display: GenerationDisplay { model_name, image_input: true },
     })
 }
 

@@ -7,6 +7,9 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GenerationDisplay {
     pub model_name: String,
+    /// Whether the model accepts image input parts. Submits carrying image
+    /// attachments are rejected while this is `false`.
+    pub image_input: bool,
 }
 
 /// Immutable model/tools/config snapshot used at admission and throughout

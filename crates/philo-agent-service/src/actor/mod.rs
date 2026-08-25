@@ -322,6 +322,7 @@ where
                 self.spawn_cancel_maintenance(request_id, maintenance_id);
             }
             FrontendCommand::ListSessions => self.handle_list_sessions(request_id),
+            FrontendCommand::ListModels => self.handle_list_models(request_id),
             FrontendCommand::RenameSession { session_id, title } => {
                 self.handle_rename_session(request_id, session_id, title);
             }
@@ -624,9 +625,7 @@ where
                     self.feed.cancel_request(request_id);
                 } else {
                     match result {
-                        Ok(()) => {
-                            self.emit(Some(request_id), FrontendUpdateKind::CommandAccepted)
-                        }
+                        Ok(()) => self.emit(Some(request_id), FrontendUpdateKind::CommandAccepted),
                         Err(reason) => self.emit(
                             Some(request_id),
                             FrontendUpdateKind::CommandRejected {

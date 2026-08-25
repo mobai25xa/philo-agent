@@ -34,25 +34,27 @@ pub use frontend::{
     FrontendAssistantBlock, FrontendAttachment, FrontendAvailability, FrontendClient,
     FrontendCommand, FrontendConfigEntry, FrontendContextMessage, FrontendFailure,
     FrontendGeneration, FrontendLease, FrontendLeaseGeneration, FrontendMaintenance,
-    FrontendMaintenancePhase, FrontendOpenTurn, FrontendOperationEvent, FrontendReasoningEffort,
-    FrontendSessionSummary, FrontendSnapshot, FrontendStatus, FrontendTokenUsage,
-    FrontendToolDisplay, FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome,
-    FrontendUnfilledBatch, FrontendUpdate, FrontendUpdateKind, FrontendUserPart,
-    PendingConfirmationView, QueuedOperationSummary, ResyncRequired, ServiceHealth,
-    SupervisorCommand,
+    FrontendMaintenancePhase, FrontendModelListing, FrontendOpenTurn, FrontendOperationEvent,
+    FrontendReasoningEffort, FrontendSessionSummary, FrontendSnapshot, FrontendStatus,
+    FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing, FrontendToolResult,
+    FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUpdate, FrontendUpdateKind,
+    FrontendUserPart, PendingConfirmationView, QueuedOperationSummary, ResyncRequired,
+    ServiceHealth, SupervisorCommand,
 };
-pub use generation::{AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler};
+pub use generation::{
+    AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler, ModelListingEntry,
+};
 pub use ids::{FrontendEpoch, FrontendInstanceId, FrontendRequestId, FrontendRevision};
 pub use live::{LiveOperationSnapshot, LiveToolProgress};
-pub use philo_agent_runtime::{
-    AdmissionError, CancelResult, ChannelBounds, CompactionSpec, ForcedSettlement,
-    FailureDomain, FailureStage, GenerationDisplay, GenerationId, MaintenanceAccepted,
-    MaintenanceError, MaintenanceId, MaintenanceResult, OperationAccepted, OperationSpec,
-    QueuedOperationSnapshot, RetryDisposition, RuntimeEvent, RuntimeEventReceiver,
-    RuntimeGeneration, RuntimeHandle, RuntimeParts, RuntimeSnapshot, SettlementRevision,
-    ShutdownError, ShutdownMode, ShutdownReport, TryRecvError,
-};
 pub use mapping::{failure_dto, operation_event};
+pub use philo_agent_runtime::{
+    AdmissionError, CancelResult, ChannelBounds, CompactionSpec, FailureDomain, FailureStage,
+    ForcedSettlement, GenerationDisplay, GenerationId, MaintenanceAccepted, MaintenanceError,
+    MaintenanceId, MaintenanceResult, OperationAccepted, OperationSpec, QueuedOperationSnapshot,
+    RetryDisposition, RuntimeEvent, RuntimeEventReceiver, RuntimeGeneration, RuntimeHandle,
+    RuntimeParts, RuntimeSnapshot, SettlementRevision, ShutdownError, ShutdownMode, ShutdownReport,
+    TryRecvError,
+};
 pub use presentation::{FailureLine, FailureLineStyle, retry_scheduled_lines, turn_failed_lines};
 pub use runtime_api::{RuntimeEvents, RuntimePort};
 pub use service::{AgentService, ServiceDeps, start};

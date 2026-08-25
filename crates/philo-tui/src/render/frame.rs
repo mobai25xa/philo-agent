@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::activity::ActivityTone;
+use crate::app::overlay::OverlayRow;
 use crate::app::select::BandLayout;
 use crate::app::state::App;
 use crate::app::text;
@@ -283,20 +284,85 @@ fn draw_overlay(
     area: Rect,
     overlay: crate::app::overlay::OverlayFrame,
 ) {
-    let title_style = if overlay.title.starts_with("approval") {
-        theme::activity_warning().add_modifier(Modifier::BOLD)
-    } else {
-        theme::activity_normal().add_modifier(Modifier::BOLD)
+    use crate::app::overlay::OverlayTone; // The overlay floats on its own full-width surface so it reads apart
+    // from the transcript; it shares the band family with the composer.
+    frame.render_widget(Block::default().style(theme::menu_panel()), area);
+    let width = usize::from(area.width);
+    let title_style = match overlay.tone {
+        OverlayTone::Warning => theme::activity_warning().add_modifier(Modifier::BOLD),
+        OverlayTone::Normal => theme::activity_normal().add_modifier(Modifier::BOLD),
     };
-    let mut lines = vec![Line::styled(overlay.title, title_style)];
-    if area.height > 2 {
-        lines.extend(overlay.body.into_iter().map(Line::from));
+    let mut lines = vec![Line::styled(overlay.title.clone(), title_style)];
+    for line in overlay.body {
+        lines.push(overlay_line(&line.row, line.selected, width));
     }
     if area.height > 1 {
         lines.push(Line::styled(overlay.footer, theme::meta()));
     }
     lines.truncate(usize::from(area.height));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Styles one overlay row. Selected rows fill the full content width with
+/// the accent tint, matching the command menu's highlight language.
+fn overlay_line(row: &OverlayRow, selected: bool, width: usize) -> Line<'static> {
+    match row {
+        OverlayRow::Text(text) => {
+            if selected {
+                Line::styled(text.clone(), theme::menu_selected_row())
+            } else {
+                Line::from(text.clone())
+            }
+        }
+        OverlayRow::Group(name) => Line::styled(
+            text::truncate(&format!("  {name}"), width),
+            theme::meta().add_modifier(Modifier::ITALIC),
+        ),
+        OverlayRow::Empty(message) => Line::styled(
+            text::truncate(&format!("  {message}"), width),
+            theme::placeholder(),
+        ),
+        OverlayRow::Detail(detail) => Line::styled(
+            text::truncate(&format!("    {detail}"), width),
+            theme::meta(),
+        ),
+        OverlayRow::Entry {
+            marked,
+            primary,
+            secondary,
+        } => {
+            let marker = if *marked { "›" } else { " " };
+            if selected {
+                // Fill the row so the accent band spans the panel width.
+                let mut spans = vec![
+                    Span::styled(format!("{marker} "), theme::menu_selected_row()),
+                    Span::styled(primary.clone(), theme::menu_selected_row()),
+                    Span::styled("  ", theme::menu_selected_row()),
+                    Span::styled(secondary.clone(), theme::menu_selected_row()),
+                ];
+                let used: usize = spans.iter().map(|span| text::width(&span.content)).sum();
+                if used < width {
+                    spans.push(Span::styled(
+                        " ".repeat(width - used),
+                        theme::menu_selected_row(),
+                    ));
+                }
+                Line::from(spans)
+            } else {
+                let secondary_style = if secondary.trim().is_empty() {
+                    theme::meta()
+                } else {
+                    theme::rule()
+                };
+                Line::from(vec![
+                    Span::styled(format!("{marker} "), theme::answer_gutter()),
+                    Span::from(primary.clone()),
+                    Span::from("  "),
+                    Span::styled(secondary.clone(), secondary_style),
+                ])
+            }
+        }
+    }
 }
 
 fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {

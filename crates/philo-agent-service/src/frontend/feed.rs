@@ -339,6 +339,7 @@ mod tests {
                     generation_id: "test".into(),
                     model_name: "test".into(),
                     reasoning_effort: None,
+                    image_input: true,
                     tool_names: Vec::new(),
                 },
                 usage: None,

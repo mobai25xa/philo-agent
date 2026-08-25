@@ -1,24 +1,59 @@
 //! Overlay state and its pure frame projection.
 //!
-//! Two overlays exist in v1: the session picker (`/sessions`) and the
-//! approval prompt fed by `ConfirmationRequested`. Both project to an
-//! [`OverlayFrame`] of plain text so the content is snapshot-testable and
-//! the terminal shell only has to paint it. Overlays are transient bottom
-//! panel content: they never touch the scrollback and never intercept
-//! frontend updates.
+//! Three overlays exist: the session picker (`/sessions`), the model picker
+//! (`/models`), and the approval prompt fed by `ConfirmationRequested`. All
+//! project to an [`OverlayFrame`] of typed rows so the content is snapshot-
+//! testable and the terminal shell only paints it. Overlays are transient
+//! bottom-panel content: they never touch the scrollback and never
+//! intercept frontend updates.
 
 use std::collections::HashMap;
 
 use super::text;
 
-/// Width of the session column in the picker.
-const LIST_WIDTH: usize = 22;
+/// Visual weight of the overlay title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayTone {
+    /// Regular pickers.
+    Normal,
+    /// The approval prompt.
+    Warning,
+}
 
-/// Rendered overlay content: a title, body rows, and one footer of hints.
+/// One paintable overlay row. Structure stays presentation-only; the shell
+/// derives styles from the variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverlayRow {
+    /// Plain body text (approval prompts).
+    Text(String),
+    /// A dim section header (`/models` provider groups).
+    Group(String),
+    /// A selectable row: accent mark column, primary label, right-aligned
+    /// secondary meta.
+    Entry {
+        marked: bool,
+        primary: String,
+        secondary: String,
+    },
+    /// An indented secondary line under the highlighted entry (previews).
+    Detail(String),
+    /// A quiet placeholder row ("no matches").
+    Empty(String),
+}
+
+/// One projected row plus its selection state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayLine {
+    pub row: OverlayRow,
+    pub selected: bool,
+}
+
+/// Rendered overlay content: a title, typed body rows, and one footer of hints.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayFrame {
     pub title: String,
-    pub body: Vec<String>,
+    pub tone: OverlayTone,
+    pub body: Vec<OverlayLine>,
     pub footer: String,
 }
 
@@ -27,9 +62,22 @@ impl OverlayFrame {
     #[cfg(test)]
     pub fn to_text(&self) -> String {
         let mut text = String::from(&self.title);
-        for row in &self.body {
+        for line in &self.body {
             text.push('\n');
-            text.push_str(row.trim_end());
+            match &line.row {
+                OverlayRow::Text(value)
+                | OverlayRow::Group(value)
+                | OverlayRow::Detail(value)
+                | OverlayRow::Empty(value) => text.push_str(value.trim_end()),
+                OverlayRow::Entry {
+                    marked,
+                    primary,
+                    secondary,
+                } => {
+                    let marker = if *marked && line.selected { ">" } else { " " };
+                    text.push_str(&format!("{marker} {primary}  {secondary}"));
+                }
+            }
         }
         text.push('\n');
         text.push_str(&self.footer);
@@ -45,55 +93,95 @@ pub enum Preview {
     Failed(String),
 }
 
-/// One listed session: the durable id plus an advisory display title.
-/// The picker shows the title when present and falls back to the id.
+/// One listed row: a stable identity plus its display facts.
+/// Sessions show the title (falling back to the id) with a relative time;
+/// models show the composite id with the owning provider as meta.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PickerEntry {
     pub(crate) id: String,
-    pub(crate) title: Option<String>,
+    pub(crate) primary: String,
+    pub(crate) secondary: String,
+    /// Grouping key (`""` disables grouping).
+    pub(crate) group: String,
+    /// Whether this entry is the current session / current model.
+    pub(crate) marked: bool,
 }
 
 impl PickerEntry {
     #[cfg(test)]
     pub(crate) fn untitled(id: impl Into<String>) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
-            title: None,
+            primary: id.clone(),
+            id,
+            secondary: String::new(),
+            group: String::new(),
+            marked: false,
         }
-    }
-
-    /// What the list column renders for this row.
-    fn display_name(&self) -> &str {
-        self.title.as_deref().unwrap_or(&self.id)
     }
 }
 
-/// The `/sessions` overlay: a list, a lazily loaded preview of the
-/// highlighted session, and a selection cursor.
+/// The `/sessions` and `/models` overlay: a live-filtered list with a
+/// selection cursor and (sessions only) lazily loaded previews rendered as
+/// detail rows under the highlight.
 #[derive(Clone, Debug)]
-pub struct SessionPicker {
-    sessions: Vec<PickerEntry>,
+pub struct Picker {
+    title: &'static str,
+    grouped: bool,
+    entries: Vec<PickerEntry>,
+    /// Case-insensitive substring query typed while the picker is open.
+    filter: String,
+    /// Index into [`Picker::visible`], not into `entries`.
     selected: usize,
+    /// Selection held across filter edits: remembered when the filter first
+    /// hides the highlighted entry, restored once it matches again.
+    restore: Option<String>,
     previews: HashMap<String, Preview>,
 }
 
-impl SessionPicker {
-    /// Opens a picker over a non-empty session list.
-    pub(crate) fn new(sessions: Vec<PickerEntry>) -> Self {
-        debug_assert!(
-            !sessions.is_empty(),
-            "the picker needs at least one session"
-        );
+impl Picker {
+    pub(crate) fn new(title: &'static str, grouped: bool, entries: Vec<PickerEntry>) -> Self {
+        debug_assert!(!entries.is_empty(), "the picker needs at least one entry");
         Self {
-            sessions,
+            title,
+            grouped,
+            entries,
+            filter: String::new(),
             selected: 0,
+            restore: None,
             previews: HashMap::new(),
         }
     }
 
-    /// The highlighted session.
+    /// Indices of entries matching the active filter.
+    fn visible(&self) -> Vec<usize> {
+        let query = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                query.is_empty()
+                    || entry.primary.to_lowercase().contains(&query)
+                    || entry.secondary.to_lowercase().contains(&query)
+                    || entry.group.to_lowercase().contains(&query)
+                    || entry.id.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The highlighted entry's stable identity (empty when nothing matches).
     pub fn selected(&self) -> &str {
-        &self.sessions[self.selected].id
+        let visible = self.visible();
+        match visible.get(self.selected.min(visible.len().saturating_sub(1))) {
+            Some(index) => &self.entries[*index].id,
+            None => "",
+        }
+    }
+
+    /// Whether this picker lists models (grouped rows, no previews).
+    pub(crate) fn is_models(&self) -> bool {
+        self.grouped
     }
 
     /// Moves the highlight; returns whether it actually moved.
@@ -107,11 +195,51 @@ impl SessionPicker {
 
     /// Moves the highlight; returns whether it actually moved.
     pub(crate) fn move_down(&mut self) -> bool {
-        if self.selected + 1 >= self.sessions.len() {
+        if self.selected + 1 >= self.visible().len() {
             return false;
         }
         self.selected += 1;
         true
+    }
+
+    /// Jumps the highlight to the first or last visible row.
+    pub(crate) fn jump(&mut self, to_top: bool) -> bool {
+        let len = self.visible().len();
+        let target = if to_top { 0 } else { len.saturating_sub(1) };
+        if self.selected == target {
+            return false;
+        }
+        self.selected = target;
+        true
+    }
+
+    /// Appends one filter character; keeps the current entry selected when
+    /// it still matches, otherwise resets the highlight to the top.
+    pub(crate) fn push_filter(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.reselect();
+    }
+
+    /// Removes the last filter character, with the same keep-selection rule.
+    pub(crate) fn pop_filter(&mut self) {
+        if self.filter.pop().is_some() {
+            self.reselect();
+        }
+    }
+
+    fn reselect(&mut self) {
+        let current = self.selected().to_owned();
+        if !current.is_empty() {
+            self.restore.get_or_insert(current);
+        }
+        let anchor = self.restore.clone();
+        self.selected = anchor
+            .and_then(|id| {
+                self.visible()
+                    .iter()
+                    .position(|index| self.entries[*index].id == id)
+            })
+            .unwrap_or(0);
     }
 
     /// Claims the preview load for the current selection: yields the id
@@ -119,7 +247,7 @@ impl SessionPicker {
     /// fetched at most once per session per overlay.
     pub(crate) fn claim_preview(&mut self) -> Option<String> {
         let id = self.selected().to_owned();
-        if self.previews.contains_key(&id) {
+        if id.is_empty() || self.previews.contains_key(&id) {
             return None;
         }
         self.previews.insert(id.clone(), Preview::Loading);
@@ -131,6 +259,10 @@ impl SessionPicker {
         self.previews.insert(id.to_owned(), preview);
     }
 
+    fn has_preview_pane(&self) -> bool {
+        self.previews.contains_key(self.selected())
+    }
+
     /// Projects the overlay content for a body of `height` rows.
     #[cfg(test)]
     pub(crate) fn frame(&self, height: usize) -> OverlayFrame {
@@ -138,54 +270,142 @@ impl SessionPicker {
     }
 
     pub(crate) fn frame_for(&self, height: usize, width: usize) -> OverlayFrame {
-        let rows = height.max(1);
-        let start = if self.selected >= rows {
-            self.selected + 1 - rows
-        } else {
-            0
-        };
-        let preview = self.preview_rows();
-        let show_preview = width >= 32;
-        let list_width = if show_preview {
-            LIST_WIDTH.min((width / 2).saturating_sub(3).max(10))
-        } else {
-            width.saturating_sub(2).max(1)
-        };
-        let body = (0..rows)
-            .map(|offset| {
-                let index = start + offset;
-                let entry = self.sessions.get(index).map_or_else(
-                    || " ".repeat(list_width + 2),
-                    |session| {
-                        let marker = if index == self.selected { ">" } else { " " };
-                        format!("{marker} {}", cell(session.display_name(), list_width))
-                    },
-                );
-                if !show_preview {
-                    return text::truncate(&entry, width);
+        let visible = self.visible();
+        let total = visible.len();
+        let filter_rows = usize::from(!self.filter.is_empty());
+        // Detail rows that follow the highlighted entry (previews).
+        let detail_lines = self.detail_rows();
+        let detail_rows = usize::from(self.has_preview_pane()) * detail_lines.len();
+
+        // Window start: keep every row above the highlight on screen when
+        // possible; otherwise slide so the highlight stays visible.
+        let mut sequence: Vec<(OverlayRow, usize)> = Vec::new();
+        let mut last_group = String::new();
+        for (position, index) in visible.iter().enumerate() {
+            let entry = &self.entries[*index];
+            if self.grouped && entry.group != last_group {
+                last_group = entry.group.clone();
+                sequence.push((OverlayRow::Group(entry.group.clone()), position));
+            }
+            sequence.push((
+                OverlayRow::Entry {
+                    marked: entry.marked,
+                    primary: entry.primary.clone(),
+                    secondary: entry.secondary.clone(),
+                },
+                position,
+            ));
+            if position == self.selected.min(total.saturating_sub(1)) && detail_rows > 0 {
+                for line in &detail_lines {
+                    sequence.push((OverlayRow::Detail(line.clone()), position));
                 }
-                let preview_row = preview.get(offset).map_or("", String::as_str);
-                let prefix = format!("{entry} | ");
-                let available = width.saturating_sub(text::width(&prefix));
-                format!("{prefix}{}", text::truncate(preview_row, available))
-            })
-            .collect();
+            }
+        }
+        let selected_row = sequence
+            .iter()
+            .position(|(_, position)| *position == self.selected.min(total.saturating_sub(1)))
+            .unwrap_or(0);
+        let capacity = height.max(1).saturating_sub(filter_rows);
+        let rows_below_highlight = detail_rows;
+        let keep_above = capacity.saturating_sub(1 + rows_below_highlight);
+        let mut start = selected_row.saturating_sub(keep_above);
+        // Never lead with an orphaned group header.
+        while start < sequence.len()
+            && matches!(sequence[start].0, OverlayRow::Group(_))
+            && start < selected_row
+        {
+            start += 1;
+        }
+
+        let mut lines: Vec<OverlayLine> = Vec::new();
+        if filter_rows > 0 {
+            lines.push(OverlayLine {
+                row: OverlayRow::Text(format!("filter {}", self.filter)),
+                selected: false,
+            });
+        }
+        for (row, position) in sequence.iter().skip(start).take(capacity) {
+            lines.push(OverlayLine {
+                row: pad_entry(row.clone(), width),
+                selected: *position == self.selected.min(total.saturating_sub(1)),
+            });
+        }
+        if total == 0 {
+            lines.push(OverlayLine {
+                row: OverlayRow::Empty("no matches".to_owned()),
+                selected: false,
+            });
+        }
+        let highlighted = self.selected.min(total.saturating_sub(1));
         OverlayFrame {
             title: text::truncate(
-                &format!("sessions  {}/{}", self.selected + 1, self.sessions.len()),
+                &format!(
+                    "{}  {}/{}",
+                    self.title,
+                    usize::from(total > 0) * (highlighted + 1),
+                    total
+                ),
                 width,
             ),
-            body,
-            footer: text::truncate("enter switch  ·  ↑↓ select  ·  esc close", width),
+            tone: OverlayTone::Normal,
+            body: lines,
+            footer: text::truncate(
+                "enter select  ·  ↑↓ move  ·  type to filter  ·  esc close",
+                width,
+            ),
         }
     }
 
-    fn preview_rows(&self) -> Vec<String> {
+    fn detail_rows(&self) -> Vec<String> {
         match self.previews.get(self.selected()) {
             None | Some(Preview::Loading) => vec!["loading preview...".to_owned()],
-            Some(Preview::Ready(lines)) => lines.clone(),
+            Some(Preview::Ready(lines)) => lines.iter().take(4).cloned().collect(),
             Some(Preview::Failed(message)) => vec![format!("preview unavailable: {message}")],
         }
+    }
+}
+
+/// Fits selectable entries to the row budget: the secondary meta shrinks (and
+/// finally the primary truncates) so full-row highlights fill but never
+/// overflow the panel width.
+fn pad_entry(row: OverlayRow, width: usize) -> OverlayRow {
+    match row {
+        OverlayRow::Entry {
+            marked,
+            primary,
+            secondary,
+        } => {
+            // marker column + gap + primary + gap.
+            let budget = width.saturating_sub(4);
+            let mut primary = primary;
+            if text::width(&primary) > budget {
+                primary = text::truncate(&primary, budget);
+            }
+            let secondary_budget = budget.saturating_sub(text::width(&primary));
+            OverlayRow::Entry {
+                marked,
+                primary,
+                secondary: text::truncate(
+                    &text::pad(&secondary, secondary_budget),
+                    secondary_budget,
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Flat display width of one row (test helper).
+#[cfg(test)]
+fn row_width(row: OverlayRow) -> usize {
+    match row {
+        OverlayRow::Text(value)
+        | OverlayRow::Group(value)
+        | OverlayRow::Detail(value)
+        | OverlayRow::Empty(value) => text::width(&value),
+        OverlayRow::Entry {
+            primary, secondary, ..
+        } => text::width(&format!("  {primary}  {secondary}")),
     }
 }
 
@@ -224,31 +444,34 @@ impl ConfirmPrompt {
             .body
             .lines()
             .take(height.max(1))
-            .map(|line| text::truncate(line, width))
+            .map(|line| OverlayLine {
+                row: OverlayRow::Text(text::truncate(line, width)),
+                selected: false,
+            })
             .collect();
         OverlayFrame {
             title: text::truncate(&format!("approval required  ·  {}", self.title), width),
+            tone: OverlayTone::Warning,
             body,
             footer: text::truncate("y allow  ·  n / esc deny", width),
         }
     }
 }
 
-/// Truncates and pads to exactly `width` terminal cells.
-fn cell(text: &str, width: usize) -> String {
-    text::pad(text, width)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn picker() -> SessionPicker {
-        SessionPicker::new(vec![
-            PickerEntry::untitled("s-1"),
-            PickerEntry::untitled("s-2"),
-            PickerEntry::untitled("s-3"),
-        ])
+    fn picker() -> Picker {
+        Picker::new(
+            "sessions",
+            false,
+            vec![
+                PickerEntry::untitled("s-1"),
+                PickerEntry::untitled("s-2"),
+                PickerEntry::untitled("s-3"),
+            ],
+        )
     }
 
     #[test]
@@ -278,8 +501,12 @@ mod tests {
         picker.move_down();
         picker.move_down();
         let frame = picker.frame(2);
-        assert!(frame.body[0].starts_with("  s-2"), "{frame:?}");
-        assert!(frame.body[1].starts_with("> s-3"), "{frame:?}");
+        let OverlayRow::Entry { primary, .. } = &frame.body[0].row else {
+            panic!("entry row expected");
+        };
+        assert!(primary.contains("s-2"), "{frame:?}");
+        assert!(!frame.body[0].selected);
+        assert!(frame.body[1].selected);
     }
 
     #[test]
@@ -300,7 +527,7 @@ mod tests {
         picker.set_preview("s-1", Preview::Failed("store busy".to_owned()));
         let frame = picker.frame(2);
         assert!(
-            frame.body[0].contains("preview unavailable: store busy"),
+            format!("{:?}", frame.body).contains("preview unavailable: store busy"),
             "{frame:?}"
         );
     }
@@ -316,38 +543,104 @@ mod tests {
     }
 
     #[test]
-    fn long_ids_truncate_inside_the_column() {
-        let picker = SessionPicker::new(vec![PickerEntry::untitled(
-            "session-with-a-very-long-identifier-indeed",
-        )]);
-        let frame = picker.frame(1);
+    fn long_ids_truncate_to_fit_the_row() {
+        let picker = Picker::new(
+            "sessions",
+            false,
+            vec![PickerEntry::untitled(
+                "session-with-a-very-long-identifier-indeed",
+            )],
+        );
+        let frame = picker.frame_for(1, 40);
+        let OverlayRow::Entry { primary, .. } = &frame.body[0].row else {
+            panic!("entry row expected");
+        };
         assert!(
-            frame.body[0].starts_with("> session-with-a-very..."),
+            primary.starts_with("session-with-a-very-long-identifi"),
+            "{primary}"
+        );
+        assert!(row_width(frame.body[0].row.clone()) <= 40, "{frame:?}");
+    }
+
+    #[test]
+    fn titled_sessions_render_the_title_in_the_column() {
+        let mut picker = Picker::new(
+            "sessions",
+            false,
+            vec![
+                PickerEntry {
+                    id: "sess-1982ab3-41".to_owned(),
+                    primary: "fix the login bug".to_owned(),
+                    secondary: "3h".to_owned(),
+                    group: String::new(),
+                    marked: true,
+                },
+                PickerEntry::untitled("sess-1982cd7-42"),
+            ],
+        );
+        picker.move_down();
+        let frame = picker.frame(2);
+        assert!(
+            frame.body.iter().any(|line| line.selected
+                && matches!(
+                    &line.row,
+                    OverlayRow::Entry { primary, .. } if primary.contains("sess-1982cd7-42")
+                )),
             "{frame:?}"
         );
     }
 
     #[test]
-    fn titled_sessions_render_the_title_in_the_column() {
-        let mut picker = SessionPicker::new(vec![
-            PickerEntry {
-                id: "sess-1982ab3-41".to_owned(),
-                title: Some("fix the login bug".to_owned()),
-            },
-            PickerEntry::untitled("sess-1982cd7-42"),
-        ]);
-        picker.move_down();
-        let frame = picker.frame(2);
-        assert!(frame.body[0].contains("fix the login bug"), "{frame:?}");
-        assert!(frame.body[1].starts_with("> sess-1982cd7-42"), "{frame:?}");
+    fn narrow_picker_keeps_rows_within_cell_width() {
+        let picker = Picker::new(
+            "sessions",
+            false,
+            vec![PickerEntry::untitled("中文-session-name")],
+        );
+        let frame = picker.frame_for(2, 20);
+        assert!(
+            frame
+                .body
+                .iter()
+                .all(|line| row_width(line.row.clone()) <= 20),
+            "{frame:?}"
+        );
     }
 
     #[test]
-    fn narrow_picker_omits_preview_and_respects_cell_width() {
-        let picker =
-            SessionPicker::new(vec![PickerEntry::untitled("中文-session-name")]);
-        let frame = picker.frame_for(2, 20);
-        assert!(frame.body.iter().all(|line| text::width(line) <= 20));
-        assert!(!frame.body[0].contains(" | "));
+    fn filtering_narrows_and_restores_selection_on_clearing() {
+        let mut picker = picker();
+        picker.move_down();
+        picker.move_down();
+        assert_eq!(picker.selected(), "s-3");
+        for ch in "-2".chars() {
+            picker.push_filter(ch);
+        }
+        assert_eq!(picker.selected(), "s-2", "kept the highlighted entry");
+        picker.pop_filter();
+        picker.pop_filter();
+        assert_eq!(picker.selected(), "s-3", "selection restored");
+    }
+
+    #[test]
+    fn filtered_views_reset_to_top_when_the_entry_vanishes() {
+        let mut picker = picker();
+        picker.move_down();
+        for ch in "-3".chars() {
+            picker.push_filter(ch);
+        }
+        assert_eq!(picker.selected(), "s-3");
+        picker.pop_filter();
+        for ch in "-9".chars() {
+            picker.push_filter(ch);
+        }
+        let frame = picker.frame(3);
+        assert!(
+            frame
+                .body
+                .iter()
+                .any(|line| line.row == OverlayRow::Empty("no matches".to_owned())),
+            "{frame:?}"
+        );
     }
 }

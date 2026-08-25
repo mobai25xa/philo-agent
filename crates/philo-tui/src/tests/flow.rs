@@ -57,10 +57,12 @@ fn frontend_complete_interaction_snapshot() {
                         FrontendSessionSummary {
                             session_id: "s-1".to_owned(),
                             title: Some("count the files".to_owned()),
+                            updated_at: None,
                         },
                         FrontendSessionSummary {
                             session_id: "s-image".to_owned(),
                             title: None,
+                            updated_at: None,
                         },
                     ],
                 },

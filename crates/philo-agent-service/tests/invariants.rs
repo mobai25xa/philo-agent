@@ -512,6 +512,7 @@ fn frontend_generation_still_has_model_name() {
         generation_id: "g-1".into(),
         model_name: "base".into(),
         reasoning_effort: None,
+        image_input: true,
         tool_names: Vec::new(),
     };
     assert_eq!(display.model_name, "base");
@@ -769,6 +770,73 @@ async fn submit_admission_failure_is_rejected() {
             .all(|kind| !matches!(kind, FrontendUpdateKind::SubmitAccepted { .. })),
         "failed submit must not emit SubmitAccepted: {extras:?}"
     );
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn image_attachments_are_rejected_when_the_model_has_no_image_input() {
+    use std::sync::Arc;
+
+    use philo_agent_service::FrontendAttachment;
+    use philo_agent_service::testing::start_test_service_with_generation;
+    use philo_agent_runtime::{GenerationDisplay, RuntimeGeneration};
+
+    let text_only = Arc::new(RuntimeGeneration {
+        generation_id: philo_agent_runtime::GenerationId::new("generation-0"),
+        model: Arc::new(philo_agent_service::testing::UnavailableModel),
+        tools: philo_agent_service::testing::empty_tools(),
+        runtime_config: Default::default(),
+        display: GenerationDisplay {
+            model_name: "text-only".to_owned(),
+            image_input: false,
+        },
+    });
+    let (service, client, _runtime) = start_test_service_with_generation(
+        FakeAssembler::new(),
+        MemorySessionStore::new(),
+        text_only,
+    );
+    assert!(matches!(
+        client.try_command(FrontendCommand::LoadSession {
+            session_id: "sess-1".into(),
+        }),
+        CommandDispatch::Enqueued(_)
+    ));
+    recv_matching(&client, |update| {
+        matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+    })
+    .await;
+
+    let request_id = match client.try_command(FrontendCommand::Submit {
+        draft: "look at this".into(),
+        attachments: vec![FrontendAttachment {
+            media_type: "image/png".into(),
+            bytes: vec![0x89, 0x50, 0x4E, 0x47],
+        }],
+    }) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("submit enqueue {other:?}"),
+    };
+    let rejected = recv_matching(&client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::CommandRejected { .. })
+    })
+    .await;
+    match &rejected.kind {
+        FrontendUpdateKind::CommandRejected {
+            reason: CommandReject::InvalidInput { reason },
+        } => {
+            assert!(
+                reason.contains("does not accept image attachments"),
+                "{reason}"
+            );
+            assert!(reason.contains("text-only"), "{reason}");
+        }
+        other => panic!("expected InvalidInput for image attachment, got {other:?}"),
+    }
+
+    // Text-only submits still pass the capability gate.
+    submit_hello(&client);
     drop(service);
 }
 

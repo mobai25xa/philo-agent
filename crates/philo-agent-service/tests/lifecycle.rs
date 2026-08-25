@@ -239,6 +239,7 @@ fn start_real_runtime_service(
         },
         display: philo_agent_runtime::GenerationDisplay {
             model_name: "fake".into(),
+            image_input: true,
         },
     });
     let parts = AgentRuntime::start(RuntimeDeps {

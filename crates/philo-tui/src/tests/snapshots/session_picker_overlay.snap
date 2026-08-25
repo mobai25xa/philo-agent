@@ -1,11 +1,12 @@
 ---
 source: crates/philo-tui/src/app/overlay.rs
+assertion_line: 520
 expression: picker.frame(5).to_text()
 ---
 sessions  1/3
-> s-1                    | > count the files
-  s-2                    | one file
-  s-3                    |
-                         |
-                         |
-enter switch  ·  ↑↓ select  ·  esc close
+  s-1                                                                           
+> count the files
+one file
+  s-2                                                                           
+  s-3                                                                           
+enter select  ·  ↑↓ move  ·  type to filter  ·  esc close

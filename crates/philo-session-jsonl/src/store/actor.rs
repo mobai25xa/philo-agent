@@ -18,7 +18,8 @@ use crate::schema::{PendingArtifact, SCHEMA_VERSION, TransactionRecord, encode_e
 
 use super::SessionState;
 use super::layout::{
-    LOG_FILE, acquire_lock, decode_session_dir_name, fsync_dir, read_title_file, session_dir_name,
+    LOG_FILE, acquire_lock, decode_session_dir_name, fsync_dir, read_title_file, read_updated_at,
+    session_dir_name,
 };
 use super::recovery::{self, RecoveryReport};
 
@@ -228,12 +229,14 @@ impl StoreActor {
     }
 
     /// Read-only like [`StoreActor::list_sessions`]; titles come from the
-    /// per-session sidecar written under lock by the actor.
+    /// per-session sidecar written under lock by the actor, and timestamps
+    /// from the log file's last modification.
     fn list_session_summaries(&self) -> Result<Vec<SessionSummary>, JsonlOpenError> {
         Ok(self
             .scan_session_dirs()?
             .into_iter()
             .map(|(session_id, dir)| SessionSummary {
+                updated_at: read_updated_at(&dir),
                 session_id,
                 title: read_title_file(&dir),
             })

@@ -40,8 +40,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "model",
-        usage: "/model <name>",
-        summary: "switch the model for later operations",
+        usage: "/model <id>",
+        summary: "switch model by id; bare /model opens the picker",
+    },
+    CommandSpec {
+        name: "models",
+        usage: "/models",
+        summary: "pick a model across configured providers",
     },
     CommandSpec {
         name: "reasoning",
@@ -92,6 +97,7 @@ pub enum Command {
     Sessions,
     Rename { title: Option<String> },
     Model { name: Option<String> },
+    Models,
     Reasoning { level: Option<String> },
     Compact,
     Image { path: Option<String> },
@@ -132,6 +138,7 @@ pub fn parse(input: &str) -> Result<Command, UnknownCommand> {
         "sessions" => Ok(Command::Sessions),
         "rename" => Ok(Command::Rename { title: argument }),
         "model" => Ok(Command::Model { name: argument }),
+        "models" => Ok(Command::Models),
         "reasoning" => Ok(Command::Reasoning { level: argument }),
         "compact" => Ok(Command::Compact),
         "image" => Ok(Command::Image { path: argument }),
@@ -242,6 +249,7 @@ mod tests {
                 "sessions",
                 "rename",
                 "model",
+                "models",
                 "reasoning",
                 "compact",
                 "image",
@@ -273,6 +281,7 @@ mod tests {
             })
         );
         assert_eq!(parse("/model"), Ok(Command::Model { name: None }));
+        assert_eq!(parse("/models"), Ok(Command::Models));
         assert_eq!(
             parse("/reasoning high"),
             Ok(Command::Reasoning {
@@ -325,10 +334,7 @@ mod tests {
             parse_reasoning("XHIGH"),
             Some(FrontendReasoningEffort::Xhigh)
         );
-        assert_eq!(
-            parse_reasoning(" max "),
-            Some(FrontendReasoningEffort::Max)
-        );
+        assert_eq!(parse_reasoning(" max "), Some(FrontendReasoningEffort::Max));
         assert_eq!(parse_reasoning("turbo"), None);
         assert_eq!(reasoning_name(FrontendReasoningEffort::Xhigh), "xhigh");
     }

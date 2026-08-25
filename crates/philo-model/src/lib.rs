@@ -20,8 +20,8 @@ mod stream;
 
 pub use adapter::PhiloModelAdapter;
 pub use assemble::{
-    AdapterBuildError, ChatReasoningFormat, ModelCompat, ModelContinuationPolicy, ModelProtocol,
-    PhiloModelBuilder,
+    AdapterBuildError, ChatReasoningFormat, ModelCachePolicy, ModelCompat, ModelContinuationPolicy,
+    ModelProtocol, PhiloModelBuilder,
 };
 pub use headers::{DEFAULT_USER_AGENT, ModelRequestHeaderError, ModelRequestHeaders};
 pub use replay::{
@@ -31,4 +31,7 @@ pub use replay::{
 
 // Assembly-time SDK vocabulary re-exported for adapter callers.
 pub use philo::api::extension::Transport;
-pub use philo::api::stable::{CallTarget, PhiloClient, RetryMode, RetryPolicy, TimeoutPolicy};
+pub use philo::api::stable::{
+    CacheRetention, CallTarget, PhiloClient, PromptCacheHints, RetryMode, RetryPolicy,
+    TimeoutPolicy,
+};

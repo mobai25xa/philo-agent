@@ -52,6 +52,20 @@ where
                 return;
             }
         };
+        // Image attachments are a model capability: reject them up front when
+        // the active generation's model does not declare image input.
+        if !attachments.is_empty() && !self.generation.current().display.image_input {
+            let model = self.generation.current().display.model_name.clone();
+            self.emit(
+                Some(request_id),
+                FrontendUpdateKind::CommandRejected {
+                    reason: CommandReject::InvalidInput {
+                        reason: format!("model '{model}' does not accept image attachments"),
+                    },
+                },
+            );
+            return;
+        }
         let user_message = match mapping::user_message(&draft, &attachments) {
             Ok(message) => message,
             Err(reason) => {
@@ -112,6 +126,27 @@ where
                 },
             );
         }
+    }
+
+    /// Read-only model catalog query. Like `ReadStatus`: synchronous, never
+    /// spawns work, and answered in every shutdown state.
+    pub(super) fn handle_list_models(&mut self, request_id: FrontendRequestId) {
+        let current = self.generation.current().display.model_name.clone();
+        let models = self
+            .assembler
+            .list_models()
+            .into_iter()
+            .map(|entry| crate::frontend::snapshot::FrontendModelListing {
+                current: entry.id == current || entry.model == current,
+                id: entry.id,
+                provider: entry.provider,
+                model: entry.model,
+            })
+            .collect();
+        self.emit(
+            Some(request_id),
+            FrontendUpdateKind::ModelListLoaded { models },
+        );
     }
 
     pub(super) fn handle_install_model(&mut self, request_id: FrontendRequestId, name: String) {

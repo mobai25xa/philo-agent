@@ -24,12 +24,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn commit(
-    store: &JsonlSessionStore,
-    session: &str,
-    revision: u64,
-    kinds: Vec<SessionEntryKind>,
-) {
+fn commit(store: &JsonlSessionStore, session: &str, revision: u64, kinds: Vec<SessionEntryKind>) {
     block_on(store.commit(SessionTransaction::linear(
         SessionId::new(session),
         SessionRevision::new(revision),
@@ -55,6 +50,15 @@ fn first_user_message(text: &str) -> Vec<SessionEntryKind> {
 }
 
 fn sorted_summaries(root: &Path) -> Vec<SessionSummary> {
+    let mut summaries = open_sorted_summaries(root);
+    for summary in &mut summaries {
+        // Timestamps are asserted separately; title tests stay exact.
+        summary.updated_at = None;
+    }
+    summaries
+}
+
+fn open_sorted_summaries(root: &Path) -> Vec<SessionSummary> {
     let store = JsonlSessionStore::open(root).expect("open store");
     let mut summaries = store.list_session_summaries().expect("summaries");
     summaries.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
@@ -63,11 +67,37 @@ fn sorted_summaries(root: &Path) -> Vec<SessionSummary> {
 }
 
 #[test]
+fn committed_sessions_report_a_listing_timestamp() {
+    let root = tempfile_dir("jsonl-title-timestamp");
+    let store = JsonlSessionStore::open(&root).expect("open store");
+    commit(&store, "sess-a", 0, first_user_message("hello"));
+    let _ = store.shutdown();
+
+    let summaries = open_sorted_summaries(&root);
+    assert_eq!(summaries.len(), 1);
+    let stamp = summaries[0].updated_at.expect("mtime-derived timestamp");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    assert!(
+        stamp <= now && now.saturating_sub(stamp) < 60,
+        "timestamp {stamp} must be recent against {now}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn titles_survive_rename_and_reopen() {
     let root = tempfile_dir("jsonl-title-rename");
     let store = JsonlSessionStore::open(&root).expect("open store");
 
-    commit(&store, "sess-a", 0, first_user_message("fix   the\nlogin bug"));
+    commit(
+        &store,
+        "sess-a",
+        0,
+        first_user_message("fix   the\nlogin bug"),
+    );
     commit(
         &store,
         "sess-b",
@@ -82,10 +112,12 @@ fn titles_survive_rename_and_reopen() {
             SessionSummary {
                 session_id: SessionId::new("sess-a"),
                 title: Some("fix the login bug".into()),
+                updated_at: None,
             },
             SessionSummary {
                 session_id: SessionId::new("sess-b"),
                 title: None,
+                updated_at: None,
             },
         ],
         "derived title lands in the sidecar at commit time"
@@ -109,10 +141,12 @@ fn titles_survive_rename_and_reopen() {
             SessionSummary {
                 session_id: SessionId::new("sess-a"),
                 title: Some("auth deep dive".into()),
+                updated_at: None,
             },
             SessionSummary {
                 session_id: SessionId::new("sess-b"),
                 title: None,
+                updated_at: None,
             },
         ],
         "the override wins after recovery"
@@ -132,7 +166,13 @@ fn a_missing_sidecar_only_costs_the_title() {
     // correct by falling back to ids, and any later touch heals the cache.
     let session_dir = std::fs::read_dir(&root)
         .expect("root")
-        .find_map(|entry| entry.expect("entry").file_name().to_str().map(str::to_owned))
+        .find_map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_str()
+                .map(str::to_owned)
+        })
         .expect("session dir");
     let sidecar = root.join(&session_dir).join("title");
     assert!(sidecar.exists(), "sidecar written at commit time");
@@ -144,6 +184,7 @@ fn a_missing_sidecar_only_costs_the_title() {
         [SessionSummary {
             session_id: SessionId::new("sess-c"),
             title: None,
+            updated_at: None,
         }]
     );
     let _ = std::fs::remove_dir_all(&root);

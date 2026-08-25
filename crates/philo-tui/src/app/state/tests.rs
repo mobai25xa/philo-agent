@@ -512,10 +512,12 @@ fn a_new_session_is_refused_while_a_turn_runs() {
 }
 
 #[test]
-fn model_needs_a_name_and_works_while_busy() {
+fn bare_model_opens_the_picker_and_a_name_works_while_busy() {
     let mut app = app();
-    let lines = appended(&run(&mut app, "/model"));
-    assert_eq!(lines[1].text, "usage: /model <name>");
+    assert_eq!(
+        host_requests(&run(&mut app, "/model")),
+        vec![HostRequest::OpenModels]
+    );
 
     app.set_busy(true, 0);
     assert_eq!(
@@ -869,7 +871,10 @@ fn an_empty_slash_opens_the_whole_table() {
 #[test]
 fn the_picker_moves_the_selection_and_loads_previews_lazily() {
     let mut app = app();
-    app.open_picker(vec![PickerEntry::untitled("s-1"), PickerEntry::untitled("s-2")]);
+    app.open_picker(vec![
+        PickerEntry::untitled("s-1"),
+        PickerEntry::untitled("s-2"),
+    ]);
     assert_eq!(app.claim_preview(), Some("s-1".to_owned()));
 
     let effects = app.on_action(Action::MoveDown);
@@ -891,7 +896,10 @@ fn the_picker_moves_the_selection_and_loads_previews_lazily() {
 #[test]
 fn the_picker_switches_on_enter_and_closes_on_escape() {
     let mut app = app();
-    app.open_picker(vec![PickerEntry::untitled("s-1"), PickerEntry::untitled("s-2")]);
+    app.open_picker(vec![
+        PickerEntry::untitled("s-1"),
+        PickerEntry::untitled("s-2"),
+    ]);
     app.on_action(Action::MoveDown);
     assert_eq!(
         host_requests(&app.on_action(Action::Submit)),
@@ -1729,4 +1737,3 @@ fn overlay_ignores_home_and_end() {
     assert!(app.follow_bottom());
     assert!(app.picker().is_some());
 }
-

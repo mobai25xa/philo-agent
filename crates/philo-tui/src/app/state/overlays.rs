@@ -1,4 +1,4 @@
-//! Overlay key handling: approval answers and session-picker navigation.
+//! Overlay key handling: approval answers and picker navigation/filtering.
 
 use philo_agent_service::ConfirmationDecision;
 
@@ -6,7 +6,7 @@ use super::App;
 use super::line;
 use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
-use crate::app::overlay::{ConfirmPrompt, PickerEntry, Preview, SessionPicker};
+use crate::app::overlay::{ConfirmPrompt, Picker, PickerEntry, Preview};
 use crate::app::transcript::LineKind;
 
 impl App {
@@ -25,8 +25,20 @@ impl App {
         previous != self.confirm.as_ref().map(|prompt| prompt.id)
     }
 
-    pub(crate) fn open_picker(&mut self, sessions: Vec<PickerEntry>) {
-        self.picker = Some(SessionPicker::new(sessions));
+    pub(crate) fn open_picker(&mut self, entries: Vec<PickerEntry>) {
+        self.picker = Some(Picker::new("sessions", false, entries));
+    }
+
+    pub(crate) fn open_model_picker(&mut self, entries: Vec<PickerEntry>) {
+        self.picker = Some(Picker::new("models", true, entries));
+    }
+
+    /// Whether the open picker lists models (drives Enter semantics and
+    /// preview suppression).
+    pub(crate) fn is_models_picker(&self) -> bool {
+        self.picker
+            .as_ref()
+            .is_some_and(|picker| picker.is_models())
     }
 
     pub(crate) fn claim_preview(&mut self) -> Option<String> {
@@ -41,7 +53,7 @@ impl App {
 
     /// The open session picker, for tests and rendering.
     #[cfg(test)]
-    pub(crate) fn picker(&self) -> Option<&SessionPicker> {
+    pub(crate) fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
     }
 
@@ -69,23 +81,64 @@ impl App {
     }
 
     pub(super) fn on_picker_action(&mut self, action: Action) -> Vec<Effect> {
+        // Filter editing first: printable keys belong to the picker query,
+        // never to the composer draft underneath.
+        match action {
+            Action::InsertChar(ch) => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.push_filter(ch);
+                }
+                return self.refresh_picker_preview();
+            }
+            Action::Backspace => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.pop_filter();
+                }
+                return Vec::new();
+            }
+            _ => {}
+        }
         let has_activity = self.has_activity();
-        let picker = self.picker.as_mut().expect("session picker is open");
+        let is_models = self.is_models_picker();
         match action {
             Action::MoveUp | Action::MoveDown => {
-                let moved = if matches!(action, Action::MoveUp) {
-                    picker.move_up()
-                } else {
-                    picker.move_down()
-                };
-                if !moved {
-                    return vec![];
+                let moved = self.picker.as_mut().is_some_and(|picker| {
+                    if matches!(action, Action::MoveUp) {
+                        picker.move_up()
+                    } else {
+                        picker.move_down()
+                    }
+                });
+                if !moved || is_models {
+                    return Vec::new();
                 }
-                self.claim_preview()
-                    .map(|id| vec![Effect::Host(HostRequest::LoadPreview(id))])
-                    .unwrap_or_default()
+                self.refresh_picker_preview()
+            }
+            Action::Home | Action::End => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.jump(matches!(action, Action::Home));
+                }
+                Vec::new()
             }
             Action::Submit => {
+                let Some(selected) = self
+                    .picker
+                    .as_ref()
+                    .map(|picker| picker.selected().to_owned())
+                else {
+                    return Vec::new();
+                };
+                if is_models {
+                    self.picker = None;
+                    self.pending_model_switch = true;
+                    return vec![
+                        Effect::Append(vec![line(
+                            LineKind::Meta,
+                            format!("switching model to {selected}..."),
+                        )]),
+                        Effect::Host(HostRequest::RebuildModel(selected)),
+                    ];
+                }
                 if has_activity {
                     return vec![Effect::Append(vec![line(
                         LineKind::Error,
@@ -93,17 +146,25 @@ impl App {
                          sessions",
                     )])];
                 }
-                let selected = picker.selected().to_owned();
                 self.picker = None;
                 self.session_load_intent = Some(SessionLoadIntent::Switch);
                 vec![Effect::Host(HostRequest::SwitchSession(selected))]
             }
             Action::Escape | Action::CtrlC => {
                 self.picker = None;
-                vec![]
+                Vec::new()
             }
-            _ => vec![],
+            _ => Vec::new(),
         }
+    }
+
+    pub(crate) fn refresh_picker_preview(&mut self) -> Vec<Effect> {
+        if self.is_models_picker() {
+            return vec![];
+        }
+        self.claim_preview()
+            .map(|id| vec![Effect::Host(HostRequest::LoadPreview(id))])
+            .unwrap_or_default()
     }
 }
 

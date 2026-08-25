@@ -65,6 +65,9 @@ pub enum FrontendCommand {
     },
     /// List durable sessions from the session store.
     ListSessions,
+    /// Read the model catalog advertised by the composition root. Like
+    /// `ReadConfig`/`ReadStatus`: a synchronous, read-only query.
+    ListModels,
     /// Append a `TitleSet` entry to one session (a manual rename). Does not
     /// touch the current session or the Runtime.
     RenameSession {

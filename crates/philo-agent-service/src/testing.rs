@@ -58,6 +58,7 @@ pub fn test_generation(model_name: &str) -> Arc<RuntimeGeneration> {
         runtime_config: RuntimeConfig::default(),
         display: GenerationDisplay {
             model_name: model_name.to_owned(),
+            image_input: true,
         },
     })
 }
@@ -195,6 +196,7 @@ impl GenerationAssembler for FakeAssembler {
                 tools: self.tools.clone(),
                 runtime_config: self.config.clone(),
                 model_name: request.name,
+                image_input: true,
             })
         })
     }
@@ -598,6 +600,16 @@ pub fn start_test_service_with(
     assembler: FakeAssembler,
     sessions: impl SessionStore + 'static,
 ) -> (AgentService, FrontendClient, FakeRuntimeHandle) {
+    start_test_service_with_generation(assembler, sessions, test_generation("base"))
+}
+
+/// Starts a service with an explicit initial generation (e.g. one whose
+/// display declares no image input).
+pub fn start_test_service_with_generation(
+    assembler: FakeAssembler,
+    sessions: impl SessionStore + 'static,
+    initial_generation: Arc<RuntimeGeneration>,
+) -> (AgentService, FrontendClient, FakeRuntimeHandle) {
     let (runtime, subscription) = FakeRuntimeHandle::pair();
     let handle = runtime.clone();
     let (service, client) = crate::start(ServiceDeps {
@@ -605,7 +617,7 @@ pub fn start_test_service_with(
         subscription,
         sessions: Arc::new(sessions),
         assembler: Arc::new(assembler),
-        initial_generation: test_generation("base"),
+        initial_generation,
     });
     (service, client, handle)
 }

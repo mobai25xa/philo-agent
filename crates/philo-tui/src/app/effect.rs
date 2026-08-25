@@ -11,6 +11,7 @@ use super::transcript::TranscriptLine;
 pub(crate) enum HostRequest {
     NewSession,
     OpenSessions,
+    OpenModels,
     LoadPreview(String),
     SwitchSession(String),
     RenameSession { title: String },

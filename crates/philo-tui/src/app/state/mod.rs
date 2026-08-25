@@ -20,7 +20,7 @@ use super::attachment::Attachments;
 use super::cells::{ScrollState, TranscriptStore, VisibleSlice};
 use super::effect::Effect;
 use super::input::{InputEditor, InputHistory};
-use super::overlay::{ConfirmPrompt, OverlayFrame, SessionPicker};
+use super::overlay::{ConfirmPrompt, OverlayFrame, Picker};
 use super::select::{BandLayout, Selection};
 use super::status::StatusData;
 use super::submit::SubmitState;
@@ -43,8 +43,8 @@ pub(crate) struct App {
     exit_armed: bool,
     /// `/quit` during a running turn asks once before leaving.
     quit_armed: bool,
-    /// The session picker, while `/sessions` is open.
-    picker: Option<SessionPicker>,
+    /// The session/model picker, while `/sessions` or `/models` is open.
+    picker: Option<Picker>,
     /// The approval prompt, while a confirmation request is pending.
     confirm: Option<ConfirmPrompt>,
     /// The auto command menu, while the draft is a bare `/word`.

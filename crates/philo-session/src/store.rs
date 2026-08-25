@@ -10,22 +10,26 @@ use crate::view::SessionContextView;
 /// Boxed future returned by the object-safe session store contract.
 pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// One listed session: its identity plus a best-effort display title.
-/// Titles are advisory presentation hints; readers fall back to the id.
+/// One listed session: its identity plus best-effort display facts.
+/// Titles and timestamps are advisory presentation hints; readers fall back
+/// to the id when either is unknown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     /// The durable session identifier.
     pub session_id: SessionId,
     /// Resolved title, when the backend knows one.
     pub title: Option<String>,
+    /// Last-known activity instant as unix seconds, when the backend knows one.
+    pub updated_at: Option<u64>,
 }
 
 impl SessionSummary {
-    /// Creates a summary without a title.
+    /// Creates a summary without a title or timestamp.
     pub fn untitled(session_id: SessionId) -> Self {
         Self {
             session_id,
             title: None,
+            updated_at: None,
         }
     }
 }

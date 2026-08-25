@@ -2,15 +2,15 @@
 
 use philo_agent_service::{
     DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendContextMessage,
-    FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase, FrontendOperationEvent,
-    FrontendSessionSummary, FrontendSnapshot, FrontendUpdate, FrontendUpdateKind as Kind,
-    FrontendUserPart, LiveOperationSnapshot, ServiceHealth,
+    FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase, FrontendModelListing,
+    FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot, FrontendUpdate,
+    FrontendUpdateKind as Kind, FrontendUserPart, LiveOperationSnapshot, ServiceHealth,
 };
 
 use super::App;
 use super::line;
 use super::overlays::SessionLoadIntent;
-use crate::app::effect::{Effect, HostRequest};
+use crate::app::effect::Effect;
 use crate::app::listings;
 use crate::app::overlay::{PickerEntry, Preview};
 use crate::app::session;
@@ -127,6 +127,7 @@ impl App {
                 Vec::new()
             }
             Kind::SessionListLoaded { sessions } => self.apply_session_list(sessions),
+            Kind::ModelListLoaded { models } => self.apply_model_list(models),
             Kind::GenerationInstalled { display } => self.apply_generation_installed(display),
             Kind::GenerationInstallFailed { message, .. } => {
                 self.pending_model_switch = false;
@@ -265,17 +266,46 @@ impl App {
                 "no sessions recorded yet; this one starts with the first message",
             )])]);
         }
+        let now = unix_now();
         let entries = summaries
             .iter()
             .map(|summary| PickerEntry {
                 id: summary.session_id.clone(),
-                title: summary.title.clone(),
+                primary: summary
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| summary.session_id.clone()),
+                secondary: summary
+                    .updated_at
+                    .and_then(|updated_at| relative_time(updated_at, now))
+                    .unwrap_or_default(),
+                group: String::new(),
+                marked: summary.session_id == self.status.session,
             })
             .collect();
         self.open_picker(entries);
-        self.claim_preview()
-            .map(|id| vec![Effect::Host(HostRequest::LoadPreview(id))])
-            .unwrap_or_default()
+        self.refresh_picker_preview()
+    }
+
+    fn apply_model_list(&mut self, models: &[FrontendModelListing]) -> Vec<Effect> {
+        if models.is_empty() {
+            return self.ingest_appends(vec![Effect::Append(vec![line(
+                LineKind::Notice,
+                "no models configured; add [providers.<id>] sections to config.toml",
+            )])]);
+        }
+        let entries = models
+            .iter()
+            .map(|listing| PickerEntry {
+                id: listing.id.clone(),
+                primary: listing.id.clone(),
+                secondary: String::new(),
+                group: listing.provider.clone(),
+                marked: listing.current,
+            })
+            .collect();
+        self.open_model_picker(entries);
+        Vec::new()
     }
 
     fn apply_session_loaded(&mut self, session_id: &str, view: &DurableSessionView) -> Vec<Effect> {
@@ -652,6 +682,51 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Compact relative age for picker meta columns: `now`, `12m`, `3h`, `5d`,
+/// then a bare date. Presentation-only; unknown stamps render nothing.
+fn relative_time(stamp: u64, now: u64) -> Option<String> {
+    let age = now.checked_sub(stamp)?;
+    Some(if age < 60 {
+        "now".to_owned()
+    } else if age < 3600 {
+        format!("{}m", age / 60)
+    } else if age < 86_400 {
+        format!("{}h", age / 3600)
+    } else if age < 7 * 86_400 {
+        format!("{}d", age / 86_400)
+    } else {
+        // Best-effort civil date from the unix stamp (UTC, presentation only).
+        let days = age / 86_400;
+        let (year, month, day) = civil_from_days((stamp / 86_400) as i64);
+        if year >= 1000 {
+            format!("{year:04}-{month:02}-{day:02} ({days}d)")
+        } else {
+            format!("{days}d")
+        }
+    })
+}
+
+/// Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((if m <= 2 { y + 1 } else { y }), m as u64, d as u64)
 }
 
 fn parse_compacted_boundary(message: &str) -> Option<&str> {

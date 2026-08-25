@@ -15,6 +15,9 @@ pub struct FrontendGeneration {
     pub model_name: String,
     /// Frozen reasoning effort label, if any.
     pub reasoning_effort: Option<String>,
+    /// Whether the model accepts image input parts. Frontends should refuse
+    /// image attachment commands while this is `false`.
+    pub image_input: bool,
     /// Registered tool names at install time.
     pub tool_names: Vec<String>,
 }
@@ -69,14 +72,32 @@ pub struct DurableSessionView {
     pub latest_compaction_boundary: Option<String>,
 }
 
-/// One entry of the session catalog: identity plus an advisory display
-/// title. Frontends fall back to the id when the title is `None`.
+/// One entry of the session catalog: identity plus advisory display facts.
+/// Frontends fall back to the id when the title is `None`, and render the
+/// timestamp only when it is known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontendSessionSummary {
     /// Durable session id.
     pub session_id: String,
     /// Best-effort display title.
     pub title: Option<String>,
+    /// Last-known activity instant as unix seconds, when known.
+    pub updated_at: Option<u64>,
+}
+
+/// One selectable model advertised by the composition root. The id is the
+/// stable install identity (`provider/model` or a configured alias target);
+/// provider and model are advisory display facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendModelListing {
+    /// Stable model identity passed back verbatim to `InstallModel`.
+    pub id: String,
+    /// Owning provider id (display).
+    pub provider: String,
+    /// Model name within the provider (display).
+    pub model: String,
+    /// Whether this listing matches the currently installed generation.
+    pub current: bool,
 }
 
 /// One model-visible context message.

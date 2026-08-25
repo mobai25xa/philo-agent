@@ -5,8 +5,8 @@ use crate::frontend::command::ConfirmationDecision;
 use crate::frontend::snapshot::FrontendGeneration;
 use crate::frontend::snapshot::{
     DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendMaintenance,
-    FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot, FrontendStatus,
-    ServiceHealth,
+    FrontendModelListing, FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot,
+    FrontendStatus, ServiceHealth,
 };
 use crate::ids::{FrontendEpoch, FrontendRequestId, FrontendRevision};
 
@@ -84,6 +84,12 @@ pub enum FrontendUpdateKind {
     SessionListLoaded {
         /// Session ids with advisory display titles.
         sessions: Vec<FrontendSessionSummary>,
+    },
+    /// The model catalog advertised by the composition root, with the
+    /// current-generation match flagged. Request-terminal like `StatusReady`.
+    ModelListLoaded {
+        /// Selectable models in service-stable order.
+        models: Vec<FrontendModelListing>,
     },
     /// Current generation was replaced.
     GenerationInstalled {

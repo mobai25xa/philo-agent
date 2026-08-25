@@ -20,19 +20,19 @@ use philo_agent_runtime::{
 };
 use philo_agent_service::{
     AssembleError, AssembleRequest, AssembledGeneration, CommandDispatch, FrontendClient,
-    FrontendCommand, FrontendReasoningEffort, GenerationAssembler, ServiceDeps,
+    FrontendCommand, FrontendReasoningEffort, GenerationAssembler, ModelListingEntry, ServiceDeps,
 };
 use philo_coding_profile::CodingProfile;
 use philo_model::{
-    AdapterBuildError, FileModelReplayStore, ModelReplayStore, PhiloModelAdapter, RetryPolicy,
-    TimeoutPolicy,
+    AdapterBuildError, FileModelReplayStore, ModelReplayStore, ModelRequestHeaders,
+    PhiloModelAdapter, RetryPolicy, TimeoutPolicy,
 };
 use philo_session::SessionStore;
 use philo_session_jsonl::JsonlSessionStore;
 use philo_tools_std::BlockingToolExecutor;
 
 use crate::args::Cli;
-use crate::config::{ResolveFlags, Settings, WatchTask};
+use crate::config::{Deployment, ResolveFlags, Settings, WatchTask};
 use crate::error::UsageError;
 use crate::ids::ProcessIdSource;
 
@@ -99,15 +99,16 @@ impl AssemblerState {
                 "data_dir cannot be changed without restarting",
             ));
         }
-        let runtime_config = runtime_config_for(&self.flags.to_cli(), &settings, &request.name)
+        // Resolve the requested id through aliases and the provider catalog;
+        // the catalog is the only deployment source, so unmatched names fail.
+        let (deployment, wire_model) = crate::config::deployment_for(&settings, &request.name)
             .map_err(|error| AssembleError::new(error.0))?;
+        let runtime_config =
+            runtime_config_for(&self.flags.to_cli(), &settings, &deployment, &request.name)
+                .map_err(|error| AssembleError::new(error.0))?;
         let model: Arc<dyn ModelPort> = Arc::new(
-            build_model(
-                &settings.deployment,
-                &request.name,
-                self.replay_store.clone(),
-            )
-            .map_err(|error| AssembleError::new(format!("{error}")))?,
+            build_model(&deployment, &wire_model, self.replay_store.clone())
+                .map_err(|error| AssembleError::new(format!("{error}")))?,
         );
         let tools = tool_port_for(&settings, runtime_config.max_parallel_tool_calls)
             .map_err(|error| AssembleError::new(error.0))?;
@@ -116,6 +117,7 @@ impl AssemblerState {
             tools,
             runtime_config,
             model_name: request.name,
+            image_input: deployment.image_input,
         })
     }
 }
@@ -345,6 +347,19 @@ impl GenerationAssembler for CliGenerationAssembler {
                 .unwrap_or_else(|_| Err(AssembleError::new("generation build worker stopped")))
         })
     }
+
+    fn list_models(&self) -> Vec<ModelListingEntry> {
+        self.state
+            .current_settings()
+            .models
+            .iter()
+            .map(|choice| ModelListingEntry {
+                id: choice.id.clone(),
+                provider: choice.provider_id.clone(),
+                model: choice.model.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Builds stores, the initial generation, Runtime, and AgentService.
@@ -378,6 +393,7 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
         runtime_config: assembled.runtime_config,
         display: GenerationDisplay {
             model_name: assembled.model_name,
+            image_input: assembled.image_input,
         },
     });
     let session_store: Arc<dyn SessionStore> = sessions.clone();
@@ -592,16 +608,26 @@ pub(crate) fn apply_config_reload(
                 return;
             }
             if only_reasoning_changed(&previous, &settings)
-                && let Some(effort) = settings.reasoning_effort
+                && let Ok((deployment, _)) =
+                    crate::config::deployment_for(&settings, &settings.deployment.model)
             {
-                enqueue_generation_command(
-                    client,
-                    assembler,
-                    FrontendCommand::SetReasoning {
-                        effort: frontend_effort(effort),
-                    },
+                let effort = effective_reasoning(
+                    assembler.state.flags.reasoning_effort.is_some(),
+                    &settings,
+                    &deployment,
                 );
-                return;
+                // An unset effective effort falls through to a full install,
+                // which resets reasoning the same way startup would.
+                if let Some(effort) = effort {
+                    enqueue_generation_command(
+                        client,
+                        assembler,
+                        FrontendCommand::SetReasoning {
+                            effort: frontend_effort(effort),
+                        },
+                    );
+                    return;
+                }
             }
             enqueue_generation_command(
                 client,
@@ -645,15 +671,6 @@ fn ui_entry(key: &str) -> bool {
     matches!(key, "verbosity" | "show_reasoning" | "screen")
 }
 
-fn header_names(settings: &Settings) -> Vec<String> {
-    settings
-        .deployment
-        .request_headers
-        .names()
-        .map(str::to_owned)
-        .collect()
-}
-
 fn non_ui_entries(settings: &Settings) -> Vec<(String, String, String)> {
     settings
         .entries
@@ -664,17 +681,19 @@ fn non_ui_entries(settings: &Settings) -> Vec<(String, String, String)> {
 }
 
 fn generation_fields_changed(left: &Settings, right: &Settings) -> bool {
+    // Compare the deployments the current models actually resolve to, so an
+    // edited provider section counts even when the active model is unchanged.
+    let left_resolves = crate::config::deployment_for(left, &left.deployment.model);
+    let right_resolves = crate::config::deployment_for(right, &right.deployment.model);
+    let (Ok((left_deployment, _)), Ok((right_deployment, _))) =
+        (&left_resolves, &right_resolves)
+    else {
+        // A catalog that no longer resolves the active model always counts
+        // as a generation change; the rebuild surfaces the error.
+        return true;
+    };
     left.deployment.model != right.deployment.model
-        || left.deployment.endpoint != right.deployment.endpoint
-        || left.deployment.protocol != right.deployment.protocol
-        || left.deployment.provider != right.deployment.provider
-        || left.deployment.api_key_env != right.deployment.api_key_env
-        || left.deployment.compat != right.deployment.compat
-        || left.deployment.chat_reasoning_format != right.deployment.chat_reasoning_format
-        || left.deployment.continuation_policy != right.deployment.continuation_policy
-        || left.deployment.response_head_timeout != right.deployment.response_head_timeout
-        || left.deployment.stream_idle_timeout != right.deployment.stream_idle_timeout
-        || header_names(left) != header_names(right)
+        || deployment_fields_changed(left_deployment, right_deployment)
         || left.compaction != right.compaction
         || left.reasoning_effort != right.reasoning_effort
         || left.max_tool_rounds != right.max_tool_rounds
@@ -683,6 +702,27 @@ fn generation_fields_changed(left: &Settings, right: &Settings) -> bool {
         || left.shell_timeout_secs != right.shell_timeout_secs
         || left.recovery != right.recovery
         || non_ui_entries(left) != non_ui_entries(right)
+}
+
+fn deployment_fields_changed(left: &Deployment, right: &Deployment) -> bool {
+    left.provider != right.provider
+        || left.endpoint != right.endpoint
+        || left.protocol != right.protocol
+        || left.credential != right.credential
+        || left.compat != right.compat
+        || left.chat_reasoning_format != right.chat_reasoning_format
+        || left.continuation_policy != right.continuation_policy
+        || left.max_output_tokens != right.max_output_tokens
+        || left.default_reasoning != right.default_reasoning
+        || left.image_input != right.image_input
+        || left.cache_policy != right.cache_policy
+        || left.response_head_timeout != right.response_head_timeout
+        || left.stream_idle_timeout != right.stream_idle_timeout
+        || header_names_of(&left.request_headers) != header_names_of(&right.request_headers)
+}
+
+fn header_names_of(headers: &ModelRequestHeaders) -> Vec<String> {
+    headers.names().map(str::to_owned).collect()
 }
 
 fn only_reasoning_changed(left: &Settings, right: &Settings) -> bool {
@@ -714,17 +754,21 @@ pub(crate) fn build_model(
         model,
         deployment.endpoint.clone(),
     )
-    .api_key_env(&deployment.api_key_env)
     .request_headers(deployment.request_headers.clone())
     .replay_store(replay_store)
     .compat(deployment.compat)
     .continuation_policy(deployment.continuation_policy)
+    .cache_policy(deployment.cache_policy)
     .retry_policy(TRANSPORT_RETRY_POLICY)
     .timeout_policy(TimeoutPolicy {
         total: None,
         response_head: deployment.response_head_timeout,
         stream_idle: deployment.stream_idle_timeout,
     });
+    builder = match &deployment.credential {
+        crate::config::Credential::EnvName(name) => builder.api_key_env(name.clone()),
+        crate::config::Credential::Literal(secret) => builder.api_key(secret.clone()),
+    };
     if let Some(format) = deployment.chat_reasoning_format {
         builder = builder.chat_reasoning_format(format);
     }
@@ -734,13 +778,18 @@ pub(crate) fn build_model(
 /// Bounded SDK attempt-level retries for transient faults before a 2xx
 /// response (connect, TLS, request write, throttling). Full jitter and caps
 /// come from the policy defaults; mid-stream faults are never retried here.
-const TRANSPORT_RETRY_POLICY: RetryPolicy = RetryPolicy::transient(std::num::NonZeroU32::new(3)
-    .expect("three is non-zero"));
+const TRANSPORT_RETRY_POLICY: RetryPolicy =
+    RetryPolicy::transient(std::num::NonZeroU32::new(3).expect("three is non-zero"));
 
 /// Maps resolved settings onto a RuntimeConfig the same way bootstrap does.
+///
+/// Model-level declarations win over `[defaults]`: the effective deployment
+/// carries `max_output_tokens` / `default_reasoning` from the active model's
+/// catalog entry, and an explicit `--reasoning-effort` flag beats both.
 pub(crate) fn runtime_config_for(
     cli: &Cli,
     settings: &Settings,
+    deployment: &Deployment,
     model_target: &str,
 ) -> Result<RuntimeConfig, UsageError> {
     let profile = coding_profile(settings)?;
@@ -754,13 +803,38 @@ pub(crate) fn runtime_config_for(
     if let Some(parallel) = settings.max_parallel_tool_calls {
         runtime_config.max_parallel_tool_calls = parallel;
     }
-    if settings.reasoning_effort.is_some() {
-        runtime_config.generation.reasoning_effort = settings.reasoning_effort;
+    if let Some(effort) = effective_reasoning(cli.reasoning_effort.is_some(), settings, deployment)
+    {
+        runtime_config.generation.reasoning_effort = Some(effort);
+    }
+    if let Some(tokens) = effective_max_output(deployment) {
+        runtime_config.generation.max_output_tokens = tokens;
     }
     runtime_config.operation_timeout = settings.operation_timeout;
     runtime_config.compaction = settings.compaction.clone();
     runtime_config.recovery = settings.recovery;
     Ok(runtime_config)
+}
+
+/// Reasoning precedence: explicit flag > the active model's default tier.
+/// Without a flag, `settings.reasoning_effort` is `None`, so this collapses
+/// to the model default.
+fn effective_reasoning(
+    flag_set: bool,
+    settings: &Settings,
+    deployment: &Deployment,
+) -> Option<ReasoningEffort> {
+    if flag_set {
+        settings.reasoning_effort
+    } else {
+        settings.reasoning_effort.or(deployment.default_reasoning)
+    }
+}
+
+/// Output cap: the active model's declared value; `None` keeps the coding
+/// profile default.
+fn effective_max_output(deployment: &Deployment) -> Option<u32> {
+    deployment.max_output_tokens
 }
 
 fn coding_profile(settings: &Settings) -> Result<CodingProfile, UsageError> {
@@ -826,14 +900,37 @@ mod tests {
                 protocol: ModelProtocol::OpenAiChat,
                 model: model.to_owned(),
                 endpoint: endpoint.to_owned(),
-                api_key_env: "PHILO_API_KEY".to_owned(),
+                credential: crate::config::Credential::EnvName("PHILO_API_KEY".to_owned()),
                 request_headers: ModelRequestHeaders::default(),
                 compat: ModelCompat::Compatible,
                 chat_reasoning_format: None,
                 continuation_policy: ModelContinuationPolicy::StatelessLocalReplay,
+                max_output_tokens: None,
+                default_reasoning: None,
+                image_input: true,
+                cache_policy: philo_model::ModelCachePolicy::default(),
                 response_head_timeout: None,
                 stream_idle_timeout: None,
             },
+            models: vec![crate::config::resolve::ModelChoice {
+                id: model.to_owned(),
+                provider_id: "test".to_owned(),
+                model: model.to_owned(),
+                endpoint: endpoint.to_owned(),
+                protocol: ModelProtocol::OpenAiChat,
+                credential: crate::config::Credential::EnvName("PHILO_API_KEY".to_owned()),
+                compat: ModelCompat::Compatible,
+                chat_reasoning_format: None,
+                continuation_policy: ModelContinuationPolicy::StatelessLocalReplay,
+                context_window: None,
+                request_headers: Vec::new(),
+                max_output_tokens: None,
+                reasoning_tiers: Vec::new(),
+                default_reasoning: None,
+                image_input: true,
+                cache_policy: philo_model::ModelCachePolicy::default(),
+            }],
+            aliases: Vec::new(),
             data_dir: dir.to_path_buf(),
             context_window: None,
             compaction: CompactionConfig::default(),
@@ -917,6 +1014,65 @@ mod tests {
         assert!(only_reasoning_changed(&left, &right));
         right.max_tool_rounds = Some(9);
         assert!(!only_reasoning_changed(&left, &right));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_config_applies_model_level_generation_params() {
+        use clap::Parser as _;
+
+        let dir = temp_dir("model-params");
+        let base = settings(
+            &dir,
+            "gw/model-a",
+            "https://example.test/v1/chat/completions",
+        );
+
+        // The active model's declarations win over profile defaults.
+        let mut deployment = base.deployment.clone();
+        deployment.max_output_tokens = Some(64_000);
+        deployment.default_reasoning = Some(ReasoningEffort::High);
+        let cli = crate::args::Cli::try_parse_from(["philo", "--model", "gw/model-a", "hi"])
+            .expect("valid CLI");
+        let config = runtime_config_for(&cli, &base, &deployment, "model-a").expect("config");
+        assert_eq!(config.generation.max_output_tokens, 64_000);
+        assert_eq!(
+            config.generation.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+
+        // Without model declarations the profile defaults stand.
+        let plain = base.deployment.clone();
+        let config = runtime_config_for(&cli, &base, &plain, "model-a").expect("config");
+        assert_ne!(config.generation.max_output_tokens, 0);
+        assert_eq!(config.generation.reasoning_effort, None);
+
+        // An explicit flag beats the model declaration. After resolve() the
+        // flag value is baked into `settings.reasoning_effort`, and the flag
+        // branch of `effective_reasoning` must keep it over the model
+        // declaration.
+        let mut flagged_settings = base.clone();
+        flagged_settings.reasoning_effort = Some(ReasoningEffort::Low);
+        let flagged =
+            crate::args::Cli::try_parse_from(["philo", "--reasoning-effort", "low", "hi"])
+                .expect("valid CLI");
+        let config = runtime_config_for(&flagged, &flagged_settings, &deployment, "model-a")
+            .expect("config");
+        assert_eq!(
+            config.generation.reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(config.generation.max_output_tokens, 64_000);
+
+        // Deployment edits count as generation changes.
+        assert!(deployment_fields_changed(&plain, &deployment));
+        let mut next = deployment.clone();
+        next.default_reasoning = Some(ReasoningEffort::Xhigh);
+        assert!(deployment_fields_changed(&deployment, &next));
+        next.cache_policy.retention = philo_model::CacheRetention::None;
+        assert!(deployment_fields_changed(&deployment, &next));
+        next.image_input = false;
+        assert!(deployment_fields_changed(&deployment, &next));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -6,10 +6,8 @@ license.workspace = true
 
 [dependencies]
 # Registry-pinned SDK: upgrades are deliberate (bump version, fix, test).
-# For local iteration against an unpublished SDK state, temporarily add:
-#   [patch.crates-io]
-#   philo = { path = "../../../philo/crates/philo" }
-philo = "=0.10.0"
+# Never point this at a local SDK checkout; only published versions.
+philo = "=0.10.1"
 philo-agent-runtime = { path = "../philo-agent-runtime" }
 # Image bytes hand off to the SDK as `bytes::Bytes` (the SDK's public input type).
 bytes = "1.10"

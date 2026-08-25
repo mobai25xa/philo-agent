@@ -1783,9 +1783,9 @@ dependencies = [
 
 [[package]]
 name = "philo"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33d8a0e9e6cd9b29c0cb6f7bc656cf2571c44da25c05e55e5dc1ed93c1a1260e"
+checksum = "29cbcaf091fd260f2bb70e7165ca63ec8a6c34768fe265dde70d447058f9deb0"
 dependencies = [
  "base64",
  "bytes",

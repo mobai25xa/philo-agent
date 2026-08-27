@@ -2,11 +2,11 @@
 source: crates/philo-tui/src/app/overlay.rs
 expression: prompt.frame(9).to_text()
 ---
-╭─ Approval required ──────╮
-│                          │
-│ run_command              │
-│ cargo test -p philo-tui  │
-│ working directory: /repo │
-│                          │
-│ y allow · n / esc deny   │
-╰──────────────────────────╯
+╭─ Approval required ────────╮
+│                            │
+│ run_command                │
+│ cargo test -p philo-tui    │
+│ working directory: /repo   │
+│                            │
+│ [Enter/y] allow · [n] deny │
+╰────────────────────────────╯

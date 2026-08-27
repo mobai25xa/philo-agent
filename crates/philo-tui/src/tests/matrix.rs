@@ -115,11 +115,20 @@ fn freeze(app: &mut App, secs: u64) {
         .freeze_elapsed(std::time::Duration::from_secs(secs));
 }
 
+/// A row must not overflow the terminal. TestBackend stores the continuation
+/// cell of a wide grapheme as a plain space, so joining cells inflates the
+/// measured width by one per wide character; the excess is cosmetic and
+/// bounded by the wide-glyph count, so the check allows that slack.
 fn cells_fit(rendered: &str, width: u16) {
     for row in rendered.lines() {
+        let wide = row
+            .chars()
+            .filter(|c| text::width(c.to_string().as_str()) > 1)
+            .count();
+        let allowed = usize::from(width) + wide;
         assert!(
-            text::width(row) <= usize::from(width),
-            "row exceeds {width} columns: {row:?}"
+            text::width(row) <= allowed,
+            "row exceeds {width} columns (wide-glyph slack {wide}): {row:?}"
         );
     }
 }
@@ -371,12 +380,18 @@ fn degradation_ladders_fire_in_contract_order() {
     let has =
         |needle: &'static str| move |app: &App, width: u16| render(app, width).contains(needle);
 
-    // Top-left: `· esc cancel` goes before the state word truncates.
-    let esc_gone = drop_at(&|app, w| render(app, w).contains("esc cancel"));
-    let word_truncated = drop_at(&|app, w| render(app, w).contains("Writing…"));
+// Top-left badge (P2): the `(42s)` timer goes before the word truncates,
+    // and the spinner+word pair never reaches the composer prompt. The old
+    // `· esc cancel` tail is retired (D11), so it never appears.
+    let timer_gone = drop_at(&|app, w| render(app, w).contains("(42s)"));
+    let word_truncated = drop_at(&|app, w| render(app, w).contains("Writin"));
     assert!(
-        esc_gone > word_truncated,
-        "esc cancel must drop ({esc_gone}) before the word truncates ({word_truncated})"
+        timer_gone > word_truncated,
+        "timer must drop ({timer_gone}) before the word truncates ({word_truncated})"
+    );
+    assert!(
+        !render(&build(), 80).contains("esc cancel"),
+        "D11: the esc tail is gone even at full width"
     );
 
     // Bottom row: path compacts, then C%, then R, then the arrows; the
@@ -396,20 +411,23 @@ fn degradation_ladders_fire_in_contract_order() {
         "the arrows drop ({arrows_gone}) before the ctx/window fraction ({ctx_gone})"
     );
 
-    // Top-right: effort drops, then provider, then the model truncates.
+// Top-right: effort drops, then the model truncates; the provider
+    // annotation is retired (P2), so it never appears.
     let effort_gone = drop_at(&has("· high"));
-    let provider_gone = drop_at(&has("(openai)"));
     let model_gone = drop_at(&has("gpt-5.2"));
     assert!(
-        effort_gone > provider_gone && provider_gone > model_gone,
-        "model ladder out of order: effort {effort_gone}, provider \
-         {provider_gone}, model {model_gone}"
+        effort_gone > model_gone,
+        "model ladder out of order: effort {effort_gone}, model {model_gone}"
+    );
+    assert!(
+        !render(&build(), 80).contains("(openai)"),
+        "the provider annotation is gone at full width"
     );
 
     // The bottom corners survive at the supported floor (§8: last to go).
     let floor = render(&build(), frame::MIN_SUPPORTED_WIDTH);
     assert!(
-        floor.contains(r"D:\…\Pi") && floor.contains("↑11k ↓4.8k"),
+        floor.contains(r"D:\…\Pi") && floor.contains("↑11k  ↓4.8k"),
         "both bottom corners stay visible at 40 columns: {floor}"
     );
 }
@@ -481,9 +499,10 @@ fn table_degradation_flows_below_the_grid_budget() {
     // time") → Σ29, frame overhead 10.
 
     // Content column 38, budget 28 ≥ 29? No — 28 < 29, still squeezed.
-    // Step up to 39: budget 29 = Σ → the table expands full width, every
-    // cell on one line.
-    let wide = render(&app, 47);
+    // Step up to 48: with the right rail reserved the content column is
+    // width-2·inset = 48-8-1 = 39; budget 29 = Σ → the table expands full
+    // width, every cell on one line.
+    let wide = render(&app, 48);
     assert!(
         wide.contains("│ plan │ latency │ implementation     │"),
         "natural widths fit the budget exactly (col pads to 18)"

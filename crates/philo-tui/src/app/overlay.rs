@@ -18,8 +18,9 @@ use super::text;
 pub enum OverlayTone {
     /// Regular pickers.
     Normal,
-    /// The approval prompt.
-    Warning,
+    /// The v4.0 P3 §8 interception-confirmation box: red surface border on
+    /// the dark CONFIRM_BG, dashed top border, green allow / red deny keys.
+    Confirm,
 }
 
 /// Padding cells between the borders and the text zone, per side.
@@ -780,7 +781,7 @@ impl ConfirmPrompt {
 
     pub(crate) fn frame_for(&self, height: usize, max_width: usize) -> OverlayFrame {
         const BORDER_TITLE: &str = "Approval required";
-        const FOOTER: &str = "y allow · n / esc deny";
+        const FOOTER: &str = "[Enter/y] allow · [n] deny";
         // The question title leads the body; the service body follows.
         let content: Vec<String> = std::iter::once(self.title.clone())
             .chain(self.body.lines().map(str::to_owned))
@@ -818,7 +819,7 @@ impl ConfirmPrompt {
 
         OverlayFrame {
             title: text::truncate(BORDER_TITLE, inner.saturating_sub(5)),
-            tone: OverlayTone::Warning,
+            tone: OverlayTone::Confirm,
             width: inner,
             body: lines,
             footer: text::truncate(FOOTER, inner),

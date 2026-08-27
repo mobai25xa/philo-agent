@@ -1,34 +1,47 @@
-//! Default-mode tool cards as a generic `FrontendToolDisplay` projection.
+//! Default-mode tool cards as a generic `FrontendToolDisplay` projection
+//! (v4.0 P3): the unified `▎` header formula, card bodies, the live running
+//! card, the concurrent tree, and the diff gutter.
 //!
-//! Cards are sequences of `Tool` cells whose [`Tone`] carries the paint
-//! structure (design §3.3): a `Title` header opens the card, `Detail` rows
-//! carry the `↳` details, `Failure` marks the red failure row, and diff
-//! bodies use `DiffDel`/`DiffIns` so the shell washes their background.
-//! The TUI holds zero tool knowledge — everything comes from the frozen
-//! facts vocabulary (`title` / repeatable `subject` / `count` / `result` /
-//! `body`) supplied by tools-std.
+//! Cards are `Tool` cells. The header projects into one single-row cell
+//! (`▎ [action] [target] [stats] ····· [status] [time]`); the body, when
+//! present, is a foldable [`CardBody`] cell. The live running card and the
+//! concurrent tree each ride one cell, rewritten in place as
+//! started/progress/completed events land (the App owns that bookkeeping in
+//! `super::live_tool`). The TUI holds zero tool knowledge — every piece
+//! comes from the frozen facts vocabulary (`title` / repeatable `subject` /
+//! `count` / `result` / `body`) supplied by tools-std.
 //!
-//! Session replay keeps the older `ok · {content}` summary in `session.rs`.
-//! Verbose mode keeps its structure (full args, model-facing result,
+//! Verbose mode keeps its older structure (full args, model-facing result,
 //! detail/facts) and only swaps tokens.
+
+use std::time::Duration;
 
 use philo_agent_service::{FrontendToolDisplay, FrontendToolResult};
 
+use super::run_state::format_card_elapsed;
 use super::text;
-use super::transcript::{LineKind, Tone, TranscriptLine, compact_args, preview};
-use crate::render::theme::DETAIL;
+use super::transcript::{
+    body_line, card_cell, header_line, CardBody, CardHeader, HeaderPiece, LineKind, SegColor,
+    SegSpan, Tone, TranscriptLine, compact_args, preview,
+};
 
-const CARD_WIDTH: usize = 120;
 const KEY_WIDTH: usize = 40;
-const BODY_LINES: usize = 16;
-const LOCS_LINES: usize = 5;
 const BODY_COLS: usize = 200;
+/// v4.0 P3 §6: completion cards fold once the body passes this many rows.
+pub(crate) const FOLD_THRESHOLD: usize = 8;
+/// v4.0 P3 §4: the live output cap in characters; past it a truncated marker
+/// replaces the tail.
+pub(crate) const LIVE_TEXT_CHARS_MAX: usize = 1600;
 
+/// One settled card: header cell, the remaining subject rows, and the
+/// foldable body. `elapsed` is the settle duration from the App's slot
+/// clock (TUI wall clock, §1); replay passes `None` and renders no time.
 pub(crate) fn default_card(
     tool_name: &str,
     arguments: &str,
     result: &FrontendToolResult,
     display: Option<&FrontendToolDisplay>,
+    elapsed: Option<Duration>,
 ) -> Vec<TranscriptLine> {
     let title = fact(display, "title").unwrap_or(tool_name);
     let subjects: Vec<String> = display
@@ -41,109 +54,212 @@ pub(crate) fn default_card(
                 .collect()
         })
         .unwrap_or_default();
-    let count = fact(display, "count").filter(|count| !count.is_empty());
-    // Count-bearing headers list their subjects below (`Read 2 files` +
-    // four paths); a subject header already names its target and never
-    // repeats it (`Edit src/app.rs`).
-    let header_used_subject = count.is_none() && !subjects.is_empty();
-    let mut lines = vec![header_line(title, count, &subjects, arguments)];
+
+    let mut lines = vec![card_header_cell(title, arguments, &subjects, display, result, elapsed)];
     if let FrontendToolResult::Error { code, message } = result {
         lines.push(card_line(
-            format!("  ↳ Failed. {code} · {}", preview(message, 80)),
+            format!("  Failed. {code} · {}", preview(message, 80)),
             Tone::Failure,
         ));
         return lines;
     }
-    if !header_used_subject {
-        push_subjects(&mut lines, &subjects);
+    // Subjects after the first ride as plain indented rows (§2); the header
+    // already carries the first subject (or the primary argument key).
+    for subject in subjects.iter().skip(1) {
+        lines.push(card_line(format!("  {subject}"), Tone::Detail));
     }
-    if let Some(result) = fact(display, "result") {
-        lines.push(card_line(format!("  ↳ {result}"), Tone::Detail));
-    }
-    let body_kind = fact(display, "body");
-    let extra = push_body(&mut lines, display, body_kind);
-    if let Some(extra) = extra.filter(|_| body_kind != Some("locs")) {
-        lines.push(card_line(format!("  ↳ … +{extra} lines"), Tone::Detail));
-    }
+    push_body(&mut lines, display);
     lines
 }
 
-/// Repeatable subject rows: the first carries the `↳` prefix, continuations
-/// align under it.
-fn push_subjects(lines: &mut Vec<TranscriptLine>, subjects: &[String]) {
-    for (index, subject) in subjects.iter().enumerate() {
-        if index == 0 {
-            lines.push(card_line(format!("  {DETAIL} {subject}"), Tone::Detail));
-        } else {
-            lines.push(card_line(format!("    {subject}"), Tone::Detail));
+/// The card header cell, built from the facts (and, for the target, the
+/// argument keys). Colors come from the family classification (§3):
+/// edit/write families are distinguishable by their frozen facts
+/// (`operation` / `bytes_before` / `exit_code`), so the TUI never guesses.
+fn card_header_cell(
+    title: &str,
+    arguments: &str,
+    subjects: &[String],
+    display: Option<&FrontendToolDisplay>,
+    result: &FrontendToolResult,
+    elapsed: Option<Duration>,
+) -> TranscriptLine {
+    let (bar, status, bold) = state_for(result, display);
+    let target = match subjects.first() {
+        Some(first) => Some(HeaderPiece {
+            text: preview(first, KEY_WIDTH),
+            color: target_color(arguments),
+            bold: false,
+        }),
+        None => primary_target(arguments).map(|(target, kind)| HeaderPiece {
+            text: preview(&target, KEY_WIDTH),
+            color: kind_color(kind),
+            bold: false,
+        }),
+    };
+    header_line(CardHeader {
+        bar: HeaderPiece {
+            text: "▎".to_owned(),
+            color: bar,
+            bold: false,
+        },
+        action: HeaderPiece {
+            text: title.to_owned(),
+            color: SegColor::Gray,
+            bold: true,
+        },
+        target,
+        stats: stats_segments(display),
+        status: HeaderPiece {
+            text: status.to_owned(),
+            color: bar,
+            bold,
+        },
+        time: elapsed.map(|elapsed| HeaderPiece {
+            text: format_card_elapsed(elapsed),
+            color: SegColor::DarkGray,
+            bold: false,
+        }),
+    })
+}
+
+/// The state classification: bar color, status word, and status weight.
+pub(crate) fn state_for(
+    result: &FrontendToolResult,
+    display: Option<&FrontendToolDisplay>,
+) -> (SegColor, &'static str, bool) {
+    match result {
+        FrontendToolResult::Error { .. } => (SegColor::Red, "✗ failed", false),
+        FrontendToolResult::Success { .. } => {
+            if fact(display, "operation").is_some() {
+                (SegColor::Green, "✓ created", false)
+            } else if fact(display, "bytes_before").is_some() {
+                (SegColor::Orange, "✓ applied", false)
+            } else if let Some(code) = fact(display, "exit_code") {
+                if code == "0" {
+                    (SegColor::Green, "✓ done", false)
+                } else {
+                    (SegColor::Red, "✗ failed", false)
+                }
+            } else {
+                (SegColor::Green, "✓ done", false)
+            }
         }
     }
 }
 
-/// `{title} {count}`, else `{title} {subject}`, else the bare display name.
-/// Without facts the primary argument key stands in for the subject so even
-/// undisplayed failures anchor to their target.
-fn header_line(
-    title: &str,
-    count: Option<&str>,
-    subjects: &[String],
-    arguments: &str,
-) -> TranscriptLine {
-    let rest = match count {
-        Some(count) => Some(count.to_owned()),
-        None => match subjects.first() {
-            Some(subject) => Some(preview(subject, KEY_WIDTH)),
-            None => primary_key(arguments),
-        },
-    };
-    let text = match rest {
-        Some(rest) if !rest.is_empty() => format!("{title} {rest}"),
-        _ => title.to_owned(),
-    };
-    card_line(text::truncate(&text, CARD_WIDTH), Tone::Title)
-}
-
-fn push_body(
-    lines: &mut Vec<TranscriptLine>,
-    display: Option<&FrontendToolDisplay>,
-    body_kind: Option<&str>,
-) -> Option<usize> {
-    let display = display?;
-    let rows = match body_kind {
-        Some("diff") => diff_rows(&display.detail),
-        Some("output") => indented_rows(&display.detail, BODY_LINES),
-        Some("locs") => indented_rows(&display.detail, LOCS_LINES),
-        _ => return None,
-    };
-    let extra = rows.extra;
-    if !rows.lines.is_empty() {
-        // One blank row between the details and the body (design §3.3).
-        lines.push(card_line("", Tone::Plain));
-        lines.extend(rows.lines);
+/// The stats cluster: `(+42 lines)` green (reads), `(+2 -1)` green/red
+/// (edits), `(+N lines)` green (writes), `N matches`/`N entries` gray
+/// (grep/list), nothing for runs. Facts only.
+fn stats_segments(display: Option<&FrontendToolDisplay>) -> Option<Vec<SegSpan>> {
+    match fact(display, "body") {
+        Some("diff") if fact(display, "bytes_before").is_some() => {
+            let mut segs = Vec::new();
+            if let Some(added) = fact(display, "added") {
+                segs.push(SegSpan::colored(format!("(+{added}"), SegColor::Green));
+            }
+            if let Some(removed) = fact(display, "removed") {
+                segs.push(SegSpan::colored(format!(" -{removed})"), SegColor::Red));
+            }
+            (!segs.is_empty()).then_some(segs)
+        }
+        Some("diff") => fact(display, "added").map(|added| {
+            vec![SegSpan::colored(format!("(+{added} lines)"), SegColor::Green)]
+        }),
+        Some("locs") => {
+            if let Some(total) = fact(display, "matches_total") {
+                Some(vec![SegSpan::colored(format!("{total} matches"), SegColor::Gray)])
+            } else {
+                count_segment(display)
+            }
+        }
+        _ => {
+            if let Some(total) = fact(display, "lines_total") {
+                Some(vec![SegSpan::colored(format!("(+{total} lines)"), SegColor::Green)])
+            } else if let Some(entries) = fact(display, "entries_total") {
+                Some(vec![SegSpan::colored(format!("{entries} entries"), SegColor::Gray)])
+            } else {
+                count_segment(display)
+            }
+        }
     }
-    extra
 }
 
-struct BodyRows {
-    lines: Vec<TranscriptLine>,
-    /// Hidden rows beyond the cap, reported by the `… +N lines` footer.
-    extra: Option<usize>,
+/// The frozen `count` fact (`2 files`, `1 directory`) as gray stats.
+fn count_segment(display: Option<&FrontendToolDisplay>) -> Option<Vec<SegSpan>> {
+    fact(display, "count").map(|count| vec![SegSpan::colored(count, SegColor::Gray)])
 }
 
-/// Diff body with a right-aligned line-number gutter: deletions carry their
-/// old number, insertions and context their new one, both derived from the
-/// unified hunk header (`@@ -a,b +a,c @@`). Write-style `+` blocks have no
-/// header and number from 1. The header itself never renders.
-fn diff_rows(source: &str) -> BodyRows {
+/// The foldable body cell (output / locs / diff). Bodies over the threshold
+/// fold by default (§6); the App's fold state can open or close one.
+fn push_body(lines: &mut Vec<TranscriptLine>, display: Option<&FrontendToolDisplay>) {
+    let Some(display) = display else {
+        return;
+    };
+    let segments = match fact(Some(display), "body") {
+        Some("diff") => diff_segments(&display.detail),
+        Some("output") | Some("locs") => indented_segments(&display.detail),
+        _ => return,
+    };
+    if segments.is_empty() {
+        return;
+    }
+    let fold_count = segments.len().saturating_sub(3);
+    lines.push(body_line(CardBody {
+        lines: segments,
+        threshold: FOLD_THRESHOLD,
+        fold_default_collapsed: true,
+        fold_count,
+        fold_label: "行已折叠".to_owned(),
+        fold_hint: true,
+        fold_all: false,
+    }));
+}
+
+/// Diff body as segmented rows: a fixed 4-column number slot (`-  3`,
+/// `+  3`, `   2`), the BORDER `│` separator, then the content. Del/ins
+/// rows carry their wash tone; the hunk header never renders.
+fn diff_segments(source: &str) -> Vec<Vec<SegSpan>> {
     let mut state: Option<(usize, usize)> = None;
-    let rendered: Vec<TranscriptLine> = source
-        .lines()
-        .filter_map(|row| numbered_diff_row(row, &mut state))
-        .map(|(tone, number, content)| {
-            card_line(format!("    {} | {content}", number.unwrap_or(0)), tone)
-        })
-        .collect();
-    finish(rendered, BODY_LINES)
+    let mut lines: Vec<Vec<SegSpan>> = Vec::new();
+    for row in source.lines() {
+        if let Some((old_start, new_start)) = parse_hunk_header(row) {
+            state = Some((old_start, new_start));
+            continue;
+        }
+        let (tone, number, content) = numbered_diff_row(row, &mut state);
+        let number = number.unwrap_or(0);
+        let (symbol, number_color, content_color, wash) = match tone {
+            Tone::DiffDel => ("-", SegColor::Red, SegColor::Red, Some(Tone::DiffDel)),
+            Tone::DiffIns => ("+", SegColor::Green, SegColor::Green, Some(Tone::DiffIns)),
+            _ => (" ", SegColor::DarkGray, SegColor::Default, None),
+        };
+        let number_text = match tone {
+            Tone::DiffDel | Tone::DiffIns => format!("{symbol}  {number}"),
+            _ => format!("   {number}"),
+        };
+        lines.push(vec![
+            SegSpan {
+                text: number_text,
+                color: number_color,
+                bold: false,
+                tone: wash,
+            },
+            SegSpan {
+                text: "│ ".to_owned(),
+                color: SegColor::Border,
+                bold: false,
+                tone: None,
+            },
+            SegSpan {
+                text: content,
+                color: content_color,
+                bold: false,
+                tone: None,
+            },
+        ]);
+    }
+    lines
 }
 
 /// Classifies one hunk row against the rolling `(old_next, new_next)`
@@ -152,10 +268,9 @@ fn diff_rows(source: &str) -> BodyRows {
 fn numbered_diff_row(
     row: &str,
     state: &mut Option<(usize, usize)>,
-) -> Option<(Tone, Option<usize>, String)> {
+) -> (Tone, Option<usize>, String) {
     if let Some((old_start, new_start)) = parse_hunk_header(row) {
         *state = Some((old_start, new_start));
-        return None;
     }
     let (deletes, inserts, content) = match row.chars().next() {
         Some('-') => (true, false, &row[1..]),
@@ -169,20 +284,20 @@ fn numbered_diff_row(
         (true, false) => {
             let old_number = counters.0;
             counters.0 += 1;
-            Some((Tone::DiffDel, Some(old_number), truncate_content(content)))
+            (Tone::DiffDel, Some(old_number), truncate_content(content))
         }
         // Insertion: consumes a new line, shown with its new number.
         (false, true) => {
             let new_number = counters.1;
             counters.1 += 1;
-            Some((Tone::DiffIns, Some(new_number), truncate_content(content)))
+            (Tone::DiffIns, Some(new_number), truncate_content(content))
         }
         // Context: consumes both sides; shows its new number.
         _ => {
             counters.0 += 1;
             let new_number = counters.1;
             counters.1 += 1;
-            Some((Tone::Plain, Some(new_number), truncate_content(content)))
+            (Tone::Plain, Some(new_number), truncate_content(content))
         }
     }
 }
@@ -206,30 +321,158 @@ fn parse_hunk_header(row: &str) -> Option<(usize, usize)> {
     Some((old_start.parse().ok()?, new_start.parse().ok()?))
 }
 
-/// Bounded `output` / `locs` body: blank rows drop out, each row indents by
-/// four and truncates horizontally.
-fn indented_rows(source: &str, cap: usize) -> BodyRows {
-    finish(
-        source
-            .lines()
-            .filter(|row| !row.trim().is_empty())
-            .map(|row| {
-                card_line(
-                    format!("    {}", text::truncate(row, BODY_COLS.saturating_sub(4))),
-                    Tone::Plain,
-                )
-            })
-            .collect(),
-        cap,
+/// Bounded `output` / `locs` body: blank rows drop out, each row truncates
+/// horizontally. The body indent (2 columns) is applied at projection.
+fn indented_segments(source: &str) -> Vec<Vec<SegSpan>> {
+    source
+        .lines()
+        .filter(|row| !row.trim().is_empty())
+        .map(|row| vec![SegSpan::plain(text::truncate(row, BODY_COLS))])
+        .collect()
+}
+
+/// The live running card, one cell (§4): header (yellow bar, spinner,
+/// elapsed) plus the bounded live output body.
+pub(crate) fn running_cell(
+    tool_name: &str,
+    arguments: &str,
+    output: &str,
+    truncated: bool,
+    spinner: &str,
+    elapsed: Duration,
+) -> TranscriptLine {
+    let target = primary_target(arguments).map(|(target, kind)| HeaderPiece {
+        text: preview(&target, KEY_WIDTH),
+        color: kind_color(kind),
+        bold: false,
+    });
+    let header = CardHeader {
+        bar: HeaderPiece {
+            text: "▎".to_owned(),
+            color: SegColor::Yellow,
+            bold: false,
+        },
+        action: HeaderPiece {
+            text: tool_name.to_owned(),
+            color: SegColor::Gray,
+            bold: true,
+        },
+        target,
+        stats: None,
+        status: HeaderPiece {
+            text: spinner.to_owned(),
+            color: SegColor::Yellow,
+            bold: false,
+        },
+        time: Some(HeaderPiece {
+            text: format_card_elapsed(elapsed),
+            color: SegColor::DarkGray,
+            bold: false,
+        }),
+    };
+    let mut lines = indented_segments(output);
+    if truncated {
+        lines.push(vec![SegSpan::colored("… (truncated)", SegColor::Gray)]);
+    }
+    card_cell(
+        header,
+        CardBody {
+            lines,
+            threshold: usize::MAX,
+            fold_default_collapsed: false,
+            fold_count: 0,
+            fold_label: "行已折叠".to_owned(),
+            fold_hint: true,
+            fold_all: false,
+        },
     )
 }
 
-fn finish(all: Vec<TranscriptLine>, cap: usize) -> BodyRows {
-    let extra = all.len().checked_sub(cap).filter(|extra| *extra > 0);
-    BodyRows {
-        lines: all.into_iter().take(cap).collect(),
-        extra,
+/// A cancelled card: red `✗ cancelled` header, no body (§2 priority).
+pub(crate) fn cancelled_cell(tool_name: &str, arguments: &str) -> TranscriptLine {
+    let target = primary_target(arguments).map(|(target, kind)| HeaderPiece {
+        text: preview(&target, KEY_WIDTH),
+        color: kind_color(kind),
+        bold: false,
+    });
+    header_line(CardHeader {
+        bar: HeaderPiece {
+            text: "▎".to_owned(),
+            color: SegColor::Red,
+            bold: false,
+        },
+        action: HeaderPiece {
+            text: tool_name.to_owned(),
+            color: SegColor::Gray,
+            bold: true,
+        },
+        target,
+        stats: None,
+        status: HeaderPiece {
+            text: "✗ cancelled".to_owned(),
+            color: SegColor::Red,
+            bold: false,
+        },
+        time: None,
+    })
+}
+
+/// The primary argument key with its kind (path / command / pattern) and
+/// the color that kind paints as.
+pub(crate) fn preview_target(arguments: &str) -> Option<(String, SegColor)> {
+    primary_target(arguments).map(|(target, kind)| (preview(&target, KEY_WIDTH), kind_color(kind)))
+}
+
+/// Target kind of the arguments JSON, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgKind {
+    Path,
+    Command,
+    Pattern,
+}
+
+fn arg_kind(arguments: &str) -> Option<ArgKind> {
+    for key in ["command", "pattern", "paths", "path"] {
+        if json_has_field(arguments, key) {
+            return Some(match key {
+                "command" => ArgKind::Command,
+                "pattern" => ArgKind::Pattern,
+                _ => ArgKind::Path,
+            });
+        }
     }
+    None
+}
+
+fn kind_color(kind: ArgKind) -> SegColor {
+    match kind {
+        ArgKind::Path => SegColor::Green,
+        ArgKind::Command | ArgKind::Pattern => SegColor::Orange,
+    }
+}
+
+fn target_color(arguments: &str) -> SegColor {
+    arg_kind(arguments).map(kind_color).unwrap_or(SegColor::Green)
+}
+
+fn json_has_field(raw: &str, key: &str) -> bool {
+    raw.contains(&format!("\"{key}\""))
+}
+
+/// First string value under the primary keys, accepting arrays (`paths`).
+fn primary_target(arguments: &str) -> Option<(String, ArgKind)> {
+    if let Some(value) = json_string_field(arguments, "path")
+        .or_else(|| json_string_field(arguments, "paths"))
+    {
+        return Some((value, ArgKind::Path));
+    }
+    if let Some(value) = json_string_field(arguments, "command") {
+        return Some((value, ArgKind::Command));
+    }
+    if let Some(value) = json_string_field(arguments, "pattern") {
+        return Some((value, ArgKind::Pattern));
+    }
+    None
 }
 
 pub(crate) fn verbose_card(
@@ -297,26 +540,23 @@ fn card_line(text: impl Into<String>, tone: Tone) -> TranscriptLine {
         kind: LineKind::Tool,
         text: text.into(),
         tone,
+        header: None,
+        body: None,
     }
-}
-
-fn primary_key(arguments: &str) -> Option<String> {
-    for key in ["path", "command", "pattern"] {
-        if let Some(value) = json_string_field(arguments, key) {
-            let preview = preview(&value, KEY_WIDTH);
-            if !preview.is_empty() {
-                return Some(preview);
-            }
-        }
-    }
-    None
 }
 
 fn json_string_field(raw: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let start = raw.find(&needle)?;
     let after = raw[start + needle.len()..].trim_start().strip_prefix(':')?;
-    let after = after.trim_start().strip_prefix('"')?;
+    let after = after.trim_start();
+    // Accept arrays (`paths: [...]`) by reading the first element.
+    let after = if let Some(rest) = after.strip_prefix('[') {
+        rest.trim_start()
+    } else {
+        after
+    };
+    let after = after.strip_prefix('"')?;
     let mut out = String::new();
     let mut chars = after.chars();
     while let Some(ch) = chars.next() {
@@ -355,6 +595,38 @@ mod tests {
         lines.iter().map(|line| line.tone).collect()
     }
 
+    fn card_header(lines: &[TranscriptLine]) -> &CardHeader {
+        lines[0].header.as_ref().expect("header cell")
+    }
+
+    fn body(lines: &[TranscriptLine]) -> &CardBody {
+        lines[1].body.as_ref().expect("body cell")
+    }
+
+    fn stats(header: &CardHeader) -> Option<Vec<String>> {
+        header
+            .stats
+            .as_ref()
+            .map(|segs| segs.iter().map(|seg| seg.text.clone()).collect())
+    }
+
+    fn row_texts(rows: &[Vec<SegSpan>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|seg| seg.text.as_str())
+                    .collect::<Vec<_>>()
+                    .concat()
+            })
+            .collect()
+    }
+
+    fn wash(rows: &[Vec<SegSpan>]) -> Vec<Option<Tone>> {
+        rows.iter()
+            .map(|row| row.first().and_then(|seg| seg.tone))
+            .collect()
+    }
+
     fn display(detail: impl Into<String>, facts: &[(&str, &str)]) -> FrontendToolDisplay {
         FrontendToolDisplay {
             detail: detail.into(),
@@ -384,7 +656,6 @@ mod tests {
             "",
             &[
                 ("title", "Read"),
-                ("verb", "Read"),
                 ("body", "none"),
                 ("subject", "src/routes/users.ts"),
                 ("subject", "src/routes/users.test.ts"),
@@ -396,16 +667,22 @@ mod tests {
             r#"{"paths":["src/routes/users.ts"]}"#,
             &success("contents"),
             Some(&read),
+            None,
         );
-        assert_eq!(
-            texts(&lines),
-            [
-                "Read 2 files",
-                "  ↳ src/routes/users.ts",
-                "    src/routes/users.test.ts"
-            ]
-        );
-        assert_eq!(tones(&lines), [Tone::Title, Tone::Detail, Tone::Detail]);
+        let header = card_header(&lines);
+        assert_eq!(header.action.text, "Read");
+        assert!(header.action.bold);
+        let target = header.target.as_ref().expect("first subject is the target");
+        assert_eq!(target.text, "src/routes/users.ts");
+        assert_eq!(target.color, SegColor::Green);
+        assert_eq!(stats(header), Some(vec!["2 files".to_owned()]));
+        assert_eq!(header.status.text, "✓ done");
+        assert_eq!(header.status.color, SegColor::Green);
+        assert_eq!(header.time, None);
+        // The remaining subjects ride as plain indented rows.
+        assert_eq!(texts(&lines), ["", "  src/routes/users.test.ts"]);
+        assert_eq!(lines[1].tone, Tone::Detail);
+        assert_eq!(tones(&lines), [Tone::Title, Tone::Detail]);
         assert!(lines.iter().all(|line| !line.text.contains("contents")));
     }
 
@@ -419,7 +696,6 @@ mod tests {
             locs,
             &[
                 ("title", "Grep"),
-                ("verb", "Searched"),
                 ("body", "locs"),
                 ("subject", "\"hit\""),
                 ("count", "1 search"),
@@ -431,27 +707,24 @@ mod tests {
             r#"{"pattern":"hit","path":"src"}"#,
             &success("dump of every match for the model"),
             Some(&grep),
+            None,
         );
-        assert_eq!(
-            texts(&lines),
-            [
-                "Grep 1 search",
-                "  ↳ \"hit\"",
-                "",
-                "    src/lib.rs:1: hit 1",
-                "    src/lib.rs:2: hit 2",
-                "    src/lib.rs:3: hit 3",
-                "    src/lib.rs:4: hit 4",
-                "    src/lib.rs:5: hit 5",
-            ]
-        );
-        assert!(tones(&lines)[3] == Tone::Plain);
+        let header = card_header(&lines);
+        assert_eq!(header.action.text, "Grep");
+        let target = header.target.as_ref().expect("pattern subject");
+        assert_eq!(target.text, "\"hit\"");
+        assert_eq!(target.color, SegColor::Orange);
+        assert_eq!(stats(header), Some(vec!["8 matches".to_owned()]));
+        assert_eq!(header.status.text, "✓ done");
+        let rows = &body(&lines).lines;
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0][0].text, "src/lib.rs:1: hit 1");
+        assert_eq!(rows[7][0].text, "src/lib.rs:8: hit 8");
         assert!(
             lines
                 .iter()
                 .all(|line| !line.text.contains("dump of every match"))
         );
-        assert!(lines.iter().all(|line| !line.text.contains("hit 8")));
     }
 
     #[test]
@@ -460,7 +733,6 @@ mod tests {
             "src/main.rs\nsrc/lib.rs",
             &[
                 ("title", "List Directory"),
-                ("verb", "Listed"),
                 ("body", "none"),
                 ("subject", "."),
                 ("count", "1 directory"),
@@ -471,21 +743,32 @@ mod tests {
             r#"{"path":"."}"#,
             &success("src/main.rs"),
             Some(&list),
+            None,
         );
-        assert_eq!(texts(&lines), ["List Directory 1 directory", "  ↳ ."]);
+        let header = card_header(&lines);
+        assert_eq!(header.action.text, "List Directory");
+        assert_eq!(
+            header.target.as_ref().map(|t| t.text.as_str()),
+            Some(".")
+        );
+        assert_eq!(header.target.as_ref().map(|t| t.color), Some(SegColor::Green));
+        assert_eq!(stats(header), Some(vec!["1 directory".to_owned()]));
+        assert_eq!(lines.len(), 1, "no body for a directory listing");
         assert!(lines.iter().all(|line| !line.text.contains("src/main.rs")));
     }
 
     #[test]
-    fn edit_card_renders_result_row_and_numbered_gutter() {
+    fn edit_card_renders_the_result_row_and_numbered_gutter() {
         let detail = "@@ -6,3 +6,3 @@\n-const limit = page * 10;\n+const limit = Math.min(page * 10, 50);\n+const offset = page * limit;\n return paginate(page);";
         let edit = display(
             detail,
             &[
                 ("title", "Edit"),
-                ("verb", "Edited"),
                 ("body", "diff"),
                 ("subject", "src/routes/users.ts"),
+                ("added", "2"),
+                ("removed", "1"),
+                ("bytes_before", "840"),
                 ("result", "Succeeded. File edited.  (+2 added, -1 removed)"),
             ],
         );
@@ -494,44 +777,54 @@ mod tests {
             r#"{"path":"src/routes/users.ts"}"#,
             &success("replaced src/routes/users.ts"),
             Some(&edit),
+            None,
         );
+        let header = card_header(&lines);
+        // Edits are their own family: orange bar, `✓ applied`, green path.
+        assert_eq!(header.bar.color, SegColor::Orange);
+        assert_eq!(header.status.text, "✓ applied");
+        assert_eq!(header.status.color, SegColor::Orange);
         assert_eq!(
-            texts(&lines),
+            header.target.as_ref().map(|t| t.color),
+            Some(SegColor::Green)
+        );
+        let stats = header.stats.as_ref().expect("edit stats");
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].text, "(+2");
+        assert_eq!(stats[0].color, SegColor::Green);
+        assert_eq!(stats[1].text, " -1)");
+        assert_eq!(stats[1].color, SegColor::Red);
+        // The gutter is 4 columns wide; the hunk header never renders.
+        let rows = &body(&lines).lines;
+        assert_eq!(
+            row_texts(rows),
             [
-                "Edit src/routes/users.ts",
-                "  ↳ Succeeded. File edited.  (+2 added, -1 removed)",
-                "",
-                "    6 | const limit = page * 10;",
-                "    6 | const limit = Math.min(page * 10, 50);",
-                "    7 | const offset = page * limit;",
-                "    8 | return paginate(page);",
+                "-  6│ const limit = page * 10;",
+                "+  6│ const limit = Math.min(page * 10, 50);",
+                "+  7│ const offset = page * limit;",
+                "   8│ return paginate(page);",
             ]
         );
-        assert_eq!(
-            tones(&lines),
-            [
-                Tone::Title,
-                Tone::Detail,
-                Tone::Plain,
-                Tone::DiffDel,
-                Tone::DiffIns,
-                Tone::DiffIns,
-                Tone::Plain,
-            ]
-        );
+        assert_eq!(wash(rows), [
+            Some(Tone::DiffDel),
+            Some(Tone::DiffIns),
+            Some(Tone::DiffIns),
+            None,
+        ]);
         assert!(lines.iter().all(|line| !line.text.contains("@@")));
         assert!(lines.iter().all(|line| !line.text.contains("replaced src")));
     }
 
     #[test]
-    fn write_cards_number_plus_lines_from_one_without_a_header() {
+    fn write_cards_number_plus_lines_from_one() {
         let write = display(
             "+hello\n+world",
             &[
                 ("title", "Write"),
-                ("verb", "Added"),
                 ("body", "diff"),
                 ("subject", "src/a.rs"),
+                ("added", "2"),
+                ("operation", "write"),
                 ("result", "Succeeded. File created.  (+2 added)"),
             ],
         );
@@ -540,27 +833,17 @@ mod tests {
             r#"{"path":"src/a.rs"}"#,
             &success("wrote src/a.rs (11 bytes, created)"),
             Some(&write),
+            None,
         );
-        assert_eq!(
-            texts(&lines),
-            [
-                "Write src/a.rs",
-                "  ↳ Succeeded. File created.  (+2 added)",
-                "",
-                "    1 | hello",
-                "    2 | world",
-            ]
-        );
-        assert_eq!(
-            tones(&lines),
-            [
-                Tone::Title,
-                Tone::Detail,
-                Tone::Plain,
-                Tone::DiffIns,
-                Tone::DiffIns,
-            ]
-        );
+        let header = card_header(&lines);
+        assert_eq!(header.bar.color, SegColor::Green);
+        assert_eq!(header.status.text, "✓ created");
+        assert_eq!(header.status.color, SegColor::Green);
+        assert_eq!(stats(header), Some(vec!["(+2 lines)".to_owned()]));
+        let rows = &body(&lines).lines;
+        assert_eq!(row_texts(rows), ["+  1│ hello", "+  2│ world"]);
+        assert_eq!(wash(rows), [Some(Tone::DiffIns), Some(Tone::DiffIns)]);
+        assert_eq!(tones(&lines), [Tone::Title, Tone::Plain]);
     }
 
     #[test]
@@ -569,10 +852,10 @@ mod tests {
             "ok\npassed",
             &[
                 ("title", "Run"),
-                ("verb", "Ran"),
                 ("body", "output"),
                 ("subject", "pnpm test"),
                 ("count", "1 command"),
+                ("exit_code", "0"),
                 ("result", "exit 0 · 4.2s"),
             ],
         );
@@ -581,27 +864,30 @@ mod tests {
             r#"{"command":"pnpm test"}"#,
             &success("exit_code: 0\nok"),
             Some(&run),
+            None,
         );
+        let header = card_header(&lines);
+        // Runs paint their command target orange, no stats beyond the count.
         assert_eq!(
-            texts(&lines),
-            [
-                "Run 1 command",
-                "  ↳ pnpm test",
-                "  ↳ exit 0 · 4.2s",
-                "",
-                "    ok",
-                "    passed",
-            ]
+            header.target.as_ref().map(|t| t.color),
+            Some(SegColor::Orange)
+        );
+        assert_eq!(stats(header), Some(vec!["1 command".to_owned()]));
+        assert_eq!(header.status.text, "✓ done");
+        assert_eq!(header.status.color, SegColor::Green);
+        assert_eq!(
+            row_texts(&body(&lines).lines),
+            ["ok", "passed"]
         );
 
         let failed = display(
             "boom",
             &[
                 ("title", "Run"),
-                ("verb", "Ran"),
                 ("body", "output"),
                 ("subject", "cargo test"),
                 ("count", "1 command"),
+                ("exit_code", "1"),
                 ("result", "exit 1 · 1.2s"),
             ],
         );
@@ -610,17 +896,12 @@ mod tests {
             r#"{"command":"cargo test"}"#,
             &success("exit_code: 1\nbloom"),
             Some(&failed),
+            None,
         );
-        assert_eq!(
-            texts(&lines),
-            [
-                "Run 1 command",
-                "  ↳ cargo test",
-                "  ↳ exit 1 · 1.2s",
-                "",
-                "    boom",
-            ]
-        );
+        let head = card_header(&lines);
+        assert_eq!(head.bar.color, SegColor::Red);
+        assert_eq!(head.status.text, "✗ failed");
+        assert_eq!(head.status.color, SegColor::Red);
         assert!(lines.iter().all(|line| !line.text.contains("bloom")));
     }
 
@@ -631,16 +912,26 @@ mod tests {
             r#"{"path":"src/lib.rs"}"#,
             &error("not_unique", "3 matches"),
             None,
+            None,
         );
+        let header = card_header(&lines);
+        assert_eq!(header.bar.color, SegColor::Red);
+        assert_eq!(header.action.text, "edit");
+        assert_eq!(
+            header.target.as_ref().map(|t| t.text.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(header.status.text, "✗ failed");
+        assert_eq!(header.status.color, SegColor::Red);
         assert_eq!(
             texts(&lines),
-            ["edit src/lib.rs", "  ↳ Failed. not_unique · 3 matches"]
+            ["", "  Failed. not_unique · 3 matches"]
         );
         assert_eq!(tones(&lines), [Tone::Title, Tone::Failure]);
     }
 
     #[test]
-    fn output_body_caps_at_sixteen_lines_with_a_footer() {
+    fn output_bodies_fold_past_the_threshold_with_a_counted_bar() {
         let detail = (1..=20)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -649,12 +940,10 @@ mod tests {
             detail,
             &[
                 ("title", "Run"),
-                ("verb", "Ran"),
                 ("body", "output"),
                 ("subject", "seq"),
                 ("count", "1 command"),
-                ("result", "exit 0"),
-                ("truncated", "true"),
+                ("exit_code", "0"),
             ],
         );
         let lines = default_card(
@@ -662,14 +951,19 @@ mod tests {
             r#"{"command":"seq"}"#,
             &success("model dump 20"),
             Some(&run),
+            None,
         );
-        assert_eq!(lines[0].text, "Run 1 command");
-        assert_eq!(lines[4].text, "    line 1");
-        assert_eq!(lines[19].text, "    line 16");
-        assert_eq!(lines[20].text, "  ↳ … +4 lines");
-        assert_eq!(lines.len(), 21);
-        assert!(tones(&lines)[20] == Tone::Detail);
-        assert!(lines.iter().all(|line| !line.text.contains("line 20")));
+        let body = body(&lines);
+        // All rows live in the cell; the projection folds past the threshold.
+        assert_eq!(body.lines.len(), 20);
+        assert_eq!(body.threshold, FOLD_THRESHOLD);
+        assert!(body.fold_default_collapsed);
+        assert_eq!(body.fold_count, 17);
+        assert_eq!(body.fold_label, "行已折叠");
+        assert!(body.fold_hint);
+        assert!(!body.fold_all);
+        assert_eq!(body.lines[0][0].text, "line 1");
+        assert_eq!(body.lines[19][0].text, "line 20");
         assert!(lines.iter().all(|line| !line.text.contains("model dump")));
     }
 
@@ -681,8 +975,16 @@ mod tests {
             r#"{"path":"src/main.rs"}"#,
             &success("fn main() {}"),
             Some(&read),
+            None,
         );
-        assert_eq!(texts(&lines), ["read_file src/main.rs"]);
+        let header = card_header(&lines);
+        assert_eq!(header.action.text, "read_file");
+        assert_eq!(
+            header.target.as_ref().map(|t| t.text.as_str()),
+            Some("src/main.rs")
+        );
+        assert_eq!(stats(header), None);
+        assert_eq!(lines.len(), 1, "no body without a body fact");
         assert!(
             lines
                 .iter()
@@ -705,8 +1007,16 @@ mod tests {
             r#"{"path":"src/main.rs"}"#,
             &success(""),
             Some(&read),
+            None,
         );
-        assert_eq!(texts(&lines), ["read_file 1 file", "  ↳ src/main.rs"]);
+        let header = card_header(&lines);
+        assert_eq!(header.action.text, "read_file");
+        assert_eq!(
+            header.target.as_ref().map(|t| t.text.as_str()),
+            Some("src/main.rs")
+        );
+        assert_eq!(stats(header), Some(vec!["1 file".to_owned()]));
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]

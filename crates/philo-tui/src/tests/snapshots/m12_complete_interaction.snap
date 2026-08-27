@@ -22,13 +22,13 @@ User: look at this
 User: [image image/png, 4 bytes]
 User: 
 overlay:
-╭─ Approval required ────╮
-│                        │
-│ write workspace file   │
-│ path: src/main.rs      │
-│                        │
-│ y allow · n / esc deny │
-╰────────────────────────╯
+╭─ Approval required ────────╮
+│                            │
+│ write workspace file       │
+│ path: src/main.rs          │
+│                            │
+│ [Enter/y] allow · [n] deny │
+╰────────────────────────────╯
 Meta: allowed: write workspace file
 confirmation: Allow
 User: 
@@ -43,5 +43,5 @@ Meta: previous turn did not end cleanly and was sealed; its tool calls may have 
 Reasoning: think
 Reasoning:   checking
 Answer: answer line
-Tool: read src/main.rs
+Tool: 
 Meta: · turn cancelled (user) · 7s

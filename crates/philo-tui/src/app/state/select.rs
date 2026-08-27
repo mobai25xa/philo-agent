@@ -108,7 +108,7 @@ impl App {
         }
         let width = self.layout_width.get();
         self.cells
-            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
+            .refresh_wraps(width, &|index| self.collapser(index));
         self.scroll
             .unfollow_keep_wrapped(&self.cells.wrap_rows(), height);
     }

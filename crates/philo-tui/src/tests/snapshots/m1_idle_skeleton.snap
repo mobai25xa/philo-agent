@@ -1,6 +1,6 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
-assertion_line: 1364
+assertion_line: 1402
 expression: rendered
 ---
     hello
@@ -10,8 +10,8 @@ expression: rendered
 
 
 
-                                                                    gpt-test
+                                                                   gpt-test
    ▌
    ▌ Ask anything
    ▌
-                                                             ↑- ↓- R- C- -/-
+                                                            ↑- ↓- R- C- -/-

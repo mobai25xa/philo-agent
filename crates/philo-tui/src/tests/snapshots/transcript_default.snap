@@ -7,6 +7,6 @@ Meta: previous turn did not end cleanly and was sealed; its tool calls may have 
 Reasoning: think
 Reasoning:   checking workspace
 Answer: answer line\nfinal
-Tool: read_file src/main.rs
+Tool: 
 Meta: · turn cancelled (timeout)
 open: None

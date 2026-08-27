@@ -224,19 +224,30 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         .iter()
         .filter(|line| line.kind == LineKind::Tool)
         .collect::<Vec<_>>();
+    assert_eq!(
+        app.cells.cells().len(),
+        before_started,
+        "Completed rewrites the tree cell in place"
+    );
     assert!(
         tool_lines[0].tone == crate::app::transcript::Tone::Title,
-        "Completed keeps a titled header: {:?}",
+        "the tree keeps a titled header: {:?}",
         tool_lines[0].tone
     );
+    let tree = tool_lines[0].header.as_ref().expect("tree header");
     assert_eq!(
-        tool_lines[0].text, "read_file src/中文.rs",
-        "old displays without verb/body become a header-only card"
+        tree.action.text, "Parallel Task (2 operations)",
+        "batch > 1 renders the concurrent tree"
     );
-    assert_eq!(
-        tool_lines.len(),
-        1,
-        "missing body fact means no body: {tool_lines:?}"
+    let body = tool_lines[0].body.as_ref().expect("tree body");
+    assert!(
+        body.lines.iter().any(|row| {
+            let text = row.iter().map(|seg| seg.text.as_str()).collect::<String>();
+            text.contains("read_file")
+                && text.contains("src/中文.rs")
+                && text.contains("✓ done")
+        }),
+        "the settled child rides in the tree: {body:?}"
     );
     assert!(
         tool_lines

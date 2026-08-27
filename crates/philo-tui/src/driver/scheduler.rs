@@ -10,7 +10,12 @@ use tokio::time::Instant;
 /// Background updates are coalesced to at most thirty terminal frames per
 /// second. The rounded-up nanosecond value keeps the actual rate <= 30 FPS.
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_334);
-pub(crate) const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Fallback animation cadence. The braille state spinner (80ms) drives the
+/// production loop via [`crate::render::theme::Spinner::interval`]; the
+/// scheduler just needs a concrete period to schedule the next tick with.
+pub(crate) const ANIMATION_INTERVAL: Duration =
+    Duration::from_millis(crate::render::theme::THINKING_SPINNER.frame_ms);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

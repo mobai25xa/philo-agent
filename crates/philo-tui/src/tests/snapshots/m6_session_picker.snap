@@ -1,28 +1,29 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
+assertion_line: 1539
 expression: rendered
 ---
 
 
-          ╭─ Sessions · 1/3 ─────────────────────────────────────────╮
-          │                                                          │
-          │ › fix the flaky test on windows                      now │
-          │     last: refactor the auth middleware to…               │
-          │     one file                                             │
-          │   s-auth                                              3m │
-          │ • s-image                                             2d │
-          │                                                          │
-          │                                                          │
-          │                                                          │
-          │                                                          │
-          │                                                          │
-          │ enter select · ↑↓ move · type filter · esc close         │
-          ╰──────────────────────────────────────────────────────────╯
+          ╭─ Sessions · 1/3 ────────────────────────────────────────╮
+          │                                                         │
+          │▎▶ fix the flaky test on windows                     now │
+          │     last: refactor the auth middleware to…              │
+          │     one file                                            │
+          │   s-auth                                             3m │
+          │ • s-image                                            2d │
+          │                                                         │
+          │                                                         │
+          │                                                         │
+          │                                                         │
+          │ enter select · ↑↓ move · type filter · esc close        │
+          ╰─────────────────────────────────────────────────────────╯
 
 
 
-                                                                    gpt-test
-   ▌
-   ▌ Ask anything
-   ▌
-                                                             ↑- ↓- R- C- -/-
+───────────────────────────────────────────────────────────────────────────────
+  ● Ready                                                            gpt-test
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ ❯ Ask anything                                                              │
+╰─────────────────────────────────────────────────────────────────────────────╯
+                                                          ↑-  ↓-  R-  C-  -/-

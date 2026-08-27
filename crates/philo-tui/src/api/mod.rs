@@ -4,5 +4,5 @@ pub mod types;
 
 pub use types::{
     RestoreFailure, RestoreReport, TerminalCapability, TuiLaunchConfig, TuiOutcome, TuiRecovery,
-    TuiRecoveryAttachment, TuiRunReport, TuiScreen,
+    TuiRecoveryAttachment, TuiRunReport,
 };

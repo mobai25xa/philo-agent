@@ -12,6 +12,7 @@ use super::line;
 use super::overlays::SessionLoadIntent;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::listings;
+use crate::app::live_tool::{self, LiveBatch, LiveSlot, SlotSettle};
 use crate::app::overlay::{PickerEntry, Preview};
 use crate::app::session;
 use crate::app::submit::{CancelDispatchResult, PendingSubmission};
@@ -37,32 +38,51 @@ impl App {
     }
 
     /// Whether presentation currently has a time-based animation: the
-    /// run-state spinner, pending paced stream text, or the settle
-    /// drop-to-bottom animation (v2.2).
+    /// run-state spinner, pending paced stream text, or the scrollbar's
+    /// scroll-heat window (P2).
     pub(crate) fn animation_active(&self) -> bool {
         self.run_state.is_active()
             || !self.pacer.is_empty()
-            || matches!(self.stream_anchor, Some(super::StreamAnchor::Settle { .. }))
+            || self
+                .tool_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.all_settled())
+            || self.scrollbar_active()
     }
 
-    /// Advances one animation tick: the spinner, the pacer's release of
-    /// buffered stream characters, and the settle drop animation. `dt` is
-    /// the driver's animation cadence; a tick never requests a clear.
+    /// Advances one animation tick: the spinner and the pacer's release of
+    /// buffered stream characters. `dt` is the driver's animation cadence;
+    /// a tick never requests a clear.
     pub(crate) fn on_tick(&mut self, dt: std::time::Duration) -> bool {
         let mut dirty = false;
         if self.run_state.is_active() {
             self.run_state.advance_spinner();
             dirty = true;
         }
-        if let Some(super::StreamAnchor::Settle { left }) = &mut self.stream_anchor {
-            *left = left.saturating_sub(1);
+        // Live tool cards tick their spinner + elapsed (v4.0 P3 §4.1).
+        if self.tool_batch.is_some() {
+            self.refresh_live_cards();
             dirty = true;
-            if *left == 0 {
-                self.stream_anchor = None;
-            }
         }
         let pieces = self.pacer.drain(dt);
         dirty | self.write_paced(pieces)
+    }
+
+    /// Rewrites the in-flight live card cell with the current spinner frame
+    /// and elapsed; settled batches are already final and skip the rewrite.
+    fn refresh_live_cards(&mut self) {
+        let Some(batch) = self.tool_batch.as_ref() else {
+            return;
+        };
+        if batch.all_settled() {
+            return;
+        }
+        let Some(cell_index) = batch.cell_index else {
+            return;
+        };
+        let spinner = self.run_state.spinner_frame().to_owned();
+        let cell = live_tool::live_cell(batch, &spinner);
+        self.cells.replace_cell(cell_index, cell);
     }
 
     /// Starts rendering a different session: fresh transcript, cells, and
@@ -73,9 +93,11 @@ impl App {
         self.transcript = crate::app::transcript::Transcript::new(self.show_reasoning);
         self.run_state.clear();
         self.clear_stream();
-        self.stream_anchor = None;
         self.cells.clear();
         self.reasoning_manually_expanded.clear();
+        self.tool_batch = None;
+        self.tool_cards_expanded.clear();
+        self.tool_cards_folded.clear();
         self.scroll = crate::app::cells::ScrollState::follow();
         self.clear_selection();
     }
@@ -97,15 +119,6 @@ impl App {
         // settlement line can cite the duration (design §2.4).
         let turn_elapsed = terminal_event_elapsed(&self.run_state, event);
         self.run_state.on_event(event);
-        // A new operation lifts the viewport to the 40% line (v2.2 T4.7);
-        // terminal events start the drop back to the band bottom (T4.9).
-        match event {
-            FrontendOperationEvent::OperationStarted { .. }
-            | FrontendOperationEvent::TurnStarted { .. } => self.try_begin_stream_lift(),
-            FrontendOperationEvent::OperationSettled { .. }
-            | FrontendOperationEvent::TurnFailed { .. } => self.begin_settle_drop(),
-            _ => {}
-        }
         match event {
             FrontendOperationEvent::ModelUsageUpdated { usage, .. } => {
                 self.status.usage = Some(*usage);
@@ -136,12 +149,290 @@ impl App {
                 self.pace_delta(crate::app::transcript::LineKind::Reasoning, text);
                 return vec![];
             }
+            // v4.0 P3: default-mode tool events drive the live cards directly
+            // (a running card rewrites in place, progress bounds its output).
+            // Verbose mode keeps the transcript's older line-based card.
+            FrontendOperationEvent::ToolBatchRequested { .. }
+            | FrontendOperationEvent::ToolExecutionStarted { .. }
+            | FrontendOperationEvent::ToolExecutionProgress { .. }
+            | FrontendOperationEvent::ToolExecutionCompleted { .. }
+                if self.level != InfoLevel::Verbose =>
+            {
+                self.flush_stream();
+                self.apply_tool_event(event);
+                return vec![];
+            }
+            // Cancellation settles any live tool cards to `✗ cancelled`.
+            FrontendOperationEvent::CancellationRequested { .. }
+            | FrontendOperationEvent::TurnCancelled { .. } => self.settle_live_tools_cancelled(),
+            // Terminal events drop the batch so later ticks never rewrite.
+            FrontendOperationEvent::OperationSettled { .. }
+            | FrontendOperationEvent::TurnFailed { .. } => self.tool_batch = None,
             _ => {}
         }
         self.flush_stream();
         self.transcript
             .apply(&mut self.cells, event, self.level, turn_elapsed);
         vec![]
+    }
+
+    /// Dispatches one default-mode tool event to the live card machine.
+    fn apply_tool_event(&mut self, event: &FrontendOperationEvent) {
+        match event {
+            FrontendOperationEvent::ToolBatchRequested { call_count, .. } => {
+                self.begin_tool_batch(*call_count);
+            }
+            FrontendOperationEvent::ToolExecutionStarted {
+                index,
+                tool_name,
+                arguments,
+                ..
+            } => {
+                self.start_live_tool(*index, tool_name, arguments);
+            }
+            FrontendOperationEvent::ToolExecutionProgress { index, tail, .. } => {
+                self.progress_live_tool(*index, tail);
+            }
+            FrontendOperationEvent::ToolExecutionCompleted {
+                index,
+                tool_name,
+                result,
+                display,
+                ..
+            } => {
+                self.complete_live_tool(*index, tool_name, result, display.as_ref());
+            }
+            _ => {}
+        }
+    }
+
+    /// A batch announcement opens the live batch; multi-call batches create
+    /// their tree cell immediately (the parent header carries the count).
+    fn begin_tool_batch(&mut self, call_count: usize) {
+        self.cells.close_open();
+        self.cells.seal_think();
+        self.tool_batch = Some(LiveBatch::new(call_count));
+        if call_count > 1 {
+            let spinner = self.run_state.spinner_frame().to_owned();
+            let batch = self.tool_batch.as_ref().expect("batch just created");
+            let cell = live_tool::live_cell(batch, &spinner);
+            self.cells.push_closed([cell]);
+            let index = self.cells.display_len() - 1;
+            self.tool_batch.as_mut().expect("batch just created").cell_index = Some(index);
+        }
+    }
+
+    /// A tool started: record its slot; the single tool's running card is
+    /// created here (the tree cell already exists).
+    fn start_live_tool(&mut self, index: usize, tool_name: &str, arguments: &str) {
+        if self.tool_batch.is_none() {
+            self.begin_tool_batch(1);
+        }
+        let Some(batch) = self.tool_batch.as_mut() else {
+            return;
+        };
+        if batch.slot(index).is_some() {
+            return;
+        }
+        let slot = LiveSlot {
+            index,
+            tool_name: tool_name.to_owned(),
+            arguments: arguments.to_owned(),
+            started_at: std::time::Instant::now(),
+            output: String::new(),
+            truncated: false,
+            settled: None,
+        };
+        batch.slots.push(slot);
+        if batch.total == 1 {
+            let (spinner, elapsed) = {
+                let batch = self.tool_batch.as_ref().expect("batch present");
+                (
+                    self.run_state.spinner_frame().to_owned(),
+                    batch.elapsed(),
+                )
+            };
+            let (tool_name, arguments) = {
+                let slot = self
+                    .tool_batch
+                    .as_ref()
+                    .expect("batch present")
+                    .slot(index)
+                    .expect("slot just pushed");
+                (slot.tool_name.clone(), slot.arguments.clone())
+            };
+            let cell = crate::app::tool_card::running_cell(
+                &tool_name,
+                &arguments,
+                "",
+                false,
+                &spinner,
+                elapsed,
+            );
+            self.cells.push_closed([cell]);
+            let cell_index = self.cells.display_len() - 1;
+            self.tool_batch
+                .as_mut()
+                .expect("batch present")
+                .cell_index = Some(cell_index);
+        } else {
+            self.rewrite_tree();
+        }
+    }
+
+    /// Progress appends to the slot's bounded output (single cards only;
+    /// tree children are headers) and rewrites the live cell.
+    fn progress_live_tool(&mut self, index: usize, tail: &str) {
+        let Some(batch) = self.tool_batch.as_mut() else {
+            return;
+        };
+        let Some(slot) = batch.slot_mut(index) else {
+            return;
+        };
+        if slot.settled.is_some() {
+            return;
+        }
+        let remaining = crate::app::tool_card::LIVE_TEXT_CHARS_MAX.saturating_sub(slot.output.len());
+        if remaining == 0 {
+            slot.truncated = true;
+            return;
+        }
+        let take = tail.len().min(remaining);
+        slot.output.push_str(&tail[..take]);
+        if take < tail.len() {
+            slot.truncated = true;
+        }
+        if batch.total == 1 {
+            let cell_index = batch.cell_index;
+            if let Some(cell_index) = cell_index {
+                let (spinner, elapsed, tool_name, arguments, output, truncated) = {
+                    let batch = self.tool_batch.as_ref().expect("batch present");
+                    let slot = batch.slot(index).expect("slot present");
+                    (
+                        self.run_state.spinner_frame().to_owned(),
+                        batch.slot_elapsed(slot),
+                        slot.tool_name.clone(),
+                        slot.arguments.clone(),
+                        slot.output.clone(),
+                        slot.truncated,
+                    )
+                };
+                let cell = crate::app::tool_card::running_cell(
+                    &tool_name, &arguments, &output, truncated, &spinner, elapsed,
+                );
+                self.cells.replace_cell(cell_index, cell);
+            }
+        }
+    }
+
+    /// A tool completed: settle the slot in place — the single card rewrites
+    /// its cell with the settled card, the tree cell folds the child in.
+    fn complete_live_tool(
+        &mut self,
+        index: usize,
+        tool_name: &str,
+        result: &philo_agent_service::FrontendToolResult,
+        display: Option<&philo_agent_service::FrontendToolDisplay>,
+    ) {
+        let Some(batch) = self.tool_batch.as_ref() else {
+            self.cells
+                .push_closed(crate::app::tool_card::default_card(
+                    tool_name,
+                    "",
+                    result,
+                    display,
+                    None,
+                ));
+            return;
+        };
+        let single = batch.total == 1;
+        let cell_index = batch.cell_index;
+        let elapsed = batch.slot(index).map(|slot| batch.slot_elapsed(slot));
+        let tool_name = batch
+            .slot(index)
+            .map(|slot| slot.tool_name.clone())
+            .unwrap_or_else(|| tool_name.to_owned());
+        let arguments = batch
+            .slot(index)
+            .map(|slot| slot.arguments.clone())
+            .unwrap_or_default();
+        let Some(batch) = self.tool_batch.as_mut() else {
+            return;
+        };
+        let Some(slot) = batch.slot_mut(index) else {
+            return;
+        };
+        if slot.settled.is_some() {
+            return;
+        }
+        slot.settled = Some(SlotSettle {
+            result: result.clone(),
+            display: display.cloned(),
+            cancelled: false,
+        });
+        if single {
+            if let Some(cell_index) = cell_index {
+                let settled = crate::app::tool_card::default_card(
+                    &tool_name,
+                    &arguments,
+                    result,
+                    display,
+                    elapsed,
+                );
+                self.cells.replace_tail(cell_index, settled);
+            }
+        } else {
+            self.rewrite_tree();
+        }
+    }
+
+    /// Cancellation rewrites every still-running slot as `✗ cancelled` — the
+    /// highest-priority settle that later completions may not overwrite.
+    fn settle_live_tools_cancelled(&mut self) {
+        let Some(batch) = self.tool_batch.as_mut() else {
+            return;
+        };
+        let single = batch.total == 1;
+        let cell_index = batch.cell_index;
+        for slot in &mut batch.slots {
+            if slot.settled.is_none() {
+                slot.settled = Some(SlotSettle {
+                    result: philo_agent_service::FrontendToolResult::Error {
+                        code: "cancelled".to_owned(),
+                        message: String::new(),
+                    },
+                    display: None,
+                    cancelled: true,
+                });
+            }
+        }
+        if single {
+            if let Some(cell_index) = cell_index {
+                let (tool_name, arguments) = {
+                    let batch = self.tool_batch.as_ref().expect("batch present");
+                    let slot = batch.slots.first().expect("single slot");
+                    (slot.tool_name.clone(), slot.arguments.clone())
+                };
+                let cell =
+                    crate::app::tool_card::cancelled_cell(&tool_name, &arguments);
+                self.cells.replace_tail(cell_index, vec![cell]);
+            }
+        } else {
+            self.rewrite_tree();
+        }
+    }
+
+    /// Rebuilds the tree cell from the batch's current children.
+    fn rewrite_tree(&mut self) {
+        let Some(batch) = self.tool_batch.as_ref() else {
+            return;
+        };
+        let Some(cell_index) = batch.cell_index else {
+            return;
+        };
+        let spinner = self.run_state.spinner_frame().to_owned();
+        let cell = live_tool::live_cell(batch, &spinner);
+        self.cells.replace_cell(cell_index, cell);
     }
 
     /// Applies one frontend update to the presentation projection.

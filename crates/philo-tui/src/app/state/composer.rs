@@ -205,6 +205,12 @@ impl App {
 
     pub(super) fn submit(&mut self) -> Vec<Effect> {
         self.clear_selection();
+        // A message always lands at the tail: submitting from browse mode
+        // (or after it) drops the reading place and follows the new turn.
+        if self.focus_mode == super::FocusMode::Browse {
+            self.exit_browse();
+            self.jump_transcript_bottom();
+        }
         if self.input.is_empty() && self.attachments.is_empty() {
             return vec![];
         }

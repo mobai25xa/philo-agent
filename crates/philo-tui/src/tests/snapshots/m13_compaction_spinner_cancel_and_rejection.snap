@@ -4,8 +4,8 @@ expression: "format!(\"START\\n{}\\n{frame_zero:?}\\n{frame_one:?}\\n\\nDUPLICAT
 ---
 START
 Meta: /compact
-("⠋", "Compacting…")
-("⠙", "Compacting…")
+("⠂", "Compacting…")
+("-", "Compacting…")
 
 DUPLICATE
 Meta: /compact

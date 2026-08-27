@@ -1,9 +1,8 @@
-//! Crossterm terminal ownership: raw mode, optional alternate screen, mouse
+//! Crossterm terminal ownership: raw mode, alternate screen, mouse
 //! capture, bracketed paste, and owner-thread restore.
 //!
-//! Alternate mode owns the isolated alternate buffer. Inline mode draws an
-//! inline viewport on the main buffer and never enters the alternate screen.
-//! Native main-buffer scrollback dump on exit is not implemented here.
+//! The session always owns the isolated alternate buffer. Native main-buffer
+//! scrollback dump on exit is not implemented here.
 
 mod backend;
 
@@ -15,9 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::ThreadId;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 
-use crate::api::types::{RestoreFailure, RestoreReport, TerminalCapability, TuiScreen};
+use crate::api::types::{RestoreFailure, RestoreReport, TerminalCapability};
 
 pub use backend::{CrosstermTerminalBackend, TerminalBackend};
 
@@ -251,11 +250,9 @@ impl<B: TerminalBackend> ModeOwner<B> {
     }
 
     /// Setup modes in doc order. Keyboard enhancement is optional.
-    fn setup_modes(&mut self, screen: TuiScreen) -> io::Result<bool> {
+    fn setup_modes(&mut self) -> io::Result<bool> {
         self.acquire(TerminalCapability::RawMode)?;
-        if matches!(screen, TuiScreen::Alternate) {
-            self.acquire(TerminalCapability::AlternateScreen)?;
-        }
+        self.acquire(TerminalCapability::AlternateScreen)?;
         self.acquire(TerminalCapability::MouseCapture)?;
         self.acquire(TerminalCapability::BracketedPaste)?;
         let mut shift_enter = cfg!(windows);
@@ -445,24 +442,13 @@ fn emergency_restore_active_session(backend: &mut impl TerminalBackend) -> Resto
     }
 }
 
-fn build_ratatui_terminal(screen: TuiScreen) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+fn build_ratatui_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     let backend = CrosstermBackend::new(stdout());
-    match screen {
-        TuiScreen::Alternate => Terminal::new(backend),
-        TuiScreen::Inline => {
-            let (_, height) = crossterm::terminal::size()?;
-            Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Inline(height),
-                },
-            )
-        }
-    }
+    Terminal::new(backend)
 }
 
-/// One terminal session: raw mode plus either an isolated alternate screen
-/// or an inline viewport on the main buffer. The type is owner-thread-bound.
+/// One terminal session: raw mode plus the isolated alternate screen.
+/// The type is owner-thread-bound.
 pub struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
     /// Whether `Shift+Enter` is deliverable (Windows native or kitty
@@ -474,10 +460,10 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     /// Takes terminal ownership and installs the panic-restore hook.
-    pub fn enter(screen: TuiScreen) -> Result<Self, TerminalEnterError> {
+    pub fn enter() -> Result<Self, TerminalEnterError> {
         install_panic_hook();
         let mut modes = ModeOwner::new(CrosstermTerminalBackend);
-        let shift_enter = match modes.setup_modes(screen) {
+        let shift_enter = match modes.setup_modes() {
             Ok(shift_enter) => shift_enter,
             Err(fault) => {
                 let restore = modes.finish();
@@ -485,7 +471,7 @@ impl TerminalSession {
             }
         };
 
-        let terminal = match build_ratatui_terminal(screen) {
+        let terminal = match build_ratatui_terminal() {
             Ok(terminal) => terminal,
             Err(fault) => {
                 let restore = modes.finish();
@@ -587,10 +573,9 @@ mod tests {
 
     fn run_setup(
         backend: RecordingBackend,
-        screen: TuiScreen,
     ) -> Result<ModeOwner<RecordingBackend>, (ModeOwner<RecordingBackend>, io::Error)> {
         let mut modes = ModeOwner::new(backend);
-        match modes.setup_modes(screen) {
+        match modes.setup_modes() {
             Ok(_) => Ok(modes),
             Err(fault) => Err((modes, fault)),
         }
@@ -600,7 +585,7 @@ mod tests {
     fn setup_step1_failure_has_no_restore_calls() {
         let _lock = lock_terminal_tests();
         let backend = RecordingBackend::new().with_setup_fail_at(0);
-        let (mut modes, fault) = run_setup(backend, TuiScreen::Alternate).unwrap_err();
+        let (mut modes, fault) = run_setup(backend).unwrap_err();
         assert!(fault.to_string().contains("enable_raw_mode"));
         let report = modes.finish();
         assert!(!report.restored);
@@ -612,7 +597,7 @@ mod tests {
     fn setup_step2_failure_only_disables_raw() {
         let _lock = lock_terminal_tests();
         let backend = RecordingBackend::new().with_setup_fail_at(1);
-        let (mut modes, _) = run_setup(backend, TuiScreen::Alternate).unwrap_err();
+        let (mut modes, _) = run_setup(backend).unwrap_err();
         let report = modes.finish();
         assert!(report.restored);
         assert_eq!(report.attempted, vec![TerminalCapability::RawMode]);
@@ -631,7 +616,7 @@ mod tests {
     fn setup_step3_failure_leaves_alternate_then_raw() {
         let _lock = lock_terminal_tests();
         let backend = RecordingBackend::new().with_setup_fail_at(2);
-        let (mut modes, _) = run_setup(backend, TuiScreen::Alternate).unwrap_err();
+        let (mut modes, _) = run_setup(backend).unwrap_err();
         let _ = modes.finish();
         assert_eq!(
             modes.backend.call_names(),
@@ -650,7 +635,7 @@ mod tests {
     fn setup_step4_failure_restores_inverse_stack() {
         let _lock = lock_terminal_tests();
         let backend = RecordingBackend::new().with_setup_fail_at(3);
-        let (mut modes, _) = run_setup(backend, TuiScreen::Alternate).unwrap_err();
+        let (mut modes, _) = run_setup(backend).unwrap_err();
         let _ = modes.finish();
         assert_eq!(
             modes.backend.call_names(),
@@ -671,7 +656,7 @@ mod tests {
     fn setup_step5_failure_restores_all_prior_inverse() {
         let _lock = lock_terminal_tests();
         let backend = RecordingBackend::new().with_setup_fail_at(4);
-        let (mut modes, _) = run_setup(backend, TuiScreen::Alternate).unwrap_err();
+        let (mut modes, _) = run_setup(backend).unwrap_err();
         let _ = modes.finish();
         assert_eq!(
             modes.backend.call_names(),
@@ -698,7 +683,7 @@ mod tests {
             TerminalCapability::MouseCapture,
             TerminalCapability::RawMode,
         ]);
-        let mut modes = run_setup(backend, TuiScreen::Alternate).expect("setup");
+        let mut modes = run_setup(backend).expect("setup");
         let report = modes.finish();
         assert_eq!(report.failures.len(), 3);
         assert!(
@@ -737,7 +722,7 @@ mod tests {
     fn failed_restore_is_retryable_until_all_capabilities_are_released() {
         let _lock = lock_terminal_tests();
         let backend = RecordingBackend::new().with_restore_fail(vec![TerminalCapability::RawMode]);
-        let mut modes = run_setup(backend, TuiScreen::Inline).expect("setup");
+        let mut modes = run_setup(backend).expect("setup");
         let first = modes.finish();
         assert!(
             first
@@ -787,7 +772,7 @@ mod tests {
     #[test]
     fn consecutive_finish_is_idempotent() {
         let _lock = lock_terminal_tests();
-        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Inline).expect("setup");
+        let mut modes = run_setup(RecordingBackend::new()).expect("setup");
         let first = modes.finish();
         assert!(first.restored);
         let calls = modes.backend.calls.len();
@@ -800,12 +785,12 @@ mod tests {
     #[test]
     fn finish_then_drop_does_not_restore_again() {
         let _lock = lock_terminal_tests();
-        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Alternate).expect("setup");
+        let mut modes = run_setup(RecordingBackend::new()).expect("setup");
         let _ = modes.finish();
         let calls = modes.backend.calls.len();
         assert!(modes.finished);
         drop(modes);
-        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Alternate).expect("setup");
+        let mut modes = run_setup(RecordingBackend::new()).expect("setup");
         let _ = modes.finish();
         let calls_after = modes.backend.calls.len();
         assert_eq!(calls, calls_after);
@@ -813,21 +798,21 @@ mod tests {
     }
 
     #[test]
-    fn inline_setup_skips_alternate_screen() {
+    fn setup_enters_the_alternate_screen() {
         let _lock = lock_terminal_tests();
-        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Inline).expect("setup");
-        assert!(!modes.capabilities.alternate_screen);
+        let mut modes = run_setup(RecordingBackend::new()).expect("setup");
+        assert!(modes.capabilities.alternate_screen);
         assert!(modes.capabilities.raw_mode);
         assert!(modes.capabilities.mouse_capture);
         let _ = modes.finish();
         assert!(
-            !modes
+            modes
                 .backend
                 .calls
                 .contains(&BackendOp::EnterAlternateScreen)
         );
         assert!(
-            !modes
+            modes
                 .backend
                 .calls
                 .contains(&BackendOp::LeaveAlternateScreen)
@@ -838,9 +823,9 @@ mod tests {
     fn stale_token_leaves_newer_registry_intact() {
         let _lock = lock_terminal_tests();
         let mut older = ModeOwner::new(RecordingBackend::new());
-        older.setup_modes(TuiScreen::Inline).expect("old setup");
+        older.setup_modes().expect("old setup");
         let mut newer = ModeOwner::new(RecordingBackend::new());
-        newer.setup_modes(TuiScreen::Inline).expect("new setup");
+        newer.setup_modes().expect("new setup");
         let new_token = newer.token;
         let report = older.finish();
         assert!(!report.restored);
@@ -852,7 +837,7 @@ mod tests {
     #[test]
     fn matching_token_clears_registry() {
         let _lock = lock_terminal_tests();
-        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Inline).expect("setup");
+        let mut modes = run_setup(RecordingBackend::new()).expect("setup");
         let report = modes.finish();
         assert!(report.restored);
         assert!(!report.skipped_stale);
@@ -863,7 +848,7 @@ mod tests {
     fn drop_without_finish_emits_diagnostics_on_failure() {
         let _capture = capture_diagnostics();
         let backend = RecordingBackend::new().with_restore_fail(vec![TerminalCapability::RawMode]);
-        let modes = run_setup(backend, TuiScreen::Inline).expect("setup");
+        let modes = run_setup(backend).expect("setup");
         drop(modes);
         let lines = diagnostic_lines();
         assert!(
@@ -876,7 +861,7 @@ mod tests {
     fn drop_retries_capability_left_by_failed_finish() {
         let _capture = capture_diagnostics();
         let backend = RecordingBackend::new().with_restore_fail(vec![TerminalCapability::RawMode]);
-        let mut modes = run_setup(backend, TuiScreen::Inline).expect("setup");
+        let mut modes = run_setup(backend).expect("setup");
         let token = modes.token;
         let first = modes.finish();
         assert_eq!(first.failures.len(), 1);
@@ -901,7 +886,6 @@ mod tests {
         let _capture = capture_diagnostics();
         let mut modes = run_setup(
             RecordingBackend::new().with_restore_fail(vec![TerminalCapability::BracketedPaste]),
-            TuiScreen::Inline,
         )
         .expect("setup");
         let token = modes.token;
@@ -949,7 +933,7 @@ mod tests {
     #[test]
     fn poisoned_registry_recovers_and_diagnoses_uncertain() {
         let _lock = lock_terminal_tests();
-        let mut modes = run_setup(RecordingBackend::new(), TuiScreen::Inline).expect("setup");
+        let mut modes = run_setup(RecordingBackend::new()).expect("setup");
         modes.finished = true;
         let _ = std::panic::catch_unwind(|| {
             let _guard = REGISTRY.active.lock().expect("registry lock");

@@ -96,6 +96,8 @@ mod tests {
             kind: LineKind::Meta,
             text: text.to_owned(),
             tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
         }
     }
 

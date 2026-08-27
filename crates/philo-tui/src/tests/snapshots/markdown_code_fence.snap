@@ -1,21 +1,21 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 161
+assertion_line: 207
 expression: "render(&[\"```rust\", \"fn main() {}\", \"```\", \"between blocks\",\n\"```not-a-language\", \"* not a list *\", \"```\", \"after\",])"
 ---
 ```rust
-  -> "```"{darkgray} "rust"{rgb(222, 137, 72)}
+  -> "```"{rgb(126, 140, 158)} "rust"{rgb(242, 117, 33)}
 fn main() {}
-  -> "│ "{darkgray} "fn"{rgb(180, 142, 173)} " "{rgb(192, 197, 206)} "main"{rgb(143, 161, 179)} "("{rgb(192, 197, 206)} ")"{rgb(192, 197, 206)} " "{rgb(192, 197, 206)} "{"{rgb(192, 197, 206)} "}"{rgb(192, 197, 206)}
+  -> "1 "{rgb(90, 106, 124)} "│ "{rgb(42, 51, 61)} "fn"{rgb(166, 99, 54),bold} " "{rgb(197, 205, 217)} "main"{rgb(88, 129, 189),bold} "("{rgb(197, 205, 217)} ")"{rgb(197, 205, 217)} " "{rgb(197, 205, 217)} "{"{rgb(197, 205, 217)} "}"{rgb(197, 205, 217)}
 ```
-  -> "```"{darkgray}
+  -> "```"{rgb(126, 140, 158)}
 between blocks
   -> "between blocks"
 ```not-a-language
-  -> "```"{darkgray} "not-a-language"{rgb(222, 137, 72)}
+  -> "```"{rgb(126, 140, 158)} "not-a-language"{rgb(242, 117, 33)}
 * not a list *
-  -> "│ "{darkgray} "* not a list *"{indexed(108)}
+  -> "1 "{rgb(90, 106, 124)} "│ "{rgb(42, 51, 61)} "* not a list *"{rgb(197, 205, 217)}
 ```
-  -> "```"{darkgray}
+  -> "```"{rgb(126, 140, 158)}
 after
   -> "after"

@@ -106,7 +106,7 @@ impl CommandMenu {
         let rows = (start..start + rows)
             .map(|index| {
                 let spec = command::spec(self.candidates[index]);
-                let marker = if index == self.selected { "›" } else { " " };
+                let marker = if index == self.selected { "▶" } else { " " };
                 let usage = format!("{marker} {:<usage_width$}  ", spec.usage);
                 MenuRow {
                     usage: text::truncate(&usage, text_zone),
@@ -273,6 +273,7 @@ impl App {
             }
             Ok(Command::Verbose) => lines.push(self.toggle_level()),
             Ok(Command::Status) => effects.push(Effect::Host(HostRequest::ShowStatus)),
+            Ok(Command::Theme { argument }) => lines.push(run_theme_command(argument)),
             Ok(Command::Config) => {
                 self.expect_config_listing = true;
                 effects.push(Effect::Host(HostRequest::ShowConfig));
@@ -325,5 +326,44 @@ impl App {
         if self.quit_armed && !"/quit".starts_with(&self.input.text()) {
             self.quit_armed = false;
         }
+    }
+}
+
+/// `/theme`: bare shows the current scheme; a preset word pins that tier;
+/// `sat N` / `light N` move the continuous sliders (new-color.md §四).
+/// Presentation-only — the palette lives behind the render layer, so no
+/// transcript state or host round-trip is involved.
+fn run_theme_command(argument: Option<String>) -> TranscriptLine {
+    use crate::render::theme::{self, ThemePreset, TuneAxis};
+
+    let Some(argument) = argument.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
+        return line(LineKind::Meta, theme::current_description());
+    };
+    if let Some(preset) = ThemePreset::from_name(argument) {
+        return line(LineKind::Meta, theme::apply_preset(preset));
+    }
+    let outcome = match argument.split_once(' ') {
+        Some(("sat", value)) => value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| format!("usage: /theme sat 40..115 (got {value:?})"))
+            .and_then(|value| theme::apply_tune(TuneAxis::Saturation, value)),
+        Some(("light", value)) => value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| format!("usage: /theme light -15..15 (got {value:?})"))
+            .and_then(|value| theme::apply_tune(TuneAxis::Lightness, value)),
+        Some(("bold", value)) => value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| format!("usage: /theme bold 0..60 (got {value:?})"))
+            .and_then(|value| theme::apply_tune(TuneAxis::BoldGain, value)),
+        _ => Err(format!(
+            "unknown theme: {argument} (try original|recommended|comfort|sat N|light N|bold N)"
+        )),
+    };
+    match outcome {
+        Ok(status) => line(LineKind::Meta, status),
+        Err(message) => line(LineKind::Error, format!("error: {message}")),
     }
 }

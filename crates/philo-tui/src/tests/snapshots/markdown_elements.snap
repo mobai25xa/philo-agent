@@ -1,33 +1,35 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 138
-expression: "render(&[\"# Title\", \"## Middle\", \"### Smaller\", \"plain paragraph text\",\n\"- first item\", \"  - nested item\", \"1. ordered item\", \"- [x] done deal\",\n\"- [ ] open item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"---\", \"\",])"
+assertion_line: 183
+expression: "render(&[\"# Title\", \"## Middle\", \"### Smaller\", \"plain paragraph text\",\n\"- first item\", \"  - nested item\", \"1. ordered item\", \"- [x] done deal\",\n\"- [ ] open item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"open src/utils/jwt.ts now\", \"---\",\n\"\",])"
 ---
 ▍ Title
-  -> "▍ Title"{rgb(222, 137, 72),bold,underlined}
+  -> "▍ Title"{rgb(166, 99, 54),bold}
 ▍ Middle
-  -> "▍ Middle"{rgb(222, 137, 72),bold}
+  -> "▍ Middle"{rgb(201, 210, 221),bold}
 ▍ Smaller
   -> "▍ Smaller"{bold}
 plain paragraph text
   -> "plain paragraph text"
-- first item
-  -> "- "{darkgray} "first item"
-  - nested item
-  -> "  - "{darkgray} "nested item"
+• first item
+  -> "• "{rgb(166, 99, 54),bold} "first item"
+  • nested item
+  -> "  • "{rgb(166, 99, 54),bold} "nested item"
 1. ordered item
-  -> "1. "{darkgray} "ordered item"
-- [x] done deal
-  -> "- "{darkgray} "[x] "{rgb(222, 137, 72)} "done deal"{darkgray,crossed}
-- [ ] open item
-  -> "- [ ] "{darkgray} "open item"
+  -> "1. "{rgb(242, 117, 33)} "ordered item"
+• [x] done deal
+  -> "• "{rgb(166, 99, 54),bold} "[x] "{rgb(242, 117, 33)} "done deal"{rgb(126, 140, 158),crossed}
+• [ ] open item
+  -> "• "{rgb(166, 99, 54),bold} "[ ] "{rgb(126, 140, 158)} "open item"
 │ quoted remark
-  -> "│ "{rgb(222, 137, 72)} "quoted remark"
+  -> "│ "{rgb(90, 106, 124)} "quoted remark"
 text with bold, italic, struck and inline code
-  -> "text with " "bold"{bold} ", " "italic"{italic} ", " "struck"{crossed} " and " "inline code"{indexed(108)}
+  -> "text with " "bold"{rgb(201, 210, 221),bold} ", " "italic"{italic} ", " "struck"{crossed} " and " "inline code"{rgb(81, 205, 128)}
 see docs
-  -> "see " "docs"{blue,underlined}
+  -> "see " "docs"{rgb(98, 153, 234),underlined}
+open src/utils/jwt.ts now
+  -> "open " "src/utils/jwt.ts"{rgb(81, 205, 128)} " now"
 ────────────────────────
-  -> "────────────────────────"{darkgray}
+  -> "────────────────────────"{rgb(126, 140, 158)}
 
   ->

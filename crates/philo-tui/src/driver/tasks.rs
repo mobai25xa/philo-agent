@@ -220,6 +220,8 @@ pub(crate) fn task_error(
         kind: crate::app::transcript::LineKind::Error,
         text: format!("error: {}", message.into()),
         tone: crate::app::transcript::Tone::Plain,
+        header: None,
+        body: None,
     }]
 }
 

@@ -36,6 +36,45 @@ pub(crate) fn truncate(text: &str, max_width: usize) -> String {
     result
 }
 
+/// Head-and-tail truncation with the middle ellipsis (v4.0 P3 header
+/// targets): `POSTGRES_PASSWORD` narrows to `POSTGRES…SWORD` so the
+/// distinguishing tail (file extension, long id) stays visible.
+pub(crate) fn truncate_mid(text: &str, max_width: usize) -> String {
+    let full = width(text);
+    if full <= max_width {
+        return text.to_owned();
+    }
+    const ELLIPSIS: &str = "...";
+    if max_width <= width(ELLIPSIS) {
+        return truncate(text, max_width);
+    }
+    let budget = max_width - width(ELLIPSIS);
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+    let mut head = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = width(grapheme);
+        if used + grapheme_width > head_budget {
+            break;
+        }
+        head.push_str(grapheme);
+        used += grapheme_width;
+    }
+    let mut tail: Vec<&str> = Vec::new();
+    let mut tail_used = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let grapheme_width = width(grapheme);
+        if tail_used + grapheme_width > tail_budget {
+            break;
+        }
+        tail.push(grapheme);
+        tail_used += grapheme_width;
+    }
+    let tail_text: String = tail.into_iter().rev().collect();
+    format!("{head}{ELLIPSIS}{tail_text}")
+}
+
 #[cfg(test)]
 pub(crate) fn tail(text: &str, max_width: usize) -> String {
     if width(text) <= max_width {

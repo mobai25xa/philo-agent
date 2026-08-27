@@ -4,6 +4,7 @@ mod attachments;
 mod compaction;
 mod flow;
 mod integration;
+mod live_cards;
 mod matrix;
 mod streaming;
 mod style_baseline;

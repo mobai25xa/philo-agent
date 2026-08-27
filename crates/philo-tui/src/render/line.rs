@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::transcript::{LineKind, Tone, TranscriptLine};
 
-use super::theme::{self, DETAIL};
+use super::theme;
 
 pub(crate) fn styled_line(line: &TranscriptLine) -> Line<'static> {
     match line.kind {
@@ -19,10 +19,25 @@ pub(crate) fn styled_line(line: &TranscriptLine) -> Line<'static> {
         LineKind::Reasoning => reasoning_line(&line.text),
         LineKind::Tool => tool_line(line),
         LineKind::Answer => Line::styled(line.text.clone(), theme::primary()),
-        LineKind::Notice => Line::styled(line.text.clone(), theme::notice()),
-        LineKind::Error => Line::styled(line.text.clone(), theme::error()),
+        // v4.0 §6.1: semantic status rows are two-tone — the symbol+tag
+        // prefix carries the kind color (bold), the summary rides primary.
+        // Prefixes pad to the 11-column tag gutter so the four templates
+        // align (`✔ [Success]` is the widest at exactly 11).
+        LineKind::Notice => {
+            system_row("⚠ [Warn]   ", theme::warn().add_modifier(Modifier::BOLD), &line.text)
+        }
+        LineKind::Error => system_row("✖ [Error]  ", theme::error(), &line.text),
         LineKind::Meta => Line::styled(line.text.clone(), theme::meta()),
     }
+}
+
+/// One semantic status row: `{symbol} [Tag]` in the kind color plus the
+/// plain summary (v4.0 §6.1).
+fn system_row(prefix: &str, prefix_style: ratatui::style::Style, summary: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(prefix.to_owned(), prefix_style),
+        Span::styled(summary.to_owned(), theme::primary()),
+    ])
 }
 
 /// User strip rows carry no prefix and no own background here: the frame
@@ -65,48 +80,28 @@ fn tool_line(line: &TranscriptLine) -> Line<'static> {
     }
 }
 
-/// `{title} {rest}` with the display name accent bold; wrapped continuation
-/// rows fall back to plain default foreground.
+/// `{title} {rest}` with the display name in the damped bold accent;
+/// wrapped continuation rows fall back to plain default foreground.
 fn title_line(text: &str) -> Line<'static> {
     let Some((title, rest)) = text.split_once(' ') else {
-        return Line::styled(
-            text.to_owned(),
-            theme::accent().add_modifier(Modifier::BOLD),
-        );
+        return Line::styled(text.to_owned(), theme::bold_accent());
     };
     if rest.is_empty() {
         return Line::from(vec![
-            Span::styled(
-                title.to_owned(),
-                theme::accent().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(title.to_owned(), theme::bold_accent()),
             Span::styled(" ".to_owned(), theme::primary()),
         ]);
     }
     Line::from(vec![
-        Span::styled(
-            title.to_owned(),
-            theme::accent().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title.to_owned(), theme::bold_accent()),
         Span::styled(format!(" {rest}"), theme::primary()),
     ])
 }
 
 fn detail_line(text: &str) -> Line<'static> {
-    let Some(rest) = text.trim_start().strip_prefix(DETAIL) else {
-        return Line::styled(text.to_owned(), theme::meta());
-    };
-    let indent_len = text.len() - text.trim_start().len();
-    let indent = &text[..indent_len];
-    let rest = rest.strip_prefix(' ').unwrap_or(rest);
-    let mut spans = vec![
-        Span::styled(indent.to_owned(), theme::meta()),
-        Span::styled(format!("{DETAIL} "), theme::meta()),
-    ];
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_owned(), theme::meta()));
-    }
-    Line::from(spans)
+    // v4.0 retires the `↳` detail glyph: detail rows render as plain
+    // indented meta text until P3 rebuilds the card body.
+    Line::styled(text.to_owned(), theme::meta())
 }
 
 /// Card body rows (output / locs / context lines) read as normal content.
@@ -134,6 +129,8 @@ mod tests {
             kind,
             text: text.to_owned(),
             tone,
+            header: None,
+            body: None,
         }
     }
 
@@ -157,24 +154,24 @@ mod tests {
     #[test]
     fn card_headers_accent_the_display_name_only() {
         let spans = styled_line(&toned(LineKind::Tool, "Grep 1 search", Tone::Title)).spans;
-        assert_eq!(spans[0].style, theme::accent().add_modifier(Modifier::BOLD));
+        assert_eq!(spans[0].style, theme::bold_accent());
         assert_eq!(spans[0].content.as_ref(), "Grep");
         assert_eq!(spans[1].content.as_ref(), " 1 search");
 
         let bare = styled_line(&toned(LineKind::Tool, "read_file", Tone::Title));
         assert_eq!(line_text(&bare), "read_file");
-        assert_eq!(bare.style, theme::accent().add_modifier(Modifier::BOLD));
+        assert_eq!(bare.style, theme::bold_accent());
     }
 
     #[test]
     fn detail_rows_and_failures_wear_their_tones() {
-        let detail = styled_line(&toned(LineKind::Tool, "  ↳ pnpm test", Tone::Detail));
-        assert_eq!(line_text(&detail), "  ↳ pnpm test");
-        assert_eq!(detail.spans[0].style, theme::meta());
+        let detail = styled_line(&toned(LineKind::Tool, "  pnpm test", Tone::Detail));
+        assert_eq!(line_text(&detail), "  pnpm test");
+        assert_eq!(detail.style, theme::meta());
 
         let failure = styled_line(&toned(
             LineKind::Tool,
-            "  ↳ Failed. not_unique · 3 matches",
+            "  Failed. not_unique · 3 matches",
             Tone::Failure,
         ));
         assert_eq!(failure.style, theme::err());

@@ -1,46 +1,45 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
-assertion_line: 1194
 expression: snapshot
 ---
 40 columns
-
-
-
-
-
-
-
-    ⠋ Running…              gpt-test
-   ▌ 中 文  é 👩‍💻  and a long draft tha
-   ▌ t wraps inside the composer
-   ▌
-                     ↑- ↓- R- C- -/-
+    ▎ read_file src....rs · ⠂ 0ms      │
+                                       │
+                                       │
+                                       │
+                                       │
+───────────────────────────────────────
+  ⠂ Running (57s)            gpt-test
+╭─────────────────────────────────────╮
+│ ❯ 中 文  é 👩‍💻  and a long draft that wr│
+│   aps inside the composer           │
+╰─────────────────────────────────────╯
+                  ↑-  ↓-  R-  C-  -/-
 
 80 columns
-
-
-
-
-
-
-
-    ⠋ Running… 57s · esc cancel                                     gpt-test
-   ▌
-   ▌ 中 文  é 👩‍💻  and a long draft that wraps inside the composer
-   ▌
-                                                             ↑- ↓- R- C- -/-
+    ▎ read_file src/中 文 .rs ······································· ⠂ 0ms      │
+                                                                               │
+                                                                               │
+                                                                               │
+                                                                               │
+                                                                               │
+───────────────────────────────────────────────────────────────────────────────
+  ⠂ Running (57s)                                                    gpt-test
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ ❯ 中 文  é 👩‍💻  and a long draft that wraps inside the composer                 │
+╰─────────────────────────────────────────────────────────────────────────────╯
+                                                          ↑-  ↓-  R-  C-  -/-
 
 120 columns
-
-
-
-
-
-
-
-    ⠋ Running… 57s · esc cancel                                                                             gpt-test
-   ▌
-   ▌ 中 文  é 👩‍💻  and a long draft that wraps inside the composer
-   ▌
-                                                                                                     ↑- ↓- R- C- -/-
+    ▎ read_file src/中 文 .rs ··············································································· ⠂ 0ms      │
+                                                                                                                       │
+                                                                                                                       │
+                                                                                                                       │
+                                                                                                                       │
+                                                                                                                       │
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⠂ Running (57s)                                                                                            gpt-test
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ❯ 中 文  é 👩‍💻  and a long draft that wraps inside the composer                                                         │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                                                                                                  ↑-  ↓-  R-  C-  -/-

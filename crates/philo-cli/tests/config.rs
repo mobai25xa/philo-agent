@@ -511,10 +511,10 @@ fn both_modes_validate_the_same_effective_configuration() {
 }
 
 #[test]
-fn invalid_ui_screen_is_a_hard_error() {
+fn removed_ui_screen_is_a_hard_error() {
     let root = TempRoot::new();
     let config_home = root.dir("home");
-    write_config(&config_home, &format!("{}\n[ui]\nscreen = \"fullscreen\"\n", catalog()));
+    write_config(&config_home, &format!("{}\n[ui]\nscreen = \"inline\"\n", catalog()));
 
     for args in [Vec::<&str>::new(), vec!["hello"]] {
         let output = philo(&config_home)
@@ -525,12 +525,8 @@ fn invalid_ui_screen_is_a_hard_error() {
         assert_eq!(output.status.code(), Some(2));
         let stderr = stderr_text(&output);
         assert!(
-            stderr.contains("invalid [ui].screen 'fullscreen'"),
-            "both entry paths resolve the same setting: {stderr}"
-        );
-        assert!(
-            stderr.contains("[ui].screen in the global config"),
-            "both entry paths retain the same source layer: {stderr}"
+            stderr.contains("unknown key [ui].screen") && stderr.contains("removed in v4.0"),
+            "screen must be a hard removal error: {stderr}"
         );
         assert!(
             !stderr.contains("needs a terminal"),

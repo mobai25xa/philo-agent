@@ -1,13 +1,14 @@
 ---
-source: crates/philo-tui/src/tests/streaming.rs
+source: crates/philo-tui/src/render/frame.rs
 expression: rendered
 ---
                                                                                │
-    ❯ Find the homepage button and make it blue                                │
                                                                                │
-    ▎ Thought for 8s ·····································  (按  Space 查 看 )    │
-    Looking at the middleware, I can see the refresh path skips expired        │
-    tokens when a session cookie is still valid.                               │
+                                                                               │
+                                                                               │
+                                                                               │
+                                                                               │
+                                                                               │
                                                                                │
                                                                                │
                                                                                │
@@ -21,8 +22,13 @@ expression: rendered
                                                                                │
                                                                                │
 ───────────────────────────────────────────────────────────────────────────────
-  ⠋ Writing (42s)                                              gpt-5.2 · high
+  ● Ready                                                            gpt-test
 ╭─────────────────────────────────────────────────────────────────────────────╮
-│ ❯ Ask anything                                                              │
-╰─────────────────────────────────────────────────────────────────────────────╯
-  D:\Code\Zed\Year2026\Jul0706\Pi        ↑11k  ↓4.8k  R14k  C51.3%  2.2%/500k
+│ ❯ line-2                                                                    │
+│   line-3                                                                    │
+│   line-4                                                                    │
+│   line-5                                                                    │
+│   line-6                                                                    │
+│   tail                                                                      │
+╰───────────────────────────────────────────────────────────────────────[L3/8]╯
+                                                          ↑-  ↓-  R-  C-  -/-

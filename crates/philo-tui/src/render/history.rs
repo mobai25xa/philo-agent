@@ -17,10 +17,12 @@ use super::markdown;
 use super::theme;
 
 /// Project each visible row with role-driven styling. Pure: no renderer
-/// state exists anywhere on this path.
+/// state exists anywhere on this path. `browse_cursor` is the P5 browse-mode
+/// logical position — the row it names gets the lifted whole-row tint.
 pub(crate) fn paint_slice(
     slice: &VisibleSlice,
     selection: Option<Selection>,
+    browse_cursor: Option<(usize, usize)>,
     width: usize,
 ) -> Vec<Line<'static>> {
     slice
@@ -29,36 +31,76 @@ pub(crate) fn paint_slice(
         .map(|row| {
             let painted = match row.kind {
                 LineKind::Answer => paint_answer(row),
-                _ => styled_row(row),
+                LineKind::User if !row.text.is_empty() => paint_user(row),
+                LineKind::Tool => paint_tool(row),
+                // Re-skinned rows (the think header, card headers) arrive
+                // with baked spans; anything else falls back to the shared
+                // styled-line path (reasoning gutter, meta, …).
+                _ => match &row.spans {
+                    Some(spans) => markdown::line_from_spans(spans),
+                    None => styled_row(row),
+                },
             };
             let painted = match row.tone {
-                Tone::DiffDel | Tone::DiffIns => fill_diff_line(painted, width),
+                Tone::DiffDel => wash_diff(painted, theme::diff_del(), width),
+                Tone::DiffIns => wash_diff(painted, theme::diff_add(), width),
                 _ => painted,
             };
-            let painted = highlight_row(
+            let painted = highlight_browse_cursor(
+                painted,
+                browse_cursor,
+                row.cell_index,
+                row.row_in_cell,
+                width,
+            );
+            highlight_row(
                 painted,
                 selection,
                 row.cell_index,
                 row.row_in_cell,
                 text::width(&row.text),
-            );
-            // User strips ride the band's bar-gap rhythm: one space of air
-            // after the pre-painted bar (v2.3). Applied after selection so
-            // the highlight offsets stay text-relative.
-            match row.kind {
-                LineKind::User if !row.text.is_empty() => prefixed_line(painted),
-                _ => painted,
-            }
+            )
         })
         .collect()
 }
 
-/// Prepends one blank cell to a painted line (paint-time only; the stored
-/// wrap rows and copied text stay untouched).
-fn prefixed_line(line: Line<'static>) -> Line<'static> {
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-    spans.push(Span::raw(" "));
-    spans.extend(line.spans);
+/// Browse-mode cursor tint (P5 §2.3): the current logical row lifts to the
+/// MENU_ACTIVE_BG family over its full band width. Only the browse mode
+/// renders it; the caller passes `None` otherwise.
+fn highlight_browse_cursor(
+    line: Line<'static>,
+    cursor: Option<(usize, usize)>,
+    cell: usize,
+    row: usize,
+    width: usize,
+) -> Line<'static> {
+    let Some((cursor_cell, cursor_row)) = cursor else {
+        return line;
+    };
+    if cursor_cell != cell || cursor_row != row {
+        return line;
+    }
+    let tint = Style::default().bg(theme::menu_active_bg_color());
+    let mut painted = apply_column_range(line, 0, width, tint);
+    let used = painted.width();
+    if used < width {
+        painted
+            .spans
+            .push(Span::styled(" ".repeat(width - used), tint));
+    }
+    painted
+}
+
+/// v4.0 user message (P2 §4): green `❯ ` prompt glyph, bold white body.
+/// Wrapped continuation rows hang two cells in, aligned past the glyph.
+fn paint_user(row: &VisibleRow) -> Line<'static> {
+    let mut spans = Vec::with_capacity(3);
+    if row.row_in_cell == 0 {
+        spans.push(Span::styled("❯ ".to_owned(), theme::user_prompt()));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(row.text.clone(), theme::user_message()));
     Line::from(spans)
 }
 
@@ -67,14 +109,31 @@ fn styled_row(row: &VisibleRow) -> Line<'static> {
         kind: row.kind,
         text: row.text.clone(),
         tone: row.tone,
+        header: None,
+        body: None,
     })
+}
+
+/// Tool-card rows paint from their baked spans (the card projection laid
+/// them out once); plain tool rows (subjects, verbose details) fall back to
+/// the shared styled-line path.
+fn paint_tool(row: &VisibleRow) -> Line<'static> {
+    match &row.spans {
+        Some(spans) => markdown::line_from_spans(spans),
+        None => styled_row(row),
+    }
 }
 
 /// Answer rows go straight into the content column — no gutter — and paint
 /// from their baked spans (or syntect, for fenced bodies): design §3.2,
-/// plan P0/P2.
+/// plan P0/P2. Fenced bodies carry the P4 line-number slot.
 fn paint_answer(row: &VisibleRow) -> Line<'static> {
-    markdown::answer_row(&row.text, &row.role, row.spans.as_deref())
+    markdown::answer_row(
+        &row.text,
+        &row.role,
+        row.spans.as_deref(),
+        row.code_line.as_deref(),
+    )
 }
 
 fn fill_diff_line(line: Line<'static>, width: usize) -> Line<'static> {
@@ -88,6 +147,30 @@ fn fill_diff_line(line: Line<'static>, width: usize) -> Line<'static> {
         spans.push(Span::styled(" ".repeat(width - used), style));
     }
     Line::from(spans).style(style)
+}
+
+/// Applies a diff wash to a (possibly multi-span) row: the background is
+/// baked into every text span so the fill reaches the row width — the old
+/// single-span `Line::styled` path no longer holds once card bodies carry
+/// colored segments (v4.0 P3 §7).
+fn wash_diff(line: Line<'static>, style: Style, width: usize) -> Line<'static> {
+    let Some(bg) = style.bg else {
+        return line;
+    };
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            if span.style.bg.is_none() {
+                let mut span_style = span.style;
+                span_style.bg = Some(bg);
+                Span::styled(span.content.clone(), span_style)
+            } else {
+                span
+            }
+        })
+        .collect::<Vec<_>>();
+    fill_diff_line(Line::from(spans).style(style), width)
 }
 
 pub(crate) fn highlight_row(
@@ -167,6 +250,7 @@ mod tests {
                 tone,
                 role: BlockRole::Plain,
                 spans: None,
+                code_line: None,
                 text: text.to_owned(),
             }],
             total_rows: 1,
@@ -174,7 +258,7 @@ mod tests {
             at_top: true,
             at_bottom: true,
         };
-        let mut lines = paint_slice(&slice, None, width);
+        let mut lines = paint_slice(&slice, None, None, width);
         assert_eq!(lines.len(), 1);
         lines.remove(0)
     }
@@ -210,6 +294,7 @@ mod tests {
                 tone: Tone::Plain,
                 role: row.role.clone(),
                 spans: row.spans.clone(),
+                code_line: row.code_line.clone(),
                 text: row.text.clone(),
             }],
             total_rows: 1,
@@ -217,7 +302,7 @@ mod tests {
             at_top: true,
             at_bottom: true,
         };
-        let painted = paint_slice(&slice, Some(selection), 80).remove(0);
+        let painted = paint_slice(&slice, Some(selection), None, 80).remove(0);
         let bolds: String = painted
             .spans
             .iter()
@@ -253,10 +338,7 @@ mod tests {
         assert_eq!(del.style, theme::diff_del());
 
         let header = paint_tool("Edit src/lib.rs", Tone::Title, 40);
-        assert_eq!(
-            header.spans[0].style,
-            theme::accent().add_modifier(ratatui::style::Modifier::BOLD)
-        );
+        assert_eq!(header.spans[0].style, theme::bold_accent());
         assert_ne!(header.style, theme::diff_add());
         assert_ne!(header.style, theme::diff_del());
 

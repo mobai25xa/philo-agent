@@ -14,9 +14,9 @@
 use std::cell::{Ref, RefCell};
 use std::time::{Duration, Instant};
 
-use super::prose::{self, ProjectedRow};
+use super::prose::{self, ProjectedRow, ProseColor, ProseSpan, ProseStyle};
 use super::text;
-use super::transcript::{LineKind, TranscriptLine};
+use super::transcript::{CardBody, CardHeader, LineKind, SegColor, SegSpan, TranscriptLine};
 
 #[derive(Clone, Debug)]
 struct WrapCache {
@@ -207,6 +207,11 @@ impl TranscriptStore {
         self.open.map(|idx| self.cells[idx].kind)
     }
 
+    /// Read access to one settled cell (fold-state queries, tests).
+    pub(crate) fn cell_at(&self, index: usize) -> Option<&TranscriptLine> {
+        self.cells.get(index)
+    }
+
     /// Close any open cell, then append already-finished cells.
     pub fn push_closed(&mut self, lines: impl IntoIterator<Item = TranscriptLine>) {
         self.close_open();
@@ -220,6 +225,8 @@ impl TranscriptStore {
             kind,
             text: text.into(),
             tone: super::transcript::Tone::Plain,
+            header: None,
+            body: None,
         });
         self.open = Some(self.cells.len() - 1);
         self.assert_open_last();
@@ -238,6 +245,51 @@ impl TranscriptStore {
 
     pub fn close_open(&mut self) {
         self.open = None;
+    }
+
+    /// Replace one settled cell in place. Live tool cards settle in their
+    /// own cell (v4.0 P3 §4.1), so the store rewrites it without re-appending.
+    /// The wrap cache is truncated from that cell so only its tail rewraps;
+    /// no revision bump, so unchanged cells keep their cached rows.
+    pub(crate) fn replace_cell(&mut self, index: usize, line: TranscriptLine) {
+        assert!(
+            index < self.cells.len(),
+            "replace_cell index {} out of bounds ({} cells)",
+            index,
+            self.cells.len()
+        );
+        assert!(
+            self.open != Some(index),
+            "replace_cell must not touch the open cell"
+        );
+        self.cells[index] = line;
+        let mut cache = self.cache.borrow_mut();
+        cache.rows.truncate(index);
+        cache.closed_upto = cache.closed_upto.min(index);
+        cache.revision = self.wrap_revision;
+    }
+
+    /// Replaces everything from `index` onward with `lines`. The live single
+    /// card settles from its one-cell form into a multi-cell settled card,
+    /// so the tail (which is exactly the live card while a batch runs) is
+    /// swapped wholesale (v4.0 P3 §4.1).
+    pub(crate) fn replace_tail(&mut self, index: usize, lines: Vec<TranscriptLine>) {
+        assert!(
+            index <= self.cells.len(),
+            "replace_tail index {} out of bounds ({} cells)",
+            index,
+            self.cells.len()
+        );
+        assert!(
+            self.open.is_none_or(|open| open < index),
+            "replace_tail must not cover the open cell"
+        );
+        self.cells.truncate(index);
+        self.cells.extend(lines);
+        let mut cache = self.cache.borrow_mut();
+        cache.rows.truncate(index);
+        cache.closed_upto = cache.closed_upto.min(index);
+        cache.revision = self.wrap_revision;
     }
 
     /// Remove the open cell so a line-oriented think remainder can be rewritten.
@@ -387,6 +439,27 @@ impl ScrollState {
         self.follow_bottom
     }
 
+    /// The pinned viewport origin, if the user has scrolled off the tail.
+    pub(crate) fn pin(&self) -> Option<(usize, usize)> {
+        self.pin
+    }
+
+    /// Pins the viewport so `target` becomes its top-left row (browse-mode
+    /// cursor chasing). Short transcripts collapse back to follow.
+    pub(crate) fn pin_at(
+        &mut self,
+        wrapped: &[Vec<ProjectedRow>],
+        height: usize,
+        target: (usize, usize),
+    ) {
+        if height == 0 || wrapped.is_empty() || row_count(wrapped) <= height {
+            *self = Self::follow();
+            return;
+        }
+        self.follow_bottom = false;
+        self.pin = Some(clamp_pin(Some(target), wrapped));
+    }
+
     /// `delta < 0` moves toward older rows. `height` is the transcript
     /// region, not the full terminal.
     #[cfg(test)]
@@ -485,6 +558,21 @@ impl ScrollState {
     pub(crate) fn jump_bottom(&mut self) {
         *self = Self::follow();
     }
+
+    /// Wrapped-row offset of the visible window's top (the scrollbar's S):
+    /// 0 while following (pinned to the tail), otherwise the rows above
+    /// the pinned start.
+    pub(crate) fn scroll_offset(&self, wrapped: &[Vec<ProjectedRow>], height: usize) -> usize {
+        let total = row_count(wrapped);
+        let viewport = height.min(total);
+        if self.follow_bottom || total <= viewport {
+            return total.saturating_sub(viewport);
+        }
+        let (cell, row) = clamp_pin(self.pin, wrapped);
+        total
+            .saturating_sub(rows_from(wrapped, cell, row))
+            .min(total.saturating_sub(viewport))
+    }
 }
 
 impl Default for ScrollState {
@@ -506,6 +594,9 @@ pub(crate) struct VisibleRow {
     /// Baked presentation spans for answer prose rows (`None` elsewhere
     /// and for fenced code bodies).
     pub spans: Option<Vec<super::prose::ProseSpan>>,
+    /// v4.0 P4: the fenced-body line-number slot (right-padded, or blank
+    /// spaces on wrapped continuations). `None` outside code fences.
+    pub code_line: Option<String>,
     pub text: String,
 }
 
@@ -635,10 +726,16 @@ pub(crate) fn wrap_line(
     width: usize,
     prev: Option<LineKind>,
 ) -> Vec<ProjectedRow> {
+    if let Some(header) = &cell.header {
+        return vec![project_card_header(header, width)];
+    }
+    if let Some(body) = &cell.body {
+        return project_card_body(body, width, false);
+    }
     let mut rows = match cell.kind {
-        // User rows paint one space ahead of the text (the strip's bar-gap
-        // rhythm); reserve that column in the wrap width (v2.3).
-        LineKind::User => plain_rows(text::wrap(&cell.text, width.saturating_sub(1).max(1))),
+        // User rows reserve the two cells of the ❯ prefix so wrapped
+        // continuations hang past it (v4.0 P2 §4).
+        LineKind::User => plain_rows(text::wrap(&cell.text, width.saturating_sub(2).max(1))),
         LineKind::Answer => prose::project_answer(&cell.text, width),
         LineKind::Tool => plain_rows(text::wrap_hanging(&cell.text, width)),
         LineKind::Reasoning => plain_rows(text::wrap_reasoning(&cell.text, width)),
@@ -652,6 +749,261 @@ pub(crate) fn wrap_line(
 
 fn plain_rows(rows: impl IntoIterator<Item = String>) -> Vec<ProjectedRow> {
     rows.into_iter().map(ProjectedRow::plain).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tool-card projection (v4.0 P3)
+// ---------------------------------------------------------------------------
+
+/// Converts a card segment color to the shared prose color vocabulary.
+fn seg_color(color: SegColor) -> ProseColor {
+    match color {
+        SegColor::Default => ProseColor::Default,
+        SegColor::Gray => ProseColor::Meta,
+        SegColor::DarkGray => ProseColor::DarkGray,
+        SegColor::Green => ProseColor::Green,
+        SegColor::Yellow => ProseColor::Yellow,
+        SegColor::Orange => ProseColor::Code,
+        SegColor::Red => ProseColor::Red,
+        SegColor::Border => ProseColor::Border,
+    }
+}
+
+/// Maps one card segment onto a baked prose span.
+fn seg_span(seg: &SegSpan) -> ProseSpan {
+    ProseSpan {
+        text: seg.text.clone(),
+        style: ProseStyle {
+            color: seg_color(seg.color),
+            bold: seg.bold,
+            ..ProseStyle::default()
+        },
+    }
+}
+
+fn header_span(piece: &super::transcript::HeaderPiece) -> ProseSpan {
+    ProseSpan {
+        text: piece.text.clone(),
+        style: ProseStyle {
+            color: seg_color(piece.color),
+            bold: piece.bold,
+            ..ProseStyle::default()
+        },
+    }
+}
+
+fn span_width(span: &ProseSpan) -> usize {
+    text::width(&span.text)
+}
+
+/// The v4.0 P3 card header, projected into exactly one row.
+///
+/// Layout: `▎ action target stats` then `·` dots (BORDER) fill to a
+/// 2-column gap, then `status time` right-aligned with a 2-column right
+/// margin. Narrow-width degradation (§1): middle-truncate the target, drop
+/// the stats, then drop the time — the status is never dropped. The row is
+/// clipped at `width` as a last resort.
+fn project_card_header(header: &CardHeader, width: usize) -> ProjectedRow {
+    if width == 0 {
+        return ProjectedRow::styled(prose::BlockRole::Plain, Vec::new());
+    }
+    let bar = &header.bar;
+    let action = &header.action;
+    let status = &header.status;
+
+    let target_piece: Option<&super::transcript::HeaderPiece> = header.target.as_ref();
+    let mut target_text: Option<String> = target_piece.map(|t| t.text.clone());
+    let mut stats: Option<&[SegSpan]> = header.stats.as_deref();
+    let mut time: Option<&super::transcript::HeaderPiece> = header.time.as_ref();
+
+    const RIGHT_MARGIN: usize = 2;
+    const LEADER_GAP: usize = 2;
+
+    let content_width = |target_text: Option<&str>, stats: Option<&[SegSpan]>| {
+        text::width(&bar.text)
+            + 1
+            + text::width(&action.text)
+            + target_text.map_or(0, |t| 1 + text::width(t))
+            + stats
+                .map_or(0, |segs| 1 + segs.iter().map(|s| text::width(&s.text)).sum::<usize>())
+    };
+    let suffix_width = |time: Option<&super::transcript::HeaderPiece>| {
+        text::width(&status.text) + time.map_or(0, |t| 1 + text::width(&t.text))
+    };
+    let dots_for = |content: usize, suffix: usize| {
+        width.saturating_sub(RIGHT_MARGIN + LEADER_GAP + content + suffix)
+    };
+
+    let mut leader = dots_for(content_width(target_text.as_deref(), stats), suffix_width(time));
+
+    // Degradation ladder (§1): middle-truncate the target, drop the stats,
+    // then drop the time. The status survives every step.
+    if leader < 1 {
+        if let (Some(_), Some(text)) = (target_piece, target_text.as_deref()) {
+            let text_width = text::width(text);
+            if text_width >= 3 {
+                let reclaim = 1 - leader;
+                let truncated = text::truncate_mid(text, text_width.saturating_sub(reclaim));
+                if dots_for(content_width(Some(&truncated), stats), suffix_width(time)) >= 1 {
+                    target_text = Some(truncated);
+                }
+            }
+        }
+        leader = dots_for(content_width(target_text.as_deref(), stats), suffix_width(time));
+        if leader < 1 && stats.is_some() {
+            stats = None;
+            leader = dots_for(content_width(target_text.as_deref(), stats), suffix_width(time));
+        }
+        if leader < 1 && time.is_some() {
+            time = None;
+            leader = dots_for(content_width(target_text.as_deref(), stats), suffix_width(None));
+        }
+        if leader < 1 {
+            leader = 0;
+        }
+    }
+
+    let mut spans: Vec<ProseSpan> = Vec::new();
+    spans.push(header_span(bar));
+    spans.push(ProseSpan::new(" ", ProseStyle::default()));
+    spans.push(header_span(action));
+    if let (Some(piece), Some(text)) = (target_piece, target_text.as_ref()) {
+        spans.push(ProseSpan::new(" ", ProseStyle::default()));
+        let mut target = piece.clone();
+        target.text.clone_from(text);
+        spans.push(header_span(&target));
+    }
+    if let Some(s) = stats {
+        spans.push(ProseSpan::new(" ", ProseStyle::default()));
+        spans.extend(s.iter().map(seg_span));
+    }
+    if leader > 0 {
+        spans.push(ProseSpan::new(" ", ProseStyle::default()));
+        spans.push(ProseSpan::new(
+            "·".repeat(leader),
+            ProseStyle::default().colored(ProseColor::Border),
+        ));
+        spans.push(ProseSpan::new(" ", ProseStyle::default()));
+    }
+    spans.push(header_span(status));
+    if let Some(t) = time {
+        spans.push(ProseSpan::new(" ", ProseStyle::default()));
+        spans.push(header_span(t));
+    }
+    let row = ProjectedRow::styled(prose::BlockRole::Plain, spans);
+    if text::width(&row.text) > width {
+        // Absolute floor: the whole row collapses to one clipped fragment.
+        return ProjectedRow::styled(
+            prose::BlockRole::Plain,
+            vec![ProseSpan::new(
+                text::truncate(&row.text, width),
+                ProseStyle::default(),
+            )],
+        );
+    }
+    row
+}
+
+/// The card body: typed rows under a header, foldable past the threshold.
+fn project_card_body(body: &CardBody, width: usize, folded: bool) -> Vec<ProjectedRow> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let line_count = body.lines.len();
+    let mut rows = Vec::new();
+    if folded && line_count > body.threshold {
+        if body.fold_all {
+            rows.push(project_fold_bar(body, width));
+        } else {
+            for line in body.lines.iter().take(2) {
+                rows.extend(project_body_line(line, width));
+            }
+            rows.push(project_fold_bar(body, width));
+            if let Some(last) = body.lines.last() {
+                rows.extend(project_body_line(last, width));
+            }
+        }
+    } else {
+        for line in &body.lines {
+            rows.extend(project_body_line(line, width));
+        }
+    }
+    rows
+}
+
+/// One body row: a 2-column indent (the §2 fixed right shift) plus the
+/// line's segments, soft-wrapped with the gutter as hanging indent when it
+/// overflows the width. Diff del/ins rows carry their wash tone.
+fn project_body_line(segments: &[SegSpan], width: usize) -> Vec<ProjectedRow> {
+    let indent = ProseSpan::new("  ", ProseStyle::default());
+    let gutter = segments
+        .first()
+        .map(seg_span)
+        .unwrap_or_else(|| ProseSpan::new("", ProseStyle::default()));
+    let mut spans: Vec<ProseSpan> = Vec::with_capacity(segments.len() + 1);
+    spans.push(indent);
+    spans.extend(segments.iter().map(seg_span));
+    let wash = segments.iter().find_map(|seg| seg.tone);
+    let finish = |row: Vec<ProseSpan>| match wash {
+        Some(tone) => ProjectedRow::styled_with_tone(prose::BlockRole::Plain, row, tone),
+        None => ProjectedRow::styled(prose::BlockRole::Plain, row),
+    };
+    if spans_width(&spans) <= width {
+        return vec![finish(spans)];
+    }
+    let indent_width = 2 + span_width(&gutter);
+    let mut rows = prose::wrap_spans(&spans, width);
+    if rows.len() > 1 && indent_width > 0 && indent_width < width {
+        let pad = ProseSpan::new(" ".repeat(indent_width), ProseStyle::default());
+        for row in &mut rows[1..] {
+            let mut full = vec![pad.clone()];
+            full.append(row);
+            *row = full;
+        }
+    }
+    rows.into_iter().map(finish).collect()
+}
+
+fn spans_width(spans: &[ProseSpan]) -> usize {
+    spans.iter().map(span_width).sum()
+}
+
+/// The fold bar row: `  ┈┈ ▾ N {label} (按 Space 展开) ┈┈`, rails GRAY, the
+/// count ORANGE, the Space hint DARK_GRAY, extended with `┈` to the width.
+/// Sits inside the body's 2-column indent like every other body row.
+fn project_fold_bar(body: &CardBody, width: usize) -> ProjectedRow {
+    let count = body.fold_count;
+    let mut spans = Vec::new();
+    spans.push(ProseSpan::new("  ", ProseStyle::default()));
+    spans.push(ProseSpan::new(
+        "┈┈ ",
+        ProseStyle::default().colored(ProseColor::Meta),
+    ));
+    let center = format!("▾ {count} {}", body.fold_label);
+    spans.push(ProseSpan::new(
+        center.clone(),
+        ProseStyle::default().colored(ProseColor::Code),
+    ));
+    let hint = if body.fold_hint {
+        let hint = " (按 Space 展开)".to_owned();
+        spans.push(ProseSpan::new(
+            hint.clone(),
+            ProseStyle::default().colored(ProseColor::DarkGray),
+        ));
+        hint
+    } else {
+        String::new()
+    };
+    let mut right = " ┈┈".to_owned();
+    let used = 2 + text::width("┈┈ ") + text::width(&center) + text::width(&hint) + text::width(&right);
+    if width > used {
+        right.push_str(&"┈".repeat(width - used));
+    }
+    spans.push(ProseSpan::new(
+        right,
+        ProseStyle::default().colored(ProseColor::Meta),
+    ));
+    ProjectedRow::styled(prose::BlockRole::Plain, spans)
 }
 
 /// Consecutive Reasoning cells form one visual think block. The scan maps
@@ -680,20 +1032,55 @@ impl ReasoningRuns {
     }
 }
 
-/// The rendered header row of the think block whose header cell is `index`:
-/// `think` bare (replay, or a block that never streamed deltas) or
-/// `think · 8s` with the block's wall-clock span. Sub-second spans wear
-/// milliseconds (`think · 850ms`, v2.2) instead of collapsing to `0s`.
-fn think_header_text(elapsed: Option<Duration>) -> String {
-    match elapsed {
-        Some(elapsed) => {
-            format!(
-                "think · {}",
-                crate::app::run_state::format_think_elapsed(elapsed)
-            )
-        }
-        None => "think".to_owned(),
+/// The think block's header row (v4.0 P3 §6 re-skin): `▎ Thought for 4.2s
+/// ··········· (按 Space 查看)`. Whole row in the gray family — `▎` and the
+/// duration DARK_GRAY, `Thought for` gray, dot leaders (BORDER) fill the
+/// width, the Space hint DARK_GRAY. Replay (no timing) renders a bare
+/// `Thought`.
+fn project_think_header(elapsed: Option<Duration>, width: usize) -> ProjectedRow {
+    if width == 0 {
+        return ProjectedRow::styled(prose::BlockRole::Plain, Vec::new());
     }
+    let timed = elapsed.is_some();
+    let label = if timed { "Thought for " } else { "Thought" };
+    let duration_text = match elapsed {
+        Some(elapsed) => crate::app::run_state::format_think_elapsed(elapsed),
+        None => String::new(),
+    };
+    let hint = " (按 Space 查看)";
+    // `▎ ` + label [+ duration] + ` ` + `·` dots + ` ` + hint.
+    let fixed = text::width("▎ ")
+        + text::width(label)
+        + text::width(&duration_text)
+        + 2
+        + text::width(hint);
+    let dots = width.saturating_sub(fixed);
+    let mut spans = Vec::new();
+    spans.push(ProseSpan::new(
+        "▎ ",
+        ProseStyle::default().colored(ProseColor::DarkGray),
+    ));
+    spans.push(ProseSpan::new(
+        label,
+        ProseStyle::default().colored(ProseColor::Meta),
+    ));
+    if !duration_text.is_empty() {
+        spans.push(ProseSpan::new(
+            duration_text,
+            ProseStyle::default().colored(ProseColor::DarkGray),
+        ));
+    }
+    spans.push(ProseSpan::new(" ", ProseStyle::default()));
+    spans.push(ProseSpan::new(
+        "·".repeat(dots),
+        ProseStyle::default().colored(ProseColor::Border),
+    ));
+    spans.push(ProseSpan::new(" ", ProseStyle::default()));
+    spans.push(ProseSpan::new(
+        hint,
+        ProseStyle::default().colored(ProseColor::DarkGray),
+    ));
+    ProjectedRow::styled(prose::BlockRole::Plain, spans)
 }
 
 /// One display row list for a cell: normal wrap, the collapsed `think`
@@ -708,13 +1095,22 @@ fn project_cell(
     collapsed: Collapser<'_>,
     think_elapsed: Option<Duration>,
 ) -> Vec<ProjectedRow> {
-    if cell.kind == LineKind::Reasoning && cell.text == "think" {
-        let header = think_header_text(think_elapsed);
-        let head = runs.head_of[index];
-        if head != usize::MAX && collapsed(head) {
-            return vec![ProjectedRow::plain(header)];
+    if cell.kind == LineKind::Tool {
+        if cell.header.is_none() && cell.body.is_none() {
+            return wrap_line(cell, width, prev);
         }
-        return plain_rows(text::wrap(&header, width));
+        let mut rows = Vec::new();
+        if let Some(header) = &cell.header {
+            rows.push(project_card_header(header, width));
+        }
+        if let Some(body) = &cell.body {
+            let folded = collapsed(index) && body.lines.len() > body.threshold;
+            rows.extend(project_card_body(body, width, folded));
+        }
+        return rows;
+    }
+    if cell.kind == LineKind::Reasoning && cell.text == "think" {
+        return vec![project_think_header(think_elapsed, width)];
     }
     if cell.kind == LineKind::Reasoning {
         let head = runs.head_of[index];
@@ -756,11 +1152,11 @@ fn wrap_all(cells: &[TranscriptLine], width: usize) -> Vec<Vec<ProjectedRow>> {
         .collect()
 }
 
-fn row_count(wrapped: &[Vec<ProjectedRow>]) -> usize {
+pub(crate) fn row_count(wrapped: &[Vec<ProjectedRow>]) -> usize {
     wrapped.iter().map(Vec::len).sum()
 }
 
-fn start_from_tail(wrapped: &[Vec<ProjectedRow>], height: usize) -> (usize, usize) {
+pub(crate) fn start_from_tail(wrapped: &[Vec<ProjectedRow>], height: usize) -> (usize, usize) {
     if wrapped.is_empty() {
         return (0, 0);
     }
@@ -774,7 +1170,7 @@ fn start_from_tail(wrapped: &[Vec<ProjectedRow>], height: usize) -> (usize, usiz
     (0, 0)
 }
 
-fn clamp_pin(pin: Option<(usize, usize)>, wrapped: &[Vec<ProjectedRow>]) -> (usize, usize) {
+pub(crate) fn clamp_pin(pin: Option<(usize, usize)>, wrapped: &[Vec<ProjectedRow>]) -> (usize, usize) {
     let Some((cell, row)) = pin else {
         return (0, 0);
     };
@@ -787,12 +1183,64 @@ fn clamp_pin(pin: Option<(usize, usize)>, wrapped: &[Vec<ProjectedRow>]) -> (usi
     (cell, row)
 }
 
-fn rows_from(wrapped: &[Vec<ProjectedRow>], cell: usize, row: usize) -> usize {
+pub(crate) fn rows_from(wrapped: &[Vec<ProjectedRow>], cell: usize, row: usize) -> usize {
     if cell >= wrapped.len() {
         return 0;
     }
     let first = wrapped[cell].len().saturating_sub(row);
     first + wrapped[cell + 1..].iter().map(Vec::len).sum::<usize>()
+}
+
+/// Clamps a logical cursor position onto the wrapped rows.
+pub(crate) fn clamp_cursor(
+    wrapped: &[Vec<ProjectedRow>],
+    pos: (usize, usize),
+) -> (usize, usize) {
+    clamp_pin(Some(pos), wrapped)
+}
+
+/// Absolute wrapped-row index of a logical position (the scrollbar's S
+/// space): rows before the cursor, 0 at the transcript head.
+pub(crate) fn logical_index(
+    wrapped: &[Vec<ProjectedRow>],
+    pos: (usize, usize),
+) -> usize {
+    row_count(wrapped).saturating_sub(rows_from(wrapped, pos.0, pos.1))
+}
+
+/// The logical position whose wrapped row sits at absolute `index`.
+/// Past-the-end indices clamp onto the last row.
+pub(crate) fn position_at_index(wrapped: &[Vec<ProjectedRow>], mut index: usize) -> (usize, usize) {
+    if wrapped.is_empty() {
+        return (0, 0);
+    }
+    for (cell, rows) in wrapped.iter().enumerate() {
+        if index < rows.len() {
+            return (cell, index);
+        }
+        index -= rows.len();
+    }
+    let last = wrapped.len() - 1;
+    (last, wrapped[last].len().saturating_sub(1))
+}
+
+/// Moves a logical cursor by `delta` wrapped rows (browse-mode stepping),
+/// clamping at both ends of the transcript.
+pub(crate) fn move_cursor(
+    wrapped: &[Vec<ProjectedRow>],
+    pos: (usize, usize),
+    delta: isize,
+) -> (usize, usize) {
+    if wrapped.is_empty() {
+        return (0, 0);
+    }
+    let (mut cell, mut row) = clamp_cursor(wrapped, pos);
+    if delta < 0 {
+        move_backward(wrapped, &mut cell, &mut row, delta.unsigned_abs());
+    } else if delta > 0 {
+        move_forward(wrapped, &mut cell, &mut row, delta as usize);
+    }
+    (cell, row)
 }
 
 fn window_reaches_tail(
@@ -804,7 +1252,12 @@ fn window_reaches_tail(
     wrapped.is_empty() || rows_from(wrapped, cell, row) <= height
 }
 
-fn move_backward(wrapped: &[Vec<ProjectedRow>], cell: &mut usize, row: &mut usize, mut n: usize) {
+pub(crate) fn move_backward(
+    wrapped: &[Vec<ProjectedRow>],
+    cell: &mut usize,
+    row: &mut usize,
+    mut n: usize,
+) {
     while n > 0 {
         if *row > 0 {
             let step = (*row).min(n);
@@ -820,7 +1273,12 @@ fn move_backward(wrapped: &[Vec<ProjectedRow>], cell: &mut usize, row: &mut usiz
     }
 }
 
-fn move_forward(wrapped: &[Vec<ProjectedRow>], cell: &mut usize, row: &mut usize, mut n: usize) {
+pub(crate) fn move_forward(
+    wrapped: &[Vec<ProjectedRow>],
+    cell: &mut usize,
+    row: &mut usize,
+    mut n: usize,
+) {
     while n > 0 {
         let len = wrapped.get(*cell).map(Vec::len).unwrap_or(0);
         if *row + 1 < len {
@@ -855,9 +1313,10 @@ fn collect_rows(
                 cell_index: cell,
                 row_in_cell: row,
                 kind: cells[cell].kind,
-                tone: cells[cell].tone,
+                tone: rows[row].tone.unwrap_or(cells[cell].tone),
                 role: rows[row].role.clone(),
                 spans: rows[row].spans.clone(),
+                code_line: rows[row].code_line.clone(),
                 text: rows[row].text.clone(),
             });
             row += 1;
@@ -887,9 +1346,10 @@ fn collect_store_rows(
                 cell_index: cell,
                 row_in_cell: row,
                 kind: store.display_kind(cell),
-                tone: store.display_tone(cell),
+                tone: rows[row].tone.unwrap_or(store.display_tone(cell)),
                 role: rows[row].role.clone(),
                 spans: rows[row].spans.clone(),
+                code_line: rows[row].code_line.clone(),
                 text: rows[row].text.clone(),
             });
             row += 1;
@@ -916,6 +1376,11 @@ mod tests {
 
     fn row_texts(rows: &[ProjectedRow]) -> Vec<&str> {
         rows.iter().map(|row| row.text.as_str()).collect()
+    }
+
+    /// The v4.0 P3 re-skinned think header row.
+    fn is_think_header(text: &str) -> bool {
+        text.starts_with("▎ Thought") && text.contains("按 Space 查看")
     }
 
     #[test]
@@ -997,13 +1462,13 @@ mod tests {
     }
 
     #[test]
-    fn user_rows_wrap_one_short_reserving_the_bar_gap() {
+    fn user_rows_wrap_two_short_reserving_the_prompt_prefix() {
         let cells = vec![line(LineKind::User, "abcdefgh")];
         let scroll = ScrollState::follow();
-        // Width 6 reserves one column for the painted bar gap, so the text
-        // wraps at 5.
+        // Width 6 reserves two columns for the painted `❯ ` prefix, so the
+        // text wraps at 4 with continuations hanging past the glyph.
         let slice = visible_slice(&cells, 6, 2, &scroll);
-        assert_eq!(texts(&slice), ["abcde", "fgh"]);
+        assert_eq!(texts(&slice), ["abcd", "efgh"]);
     }
 
     #[test]
@@ -1012,12 +1477,14 @@ mod tests {
             kind: LineKind::Tool,
             text: text.to_owned(),
             tone,
+            header: None,
+            body: None,
         };
         let cells = vec![
             line(LineKind::Answer, "abcdefgh"),
             line(LineKind::Answer, "ijklmnop"),
             tool("Grep 1 search", Tone::Title),
-            tool("  ↳ \"hit\"", Tone::Detail),
+            tool("  \"hit\"", Tone::Detail),
             line(LineKind::Answer, "next"),
         ];
         let scroll = ScrollState::follow();
@@ -1033,8 +1500,8 @@ mod tests {
                 "Grep 1",
                 " searc",
                 "h",
-                "  ↳ \"h",
-                "  it\"",
+                "  \"hit",
+                "  \"",
                 "",
                 "next"
             ]
@@ -1082,17 +1549,20 @@ mod tests {
         ]);
         store.refresh_wraps(80, &|head| head == 1);
         let slice = store.visible_slice(80, 10, &ScrollState::follow(), &|head| head == 1);
-        assert_eq!(
-            texts(&slice),
-            ["a", "think", "tail"],
-            "the folded run renders one header row"
+        let folded = texts(&slice);
+        assert_eq!(folded.len(), 3, "the folded run renders one header row: {folded:?}");
+        assert_eq!(folded[0], "a");
+        assert_eq!(folded[2], "tail");
+        assert!(
+            is_think_header(folded[1]),
+            "the folded run renders the think header: {folded:?}"
         );
 
         let mut store = TranscriptStore::default();
         store.push_closed([crate::app::transcript::line(LineKind::Reasoning, "think")]);
         store.refresh_wraps(80, &|_| true);
         let slice = store.visible_slice(80, 10, &ScrollState::follow(), &|_| true);
-        assert_eq!(texts(&slice), ["think"]);
+        assert!(is_think_header(texts(&slice)[0]));
     }
 
     #[test]
@@ -1112,7 +1582,11 @@ mod tests {
         store.refresh_wraps(80, &|_| true);
         {
             let rows = store.wrap_rows();
-            assert_eq!(row_texts(&rows[head]), ["think · 8s"]);
+            let head_text = row_texts(&rows[head])[0];
+            assert!(
+                head_text.contains("Thought for 8s") && head_text.contains("按 Space 查看"),
+                "timed header: {head_text:?}"
+            );
             assert_eq!(row_texts(&rows[2]), ["after"]);
         }
 
@@ -1122,7 +1596,11 @@ mod tests {
         store.refresh_wraps(80, &|_| false);
         {
             let rows = store.wrap_rows();
-            assert_eq!(row_texts(&rows[head]), ["think · 8s"]);
+            let head_text = row_texts(&rows[head])[0];
+            assert!(
+                head_text.contains("Thought for 8s") && head_text.contains("按 Space 查看"),
+                "timed header after seal: {head_text:?}"
+            );
             assert_eq!(row_texts(&rows[1]), ["│ body"]);
         }
 
@@ -1130,7 +1608,12 @@ mod tests {
         let mut replay = TranscriptStore::default();
         replay.push_closed([crate::app::transcript::line(LineKind::Reasoning, "think")]);
         replay.refresh_wraps(80, &|_| true);
-        assert_eq!(row_texts(&replay.wrap_rows()[0]), ["think"]);
+        let replay_rows = replay.wrap_rows();
+        let replay_text = row_texts(&replay_rows[0])[0];
+        assert!(
+            replay_text.starts_with("▎ Thought ") && replay_text.contains("按 Space 查看"),
+            "untimed header: {replay_text:?}"
+        );
     }
 
     #[test]
@@ -1140,13 +1623,13 @@ mod tests {
         store.refresh_wraps(80, &|_| true);
         {
             let rows = store.wrap_rows();
-            assert_eq!(row_texts(&rows[0]), ["think"]);
+            assert!(is_think_header(row_texts(&rows[0])[0]));
         }
         store.bump_wrap_revision();
         store.refresh_wraps(80, &|_| false);
         {
             let rows = store.wrap_rows();
-            assert_eq!(rows[0], wrap_line(&store.cells()[0], 80, None));
+            assert!(is_think_header(row_texts(&rows[0])[0]));
         }
     }
 

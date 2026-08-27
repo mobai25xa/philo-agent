@@ -64,6 +64,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "session, model, usage and the tool lineup",
     },
     CommandSpec {
+        name: "theme",
+        usage: "/theme [original|recommended|comfort|sat N|light N|bold N]",
+        summary: "color scheme preset or slider retune",
+    },
+    CommandSpec {
         name: "config",
         usage: "/config",
         summary: "effective configuration and its source layers",
@@ -88,6 +93,7 @@ pub enum Command {
     Image { path: Option<String> },
     Verbose,
     Status,
+    Theme { argument: Option<String> },
     Config,
     Quit,
 }
@@ -127,6 +133,7 @@ pub fn parse(input: &str) -> Result<Command, UnknownCommand> {
         "image" => Ok(Command::Image { path: argument }),
         "verbose" => Ok(Command::Verbose),
         "status" => Ok(Command::Status),
+        "theme" => Ok(Command::Theme { argument }),
         "config" => Ok(Command::Config),
         "quit" => Ok(Command::Quit),
         _ => Err(UnknownCommand {
@@ -236,6 +243,7 @@ mod tests {
                 "image",
                 "verbose",
                 "status",
+                "theme",
                 "config",
                 "quit",
             ],
@@ -266,6 +274,13 @@ mod tests {
         );
         assert_eq!(parse("/verbose"), Ok(Command::Verbose));
         assert_eq!(parse("/status"), Ok(Command::Status));
+        assert_eq!(parse("/theme"), Ok(Command::Theme { argument: None }));
+        assert_eq!(
+            parse("/theme  comfort "),
+            Ok(Command::Theme {
+                argument: Some("comfort".to_owned())
+            })
+        );
         assert_eq!(parse("/config"), Ok(Command::Config));
         assert_eq!(parse("/quit"), Ok(Command::Quit));
     }

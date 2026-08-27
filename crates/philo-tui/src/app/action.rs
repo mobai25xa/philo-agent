@@ -29,9 +29,30 @@ pub(crate) enum Action {
     /// `Ctrl+L`: force a full redraw.
     Redraw,
     /// `PageUp`: scroll the sealed transcript toward older rows.
+    /// Kept as the browse-page engine's internal contract (P5 §6) — the
+    /// keymap no longer binds PgUp/PgDn to it, and tests exercise the
+    /// dispatch path directly.
+    #[allow(dead_code)]
     PageTranscriptUp,
     /// `PageDown`: scroll the sealed transcript toward newer rows.
+    /// Same P5 §6 rationale as `PageTranscriptUp`.
+    #[allow(dead_code)]
     PageTranscriptDown,
+    /// `PgUp` / `Ctrl+U` from the composer: leave the input (draft intact)
+    /// and enter history browse mode.
+    EnterBrowse,
+    /// `k`/`↑` and `j`/`↓` in browse mode: step the logical cursor by one
+    /// row toward older (`-1`) or newer (`+1`) history.
+    BrowseStep(isize),
+    /// `PgUp` / `PgDn` in browse mode: page the logical cursor by a whole
+    /// viewport (`-1` toward older, `+1` toward newer).
+    BrowsePage(isize),
+    /// `Space` / `o` in browse mode: toggle the foldable element under the
+    /// cursor — a tool-card body or a think header.
+    BrowseToggleFold,
+    /// `i` in browse mode (or `Esc` with no overlay open): return the focus
+    /// to the composer without disturbing the scroll position.
+    ExitBrowse,
     /// Wheel or equivalent: negative moves toward older rows.
     ScrollTranscript(isize),
     /// Left-button down inside the transcript/live band.

@@ -697,7 +697,7 @@ fn frontend_effort(effort: ReasoningEffort) -> FrontendReasoningEffort {
 }
 
 fn ui_entry(key: &str) -> bool {
-    matches!(key, "verbosity" | "show_reasoning" | "screen")
+    matches!(key, "verbosity" | "show_reasoning")
 }
 
 fn non_ui_entries(settings: &Settings) -> Vec<(String, String, String)> {
@@ -911,7 +911,6 @@ mod tests {
         MemoryModelReplayStore, ModelCompat, ModelContinuationPolicy, ModelProtocol,
         ModelRequestHeaders,
     };
-    use philo_tui::TuiScreen;
 
     use crate::config::{Deployment, Verbosity};
 
@@ -971,8 +970,6 @@ mod tests {
             recovery: Default::default(),
             verbosity: Verbosity::Default,
             show_reasoning: true,
-            screen: TuiScreen::Alternate,
-            terminal_bg: None,
             entries: vec![],
         }
     }
@@ -1031,7 +1028,6 @@ mod tests {
         let mut right = left.clone();
         right.show_reasoning = false;
         right.verbosity = Verbosity::Verbose;
-        right.screen = TuiScreen::Inline;
         assert!(!generation_fields_changed(&left, &right));
         let _ = std::fs::remove_dir_all(dir);
     }

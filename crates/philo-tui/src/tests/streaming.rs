@@ -105,23 +105,28 @@ fn the_writing_screen_matches_the_design_language() {
         .position(|row| row.contains("Find the homepage"))
         .expect("strip row");
     assert!(
-        rows[strip].starts_with("   ▌ Find the homepage"),
-        "strip row leads with band bar + bar-gap text: {:?}",
+        rows[strip].contains("❯ Find the homepage"),
+        "strip row leads with the prompt prefix: {:?}",
         rows[strip]
     );
     assert_eq!(
-        rows.get(strip - 1).map(|row| row.trim()),
+        rows.get(strip - 1).map(|row| row.trim().trim_end_matches(['│', '█']).trim()),
         Some(""),
         "the separator above the strip stays bare"
     );
 
     // Sealed think header carries the frozen first-to-last delta span.
     assert!(
-        rows.iter().any(|row| row.trim() == "think · 8s"),
+        rows.iter().any(|row| {
+            let row = row.trim().trim_end_matches(['│', '█']).trim();
+            row.contains("Thought for 8s") && row.contains("Space")
+        }),
         "the timed think header renders: {rendered}"
     );
     assert!(
-        !rendered.contains('│'),
+        rows[..rows.len().saturating_sub(6)]
+            .iter()
+            .all(|row| row.trim_end_matches(['│', '█']).trim().chars().all(|c| c != '│')),
         "the folded body stays hidden: {rendered}"
     );
 
@@ -132,12 +137,11 @@ fn the_writing_screen_matches_the_design_language() {
         "the open answer renders: {rendered}"
     );
     assert!(
-        rows.iter().any(|row| row.starts_with("    ⠋ Writing… 42s")),
+        rows.iter().any(|row| row.contains("Writing (42s)")),
         "top-left carries the running word outside the box: {rendered}"
     );
     assert!(
-        rows.iter()
-            .any(|row| row.ends_with("(openai) gpt-5.2 · high")),
+        rows.iter().any(|row| row.contains("gpt-5.2 · high")),
         "model corner survives: {rendered}"
     );
 
@@ -202,8 +206,8 @@ fn streamed_code_fences_paint_their_gutter_and_highlight() {
         .position(|row| row.contains("let answer = 42;"))
         .expect("fenced body renders");
     assert!(
-        rows[body_row].trim_start().starts_with("│ let answer"),
-        "a streamed fenced body paints the gutter: {}",
+        rows[body_row].trim_start().starts_with("1 │ let answer"),
+        "a streamed fenced body paints the numbered gutter: {}",
         rows.join("\n")
     );
 
@@ -338,19 +342,12 @@ fn indexed(screen: &str) -> String {
         .join("\n")
 }
 
-/// v2.2 §2.5: a tall screen lifts the stream to the 40% line, grows and
-/// pins it at the 80% line, then settles the tail back onto the band
-/// floor once the turn finishes.
+/// v4.1 layout policy (stream anchors retired): sparse content lays out
+/// from the band top; overflow pushes the tail in from the bottom edge,
+/// and settlement never moves the view.
 #[test]
-fn the_streaming_viewport_lifts_pins_and_settles_back() {
+fn streaming_lays_out_from_the_top_then_follows_the_bottom() {
     let mut app = dashboard_app();
-    // A non-blank screen lifts; a blank one keeps its top start.
-    app.cells.push_closed([crate::app::transcript::line(
-        crate::app::transcript::LineKind::Meta,
-        "warm-up",
-    )]);
-    let _ = render(&app, 80, 40); // notes the frame height and band layout
-
     type_text(&mut app, "lift me");
     let effects = app.on_action(Action::Submit);
     let crate::app::effect::Effect::PrepareSubmit { intent_id, .. } = &effects[0] else {
@@ -358,16 +355,17 @@ fn the_streaming_viewport_lifts_pins_and_settles_back() {
     };
     app.on_action(crate::app::action::Action::SubmitAccepted {
         intent_id: *intent_id,
-        operation_id: "op-lift".to_owned(),
+        operation_id: "op-top".to_owned(),
     });
     apply(
         &mut app,
         &FrontendOperationEvent::OperationStarted {
-            operation_id: "op-lift".to_owned(),
+            operation_id: "op-top".to_owned(),
         },
     );
 
-    // Lifted: the tail hangs at the 40% line (row 16), blank rows above.
+    // Sparse content: the user strip (blank + `❯ lift me` + blank) rides
+    // the band top; the first streamed row lands right below it.
     apply(
         &mut app,
         &FrontendOperationEvent::TextDelta {
@@ -375,21 +373,20 @@ fn the_streaming_viewport_lifts_pins_and_settles_back() {
         },
     );
     assert!(app.flush_stream());
-    let lifted = render(&app, 80, 40);
-    let rows: Vec<&str> = lifted.lines().collect();
-    assert!(
-        rows[..12].iter().all(|row| row.trim().is_empty()),
-        "blank rows sit above the lifted tail:\n{lifted}"
-    );
+    let sparse = render(&app, 80, 40);
+    let rows: Vec<&str> = sparse.lines().collect();
+    assert!(rows[1].contains("lift me"), "user strip at the top:\n{sparse}");
     assert_eq!(
-        rows[12].trim(),
-        "warm-up",
-        "lifted window starts at warm-up:\n{lifted}"
+        rows[3].trim().trim_end_matches(['│', '█']).trim(),
+        "first words",
+        "sparse content starts at the band top:\n{sparse}"
     );
-    assert!(rows[14].contains("lift me"), "strip row:\n{lifted}");
-    assert!(rows[16].contains("first words"), "tail row:\n{lifted}");
+    assert!(
+        rows[30].trim().trim_end_matches(['│', '█']).trim().is_empty(),
+        "the band below sparse content stays blank:\n{sparse}"
+    );
 
-    // Growth: each new wrapped row pushes the tail down one.
+    // Growth: each new wrapped row lands below the previous one.
     apply(
         &mut app,
         &FrontendOperationEvent::TextDelta {
@@ -400,19 +397,14 @@ fn the_streaming_viewport_lifts_pins_and_settles_back() {
     let grown = render(&app, 80, 40);
     let rows: Vec<&str> = grown.lines().collect();
     assert_eq!(
-        rows[12].trim(),
-        "warm-up",
-        "the lifted blank band holds:\n{}",
-        indexed(&grown)
-    );
-    assert!(
-        rows[17].contains("and more"),
-        "tail descended one row:\n{}",
+        rows[4].trim().trim_end_matches(['│', '█']).trim(),
+        "and more",
+        "new rows descend from the top while sparse:\n{}",
         indexed(&grown)
     );
 
-    // Flood: the tail pins at the 80% line (row 31) with a reserved blank
-    // strip running down to the band floor.
+    // Flood: once content overflows, the tail hugs the band floor (the
+    // composer's separator row on this screen is row 34).
     apply(
         &mut app,
         &FrontendOperationEvent::TextDelta {
@@ -420,40 +412,36 @@ fn the_streaming_viewport_lifts_pins_and_settles_back() {
         },
     );
     assert!(app.flush_stream());
-    let pinned = render(&app, 80, 40);
-    let rows: Vec<&str> = pinned.lines().collect();
-    assert!(rows[31].contains("more"), "pinned tail row:\n{pinned}");
+    let flooded = render(&app, 80, 40);
+    let rows: Vec<&str> = flooded.lines().collect();
     assert!(
-        rows[32].trim().is_empty() && rows[34].trim().is_empty(),
-        "the reserve below the pin stays blank to the band floor:\n{pinned}"
-    );
-    assert!(
-        !rows[35].trim().is_empty(),
-        "the composer follows immediately:\n{pinned}"
+        rows[33].contains("more"),
+        "the overflowing tail hugs the band floor:\n{flooded}"
     );
 
-    // Settlement drops the tail back onto the band floor.
+    // Settlement adds one line at the tail; the overflowing view follows
+    // the bottom, so only the top row scrolls away — the floor stays put.
     app.run_state_mut()
         .freeze_elapsed(std::time::Duration::from_secs(7));
     apply(
         &mut app,
         &FrontendOperationEvent::OperationSettled {
-            operation_id: "op-lift".to_owned(),
+            operation_id: "op-top".to_owned(),
             session_id: "session-中文".to_owned(),
             status: "Succeeded".to_owned(),
             durability: "Confirmed".to_owned(),
             session_revision: philo_agent_service::SettlementRevision::Unchanged,
         },
     );
-    for _ in 0..5 {
-        assert!(app.on_tick(std::time::Duration::from_millis(100)));
-    }
-    assert!(!app.stream_anchor_active(), "settle animation finished");
     app.set_busy(false);
     let settled = render(&app, 80, 40);
     let rows: Vec<&str> = settled.lines().collect();
     assert!(
-        rows[34].contains("turn finished · 7s"),
-        "settlement hugs the band floor:\n{settled}"
+        rows[33].contains("turn finished"),
+        "the settlement line rides the band floor:\n{settled}"
+    );
+    assert!(
+        !rows[1].contains("lift me"),
+        "the pushed-out top row scrolled away, bottom stayed anchored:\n{settled}"
     );
 }

@@ -1,20 +1,20 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 178
+assertion_line: 224
 expression: "render(&[\"| plan | latency | notes |\", \"|---|---|---|\",\n\"| fast | 2ms | cached path |\",\n\"| slow | 200ms | hits the network every single time |\", \"\",\n\"back to prose\",])"
 ---
 ╭──────┬─────────┬────────────────────────────────────╮
-  -> "╭"{darkgray} "──────"{darkgray} "┬"{darkgray} "─────────"{darkgray} "┬"{darkgray} "────────────────────────────────────"{darkgray} "╮"{darkgray}
+  -> "╭"{rgb(42, 51, 61)} "──────"{rgb(42, 51, 61)} "┬"{rgb(42, 51, 61)} "─────────"{rgb(42, 51, 61)} "┬"{rgb(42, 51, 61)} "────────────────────────────────────"{rgb(42, 51, 61)} "╮"{rgb(42, 51, 61)}
 │ plan │ latency │ notes                              │
-  -> "│ "{darkgray} "plan"{rgb(222, 137, 72),bold} " │ "{darkgray} "latency"{rgb(222, 137, 72),bold} " │ "{darkgray} "notes"{rgb(222, 137, 72),bold} "                             " " │"{darkgray}
+  -> "│ "{rgb(42, 51, 61)} "plan"{rgb(166, 99, 54),bold} " │ "{rgb(42, 51, 61)} "latency"{rgb(166, 99, 54),bold} " │ "{rgb(42, 51, 61)} "notes"{rgb(166, 99, 54),bold} "                             " " │"{rgb(42, 51, 61)}
 ├──────┼─────────┼────────────────────────────────────┤
-  -> "├"{darkgray} "──────"{darkgray} "┼"{darkgray} "─────────"{darkgray} "┼"{darkgray} "────────────────────────────────────"{darkgray} "┤"{darkgray}
+  -> "├"{rgb(42, 51, 61)} "──────"{rgb(42, 51, 61)} "┼"{rgb(42, 51, 61)} "─────────"{rgb(42, 51, 61)} "┼"{rgb(42, 51, 61)} "────────────────────────────────────"{rgb(42, 51, 61)} "┤"{rgb(42, 51, 61)}
 │ fast │ 2ms     │ cached path                        │
-  -> "│ "{darkgray} "fast" " │ "{darkgray} "2ms" "    " " │ "{darkgray} "cached path" "                       " " │"{darkgray}
+  -> "│ "{rgb(42, 51, 61)} "fast" " │ "{rgb(42, 51, 61)} "2ms" "    " " │ "{rgb(42, 51, 61)} "cached path" "                       " " │"{rgb(42, 51, 61)}
 │ slow │ 200ms   │ hits the network every single time │
-  -> "│ "{darkgray} "slow" " │ "{darkgray} "200ms" "  " " │ "{darkgray} "hits the network every single time" " │"{darkgray}
+  -> "│ "{rgb(42, 51, 61)} "slow" " │ "{rgb(42, 51, 61)} "200ms" "  " " │ "{rgb(42, 51, 61)} "hits the network every single time" " │"{rgb(42, 51, 61)}
 ╰──────┴─────────┴────────────────────────────────────╯
-  -> "╰"{darkgray} "──────"{darkgray} "┴"{darkgray} "─────────"{darkgray} "┴"{darkgray} "────────────────────────────────────"{darkgray} "╯"{darkgray}
+  -> "╰"{rgb(42, 51, 61)} "──────"{rgb(42, 51, 61)} "┴"{rgb(42, 51, 61)} "─────────"{rgb(42, 51, 61)} "┴"{rgb(42, 51, 61)} "────────────────────────────────────"{rgb(42, 51, 61)} "╯"{rgb(42, 51, 61)}
 
   -> 
 back to prose

@@ -135,10 +135,6 @@ pub(super) struct FileConfig {
     // [ui]
     pub(super) verbosity: Option<Sourced<String>>,
     pub(super) show_reasoning: Option<Sourced<bool>>,
-    pub(super) screen: Option<Sourced<String>>,
-    /// Explicit terminal background override (`#RRGGBB`) injected into the
-    /// TUI palette; empty means the TUI uses its stable fallback surfaces.
-    pub(super) terminal_bg: Option<Sourced<String>>,
     /// Unknown sections and keys are retained as forward-compatible warnings.
     pub(super) warnings: Vec<String>,
 }
@@ -372,8 +368,20 @@ fn apply(
                 }
                 ("ui", "verbosity") => config.verbosity = Some(reader.string()?),
                 ("ui", "show_reasoning") => config.show_reasoning = Some(reader.boolean()?),
-                ("ui", "screen") => config.screen = Some(reader.string()?),
-                ("ui", "terminal_bg") => config.terminal_bg = Some(reader.string()?),
+                ("ui", "screen") => {
+                    return Err(UsageError::new(format!(
+                        "{}: unknown key [ui].screen - removed in v4.0 (alternate \
+                         screen only); delete this line",
+                        path.display()
+                    )));
+                }
+                ("ui", "terminal_bg") => {
+                    return Err(UsageError::new(format!(
+                        "{}: unknown key [ui].terminal_bg - removed in v4.0 (fixed \
+                         brand canvas); delete this line",
+                        path.display()
+                    )));
+                }
                 _ => config.warnings.push(format!(
                     "{}: unknown key [{section}].{key}; ignored",
                     path.display()

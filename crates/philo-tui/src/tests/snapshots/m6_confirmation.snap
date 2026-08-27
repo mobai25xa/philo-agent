@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
-assertion_line: 1027
 expression: rendered
 ---
 
@@ -8,22 +7,22 @@ expression: rendered
 
 
 
-
-                         ╭─ Approval required ───────╮
-                         │                           │
-                         │ write workspace file      │
-                         │ path  src/auth/session.rs │
-                         │                           │
-                         │ y allow · n / esc deny    │
-                         ╰───────────────────────────╯
-
+                        ╭╌ Approval required ╌╌╌╌╌╌╌╌╮
+                        │                            │
+                        │ write workspace file       │
+                        │ path  src/auth/session.rs  │
+                        │                            │
+                        │ [Enter/y] allow · [n] deny │
+                        ╰────────────────────────────╯
 
 
 
 
 
-                                                                    gpt-test
-   ▌
-   ▌ draft 中 文
-   ▌
-                                                             ↑- ↓- R- C- -/-
+
+───────────────────────────────────────────────────────────────────────────────
+  ● Ready                                                            gpt-test
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ ❯ draft 中 文                                                                 │
+╰─────────────────────────────────────────────────────────────────────────────╯
+                                                          ↑-  ↓-  R-  C-  -/-

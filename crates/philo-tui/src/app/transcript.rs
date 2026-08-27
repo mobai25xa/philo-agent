@@ -71,6 +71,117 @@ pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
     pub(crate) tone: Tone,
+    /// v4.0 P3: the tool-card header formula, projected as one single-row
+    /// cell (`▎ action target ····· status time`). Present on default-mode
+    /// tool cards; absent for every other line.
+    pub(crate) header: Option<CardHeader>,
+    /// v4.0 P3: the tool-card body (foldable rows below the header).
+    pub(crate) body: Option<CardBody>,
+}
+
+/// One colored segment of a tool-card span. The card vocabulary is a small
+/// closed set (no prose lookups); projection converts it to prose spans so
+/// the single wrap/paint path renders every typed row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SegColor {
+    /// Primary foreground (the grid text color).
+    #[default]
+    Default,
+    /// Dim chrome: action labels, subject rows, dot leaders.
+    Gray,
+    /// Dark-gray hints: durations, number slots, line counts.
+    DarkGray,
+    /// Success green: paths, line deltas, `✓` status words.
+    Green,
+    /// Warning yellow: spinners, running-state bars.
+    Yellow,
+    /// Brand orange: edit-family cards, command/pattern targets, fold text.
+    Orange,
+    /// Error red: failures, deletion lines, `✗` status words.
+    Red,
+    /// Border color: the card `│` gutter and `·` leaders.
+    Border,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SegSpan {
+    pub(crate) text: String,
+    pub(crate) color: SegColor,
+    pub(crate) bold: bool,
+    /// Per-row wash intent for diff bodies (del/ins); `None` everywhere else.
+    pub(crate) tone: Option<Tone>,
+}
+
+impl SegSpan {
+    pub(crate) fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            color: SegColor::Default,
+            bold: false,
+            tone: None,
+        }
+    }
+
+    pub(crate) fn colored(text: impl Into<String>, color: SegColor) -> Self {
+        Self {
+            text: text.into(),
+            color,
+            bold: false,
+            tone: None,
+        }
+    }
+}
+
+/// One header segment: text plus its card color. Bold is carried separately
+/// so the action/status weights stay independent of color.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeaderPiece {
+    pub(crate) text: String,
+    pub(crate) color: SegColor,
+    pub(crate) bold: bool,
+}
+
+/// The v4.0 P3 card header: `▎ [action] [target] [stats] ····· [status] [time]`.
+/// Projection lays it into one row (dot-fill, right-aligned status), so the
+/// header never wraps; width pressure falls back through stats → time →
+/// target → action, never the status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CardHeader {
+    /// The `▎` bar glyph, one column, colored by card state.
+    pub(crate) bar: HeaderPiece,
+    /// The action word (tool name), gray bold.
+    pub(crate) action: HeaderPiece,
+    /// The target (path/command/pattern), colored by its kind.
+    pub(crate) target: Option<HeaderPiece>,
+    /// The stats cluster (`+2 -1` green/red, `N entries` gray) as segments.
+    pub(crate) stats: Option<Vec<SegSpan>>,
+    /// The status word (`✓ done`), always painted, never dropped.
+    pub(crate) status: HeaderPiece,
+    /// The settle duration, right-aligned before the status when space allows.
+    pub(crate) time: Option<HeaderPiece>,
+}
+
+/// A tool-card body: typed rows with a fold policy. Lines are already
+/// segmented (diff gutter + content); plain rows carry a single default
+/// segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CardBody {
+    pub(crate) lines: Vec<Vec<SegSpan>>,
+    /// Fold once the line count exceeds this.
+    pub(crate) threshold: usize,
+    /// Fold by default (completion cards) or only after the user folds.
+    pub(crate) fold_default_collapsed: bool,
+    /// Count the fold bar cites (`行已折叠` counts the hidden rows; the
+    /// concurrent tree counts its child operations).
+    pub(crate) fold_count: usize,
+    /// Word used in the fold bar (`行已折叠` for outputs, `operations 已折叠`
+    /// for the concurrent tree).
+    pub(crate) fold_label: String,
+    /// Whether the fold bar appends the Space hint.
+    pub(crate) fold_hint: bool,
+    /// Trees replace every child row with the fold bar; output bodies keep
+    /// the first two and last rows (§5 vs §6).
+    pub(crate) fold_all: bool,
 }
 
 pub(crate) fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
@@ -78,6 +189,43 @@ pub(crate) fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
         kind,
         text: text.into(),
         tone: Tone::Plain,
+        header: None,
+        body: None,
+    }
+}
+
+/// A card header cell: one single-row line carrying the header formula.
+pub(crate) fn header_line(header: CardHeader) -> TranscriptLine {
+    TranscriptLine {
+        kind: LineKind::Tool,
+        text: String::new(),
+        tone: Tone::Title,
+        header: Some(header),
+        body: None,
+    }
+}
+
+/// A card body cell: foldable typed rows under a card header.
+pub(crate) fn body_line(body: CardBody) -> TranscriptLine {
+    TranscriptLine {
+        kind: LineKind::Tool,
+        text: String::new(),
+        tone: Tone::Plain,
+        header: None,
+        body: Some(body),
+    }
+}
+
+/// A one-cell card carrying both its header formula and its body (the live
+/// running card and the concurrent tree ride a single cell, rewritten in
+/// place as events land).
+pub(crate) fn card_cell(header: CardHeader, body: CardBody) -> TranscriptLine {
+    TranscriptLine {
+        kind: LineKind::Tool,
+        text: String::new(),
+        tone: Tone::Title,
+        header: Some(header),
+        body: Some(body),
     }
 }
 
@@ -234,7 +382,7 @@ impl Transcript {
                         display.as_ref(),
                     )
                 } else {
-                    tool_card::default_card(tool_name, &arguments, result, display.as_ref())
+                    tool_card::default_card(tool_name, &arguments, result, display.as_ref(), None)
                 };
                 store.push_closed(card);
             }

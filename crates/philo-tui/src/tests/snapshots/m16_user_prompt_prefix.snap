@@ -1,0 +1,16 @@
+---
+source: crates/philo-tui/src/render/frame.rs
+expression: rendered
+---
+    ❯ hello world this wraps somewh    │
+      ere here                         │
+    hello                              │
+                                       │
+                                       │
+                                       │
+───────────────────────────────────────
+  ● Ready                    gpt-test
+╭─────────────────────────────────────╮
+│ ❯ Ask anything                      │
+╰─────────────────────────────────────╯
+                  ↑-  ↓-  R-  C-  -/-

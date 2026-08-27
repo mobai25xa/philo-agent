@@ -1,82 +1,81 @@
 ---
 source: crates/philo-tui/src/tests/matrix.rs
-assertion_line: 471
 expression: matrix_render(stream_prose)
 ---
 40 columns
-    - [x] done deal
-    │ quoted remark
-    see docs
-    ────────────────────────
-    ```rust
-    │ fn main() { println!("稳 定 ");
-    ```
-    ╭──────┬─────────┬─────────╮
-    │ plan │ latency │ impleme │
-    │      │         │ ntation │
-    ├──────┼─────────┼─────────┤
-    │ fast │ 2ms     │ cached  │
-    │ slow │ 200ms   │ network │
-    │      │         │  every  │
-    │      │         │ time    │
-    ╰──────┴─────────┴─────────╯
-    Mixed 中 文  and English long
-    tail keeps wrapping at every
-    width.
-             (openai) gpt-5.2 · high
-   ▌
-   ▌ Ask anything
-   ▌
-    D:\…\Pi     ↑11k ↓4.8k 2.2%/500k
+    see docs                           │
+    ────────────────────────           │
+    ```rust                            │
+    1 │ fn main() { println!("稳 定 "    │
+      │ ; }                            │
+    ```                                │
+    ╭──────┬─────────┬─────────╮       │
+    │ plan │ latency │ impleme │       │
+    │      │         │ ntation │       █
+    ├──────┼─────────┼─────────┤       █
+    │ fast │ 2ms     │ cached  │       █
+    │ slow │ 200ms   │ network │       █
+    │      │         │  every  │       █
+    │      │         │ time    │       █
+    ╰──────┴─────────┴─────────╯       █
+    Mixed 中 文  and English long        █
+    tail keeps wrapping at every       █
+    width.                             █
+───────────────────────────────────────
+  ● Ready              gpt-5.2 · high
+╭─────────────────────────────────────╮
+│ ❯ Ask anything                      │
+╰─────────────────────────────────────╯
+  D:\…\Pi      ↑11k  ↓4.8k  2.2%/500k
 
 80 columns
-    ▍ Middle rung
-    ▍ Small rung
-    Body bold, italic, struck and inline code.
-    - bullet one
-    - bullet two
-    - [x] done deal
-    │ quoted remark
-    see docs
-    ────────────────────────
-    ```rust
-    │ fn main() { println!("稳 定 "); }
-    ```
-    ╭──────┬─────────┬────────────────────╮
-    │ plan │ latency │ implementation     │
-    ├──────┼─────────┼────────────────────┤
-    │ fast │ 2ms     │ cached             │
-    │ slow │ 200ms   │ network every time │
-    ╰──────┴─────────┴────────────────────╯
-    Mixed 中 文  and English long tail keeps wrapping at every width.
-                                                     (openai) gpt-5.2 · high
-   ▌
-   ▌ Ask anything
-   ▌
-    D:\Code\Zed\Year2026\Jul0706\Pi         ↑11k ↓4.8k R14k C51.3% 2.2%/500k
+    ▍ Small rung                                                               │
+    Body bold, italic, struck and inline code.                                 │
+    • bullet one                                                               │
+    • bullet two                                                               │
+    • [x] done deal                                                            █
+    │ quoted remark                                                            █
+    see docs                                                                   █
+    ────────────────────────                                                   █
+    ```rust                                                                    █
+    1 │ fn main() { println!("稳 定 "); }                                        █
+    ```                                                                        █
+    ╭──────┬─────────┬────────────────────╮                                    █
+    │ plan │ latency │ implementation     │                                    █
+    ├──────┼─────────┼────────────────────┤                                    █
+    │ fast │ 2ms     │ cached             │                                    █
+    │ slow │ 200ms   │ network every time │                                    █
+    ╰──────┴─────────┴────────────────────╯                                    █
+    Mixed 中 文  and English long tail keeps wrapping at every width.            █
+───────────────────────────────────────────────────────────────────────────────
+  ● Ready                                                      gpt-5.2 · high
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ ❯ Ask anything                                                              │
+╰─────────────────────────────────────────────────────────────────────────────╯
+  D:\Code\Zed\Year2026\Jul0706\Pi        ↑11k  ↓4.8k  R14k  C51.3%  2.2%/500k
 
 120 columns
-    ▍ Middle rung
-    ▍ Small rung
-    Body bold, italic, struck and inline code.
-    - bullet one
-    - bullet two
-    - [x] done deal
-    │ quoted remark
-    see docs
-    ────────────────────────
-    ```rust
-    │ fn main() { println!("稳 定 "); }
-    ```
-    ╭──────┬─────────┬────────────────────╮
-    │ plan │ latency │ implementation     │
-    ├──────┼─────────┼────────────────────┤
-    │ fast │ 2ms     │ cached             │
-    │ slow │ 200ms   │ network every time │
-    ╰──────┴─────────┴────────────────────╯
-    Mixed 中 文  and English long tail keeps wrapping at every width.
-                                                                                             (openai) gpt-5.2 · high
-   ▌
-   ▌ Ask anything
-   ▌
-    D:\Code\Zed\Year2026\Jul0706\Pi                                                 ↑11k ↓4.8k R14k C51.3% 2.2%/500k
+    ▍ Small rung                                                                                                       │
+    Body bold, italic, struck and inline code.                                                                         │
+    • bullet one                                                                                                       │
+    • bullet two                                                                                                       │
+    • [x] done deal                                                                                                    █
+    │ quoted remark                                                                                                    █
+    see docs                                                                                                           █
+    ────────────────────────                                                                                           █
+    ```rust                                                                                                            █
+    1 │ fn main() { println!("稳 定 "); }                                                                                █
+    ```                                                                                                                █
+    ╭──────┬─────────┬────────────────────╮                                                                            █
+    │ plan │ latency │ implementation     │                                                                            █
+    ├──────┼─────────┼────────────────────┤                                                                            █
+    │ fast │ 2ms     │ cached             │                                                                            █
+    │ slow │ 200ms   │ network every time │                                                                            █
+    ╰──────┴─────────┴────────────────────╯                                                                            █
+    Mixed 中 文  and English long tail keeps wrapping at every width.                                                    █
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● Ready                                                                                              gpt-5.2 · high
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ❯ Ask anything                                                                                                      │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  D:\Code\Zed\Year2026\Jul0706\Pi                                                ↑11k  ↓4.8k  R14k  C51.3%  2.2%/500k

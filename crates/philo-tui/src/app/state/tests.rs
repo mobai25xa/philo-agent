@@ -705,7 +705,7 @@ fn typing_a_slash_opens_the_menu_and_typing_filters_it() {
     type_text(&mut app, "s");
     let frame = app.command_menu_frame(80, 10).expect("menu is open");
     assert_eq!(frame.rows.len(), 2);
-    assert!(frame.rows[0].usage.starts_with("› /sessions"));
+    assert!(frame.rows[0].usage.starts_with("▶ /sessions"));
     assert_eq!(frame.rows[0].summary, "pick a session to continue");
     assert!(frame.rows[1].usage.starts_with("  /status"));
 
@@ -1201,16 +1201,22 @@ fn submit_ingests_append_payloads_into_cells() {
                 kind: LineKind::User,
                 text: String::new(),
                 tone: Tone::Plain,
+                header: None,
+                body: None,
             },
             TranscriptLine {
                 kind: LineKind::User,
                 text: "hello".to_owned(),
                 tone: Tone::Plain,
+                header: None,
+                body: None,
             },
             TranscriptLine {
                 kind: LineKind::User,
                 text: String::new(),
                 tone: Tone::Plain,
+                header: None,
+                body: None,
             },
         ]
     );
@@ -1235,6 +1241,8 @@ fn agent_events_apply_into_cells() {
                 kind: LineKind::Meta,
                 text: "queued behind the active turn".to_owned(),
                 tone: Tone::Plain,
+                header: None,
+                body: None,
             },
             TranscriptLine {
                 kind: LineKind::Meta,
@@ -1242,6 +1250,8 @@ fn agent_events_apply_into_cells() {
                        calls may have executed without recorded results"
                     .to_owned(),
                 tone: Tone::Plain,
+                header: None,
+                body: None,
             },
         ]
     );
@@ -1271,6 +1281,8 @@ fn page_up_unfollows_after_layout_is_noted() {
         kind: LineKind::Meta,
         text: format!("row-{i}"),
         tone: Tone::Plain,
+        header: None,
+        body: None,
     }));
     app.note_history_layout(80, 3);
     assert!(app.follow_bottom());
@@ -1299,6 +1311,8 @@ fn seed_rows(app: &mut App, count: usize) {
         kind: LineKind::Meta,
         text: format!("row-{i}"),
         tone: Tone::Plain,
+        header: None,
+        body: None,
     }));
 }
 
@@ -1436,27 +1450,40 @@ fn slice_texts(app: &App, width: usize, height: usize) -> Vec<String> {
         .collect()
 }
 
+/// The v4.0 P3 re-skinned think header row.
+fn is_think_header(text: &str) -> bool {
+    text.starts_with("▎ Thought") && text.contains("按 Space 查看")
+}
+
 fn think_run() -> Vec<TranscriptLine> {
     vec![
         TranscriptLine {
             kind: LineKind::Meta,
             text: "before".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "think".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "  hidden thought".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
         TranscriptLine {
             kind: LineKind::Meta,
             text: "after".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
     ]
 }
@@ -1466,19 +1493,29 @@ fn sealed_think_blocks_fold_and_toggle_reopens() {
     let mut app = app();
     app.cells.push_closed(think_run());
     app.note_history_layout(80, 10);
-    assert_eq!(
-        slice_texts(&app, 80, 10),
-        ["before", "think", "after"],
-        "sealed think blocks fold their body"
+    let texts = slice_texts(&app, 80, 10);
+    assert_eq!(texts.len(), 3, "sealed think blocks fold their body: {texts:?}");
+    assert_eq!(texts[0], "before");
+    assert_eq!(texts[2], "after");
+    assert!(
+        is_think_header(&texts[1]),
+        "the folded run renders the think header: {texts:?}"
     );
 
     assert!(app.toggle_reasoning_block(1, 0));
     let texts = slice_texts(&app, 80, 10);
     assert!(texts.iter().any(|text| text.contains("hidden thought")));
-    assert_eq!(*texts.get(1).expect("header row"), "think");
+    assert!(
+        is_think_header(texts.get(1).expect("header row")),
+        "the header row keeps its re-skin: {texts:?}"
+    );
 
     assert!(app.toggle_reasoning_block(1, 0));
-    assert_eq!(slice_texts(&app, 80, 10), ["before", "think", "after"]);
+    let texts = slice_texts(&app, 80, 10);
+    assert_eq!(texts.len(), 3, "refolded to one header row: {texts:?}");
+    assert_eq!(texts[0], "before");
+    assert_eq!(texts[2], "after");
+    assert!(is_think_header(&texts[1]));
 }
 
 #[test]
@@ -1501,12 +1538,15 @@ fn streaming_think_starts_folded_and_expansion_survives_the_seal() {
         kind: LineKind::Reasoning,
         text: "think".to_owned(),
         tone: Tone::Plain,
+        header: None,
+        body: None,
     }]);
     app.cells.begin(LineKind::Reasoning, "  partial thought");
-    assert_eq!(
-        slice_texts(&app, 80, 10),
-        ["think"],
-        "a streaming block stays folded until the user expands it"
+    let texts = slice_texts(&app, 80, 10);
+    assert_eq!(texts.len(), 1, "a streaming block stays folded: {texts:?}");
+    assert!(
+        is_think_header(&texts[0]),
+        "the folded header wears the re-skin: {texts:?}"
     );
 
     app.toggle_reasoning_block(0, 0);
@@ -1524,14 +1564,14 @@ fn streaming_think_starts_folded_and_expansion_survives_the_seal() {
         kind: LineKind::Reasoning,
         text: "think".to_owned(),
         tone: Tone::Plain,
+        header: None,
+        body: None,
     }]);
     fresh.cells.begin(LineKind::Reasoning, "  partial thought");
     fresh.cells.close_open();
-    assert_eq!(
-        slice_texts(&fresh, 80, 10),
-        ["think"],
-        "sealing leaves an untouched stream folded"
-    );
+    let texts = slice_texts(&fresh, 80, 10);
+    assert_eq!(texts.len(), 1, "sealing leaves an untouched stream folded: {texts:?}");
+    assert!(is_think_header(&texts[0]));
 }
 
 #[test]
@@ -1542,16 +1582,22 @@ fn plain_click_on_a_think_header_toggles_it() {
             kind: LineKind::Meta,
             text: "row-0".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "think".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "  body".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         },
     ]);
     app.note_history_layout(80, 4);
@@ -1595,6 +1641,8 @@ fn text_delta_without_close_stays_open() {
             kind: LineKind::Answer,
             text: "partial answer".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         }]
     );
     let slice = app.history_slice(80, 3);
@@ -1624,6 +1672,8 @@ fn newline_stays_inside_one_open_answer_cell() {
             kind: LineKind::Answer,
             text: "hello\nworld".to_owned(),
             tone: Tone::Plain,
+            header: None,
+            body: None,
         }]
     );
     let texts: Vec<_> = app
@@ -1765,109 +1815,294 @@ fn overlay_ignores_home_and_end() {
 }
 
 #[test]
-fn stream_anchor_viewport_heights_follow_the_lifecycle() {
-    let mut app = app();
-    let full = 90u16;
-    let anchors = Some((40u16, 80u16));
-    assert_eq!(
-        app.transcript_viewport_height(full, anchors),
-        full,
-        "idle without an anchor shows the whole band"
-    );
-
-    app.set_busy(true);
-    assert_eq!(
-        app.transcript_viewport_height(full, anchors),
-        80,
-        "busy follow pins the window at the 80% cap"
-    );
-
-    seed_rows(&mut app, 3);
-    app.note_frame_height(100);
-    app.note_history_layout(80, usize::from(full));
-    app.on_operation_event(&FrontendOperationEvent::OperationStarted {
-        operation_id: "op".to_owned(),
-    });
-    assert!(app.stream_anchor_active(), "a non-blank busy turn lifts");
-    assert_eq!(
-        app.transcript_viewport_height(full, anchors),
-        40,
-        "the lift starts with a base window at the 40% line"
-    );
-    seed_rows(&mut app, 25);
-    assert_eq!(
-        app.transcript_viewport_height(full, anchors),
-        65,
-        "the window grows one row per wrapped row"
-    );
-    seed_rows(&mut app, 100);
-    assert_eq!(
-        app.transcript_viewport_height(full, anchors),
-        80,
-        "growth stops at the 80% cap"
-    );
-
-    app.run_state_mut()
-        .freeze_elapsed(std::time::Duration::from_secs(7));
-    app.on_operation_event(&FrontendOperationEvent::OperationSettled {
-        operation_id: "op".to_owned(),
-        session_id: "s-1".to_owned(),
-        status: "Succeeded".to_owned(),
-        durability: "Confirmed".to_owned(),
-        session_revision: philo_agent_service::SettlementRevision::Unchanged,
-    });
-    assert!(app.animation_active(), "settlement starts the settle drop");
-    for expected in [82, 84, 86, 88] {
-        assert!(app.on_tick(std::time::Duration::from_millis(100)));
-        assert_eq!(
-            app.transcript_viewport_height(full, anchors),
-            expected,
-            "settle interpolates toward the full band"
-        );
-    }
-    assert!(app.on_tick(std::time::Duration::from_millis(100)));
-    assert!(!app.stream_anchor_active(), "the settle animation ends");
-    app.set_busy(false);
-    assert_eq!(
-        app.transcript_viewport_height(full, anchors),
-        full,
-        "settled turns return to the full band"
-    );
-}
-
-#[test]
-fn blank_screens_and_unfollowed_turns_never_lift() {
-    // A blank screen keeps its top start.
-    {
-        let mut app = app();
-        app.note_frame_height(40);
-        app.note_history_layout(80, 33);
-        app.set_busy(true);
-        app.on_operation_event(&FrontendOperationEvent::OperationStarted {
-            operation_id: "op".to_owned(),
-        });
-        assert!(!app.stream_anchor_active());
-    }
-
-    // A user who scrolled up is left alone, and scrolling cancels an
-    // active lift.
+fn scrolling_stays_effective_during_busy_turns() {
+    // Busy turns no longer lift or pin the viewport: the user's scroll is
+    // simply never fought by an anchor state machine.
     let mut app = app();
     seed_rows(&mut app, 50);
-    app.note_frame_height(40);
     app.note_history_layout(80, 33);
     app.set_busy(true);
     app.on_action(Action::PageTranscriptUp);
-    app.on_operation_event(&FrontendOperationEvent::OperationStarted {
-        operation_id: "op".to_owned(),
-    });
-    assert!(!app.stream_anchor_active());
+    assert!(!app.follow_bottom(), "paging up unfollows");
+    assert!(app.history_slice(80, 33).at_top);
 
     app.on_action(Action::End);
-    app.on_operation_event(&FrontendOperationEvent::OperationStarted {
-        operation_id: "op".to_owned(),
-    });
-    assert!(app.stream_anchor_active());
-    app.on_action(Action::PageTranscriptUp);
-    assert!(!app.stream_anchor_active());
-    assert_eq!(app.transcript_viewport_height(33, Some((13, 26))), 26);
+    app.on_action(Action::End);
+    assert!(app.follow_bottom(), "double End returns to follow");
+    assert!(app.history_slice(80, 33).at_bottom);
+}
+
+// -- P5 history browse mode ------------------------------------------------
+
+#[test]
+fn browse_mode_preserves_the_draft_attachments_and_caret() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    type_text(&mut app, "keep me");
+    app.on_action(Action::MoveLeft);
+    let cursor = app.input.cursor();
+    app.attach_image("image/png".to_owned(), vec![0; 4], "clipboard image");
+
+    app.on_action(Action::EnterBrowse);
+    assert!(app.in_browse_mode(), "PgUp/Ctrl+U enters browse");
+    assert!(!app.input_focused());
+    assert_eq!(app.input.text(), "keep me", "the draft survives entry");
+    assert_eq!(app.input.cursor(), cursor, "the caret survives entry");
+    assert_eq!(app.attachments().len(), 1, "attachments survive entry");
+
+    // The modal's own keys move the cursor; the composer stays untouched.
+    app.on_action(Action::BrowseStep(1));
+    app.on_action(Action::BrowseStep(-1));
+    assert_eq!(app.input.text(), "keep me");
+    assert_eq!(app.input.cursor(), cursor);
+
+    app.on_action(Action::ExitBrowse);
+    assert!(!app.in_browse_mode());
+    assert!(app.input_focused());
+    assert_eq!(app.input.text(), "keep me", "the draft survives the round trip");
+    assert_eq!(app.input.cursor(), cursor, "the caret survives the round trip");
+    assert_eq!(app.attachments().len(), 1);
+
+    // Esc exits the same way, and the cursor clears outside browse mode.
+    assert!(app.browse_cursor().is_none(), "no cursor outside browse");
+    app.on_action(Action::EnterBrowse);
+    assert!(app.browse_cursor().is_some());
+    app.on_action(Action::Escape);
+    assert!(!app.in_browse_mode());
+    assert!(app.input_focused());
+    assert_eq!(app.input.text(), "keep me");
+}
+
+#[test]
+fn browse_entry_defers_to_the_confirmation_and_picker_layers() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+
+    // P1: a pending confirmation owns the keyboard; PgUp is inert.
+    let (title, body) = request("run_command");
+    app.sync_confirmation(Some((1, title, body)));
+    app.on_action(Action::EnterBrowse);
+    assert!(app.has_confirmation(), "P1 confirmation stays up");
+    assert!(!app.in_browse_mode(), "browse entry is blocked under P1");
+    app.on_action(Action::InsertChar('y'));
+    assert!(!app.has_confirmation());
+
+    // P2: an open picker owns the keyboard; EnterBrowse cannot reach below.
+    app.open_picker(vec![PickerEntry::untitled("s-1")]);
+    app.on_action(Action::EnterBrowse);
+    assert!(app.picker().is_some(), "P2 picker stays up");
+    assert!(!app.in_browse_mode(), "browse entry is blocked under P2");
+    app.on_action(Action::Escape);
+    assert!(app.picker().is_none());
+}
+
+#[test]
+fn entering_browse_from_a_slash_menu_closes_the_menu() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    type_text(&mut app, "/s");
+    assert!(app.command_menu_frame(80, 10).is_some());
+
+    app.on_action(Action::EnterBrowse);
+    assert!(app.in_browse_mode(), "PgUp from a slash menu opens browse");
+    assert!(
+        app.command_menu_frame(80, 10).is_none(),
+        "entering browse drops the menu"
+    );
+    assert_eq!(app.input.text(), "/s", "the slash draft survives");
+}
+
+#[test]
+fn browse_steps_move_the_cursor_and_clamp_at_the_transcript_ends() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::EnterBrowse);
+    assert_eq!(
+        app.browse_cursor(),
+        Some((7, 0)),
+        "entry takes over the current window's top row"
+    );
+
+    for _ in 0..5 {
+        app.on_action(Action::BrowseStep(1));
+    }
+    assert_eq!(app.browse_cursor(), Some((9, 0)), "steps clamp at the tail");
+
+    app.on_action(Action::BrowseStep(-2));
+    assert_eq!(app.browse_cursor(), Some((7, 0)));
+    for _ in 0..10 {
+        app.on_action(Action::BrowseStep(-1));
+    }
+    assert_eq!(app.browse_cursor(), Some((0, 0)), "steps clamp at the head");
+
+    app.on_action(Action::Home);
+    assert_eq!(app.browse_cursor(), Some((0, 0)));
+    app.on_action(Action::End);
+    assert_eq!(app.browse_cursor(), Some((9, 0)), "End jumps to the last row");
+}
+
+#[test]
+fn browse_pages_step_a_whole_window_and_stay_in_view() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 8);
+    app.on_action(Action::EnterBrowse);
+    assert_eq!(app.browse_cursor(), Some((2, 0)));
+
+    // PgUp rides the viewport up by the full height; the cursor follows by
+    // a page (height - 2) and clamps at the head.
+    app.on_action(Action::BrowsePage(-1));
+    assert_eq!(app.browse_cursor(), Some((0, 0)));
+    assert!(app.history_slice(80, 8).at_top, "PgUp reaches the head");
+
+    // PgDn rides back toward the tail, following once the window bottoms.
+    app.on_action(Action::BrowsePage(1));
+    assert!(app.history_slice(80, 8).at_bottom, "PgDn re-follows the tail");
+    assert!(app.follow_bottom());
+    assert_eq!(app.browse_cursor(), Some((6, 0)));
+
+    // Re-entering after the re-follow resumes at the tail again.
+    app.on_action(Action::ExitBrowse);
+    app.on_action(Action::EnterBrowse);
+    assert_eq!(app.browse_cursor(), Some((2, 0)));
+}
+
+#[test]
+fn browse_toggle_fold_hits_think_heads_and_ignores_plain_rows() {
+    // Think head: Space expands and refolds the run.
+    let mut app = app();
+    app.cells.push_closed(think_run());
+    app.note_history_layout(80, 10);
+    app.on_action(Action::EnterBrowse);
+    app.on_action(Action::BrowseStep(1));
+    assert_eq!(app.browse_cursor(), Some((1, 0)));
+    assert_eq!(slice_texts(&app, 80, 10).len(), 3, "sealed runs start folded");
+    app.on_action(Action::BrowseToggleFold);
+    assert!(
+        slice_texts(&app, 80, 10)
+            .iter()
+            .any(|text| text.contains("hidden thought")),
+        "Space opens the think body"
+    );
+    app.on_action(Action::BrowseToggleFold);
+    assert_eq!(slice_texts(&app, 80, 10).len(), 3, "Space refolds the run");
+
+    // Plain row: no-op, the transcript stays untouched.
+    app.on_action(Action::Home);
+    assert_eq!(app.browse_cursor(), Some((0, 0)));
+    app.on_action(Action::BrowseToggleFold);
+    assert_eq!(slice_texts(&app, 80, 10).len(), 3);
+}
+
+#[test]
+fn browse_toggle_fold_hits_tool_card_bodies() {
+    use crate::app::transcript::{CardBody, SegSpan};
+    let mut app = app();
+    app.cells.push_closed(vec![
+        crate::app::transcript::line(LineKind::Meta, "before"),
+        crate::app::transcript::line(LineKind::Meta, "head"),
+        TranscriptLine {
+            kind: LineKind::Tool,
+            text: String::new(),
+            tone: Tone::Plain,
+            header: None,
+            body: Some(CardBody {
+                lines: (0..4)
+                    .map(|i| vec![SegSpan::plain(format!("line-{i}"))])
+                    .collect(),
+                threshold: 2,
+                fold_default_collapsed: true,
+                fold_count: 2,
+                fold_label: "行已折叠".to_owned(),
+                fold_hint: true,
+                fold_all: false,
+            }),
+        },
+        crate::app::transcript::line(LineKind::Meta, "after"),
+    ]);
+    app.note_history_layout(80, 10);
+    app.on_action(Action::EnterBrowse);
+    app.on_action(Action::BrowseStep(1));
+    app.on_action(Action::BrowseStep(1));
+    assert_eq!(app.browse_cursor(), Some((2, 0)));
+    assert!(app.tool_card_collapsed_at(2), "bodies fold past the threshold");
+    app.on_action(Action::BrowseToggleFold);
+    assert!(!app.tool_card_collapsed_at(2), "Space opens the body");
+    app.on_action(Action::BrowseToggleFold);
+    assert!(app.tool_card_collapsed_at(2), "Space refolds the body");
+}
+
+#[test]
+fn submit_from_browse_mode_exits_and_follows_the_turn() {
+    let mut app = app();
+    seed_rows(&mut app, 20);
+    app.note_history_layout(80, 3);
+    type_text(&mut app, "from browse");
+    app.on_action(Action::EnterBrowse);
+    app.on_action(Action::Home);
+    assert!(!app.follow_bottom(), "browsing away from the tail pins the view");
+
+    let effects = app.on_action(Action::Submit);
+    assert!(!app.in_browse_mode(), "Enter from browse mode leaves the modal");
+    assert!(app.follow_bottom(), "the turn follows the tail again");
+    assert_eq!(app.input.text(), "", "the preserved draft was consumed");
+    assert!(
+        matches!(effects.as_slice(), [Effect::PrepareSubmit { intent_id: 1, .. }]),
+        "the draft sends: {effects:?}"
+    );
+
+    // An empty draft: Enter still leaves browse and returns to the tail.
+    let mut fresh = App::new(StatusData::new("m", "s", InfoLevel::Default), true);
+    seed_rows(&mut fresh, 20);
+    fresh.note_history_layout(80, 3);
+    fresh.on_action(Action::EnterBrowse);
+    fresh.on_action(Action::Home);
+    assert!(!fresh.follow_bottom());
+    assert!(fresh.on_action(Action::Submit).is_empty(), "nothing to send");
+    assert!(!fresh.in_browse_mode());
+    assert!(fresh.follow_bottom());
+}
+
+#[test]
+fn ctrl_c_in_browse_mode_interrupts_and_exits_the_modal() {
+    let mut app = app();
+    seed_rows(&mut app, 10);
+    app.note_history_layout(80, 3);
+    app.set_busy(true);
+    app.on_action(Action::EnterBrowse);
+    let effects = app.on_action(Action::CtrlC);
+    assert_eq!(effects, vec![Effect::InterruptCancel]);
+    assert!(!app.in_browse_mode(), "Ctrl+C leaves browse mode");
+    assert!(app.input_focused());
+}
+
+#[test]
+fn mouse_scroll_passes_through_browse_mode() {
+    let mut app = app();
+    seed_rows(&mut app, 20);
+    app.note_history_layout(80, 3);
+    app.on_action(Action::EnterBrowse);
+    app.on_action(Action::ScrollTranscript(-3));
+    assert!(app.in_browse_mode(), "wheel stays inside the modal");
+    assert!(!app.follow_bottom());
+}
+
+#[test]
+fn browse_on_an_empty_transcript_is_safe() {
+    let mut app = app();
+    app.note_history_layout(80, 3);
+    app.on_action(Action::EnterBrowse);
+    assert!(app.in_browse_mode());
+    assert_eq!(app.browse_cursor(), Some((0, 0)));
+    app.on_action(Action::BrowseStep(-5));
+    app.on_action(Action::BrowsePage(1));
+    app.on_action(Action::BrowseToggleFold);
+    app.on_action(Action::End);
+    assert_eq!(app.browse_cursor(), Some((0, 0)));
+    assert!(app.on_action(Action::ExitBrowse).is_empty());
+    assert!(app.input_focused());
 }

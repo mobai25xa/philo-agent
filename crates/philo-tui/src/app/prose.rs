@@ -15,7 +15,7 @@
 //! one pass per width change, not per frame per visible row.
 //!
 //! Classification is deterministic by construction: fences win first (a
-//! ``` run owns everything until its matching close), then tables settle
+//! ``` ``run`` block owns everything until its matching close), then tables settle
 //! only outside fences (a pipe row confirmed by a following delimiter
 //! row). Pipe rows never settled by a delimiter stay ordinary prose — the
 //! flush rule is implicit in the two-pass shape, with no buffering.
@@ -39,6 +39,14 @@ pub(crate) struct ProjectedRow {
     /// `None` only for fenced code bodies — syntect paints those at render
     /// time from the role's language tag.
     pub(crate) spans: Option<Vec<ProseSpan>>,
+    /// Per-row wash intent (v4.0 P3 diff bodies). `None` everywhere else;
+    /// `Some(DiffDel | DiffIns)` gives the shell its background fill.
+    pub(crate) tone: Option<super::transcript::Tone>,
+    /// v4.0 P4: the right-padded code-fence line-number slot (`" 3"`,
+    /// `"42"`, or all spaces on wrapped continuation rows). The render
+    /// layer paints it before the BORDER `│` gutter. `None` outside fenced
+    /// code bodies.
+    pub(crate) code_line: Option<String>,
 }
 
 impl ProjectedRow {
@@ -48,32 +56,52 @@ impl ProjectedRow {
             role: BlockRole::Plain,
             text: text.into(),
             spans: None,
+            tone: None,
+            code_line: None,
         }
     }
 
     /// A styled row: text derives from the spans so visual width, selection
     /// geometry, and paint never disagree.
-    fn styled(role: BlockRole, spans: Vec<ProseSpan>) -> Self {
-        let text = spans.iter().map(|span| span.text.as_str()).collect();
+    pub(crate) fn styled(role: BlockRole, spans: Vec<ProseSpan>) -> Self {
         Self {
             role,
-            text,
+            text: spans.iter().map(|span| span.text.as_str()).collect(),
             spans: Some(spans),
+            tone: None,
+            code_line: None,
         }
     }
 
-    /// A fenced code body: raw text; syntect styles it later.
-    fn code(text: String, lang: String) -> Self {
+    /// A styled row carrying a wash tone (diff del/ins bodies).
+    pub(crate) fn styled_with_tone(
+        role: BlockRole,
+        spans: Vec<ProseSpan>,
+        tone: super::transcript::Tone,
+    ) -> Self {
+        Self {
+            tone: Some(tone),
+            ..Self::styled(role, spans)
+        }
+    }
+
+    /// A fenced code body: raw text; syntect styles it later. `slot` is the
+    /// right-padded line-number slot (or all-spaces continuation gutter).
+    fn code(text: String, lang: String, slot: Option<String>) -> Self {
         Self {
             role: BlockRole::FenceBody { lang },
             text,
             spans: None,
+            tone: None,
+            code_line: slot,
         }
     }
 }
 
-/// Semantic color slot of a baked prose span. App-side vocabulary only —
-/// the render layer spends theme tokens to realize it.
+/// Semantic color slot of a baked span. App-side vocabulary only — the
+/// render layer spends theme tokens to realize it. The tool-card families
+/// (v4.0 P3) ride the same span machinery as prose so one wrap cache and
+/// one paint path cover every typed row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ProseColor {
     /// Primary foreground.
@@ -83,13 +111,28 @@ pub(crate) enum ProseColor {
     Meta,
     /// Universal link blue.
     Link,
-    /// Soft code green: the universal "this is code" hue, applied to the
-    /// text itself — no background block (prose v4, mirrors opencode).
+    /// Brand orange: inline code, document skeleton highlights (headings,
+    /// quote bars, checked boxes, language tags, table headers) and the
+    /// tool-card edit family.
     Code,
-    /// Brand orange: document skeleton highlights (headings, quote bars,
-    /// checked boxes, language tags, table headers). Prose v3 loosened the
-    /// old restraint so element types read apart at a glance.
+    /// Brand orange alias used by document skeleton highlights.
     Accent,
+    /// Dark-gray hints: line numbers, timestamps, card durations.
+    DarkGray,
+    /// Success green: paths, line deltas, ready state, read/write cards.
+    Green,
+    /// Warning yellow: warnings, Running state, spinners.
+    Yellow,
+    /// Error red: failures, deletion, confirm borders.
+    Red,
+    /// Information blue: model names, function names, hunk heads. Exposed
+    /// as a token for tool-card hunk heads and future surfaces.
+    #[allow(dead_code)]
+    Blue,
+    /// Border/separator color: gutter pipes, dot leaders.
+    Border,
+    /// Bold white (#FFFFFF): H2 rungs and `**emphasis**` body words.
+    White,
 }
 
 /// Presentation-neutral span style. Covers every prose combination
@@ -105,13 +148,20 @@ pub(crate) struct ProseStyle {
 }
 
 impl ProseStyle {
-    fn colored(mut self, color: ProseColor) -> Self {
+    pub(crate) fn colored(mut self, color: ProseColor) -> Self {
         self.color = color;
         self
     }
 
-    fn bold(mut self) -> Self {
+    pub(crate) fn bold(mut self) -> Self {
         self.bold = true;
+        self
+    }
+
+    pub(crate) fn bold_if(mut self, on: bool) -> Self {
+        if on {
+            self.bold = true;
+        }
         self
     }
 
@@ -139,7 +189,7 @@ pub(crate) struct ProseSpan {
 }
 
 impl ProseSpan {
-    fn new(text: impl Into<String>, style: ProseStyle) -> Self {
+    pub(crate) fn new(text: impl Into<String>, style: ProseStyle) -> Self {
         Self {
             text: text.into(),
             style,
@@ -255,6 +305,28 @@ pub(crate) fn project_answer(answer: &str, width: usize) -> Vec<ProjectedRow> {
         return Vec::new();
     }
     let lines = classify(answer);
+    // v4.0 P4 §3.1: fence bodies number 1..N within their fence, right
+    // padded to the widest number so the `│` gutters line up. One pre-pass
+    // pairs every body line with its slot (this is a presentation fact).
+    let mut code_line: Vec<Option<String>> = vec![None; lines.len()];
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].role != BlockRole::FenceEdge {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < lines.len() && lines[end].role != BlockRole::FenceEdge {
+            end += 1;
+        }
+        let total = (end - index - 1).max(1);
+        let digits = total.to_string().len();
+        for (offset, body) in ((index + 1)..end).enumerate() {
+            code_line[body] = Some(format!("{:>digits$}", offset + 1));
+        }
+        index = end;
+    }
+
     let mut rows = Vec::new();
     let mut index = 0;
     while index < lines.len() {
@@ -266,10 +338,21 @@ pub(crate) fn project_answer(answer: &str, width: usize) -> Vec<ProjectedRow> {
                 index = end;
             }
             BlockRole::FenceBody { lang } => {
+                let slot = code_line[index].clone();
+                let gutter = slot.as_ref().map(String::len).unwrap_or(0) + 2;
+                let content_width = width.saturating_sub(gutter).max(1);
                 rows.extend(
-                    text::wrap(&line.text, width)
+                    text::wrap(&line.text, content_width)
                         .into_iter()
-                        .map(|fragment| ProjectedRow::code(fragment, lang.clone())),
+                        .enumerate()
+                        .map(|(fragment, text)| {
+                            let slot = match (&slot, fragment) {
+                                (Some(slot), 0) => Some(slot.clone()),
+                                (Some(slot), _) => Some(" ".repeat(slot.len())),
+                                (None, _) => None,
+                            };
+                            ProjectedRow::code(text, lang.clone(), slot)
+                        }),
                 );
                 index += 1;
             }
@@ -351,13 +434,17 @@ fn parse_prose(text: &str) -> Vec<ProseSpan> {
             Event::End(TagEnd::List(_)) => ordered = None,
             Event::Start(Tag::Item) => {
                 struck_task = false;
+                // v4.0 §6: bullet `•` and ordered numbers ride brand
+                // orange (demo `::before` bolds the bullet).
                 let marker = match ordered {
                     Some(number) => format!("{number}. "),
-                    None => "- ".to_owned(),
+                    None => "• ".to_owned(),
                 };
                 spans.push(ProseSpan::new(
                     format!("{indent}{marker}"),
-                    ProseStyle::default().colored(ProseColor::Meta),
+                    ProseStyle::default()
+                        .colored(ProseColor::Code)
+                        .bold_if(ordered.is_none()),
                 ));
             }
             Event::End(TagEnd::Item) => {
@@ -380,16 +467,29 @@ fn parse_prose(text: &str) -> Vec<ProseSpan> {
                 }
             }
             Event::Start(Tag::BlockQuote(_)) => {
+                // v4.0 §6: the quote bar is a dark-gray `│` hairline; the
+                // body stays primary.
                 spans.push(ProseSpan::new(
                     format!("{indent}│ "),
-                    accent(),
+                    ProseStyle::default().colored(ProseColor::DarkGray),
                 ));
             }
             Event::Start(Tag::Emphasis) => {
                 styles.push(top(&styles).italic());
             }
             Event::End(TagEnd::Emphasis) => pop(&mut styles),
-            Event::Start(Tag::Strong) => styles.push(top(&styles).bold()),
+            Event::Start(Tag::Strong) => {
+                // v4.0 §6: `**emphasis**` lifts to bold white. Inside a
+                // colored host (headings, links, table headers) the host
+                // color wins and only the weight changes.
+                let base = top(&styles);
+                let style = if base.color == ProseColor::Default {
+                    base.colored(ProseColor::White).bold()
+                } else {
+                    base.bold()
+                };
+                styles.push(style);
+            }
             Event::End(TagEnd::Strong) => pop(&mut styles),
             Event::Start(Tag::Strikethrough) => styles.push(top(&styles).crossed()),
             Event::End(TagEnd::Strikethrough) => pop(&mut styles),
@@ -400,10 +500,15 @@ fn parse_prose(text: &str) -> Vec<ProseSpan> {
             // Indented code: the code hue, without a language tag.
             Event::Start(Tag::CodeBlock(_)) => styles.push(top(&styles).colored(ProseColor::Code)),
             Event::End(TagEnd::CodeBlock) => pop(&mut styles),
-            Event::Code(code) => spans.push(ProseSpan::new(code.to_string(), code_style())),
-            Event::Text(text) => spans.push(ProseSpan::new(text.to_string(), top(&styles))),
+            Event::Code(code) => {
+                spans.push(ProseSpan::new(code.to_string(), code_style()));
+            }
+            Event::Text(text) => {
+                spans.extend(colorize(&text, top(&styles)));
+            }
             Event::SoftBreak | Event::HardBreak => spans.push(ProseSpan::raw(" ")),
             Event::Rule => spans.push(ProseSpan::new(
+                // v4.0 §2: the rule run is annotation gray.
                 "─".repeat(24),
                 ProseStyle::default().colored(ProseColor::Meta),
             )),
@@ -416,18 +521,90 @@ fn parse_prose(text: &str) -> Vec<ProseSpan> {
     spans
 }
 
-/// Inline code: soft green text, no background block.
+/// Inline code: helper green foreground, no background block (v4.0 §6 paths
+/// are green; the user ruled inline code to a single uniform green — no
+/// path-shaped probing, no density rationing). The `Code` hue itself stays
+/// orange for list markers and tool-card Edit states.
 fn code_style() -> ProseStyle {
-    ProseStyle::default().colored(ProseColor::Code)
+    ProseStyle::default().colored(ProseColor::Green)
 }
 
-/// The heading ladder spends brand orange on the document skeleton: H1
-/// underlined accent, H2 accent, deeper rungs fall back to primary weight.
+// ---------------------------------------------------------------------------
+// Bare-path detection (v4.0 §6 / P4 §4)
+// ---------------------------------------------------------------------------
+
+/// Splits a text event into spans, lifting bare file paths to helper green
+/// (`src/utils/jwt.ts`, `C:\x\y.rs`). Inline code and link text are skipped
+/// (their own semantics own the coloring); URLs are never flagged.
+fn colorize(text: &str, style: ProseStyle) -> Vec<ProseSpan> {
+    if matches!(style.color, ProseColor::Link | ProseColor::Code) {
+        return vec![ProseSpan::new(text.to_owned(), style)];
+    }
+    let mut out: Vec<ProseSpan> = Vec::new();
+    let mut buffer = String::new();
+    let flush = |buffer: &mut String, style: ProseStyle, out: &mut Vec<ProseSpan>| {
+        if !buffer.is_empty() {
+            out.push(ProseSpan::new(std::mem::take(buffer), style));
+        }
+    };
+    for token in text.split_inclusive(char::is_whitespace) {
+        let body = token.trim_end();
+        let trailing = &token[body.len()..];
+        if is_path_like(body) {
+            flush(&mut buffer, style, &mut out);
+            out.push(ProseSpan::new(
+                body.to_owned(),
+                style.colored(ProseColor::Green),
+            ));
+            if !trailing.is_empty() {
+                out.push(ProseSpan::new(trailing.to_owned(), style));
+            }
+        } else {
+            buffer.push_str(token);
+        }
+    }
+    flush(&mut buffer, style, &mut out);
+    out
+}
+
+/// Narrow path probe: a contiguous token carrying `/` or `\` and ending in a
+/// file-like extension (`src/utils/jwt.ts`, `C:\x\y.rs`). URLs and plain
+/// words are rejected.
+fn is_path_like(token: &str) -> bool {
+    if token.is_empty() || token.contains("://") {
+        return false;
+    }
+    let core = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '"' | '\''
+                | '`' | '，' | '。' | '、' | '；' | '：' | '（' | '）' | '」' | '』' | '『' | '「'
+        )
+    });
+    if !(core.contains('/') || core.contains('\\')) {
+        return false;
+    }
+    match core.rsplit_once('.') {
+        Some((_, extension)) => {
+            !extension.is_empty()
+                && !extension.contains('/')
+                && !extension.contains('\\')
+                && extension
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        }
+        None => false,
+    }
+}
+
+/// The heading ladder (v4.0 §6 / decision D10): `▍ ` hangs every rung; H1
+/// is orange bold without the old underline, H2 lifts to bold white, deeper
+/// rungs fall back to primary weight.
 fn heading_style(level: HeadingLevel) -> ProseStyle {
     let base = ProseStyle::default().bold();
     match level {
-        HeadingLevel::H1 => base.colored(ProseColor::Accent).underlined(),
-        HeadingLevel::H2 => base.colored(ProseColor::Accent),
+        HeadingLevel::H1 => base.colored(ProseColor::Accent),
+        HeadingLevel::H2 => base.colored(ProseColor::White),
         _ => base,
     }
 }
@@ -452,7 +629,7 @@ fn pop(styles: &mut Vec<ProseStyle>) {
 /// `inde/x.ht/ml`); falls back to a hard break for spaceless runs (CJK
 /// wraps per character, as it should). Style context survives every
 /// break: a fragment continues its source span's style verbatim.
-fn wrap_spans(input: &[ProseSpan], width: usize) -> Vec<Vec<ProseSpan>> {
+pub(crate) fn wrap_spans(input: &[ProseSpan], width: usize) -> Vec<Vec<ProseSpan>> {
     if width == 0 {
         return Vec::new();
     }
@@ -617,14 +794,14 @@ fn waterfill(naturals: &[usize], budget: usize) -> Vec<usize> {
 /// spans its column plus the single-space padding so junctions line up
 /// with the data-row bars exactly.
 fn frame_row(widths: &[usize], left: &str, mid: &str, right: &str) -> ProjectedRow {
-    let mut spans = vec![ProseSpan::new(left, bar())];
+    let mut spans = vec![ProseSpan::new(left, border())];
     for (column, &width) in widths.iter().enumerate() {
         if column > 0 {
-            spans.push(ProseSpan::new(mid, bar()));
+            spans.push(ProseSpan::new(mid, border()));
         }
-        spans.push(ProseSpan::new("─".repeat(width + 2), bar()));
+        spans.push(ProseSpan::new("─".repeat(width + 2), border()));
     }
-    spans.push(ProseSpan::new(right, bar()));
+    spans.push(ProseSpan::new(right, border()));
     ProjectedRow::styled(BlockRole::TableDelim, spans)
 }
 
@@ -660,7 +837,7 @@ fn grid_rows(
 
     let mut out = Vec::with_capacity(height);
     for row_index in 0..height {
-        let mut spans = vec![ProseSpan::new("│ ", bar())];
+        let mut spans = vec![ProseSpan::new("│ ", border())];
         for (column, &width) in widths.iter().enumerate() {
             let line = wrapped_columns[column].get(row_index);
             if let Some(line) = line {
@@ -672,7 +849,7 @@ fn grid_rows(
             }
             spans.push(ProseSpan::new(
                 if column + 1 == widths.len() { " │" } else { " │ " },
-                bar(),
+                border(),
             ));
         }
         out.push(ProjectedRow::styled(role.clone(), spans));
@@ -690,7 +867,7 @@ fn flow_rows(text: &str, width: usize, role: BlockRole) -> Vec<ProjectedRow> {
             if !plain.is_empty() {
                 spans.push(ProseSpan::raw(std::mem::take(&mut plain)));
             }
-            spans.push(ProseSpan::new("|", bar()));
+            spans.push(ProseSpan::new("|", border()));
         } else {
             plain.push(ch);
         }
@@ -711,6 +888,12 @@ fn bar() -> ProseStyle {
 /// Brand-orange highlight for document skeleton elements.
 fn accent() -> ProseStyle {
     ProseStyle::default().colored(ProseColor::Accent)
+}
+
+/// v4.0 §6: GFM table frame / gutter lines ride the BORDER token instead
+/// of the old meta gray.
+fn border() -> ProseStyle {
+    ProseStyle::default().colored(ProseColor::Border)
 }
 
 /// A fence opener and its info string, if this line is one. Leading
@@ -929,25 +1112,29 @@ mod tests {
     #[test]
     fn fragments_carry_their_role_across_wraps() {
         let rows = project_answer("before\n```\n中文二 very long body line\n```", 8);
+        // The one-digit number slot plus `│ ` gutter reserve 3 cells, so the
+        // body wraps inside 5.
         assert_eq!(
             texts(&rows),
             [
-                "before",
-                "```",
-                "中文二 v",
-                "ery long",
-                " body li",
-                "ne",
-                "```"
+                "before", "```", "中文", "二 ve", "ry lo", "ng bo", "dy li", "ne", "```"
             ]
         );
-        for row in &rows[2..6] {
+        for row in &rows[2..8] {
             assert_eq!(
                 row.role,
                 BlockRole::FenceBody {
                     lang: String::new()
                 },
                 "every fragment of one logical line keeps the role"
+            );
+        }
+        assert_eq!(rows[2].code_line.as_deref(), Some("1"), "head carries the number");
+        for row in &rows[3..8] {
+            assert_eq!(
+                row.code_line.as_deref(),
+                Some(" "),
+                "wrapped continuations blank the number slot"
             );
         }
         assert_eq!(rows[0].role, BlockRole::Plain);
@@ -1025,6 +1212,7 @@ mod tests {
         assert!(matches!(body.role, BlockRole::FenceBody { .. }));
         assert!(body.spans.is_none(), "code bodies paint via syntect later");
         assert_eq!(body.text, "let x = 1;");
+        assert_eq!(body.code_line.as_deref(), Some("1"));
     }
 
     #[test]
@@ -1044,12 +1232,12 @@ mod tests {
         assert_eq!(rows[3].text, "│ fast │ 2ms     │");
         assert_eq!(rows[4].text, "╰──────┴─────────╯");
 
-        // Header content rides bold accent; bars and frames ride meta.
+        // Header content rides bold accent; bars and frames ride BORDER.
         let header = rows[1].spans.as_ref().expect("styled");
-        assert!(header[0].style.color == ProseColor::Meta, "bar dims");
+        assert!(header[0].style.color == ProseColor::Border, "bar is the frame token");
         assert!(header[1].style.bold && header[1].style.color == ProseColor::Accent);
         let frame = rows[2].spans.as_ref().expect("styled");
-        assert!(frame.iter().all(|span| span.style.color == ProseColor::Meta));
+        assert!(frame.iter().all(|span| span.style.color == ProseColor::Border));
     }
 
     #[test]
@@ -1163,7 +1351,7 @@ mod tests {
         assert!(
             flow_spans
                 .iter()
-                .any(|span| span.text == "|" && span.style.color == ProseColor::Meta)
+                .any(|span| span.text == "|" && span.style.color == ProseColor::Border)
         );
     }
 
@@ -1181,6 +1369,143 @@ mod tests {
         joined_chars.sort_unstable();
         assert_eq!(joined_chars, source_chars);
     }
+#[test]
+    fn path_probe_accepts_only_separator_plus_extension_tokens() {
+        assert!(is_path_like("src/utils/jwt.ts"));
+        assert!(is_path_like("C:\\x\\y.rs"));
+        assert!(is_path_like("src/a.ts."), "trailing punctuation trims off");
+        assert!(is_path_like("(src/a.ts)"));
+        assert!(!is_path_like("config.yaml"), "no separator");
+        assert!(!is_path_like("src/utils/"), "no extension");
+        assert!(!is_path_like("https://example.com/a.ts"), "URLs never flag");
+        assert!(!is_path_like("http://x/y"), "URLs never flag");
+        assert!(!is_path_like("plain"), "ordinary words stay put");
+        assert!(!is_path_like("src/a."), "empty extension");
+        assert!(!is_path_like(""), "empty token");
+    }
+
+    #[test]
+    fn colorize_lifts_bare_paths_but_not_inline_code_or_links() {
+        let default = ProseStyle::default();
+        let spans = colorize("from src/utils/jwt.ts extract", default);
+        let texts: Vec<&str> = spans.iter().map(|span| span.text.as_str()).collect();
+        assert_eq!(texts, ["from ", "src/utils/jwt.ts", " ", "extract"]);
+        assert_eq!(spans[1].style.color, ProseColor::Green);
+        assert_eq!(spans[3].style.color, ProseColor::Default);
+
+        let code = colorize("use `src/a.ts` now", default.colored(ProseColor::Code));
+        assert_eq!(code.len(), 1, "inline code keeps one span");
+        assert_eq!(code[0].style.color, ProseColor::Code);
+
+        let link = colorize("see src/a.ts", default.colored(ProseColor::Link));
+        assert_eq!(link.len(), 1, "link text is never re-colored");
+        assert_eq!(link[0].style.color, ProseColor::Link);
+    }
+
+    #[test]
+    fn inline_code_rides_uniform_green_everywhere() {
+        // Every backtick fragment paints helper green — paths, commands,
+        // identifiers, single or clustered, no density rationing.
+        let spans = parse_prose("edit `src/utils/jwt.ts` then run `npm test` and `fast_path` ok");
+        for name in ["src/utils/jwt.ts", "npm test", "fast_path"] {
+            assert_eq!(
+                spans
+                    .iter()
+                    .find(|span| span.text == name)
+                    .unwrap_or_else(|| panic!("{name} span"))
+                    .style
+                    .color,
+                ProseColor::Green,
+                "`{name}` rides the uniform green"
+            );
+        }
+        // Multiple chips on one line: all stay green (the carpet rule is
+        // retired with the orange chip).
+        for name in ["a/b.rs", "c/d.rs"] {
+            assert!(parse_prose(&format!("touch `{name}` files"))
+                .iter()
+                .any(|span| span.text == name && span.style.color == ProseColor::Green));
+        }
+        // Code chips on structural rows keep their green too; markers are
+        // untouched chrome.
+        let list = parse_prose("- `Viewport::FullScreen` ⇔ 备用屏幕");
+        assert!(
+            list.iter().any(|span| span.text == "• " && span.style.bold),
+            "the bullet marker survives"
+        );
+        assert_eq!(
+            list.iter()
+                .find(|span| span.text == "Viewport::FullScreen")
+                .expect("code chip")
+                .style
+                .color,
+            ProseColor::Green
+        );
+        let heading = parse_prose("# `ratatui` 框架知识");
+        assert_eq!(
+            heading
+                .iter()
+                .find(|span| span.text == "ratatui")
+                .expect("heading chip")
+                .style
+                .color,
+            ProseColor::Green
+        );
+    }
+
+    #[test]
+    fn multi_digit_slots_pad_to_the_widest_number_in_the_fence() {
+        let code = "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\nfn five() {}\nfn six() {}\nfn seven() {}\nfn eight() {}\nfn nine() {}\nfn ten() {}";
+        let rows = project_answer(&format!("```rust\n{code}\n```"), 80);
+        let heads: Vec<Option<&str>> = rows
+            .iter()
+            .filter(|row| matches!(row.role, BlockRole::FenceBody { .. }))
+            .map(|row| row.code_line.as_deref())
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                Some(" 1"),
+                Some(" 2"),
+                Some(" 3"),
+                Some(" 4"),
+                Some(" 5"),
+                Some(" 6"),
+                Some(" 7"),
+                Some(" 8"),
+                Some(" 9"),
+                Some("10"),
+            ]
+        );
+        assert!(heads.iter().all(|slot| slot.is_some()));
+    }
+
+    #[test]
+    fn bold_words_lift_to_white_inside_body_text() {
+        let rows = project_answer("plain **word** tail", 80);
+        let spans = rows[0].spans.as_ref().expect("styled");
+        let bold = spans
+            .iter()
+            .find(|span| span.text == "word" && span.style.bold)
+            .expect("the strong span");
+        assert_eq!(bold.style.color, ProseColor::White);
+        let plain = spans
+            .iter()
+            .find(|span| span.text.contains("plain"))
+            .expect("body span");
+        assert_eq!(plain.style.color, ProseColor::Default);
+    }
+
+    #[test]
+    fn quote_bar_rides_dark_gray_and_headers_step_white() {
+        let rows = project_answer("> quoted\n## Sub", 80);
+        let quote_spans = rows[0].spans.as_ref().expect("styled");
+        assert_eq!(quote_spans[0].style.color, ProseColor::DarkGray);
+        let sub_spans = rows[1].spans.as_ref().expect("styled");
+        assert!(sub_spans[0].style.bold);
+        assert_eq!(sub_spans[0].style.color, ProseColor::White, "H2 is bold white");
+    }
+
 #[test]
 fn probe_wrap_debug() {
     let line = "aaaa **bbbbbbbbbbbbbbbb cccccccccccccccc dddddddddddd** tail";

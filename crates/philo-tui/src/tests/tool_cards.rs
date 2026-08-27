@@ -2,7 +2,7 @@
 //!
 //! One screen pins the four card families from the design mock — Grep,
 //! multi-path Read, Edit with its numbered diff gutter, and Run — plus a
-//! cell dump pins the failure card (`↳ Failed. …`).
+//! cell dump pins the failure card (red `✗ failed` header).
 
 use philo_agent_service::{FrontendOperationEvent, FrontendToolDisplay, FrontendToolResult};
 use ratatui::Terminal;
@@ -160,6 +160,9 @@ fn the_four_card_families_match_the_design_language() {
                 ("verb", "Edited"),
                 ("body", "diff"),
                 ("subject", "src/routes/users.ts"),
+                ("bytes_before", "1024"),
+                ("added", "3"),
+                ("removed", "2"),
                 ("result", "Succeeded. File edited.  (+3 added, -2 removed)"),
             ],
         ),
@@ -182,6 +185,7 @@ fn the_four_card_families_match_the_design_language() {
                 ("body", "output"),
                 ("subject", "pnpm test"),
                 ("count", "1 command"),
+                ("exit_code", "0"),
                 ("result", "exit 0 · 4.2s"),
             ],
         ),
@@ -199,38 +203,63 @@ fn the_four_card_families_match_the_design_language() {
     let rendered = render(&app, 80, 56);
     let rows: Vec<&str> = rendered.lines().collect();
 
-    // Headers open their cards at the content column; no legacy bullets.
-    for header in ["Grep 1 search", "Read 2 files", "Run 1 command"] {
-        assert!(
-            rows.iter()
-                .any(|row| row.starts_with(&format!("    {header}"))),
-            "{header} opens its card in the content column: {rendered}"
-        );
-    }
+    // Headers wear the `▎` formula at the content column; the action word,
+    // its colored target, and the stats all ride one row.
+    assert!(
+        rows.iter().any(|row| {
+            row.contains("▎ Grep")
+                && row.contains("\"page >\"")
+                && row.contains("3 matches")
+        }),
+        "grep opens its card with the formula: {rendered}"
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row.contains("▎ Read")
+                && row.contains("src/routes/users.ts")
+                && row.contains("2 files")
+        }),
+        "read opens its card with the formula: {rendered}"
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row.contains("▎ Run")
+                && row.contains("pnpm test")
+                && row.contains("1 command")
+        }),
+        "run opens its card with the formula: {rendered}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("▎ Edit") && row.contains("✓ applied")),
+        "edits paint their own family status: {rendered}"
+    );
     assert!(
         !rendered.contains('•') && !rendered.contains('▸') && !rendered.contains('└'),
         "legacy glyph family is gone: {rendered}"
     );
 
-    // Repeatable subjects align under the first ↳ row.
+    // Repeatable subjects align in the indented detail column: the card's
+    // first subject rides its own header row; continuations follow with the
+    // same two-space indent.
     let read_subject = rows
         .iter()
-        .position(|row| row.contains("↳ src/routes/users.ts"))
+        .position(|row| row.contains("src/routes/users.ts"))
         .expect("first read subject");
     assert!(
-        rows[read_subject + 1].contains("src/routes/users.test.ts")
-            && !rows[read_subject + 1].contains('↳'),
-        "continuation subjects align without a second ↳: {rendered}"
+        rows.iter()
+            .skip(read_subject + 1)
+            .any(|row| row.contains("src/routes/users.test.ts")),
+        "continuation subjects align under the first: {rendered}"
     );
 
     // The Edit diff renders its gutter; the hunk header stays hidden.
     assert!(
         rows.iter()
-            .any(|row| row.contains("12 | if (page > limit)")),
+            .any(|row| row.contains("-  12│ if (page > limit)")),
         "deleted lines carry their old number: {rendered}"
     );
     assert!(
-        rows.iter().any(|row| row.contains("12 | const size")),
+        rows.iter().any(|row| row.contains("+  12│ const size")),
         "inserted lines carry their new number: {rendered}"
     );
     assert!(
@@ -260,7 +289,21 @@ fn failures_keep_the_header_and_report_a_red_row() {
         .cells()
         .iter()
         .filter(|cell| cell.kind == LineKind::Tool)
-        .map(|cell| format!("{:?}: {}", cell.tone, cell.text))
+        .map(|cell| {
+            let header = cell
+                .header
+                .as_ref()
+                .map(|h| {
+                    format!(
+                        "action={} target={} status={}",
+                        h.action.text,
+                        h.target.as_ref().map(|t| t.text.as_str()).unwrap_or(""),
+                        h.status.text,
+                    )
+                })
+                .unwrap_or_default();
+            format!("{:?}: {header}", cell.tone)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     crate::tests::assert_tui_snapshot!("m5_failure_card", dump);

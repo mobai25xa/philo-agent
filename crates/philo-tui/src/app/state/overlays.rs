@@ -70,7 +70,9 @@ impl App {
         let prompt = self.confirm.as_ref().expect("approval overlay is open");
         let (id, title) = (prompt.id, prompt.title().to_owned());
         let (decision, verb) = match action {
-            Action::InsertChar('y' | 'Y') => (ConfirmationDecision::Allow, "allowed"),
+            Action::InsertChar('y' | 'Y') | Action::Submit => {
+                (ConfirmationDecision::Allow, "allowed")
+            }
             Action::InsertChar('n' | 'N') | Action::Escape | Action::CtrlC => {
                 (ConfirmationDecision::Deny, "denied")
             }

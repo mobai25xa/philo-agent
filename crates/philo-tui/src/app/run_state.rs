@@ -11,7 +11,7 @@ use philo_agent_service::FrontendOperationEvent;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::text;
-use crate::render::theme::{ELLIPSIS, SPINNER_FRAMES};
+use crate::render::theme::{ELLIPSIS, RUNNING_SPINNER, THINKING_SPINNER};
 
 /// The seven run phases behind the state word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,10 +115,31 @@ impl RunState {
         self.spinner = 0;
     }
 
-    /// Braille spinner frame — the only animated element in the UI.
+    /// Spinner frame — the only animated element in the UI. All phases
+    /// currently ride the braille THINKING_SPINNER; the Running phase
+    /// switches to the yellow horizontal-dash spinner with P2/P3's badge.
     pub(crate) fn advance_spinner(&mut self) {
         if self.is_active() {
-            self.spinner = (self.spinner + 1) % SPINNER_FRAMES.len();
+            self.spinner = (self.spinner + 1) % self.spinner_len();
+        }
+    }
+
+    /// The active spinner's current frame, selected by phase (Running and
+    /// Compacting ride the horizontal-dash RUNNING_SPINNER, everything else
+    /// the braille one). Exposed for the live tool-card headers (P3 §4.1).
+    pub(crate) fn spinner_frame(&self) -> &'static str {
+        match self.phase {
+            Some(Phase::Running) | Some(Phase::Compacting) => {
+                RUNNING_SPINNER.frame(self.spinner)
+            }
+            _ => THINKING_SPINNER.frame(self.spinner),
+        }
+    }
+
+    fn spinner_len(&self) -> usize {
+        match self.phase {
+            Some(Phase::Running) | Some(Phase::Compacting) => RUNNING_SPINNER.frames.len(),
+            _ => THINKING_SPINNER.frames.len(),
         }
     }
 
@@ -238,20 +259,21 @@ impl RunState {
         }
     }
 
-    /// Composer top-left corner content (§2.4): `⠹ {State}… {elapsed} · esc
-    /// cancel`, degrading deterministically — drop `· esc cancel` first,
-    /// then truncate the word (§3.10). `approval` swaps in the overlay flag
+    /// Footer badge content (§8, v4.0 P2): `{spinner} {Word} ({elapsed})` —
+    /// spinner + phase word + pure timer. The v3 `· esc cancel` tail is
+    /// retired (decision D11); degradation drops the timing first, then
+    /// truncates the word (§3.10). `approval` swaps in the overlay flag
     /// word without touching the underlying phase.
     pub(crate) fn corner(&self, max_width: usize, approval: bool) -> Option<CornerWord> {
         let phase = self.phase?;
-        let spinner = SPINNER_FRAMES[self.spinner % SPINNER_FRAMES.len()].to_owned();
+        let spinner = self.spinner_frame().to_owned();
         let word = if approval {
             format!("Approval{ELLIPSIS}")
         } else {
             format!("{}{ELLIPSIS}", phase.word())
         };
         let timing = match self.clock.elapsed() {
-            Some(elapsed) => format!("{} · esc cancel", format_elapsed(elapsed)),
+            Some(elapsed) => format_elapsed(elapsed),
             None => String::new(),
         };
         let mut corner = CornerWord {
@@ -309,6 +331,7 @@ impl CornerWord {
         self.word = truncate_word(&self.word, max_width.saturating_sub(2));
     }
 
+    #[cfg(test)]
     pub(crate) fn painted_width(&self) -> usize {
         self.width()
     }
@@ -333,6 +356,20 @@ pub(crate) fn format_elapsed(elapsed: Duration) -> String {
 pub(crate) fn format_think_elapsed(elapsed: Duration) -> String {
     if elapsed.as_secs() == 0 {
         format!("{}ms", elapsed.as_millis())
+    } else {
+        format_elapsed(elapsed)
+    }
+}
+
+/// Tool-card durations (P3 §1 `Time` slot): sub-second spans render as
+/// milliseconds (`12ms`), from a second up as one-decimal seconds (`4.8s`),
+/// and from a minute up as `1m23s`.
+pub(crate) fn format_card_elapsed(elapsed: Duration) -> String {
+    let ms = elapsed.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if elapsed.as_secs() < 60 {
+        format!("{}.{}s", elapsed.as_secs(), (ms % 1000) / 100)
     } else {
         format_elapsed(elapsed)
     }
@@ -640,7 +677,7 @@ mod tests {
 
         state.on_event(&op_started());
         let corner = state.corner(120, false).expect("restarted");
-        assert_eq!(corner.timing, "0s · esc cancel");
+        assert_eq!(corner.timing, "0s");
     }
 
     #[test]
@@ -663,11 +700,11 @@ mod tests {
         state.freeze_elapsed(Duration::from_secs(42));
         state.on_event(&tool_started(0));
         let corner = state.corner(120, false).expect("running");
-        assert_eq!(corner.timing, "42s · esc cancel");
+        assert_eq!(corner.timing, "42s");
 
         state.on_event(&cancelled());
         let corner = state.corner(120, false).expect("cancelling");
-        assert_eq!(corner.timing, "42s · esc cancel");
+        assert_eq!(corner.timing, "42s");
         assert!(corner.warning, "Cancelling… wears warn");
 
         state.on_event(&settled());
@@ -718,10 +755,10 @@ mod tests {
         let full = state.corner(80, false).expect("wide");
         assert_eq!(full.spinner, "⠋");
         assert_eq!(full.word, "Writing…");
-        assert_eq!(full.timing, "42s · esc cancel");
+        assert_eq!(full.timing, "42s");
         assert_eq!(
             full.painted_width(),
-            text::width("⠹") + 1 + text::width("Writing…") + 1 + text::width("42s · esc cancel")
+            text::width("⠹") + 1 + text::width("Writing…") + 1 + text::width("42s")
         );
 
         let squeezed = state
@@ -755,11 +792,14 @@ mod tests {
 
         state.on_event(&op_started());
         let first = state.corner(80, false).expect("active").spinner;
-        assert_eq!(first, SPINNER_FRAMES[0]);
-        for expected in 1..=SPINNER_FRAMES.len() {
+        assert_eq!(first, THINKING_SPINNER.frames[0]);
+        for expected in 1..=THINKING_SPINNER.frames.len() {
             state.advance_spinner();
             let frame = state.corner(80, false).expect("active").spinner;
-            assert_eq!(frame, SPINNER_FRAMES[expected % SPINNER_FRAMES.len()]);
+            assert_eq!(
+                frame,
+                THINKING_SPINNER.frames[expected % THINKING_SPINNER.frames.len()]
+            );
         }
 
         state.on_event(&settled());

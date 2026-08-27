@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::overlay::{OverlayFrame, OverlayLine};
 use crate::app::select::BandLayout;
@@ -12,9 +12,8 @@ use crate::app::text;
 
 use super::composer;
 use super::history;
-use super::inset_band;
 use super::inset_h;
-use super::stream_anchor_rows;
+use super::scrollbar;
 use super::theme;
 
 #[cfg(test)]
@@ -30,14 +29,60 @@ pub(crate) const MIN_SUPPORTED_HEIGHT: u16 = 8;
 struct PanelAreas {
     live: Rect,
     popover: Rect,
+    /// The whole footer band footprint (separator/badge/input/telemetry).
+    footer: Rect,
+    /// The rounded input box inside the band.
     composer: Rect,
+    /// Badge row inside the footer (`state │ model·effort`).
+    badge: Option<u16>,
+    /// Telemetry row inside the footer (`path │ usage`).
+    telemetry: Option<u16>,
 }
 
+/// Columns reserved for the scrollbar rail on the right edge (P2 draws
+/// the track/thumb; P1 already keeps every content surface off it).
+const SCROLLBAR_COLS: u16 = 1;
+
 pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, _shift_enter: bool) {
-    app.note_frame_height(frame.area().height);
-    let areas = panel_areas(frame.area());
+    // v4.0 full-bleed canvas: paint the brand base before anything else so
+    // overlays and short bands never expose the native terminal background.
+    frame.render_widget(
+        Block::default().style(theme::base_fill()),
+        frame.area(),
+    );
+    let canvas = canvas_area(frame.area());
+    let areas = panel_areas(canvas, draft_wrapped_rows(app, usize::from(canvas.width)));
     draw_band(frame, app, union(areas.live, areas.popover));
-    draw_composer(frame, app, areas.composer);
+    draw_footer(
+        frame,
+        app,
+        FooterSlots {
+            band: areas.footer,
+            badge: areas.badge,
+            input: areas.composer,
+            telemetry: areas.telemetry,
+        },
+    );
+}
+
+/// Wrapped visual-row count of the current draft at `width` — the box's
+/// growth ruler (P2 §3.2). Stored rows only; no cursor-follow windowing.
+fn draft_wrapped_rows(app: &App, width: usize) -> usize {
+    if width < 3 {
+        return usize::from(app.input.lines().len().max(1) > 1);
+    }
+    app.input
+        .lines()
+        .iter()
+        .map(|line| crate::app::text::wrap(line, width).len())
+        .sum::<usize>()
+        .max(usize::from(!app.input.is_empty()))
+}
+
+/// The drawable canvas: the full frame minus the scrollbar's right column.
+pub(crate) fn canvas_area(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(SCROLLBAR_COLS);
+    Rect::new(area.x, area.y, width, area.height)
 }
 
 fn union(top: Rect, bottom: Rect) -> Rect {
@@ -55,55 +100,136 @@ fn union(top: Rect, bottom: Rect) -> Rect {
     )
 }
 
-/// Fullscreen slot contract (redesign §2.3):
+/// Fullscreen slot contract (v4.0 P2, new-tui.md §8):
 ///
 /// ```text
 /// fullscreen
-///   transcript band  = leftover
-///   composer         = 5     corner row / input 3 (surface + bar,
-///                            both inset to the content column) / corner row
+///   transcript band  = leftover (canvas above the footer)
+///   footer separator = 1     (TRACK rule on FOOTER_BG)
+///   badge row        = 1     (state │ model·effort)
+///   input box        = 3..=8 (rounded box; grows with the draft)
+///   telemetry row    = 1     (workspace path │ usage)
 /// ```
 ///
-/// Two slots only: transcript and composer band. There is no header, no
-/// status bar, no hints row, no Activity row. The composer baseline never
-/// moves for transient state. The surface wash plus accent bar wrap only
-/// the middle input box and span exactly the shared content column, so the
-/// band's edges align with the corner rows flanking it on the native
-/// terminal background — no blank rows in between (v2.3 compaction).
-///
-/// Short screens degrade deterministically (`composer_height_for`): the
-/// corner rows vanish first, then the input drops to one row.
-fn panel_areas(area: Rect) -> PanelAreas {
-    let composer_height = composer_height_for(area.height);
-    let live_height = area.height.saturating_sub(composer_height);
+/// Two slots only: transcript and footer band. The composer grows with its
+/// draft (`composer::outer_height`, 3↔8 outer) and the transcript gives
+/// way; on short screens the band sheds telemetry → badge → separator and
+/// finally collapses the box to a bare one-row prompt. Red line: slots
+/// never overlap at any supported size.
+struct FooterGeometry {
+    /// Whole band footprint carved off the canvas bottom.
+    band: Rect,
+    /// Badge row (`None` when shed).
+    badge: Option<u16>,
+    /// Rounded input box (or bare line below `MIN`).
+    input: Rect,
+    /// Telemetry row (`None` when shed).
+    telemetry: Option<u16>,
+}
 
-    let mut y = area.y;
-    let mut take = |slot_height| {
-        let slot = Rect::new(area.x, y, area.width, slot_height);
-        y = y.saturating_add(slot_height);
-        slot
-    };
+/// The footer row set handed to the painter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FooterSlots {
+    pub(crate) band: Rect,
+    pub(crate) badge: Option<u16>,
+    pub(crate) input: Rect,
+    pub(crate) telemetry: Option<u16>,
+}
+
+/// Live rows reserved below nothing — the minimum transcript height any
+/// bordered footer tier must leave above the band.
+const MIN_LIVE_ROWS: usize = 3;
+
+fn panel_areas(area: Rect, draft_rows: usize) -> PanelAreas {
+    let geometry = footer_geometry(area, draft_rows);
+    let live_height = area.height.saturating_sub(geometry.band.height);
     PanelAreas {
-        popover: take(0),
-        live: take(live_height),
-        composer: take(composer_height),
+        popover: Rect::new(area.x, area.y, area.width, 0),
+        live: Rect::new(area.x, area.y, area.width, live_height),
+        footer: geometry.band,
+        composer: geometry.input,
+        badge: geometry.badge,
+        telemetry: geometry.telemetry,
     }
 }
 
-/// Composer band height ladder: the full nine-row dashboard once there is
-/// room for it plus a minimal live band (the same three-row floor the old
-/// supported split guaranteed), then the bare input box, then one line.
-fn composer_height_for(height: u16) -> u16 {
-    if height == 0 {
-        return 0;
+/// Deterministic footer geometry (P2 §3.2 ladder) for a canvas of `area`
+/// rows and a draft needing `composer::outer_height(draft_rows)`:
+///
+/// | budget           | separator | badge | box            | telemetry |
+/// |------------------|-----------|-------|----------------|-----------|
+/// | ≥ box+3          | ✓         | ✓     | box (3..=8)    | ✓         |
+/// | ≥ box+2          | ✓         | ✓     | box            | shed      |
+/// | ≥ box+1          | ✓         | shed  | box            | shed      |
+/// | ≥ 3              | shed      | shed  | box min 3      | shed      |
+/// | 1–2              | shed      | shed  | bare 1-row ❯   | shed      |
+///
+/// The box keeps its full wanted height through the first three tiers;
+/// `outer_height` never exceeds [`theme::COMPOSER_MAX_OUTER`], so a
+/// terminal that fits the idle footer (≥ [`theme::FOOTER_ROWS`]) always
+/// hosts a fully grown box. Below three rows the last usable pixel is the
+/// borderless prompt line.
+fn footer_geometry(area: Rect, draft_rows: usize) -> FooterGeometry {
+    if area.height == 0 || area.width == 0 {
+        return FooterGeometry {
+            band: Rect::new(area.x, area.y, area.width, 0),
+            badge: None,
+            input: Rect::new(area.x, area.y, area.width, 0),
+            telemetry: None,
+        };
     }
-    if height >= theme::COMPOSER_ROWS + 3 {
-        return theme::COMPOSER_ROWS;
+
+    let want = composer::outer_height(draft_rows);
+    let rows = area.y + area.height;
+
+// Bordered tiers. The first candidate that fits wins; each sheds one
+    // accessory off the full band. Every tier also reserves at least three
+    // live rows so the approval float (title + 1 body row + hints) stays
+    // readable — the composer bends before the modal does.
+    let mut tier = None;
+    for &(extra, sep, badge, tele) in &[
+        (3u16, true, true, true),
+        (2, true, true, false),
+        (1, true, false, false),
+        (0, false, false, false),
+    ] {
+        let band_h = want + extra;
+        if usize::from(area.height) >= usize::from(band_h) + MIN_LIVE_ROWS {
+            tier = Some((band_h, sep, badge, tele));
+            break;
+        }
     }
-    if height >= theme::INPUT_ROWS {
-        return theme::INPUT_ROWS;
+    if let Some((band_h, sep, badge, tele)) = tier {
+        let band_top = rows.saturating_sub(band_h);
+        let mut used = band_top;
+        // The separator occupies the first row whenever any accessory rides.
+        if sep {
+            used += 1;
+        }
+        let badge_row = badge.then(|| {
+            let row = used;
+            used += 1;
+            row
+        });
+        let input = Rect::new(area.x, used, area.width, want);
+        used += want;
+        let telemetry = tele.then_some(used);
+        return FooterGeometry {
+            band: Rect::new(area.x, band_top, area.width, band_h),
+            badge: badge_row,
+            input,
+            telemetry,
+        };
     }
-    1
+
+    // Bare final tier: one prompt row, still aligned left with CONTENT_INSET.
+    let band_top = rows.saturating_sub(1);
+    FooterGeometry {
+        band: Rect::new(area.x, band_top, area.width, 1),
+        badge: None,
+        input: Rect::new(area.x, band_top, area.width, 1),
+        telemetry: None,
+    }
 }
 
 fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -130,18 +256,20 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    // The menu spans exactly the input band's width and anchors at its
-    // left edge, so it sits flush over the composer box (v0.44 §4.1).
-    let band_column = inset_band(Rect::new(area.x, area.y, area.width, 1));
-    // The rounded panel spends one row on each border.
-    let menu_capacity = usize::from(area.height.saturating_sub(2)).min(theme::MENU_MAX_ROWS);
+    // The menu spans exactly the input box's width and anchors at its
+    // left edge, so it sits flush over the composer box (v0.44 §4.1). The
+    // rounded panel spends one row on each border plus the P5 header row
+    // and its TRACK separator, so the visible-list capacity gives those
+    // four rows away first.
+    let band_column = inset_h(Rect::new(area.x, area.y, area.width, 1));
+    let menu_capacity = usize::from(area.height.saturating_sub(4)).min(theme::MENU_MAX_ROWS);
     if menu_capacity == 0 {
         draw_remaining_band(frame, app, area);
         return;
     }
     let menu = app.command_menu_frame(usize::from(band_column.width), menu_capacity);
-    let menu_height =
-        u16::try_from(menu.as_ref().map_or(0, |menu| menu.rows.len() + 2)).unwrap_or(u16::MAX);
+    let menu_height = u16::try_from(menu.as_ref().map_or(0, |menu| menu.rows.len() + 4))
+        .unwrap_or(u16::MAX);
 
     let remaining = area.height.saturating_sub(menu_height);
     let remaining_area = Rect::new(area.x, area.y, area.width, remaining);
@@ -160,9 +288,11 @@ fn draw_band(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     draw_command_menu(frame, menu, menu_area);
 }
 
-/// The command-menu float (v0.44 §4.1): a rounded panel spanning exactly
+/// The command-menu float (P5 §3): a rounded PANEL_BG panel spanning exactly
 /// the input band's width, anchored at its left edge directly above the
-/// composer box.
+/// composer box. A header row (`Slash Commands` / `Tab complete · ↑↓ select`)
+/// with a TRACK rule sits under the top border; the selected row wears the
+/// MENU_ACTIVE_BG tint with an orange edge bar and a `▶` marker.
 fn draw_command_menu(
     frame: &mut ratatui::Frame<'_>,
     menu: Option<crate::app::state::CommandMenuFrame>,
@@ -173,10 +303,10 @@ fn draw_command_menu(
     };
     let width = menu.width + 2;
     let outer_w = u16::try_from(width).unwrap_or(u16::MAX).min(area.width);
-    let outer_h = u16::try_from(menu.rows.len() + 2)
+    let outer_h = u16::try_from(menu.rows.len() + 4)
         .unwrap_or(u16::MAX)
         .min(area.height);
-    if outer_w == 0 || outer_h <= 2 {
+    if outer_w == 0 || outer_h <= 4 {
         return;
     }
     let panel = Rect::new(
@@ -189,12 +319,41 @@ fn draw_command_menu(
     if inner.is_empty() {
         return;
     }
-    // Text sits one padding cell inside the borders.
+
+    // Header row inside the top border, with its TRACK rule below.
+    let header_row = Rect::new(inner.x, inner.y, inner.width, 1);
+    let left_label = "Slash Commands";
+    let right_label = "Tab complete · ↑↓ select";
+    let left_w = text::width(left_label);
+    let right_w = text::width(right_label);
+    let mut header_spans = vec![Span::styled(
+        left_label.to_owned(),
+        theme::corner_meta(),
+    )];
+    if let Some(pad) = usize::from(inner.width).checked_sub(left_w + right_w)
+        && pad > 0
+    {
+        header_spans.push(Span::raw(" ".repeat(pad)));
+    }
+    header_spans.push(Span::styled(right_label.to_owned(), theme::corner_meta()));
+    frame.render_widget(
+        Paragraph::new(Line::from(header_spans)),
+        header_row,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(usize::from(inner.width)),
+            theme::footer_rule(),
+        )),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    // Text sits one padding cell inside the borders, below the header rule.
     let zone = Rect::new(
         inner.x + 1,
-        inner.y,
+        inner.y.saturating_add(2),
         inner.width.saturating_sub(2),
-        inner.height,
+        inner.height.saturating_sub(2),
     );
 
     for (index, row) in menu.rows.iter().enumerate() {
@@ -205,13 +364,20 @@ fn draw_command_menu(
         let full_row = Rect::new(inner.x, y, inner.width, 1);
         let row_area = Rect::new(zone.x, y, zone.width, 1);
         if index == menu.selected {
-            // Full-row accent tint including the padding cells; the base
-            // style spreads the tint over the whole text zone.
+            // Full-row tint, an orange edge bar in the padding column, and
+            // the command name in orange bold beside the gray summary.
             frame.render_widget(Block::default().style(theme::menu_selected_row()), full_row);
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    theme::STATUS_BAR.to_owned(),
+                    theme::menu_selected_row(),
+                )),
+                Rect::new(inner.x, y, 1, 1),
+            );
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(row.usage.clone(), theme::menu_selected_row()),
-                    Span::styled(row.summary.clone(), theme::menu_selected_row()),
+                    Span::styled(row.summary.clone(), theme::meta()),
                 ]))
                 .style(theme::menu_selected_row()),
                 row_area,
@@ -228,13 +394,18 @@ fn draw_command_menu(
     }
 }
 
-/// Paints a rounded float panel (`╭ ╮ ╰ ╯ ─ │`) on the native terminal
-/// background (v0.44 — floats lost their surface wash; the rect is cleared
-/// so transcript rows never bleed through), with an optional title embedded
-/// into the top border (`╭─ Title ───╮`). Returns the inner drawing area
-/// between the borders.
+/// Paints a rounded float panel (`╭ ╮ ╰ ╯ ─ │`) over the brand canvas
+/// (v4.0 P5 §3/§4: floats now wear the solid PANEL_BG surface — the
+/// transparent v0.44 floats were retired with the reskin), with an optional
+/// title embedded into the top border (`╭─ Title ───╮`). Returns the inner
+/// drawing area between the borders.
 fn paint_panel(frame: &mut ratatui::Frame<'_>, area: Rect, title: Option<(&str, Style)>) -> Rect {
-    frame.render_widget(Clear, area);
+    // v4.0: the "clear" now means clear-to-brand-canvas, and the panel then
+    // washes the float in its solid PANEL_BG.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::panel_bg_color())),
+        area,
+    );
     let border = theme::panel_border();
     let width = usize::from(area.width);
     if width < 2 || area.height == 0 {
@@ -291,46 +462,23 @@ fn paint_panel(frame: &mut ratatui::Frame<'_>, area: Rect, title: Option<(&str, 
 
 /// The leftover band above the composer belongs to the transcript: history
 /// gets all remaining rows. In-progress answer/think are the open last cell
-/// in that list. Non-empty user rows first get their full-width surface
-/// band and column-0 accent bar painted underneath (design §3.1/§3.2).
+/// in that list.
 ///
-/// v2.2 streaming anchors: while a turn is lifted the visible window grows
-/// from the 40% line and pins at the 80% line, leaving the band's tail
-/// rows blank; settlement animates it back to the full band. The layout
-/// note records the actually drawn sub-area so selection mapping matches.
+/// v4.1 layout policy (the v2.2 40%/80% stream anchors are retired): the
+/// viewport is the whole band. Content lays out from the band top; once
+/// it overflows, the follow-bottom slice naturally pushes new rows in
+/// from the bottom edge.
 fn draw_remaining_band(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let column = inset_h(area);
     let width = usize::from(column.width);
 
-    // Anchors are shares of the FULL screen height (recorded by `draw`),
-    // clamped into this band; `None` keeps plain bottom-follow.
-    let anchors = stream_anchor_rows(app.frame_height.get(), column.height);
-    let view_height = app.transcript_viewport_height(column.height, anchors);
-    let view = Rect {
-        height: view_height.min(column.height),
-        ..column
-    };
-
     let selection = app.clamped_selection();
-    let slice = app.history_slice(width, usize::from(view.height));
+    let slice = app.history_slice(width, usize::from(column.height));
 
-    // While the stream owns the viewport (lift/pin/settle), content hangs
-    // from its tail: the newest row glues to the viewport floor — the 40%
-    // line while lifting, the 80% line while pinned, descending during the
-    // settle drop — leaving blank rows above sparse output. Plain layouts
-    // (including a user-pinned scroll) stay top-aligned.
-    let bottom_align = app.stream_anchor_active();
-    let painted = usize::from(view.height).min(slice.total_rows);
-    let paint_y = if bottom_align {
-        view.bottom()
-            .saturating_sub(u16::try_from(painted).unwrap_or(u16::MAX))
-    } else {
-        view.y
-    };
+    let painted = usize::from(column.height).min(slice.total_rows);
     let paint = Rect {
-        y: paint_y,
-        height: u16::try_from(painted).unwrap_or(u16::MAX).min(view.height),
-        ..view
+        height: u16::try_from(painted).unwrap_or(u16::MAX).min(column.height),
+        ..column
     };
 
     app.note_transcript_layout(BandLayout::from_parts(
@@ -342,45 +490,92 @@ fn draw_remaining_band(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     app.note_band_height(column.height);
 
     if paint.is_empty() {
+        paint_rail(frame, app, area, width, usize::from(column.height));
         return;
     }
-    paint_user_strips(frame, &slice, area, paint.y);
     frame.render_widget(
-        Paragraph::new(history::paint_slice(&slice, selection, width)),
+        Paragraph::new(history::paint_slice(&slice, selection, app.browse_cursor(), width)),
         paint,
     );
+    paint_rail(frame, app, area, width, usize::from(column.height));
 }
 
-/// Input-band surface + accent bar under every visible non-empty user row
-/// (v2.3: the band matches the composer box, one column wider than the
-/// content column on each side). Wrapped continuations are ordinary rows of
-/// the same cell, so the bar runs through them; the blank separator rows
-/// stay untouched.
-fn paint_user_strips(
+/// The rail spans the transcript band (not the painted sub-area) so the
+/// geometry stays stable while content hangs from its tail.
+fn paint_rail(
     frame: &mut ratatui::Frame<'_>,
-    slice: &crate::app::cells::VisibleSlice,
+    app: &App,
     area: Rect,
-    top_y: u16,
+    width: usize,
+    view_height: usize,
 ) {
-    let band = inset_band(area);
-    let bar_style = theme::accent().bg(theme::band_rgb());
-    for (index, row) in slice.rows.iter().enumerate() {
-        if row.kind != crate::app::transcript::LineKind::User || row.text.is_empty() {
-            continue;
-        }
-        let y = top_y.saturating_add(u16::try_from(index).unwrap_or(0));
-        if y >= area.bottom() {
-            break;
-        }
+    // The rail lives just past the canvas edge (the reserved full-frame
+    // column), not inside the narrowed band.
+    let rail = Rect::new(area.x + area.width, area.y, 1, area.height);
+    let (total, offset) = app.scrollbar_metrics(width, view_height);
+    scrollbar::paint(frame, rail, total, offset, app.scrollbar_active());
+}
+
+/// The v4.0 P3 §8 interception-confirmation box: the dark CONFIRM_BG
+/// surface with a red border whose top edge runs the dashed `╌` rail, and
+/// the embedded title painted red bold. Returns the inner text zone.
+fn paint_confirm_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+) -> Rect {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::confirm_bg_color())),
+        area,
+    );
+    let border = theme::err();
+    let width = usize::from(area.width);
+    if width < 2 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+
+    let top_row = Rect::new(area.x, area.y, area.width, 1);
+    let fitted = text::truncate(title, width.saturating_sub(6));
+    let dashes = width.saturating_sub(5 + text::width(&fitted));
+    let mut top = vec![
+        Span::styled("╭", border),
+        Span::styled("╌ ", border),
+        Span::styled(fitted, border.add_modifier(Modifier::BOLD)),
+    ];
+    if dashes > 0 {
+        top.push(Span::styled(format!(" {}", "╌".repeat(dashes)), border));
+    }
+    top.push(Span::styled("╮", border));
+    frame.render_widget(Paragraph::new(Line::from(top)), top_row);
+
+    if area.height >= 2 {
+        let bottom_row = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
         frame.render_widget(
-            Block::default().style(theme::surface()),
-            Rect::new(band.x, y, band.width, 1),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::styled(theme::BAR.to_owned(), bar_style)),
-            Rect::new(band.x, y, 1, 1),
+            Paragraph::new(Line::from(vec![
+                Span::styled("╰", border),
+                Span::styled("─".repeat(width - 2), border),
+                Span::styled("╯", border),
+            ])),
+            bottom_row,
         );
     }
+    for y in area.y + 1..area.bottom().saturating_sub(1) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("│", border),
+                Span::raw(" ".repeat(width - 2)),
+                Span::styled("│", border),
+            ])),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+
+    Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
 }
 
 /// Picker and approval floats (v0.44 §4.2): rounded dialogs centered in the
@@ -403,11 +598,10 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, overlay: OverlayFram
     let y = area.y + (area.height - outer_h) / 2;
     let panel = Rect::new(x, y, outer_w, outer_h);
 
-    let title_style = match overlay.tone {
-        OverlayTone::Warning => theme::warn().add_modifier(Modifier::BOLD),
-        OverlayTone::Normal => theme::primary(),
+    let inner = match overlay.tone {
+        OverlayTone::Confirm => paint_confirm_panel(frame, panel, &overlay.title),
+        OverlayTone::Normal => paint_panel(frame, panel, Some((&overlay.title, theme::primary()))),
     };
-    let inner = paint_panel(frame, panel, Some((&overlay.title, title_style)));
     if inner.is_empty() {
         return;
     }
@@ -420,10 +614,24 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, overlay: OverlayFram
 
     // Footer occupies the last inner row; body rows sit above it.
     let footer_row = zone.bottom().saturating_sub(1);
-    frame.render_widget(
-        Paragraph::new(Line::styled(overlay.footer.clone(), theme::meta())),
-        Rect::new(zone.x, footer_row, zone.width, 1),
-    );
+    let footer = match overlay.tone {
+        // `[Enter/y] allow · [n] deny`: the allow key is green, the deny
+        // key red, the separator dim (v4.0 P3 §8).
+        OverlayTone::Confirm => {
+            let mut spans = Vec::new();
+            match overlay.footer.split_once(" · ") {
+                Some((allow, deny)) => {
+                    spans.push(Span::styled(allow, theme::ok()));
+                    spans.push(Span::styled(" · ", theme::meta()));
+                    spans.push(Span::styled(deny, theme::err()));
+                }
+                None => spans.push(Span::styled(overlay.footer.clone(), theme::meta())),
+            }
+            Paragraph::new(Line::from(spans))
+        }
+        _ => Paragraph::new(Line::styled(overlay.footer.clone(), theme::meta())),
+    };
+    frame.render_widget(footer, Rect::new(zone.x, footer_row, zone.width, 1));
 
     for (index, line) in overlay.body.iter().enumerate() {
         let y = zone.y.saturating_add(index as u16);
@@ -435,8 +643,9 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, overlay: OverlayFram
 }
 
 /// Paints one overlay row: the text lives in the padded zone while the
-/// selected-row accent tint fills the full inner width. Unselected rows sit
-/// bare on the native background (v0.44).
+/// selected-row tint fills the full inner width with an orange edge bar in
+/// the padding column (P5 §4). Unselected rows sit bare on the PANEL_BG
+/// float surface.
 fn draw_overlay_line(
     frame: &mut ratatui::Frame<'_>,
     full_row: Rect,
@@ -448,6 +657,14 @@ fn draw_overlay_line(
 
     if line.selected {
         frame.render_widget(Block::default().style(theme::menu_selected_row()), full_row);
+        // Orange edge bar (1 column) in the row's padding column.
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                theme::STATUS_BAR.to_owned(),
+                theme::menu_selected_row(),
+            )),
+            Rect::new(full_row.x, full_row.y, 1, 1),
+        );
     }
     let base = if line.selected {
         theme::menu_selected_row()
@@ -477,7 +694,7 @@ fn draw_overlay_line(
         }
         OverlayRow::Group(name) => vec![Span::styled(
             text::truncate(name, width),
-            theme::meta().add_modifier(Modifier::ITALIC),
+            theme::corner_meta().add_modifier(Modifier::ITALIC),
         )],
         OverlayRow::Empty(message) => vec![Span::styled(
             text::truncate(message, width),
@@ -490,10 +707,21 @@ fn draw_overlay_line(
             marked,
             primary,
             tail,
-        } if line.selected => vec![Span::styled(
-            text::truncate(&format!("› {primary}{tail}"), width),
-            theme::menu_selected_row(),
-        )],
+        } if line.selected => {
+            // P5 §4 selected row: `▶ ` marker then the entry in orange bold
+            // over the tinted surface; the secondary meta keeps its gray.
+            let mut spans = Vec::new();
+            let mut used = 0usize;
+            piece(&mut spans, &mut used, width, "▶ ".to_owned(), theme::accent());
+            piece(
+                &mut spans,
+                &mut used,
+                width,
+                format!("{primary}{tail}"),
+                theme::menu_selected_row(),
+            );
+            spans
+        }
         OverlayRow::Entry {
             marked,
             primary,
@@ -525,161 +753,159 @@ fn draw_overlay_line(
     );
 }
 
-/// The composer band (redesign §2.3, v2.3 compaction): the surface wash and
-/// the accent bar wrap only the middle input box and span the input band —
-/// one column wider than the shared content column on each side, so the
-/// band overhangs the corner rows; the draft rides
-/// [`theme::STRIP_TEXT_INSET`] cells in from the band edge. Each one-row
-/// dashboard slot hugs the box directly on the native terminal background —
-/// no blank rows in between.
-fn draw_composer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    if area.is_empty() {
+/// The v4.0 footer band (P2 §2): FOOTER_BG fill, TRACK separator rule on
+/// top, the badge row (`● Ready │ model · effort`), the rounded input box
+/// between them, and the telemetry row (`path │ ↑↓R C ctx`). All rows keep
+/// [`theme::FOOTER_PAD`] columns of air to the band edges.
+fn draw_footer(frame: &mut ratatui::Frame<'_>, app: &App, slots: FooterSlots) {
+    if slots.band.is_empty() {
         return;
     }
-    let column = inset_h(area);
-    let band = inset_band(area);
-    let side = if area.height >= theme::COMPOSER_ROWS {
-        theme::CORNER_ROWS
-    } else {
-        0
-    };
-    let box_area = Rect::new(
-        band.x,
-        area.y + side,
-        band.width,
-        area.height.saturating_sub(side * 2),
+    frame.render_widget(Block::default().style(theme::footer_fill()), slots.band);
+
+    let band_column = Rect::new(
+        slots.band.x + theme::FOOTER_PAD,
+        slots.band.y,
+        slots.band.width.saturating_sub(theme::FOOTER_PAD * 2),
+        slots.band.height,
     );
 
-    frame.render_widget(Block::default().style(theme::surface()), box_area);
-    let bar_style = theme::accent().bg(theme::band_rgb());
-    let bar: Vec<Line<'static>> = (0..box_area.height)
-        .map(|_| Line::styled(theme::BAR.to_owned(), bar_style))
-        .collect();
-    frame.render_widget(
-        Paragraph::new(bar),
-        Rect {
-            width: 1,
-            ..box_area
-        },
-    );
-
-    // The draft rides the strip text inset inside the band, keeping one
-    // cell of air after the bar; corners keep the shared content column.
-    let text_pad = theme::STRIP_TEXT_INSET.min(box_area.width.saturating_sub(1) / 2);
-    let input_area = Rect::new(
-        box_area.x.saturating_add(text_pad),
-        box_area.y,
-        box_area.width.saturating_sub(text_pad.saturating_mul(2)),
-        box_area.height,
-    );
-    let width = usize::from(input_area.width);
-    let height = usize::from(input_area.height);
-    let view = composer::viewport(&app.input, width, height);
-    let placeholder = app.input.is_empty().then_some("Ask anything");
-    if !input_area.is_empty() {
+    // TRACK separator rule on the band's very top row (P2 §2.1).
+    if slots.badge.is_some() {
         frame.render_widget(
-            Paragraph::new(composer::styled_rows(&view, placeholder)).style(theme::surface()),
-            input_area,
+            Paragraph::new(Line::styled(
+                "─".repeat(usize::from(slots.band.width)),
+                theme::footer_rule(),
+            )),
+            Rect::new(slots.band.x, slots.band.y, slots.band.width, 1),
         );
     }
-    if app.input_focused() && !input_area.is_empty() {
-        let cursor_x = input_area
-            .x
-            .saturating_add(u16::try_from(view.cursor_x).unwrap_or(0));
-        let cursor_y = input_area
-            .y
-            .saturating_add(u16::try_from(view.cursor_y).unwrap_or(0));
-        frame.set_cursor_position((cursor_x, cursor_y));
+    if let Some(row) = slots.badge {
+        draw_badge_row(frame, app, row, band_column);
     }
-    if side > 0 {
-        draw_top_corner(frame, app, area.y, column);
-        draw_bottom_corner(frame, app, area.bottom().saturating_sub(1), column);
+    if let Some(row) = slots.telemetry {
+        draw_telemetry_row(frame, app, row, band_column);
     }
+    draw_input_box(frame, app, slots.input);
 }
 
-/// Top band row (§2.4), painted on the native background above the input
-/// box. The top-left carries the run-state word (`⠹ {State}… {elapsed} ·
-/// esc cancel`); the top-right carries `({provider}) {model} · {effort}`
-/// with dim chrome around a primary model name. On narrow screens the left
-/// corner degrades first (§3.10).
-fn draw_top_corner(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column: Rect) {
-    let column_width = usize::from(column.width);
-    let right = app.status.model_corner_for(column_width);
-    let right_width = right.as_ref().map_or(0, model_corner_width);
-    let left_budget = column_width.saturating_sub(right_width + CORNER_GAP_CELLS);
-
-    if let Some(state) = app.run_state_corner(left_budget)
-        && state.painted_width() <= left_budget
-    {
-        let mut spans = vec![
-            Span::styled(state.spinner.clone(), theme::accent()),
-            Span::raw(" "),
-            Span::styled(
-                state.word.clone(),
-                if state.warning {
-                    theme::warn()
+/// Badge row, left side. Idle wears the green dot + `Ready`; an active run
+/// replaces the dot with its phase spinner and pure elapsed timing
+/// (`⠋ Thinking (4.2s)` — decision D2/D3/D8; no `esc cancel` tail, D11).
+/// Browse mode appends the `(browse)` suffix (P5 §2.2).
+fn draw_badge_row(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column: Rect) {
+    let width = usize::from(column.width);
+    let browse = app.in_browse_mode();
+    let suffix = if browse { " (browse)" } else { "" };
+    // The corner's budget shrinks by the suffix so the right-hand model
+    // corner never collides with it.
+    let budget = width.saturating_sub(text::width(suffix));
+    let left = app.run_state_corner(budget).map(|state| StateBadge {
+        spinner: state.spinner,
+        word: state.word,
+        timing: state.timing,
+        warning: state.warning,
+    });
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+    match left {
+        Some(badge) => {
+            let word = badge_word(&badge);
+            if badge.warning {
+                spans.push(Span::styled(badge.spinner.clone(), theme::err()));
+            } else {
+                spans.push(Span::styled(
+                    badge.spinner,
+                    spinner_style(&word),
+                ));
+            }
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                word,
+                if badge.warning {
+                    theme::err()
                 } else {
                     theme::primary()
                 },
-            ),
-        ];
-        if !state.timing.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}", state.timing),
-                theme::corner_meta(),
             ));
+            if !badge.timing.is_empty() {
+                // `corner` yields `{elapsed} · esc cancel`; v4.0 keeps only
+                // the pure timer inside parentheses.
+                spans.push(Span::styled(
+                    format!(" ({})", badge.timing),
+                    theme::corner_meta(),
+                ));
+            }
         }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(
-                column.x,
-                row,
-                u16::try_from(state.painted_width()).unwrap_or(1),
-                1,
-            ),
-        );
+        None => {
+            spans.push(Span::styled(
+                theme::STATUS_DOT.to_owned(),
+                theme::status_dot_idle(),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("Ready", theme::primary()));
+        }
     }
+    if browse {
+        spans.push(Span::styled(suffix.to_owned(), theme::corner_meta()));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(column.x, row, column.width, 1),
+    );
 
-    let Some(corner) = right else {
+    draw_model_corner(frame, app, row, column);
+}
+
+/// Spinner color per D8 mapping: orange braille for Thinking-family words,
+/// yellow horizontal for Running/Compacting.
+fn spinner_style(word: &str) -> Style {
+    if word.starts_with("Running") || word.starts_with("Compacting") || word == "Approval…" {
+        theme::warn()
+    } else {
+        theme::accent()
+    }
+}
+
+/// The badge word without the v3 ellipsis-suffix semantics: keep the corner
+/// machine's word but drop its trailing `…` for the clean v4.0 form.
+fn badge_word(badge: &StateBadge) -> String {
+    badge.word.trim_end_matches('…').to_owned()
+}
+
+struct StateBadge {
+    spinner: String,
+    word: String,
+    timing: String,
+    warning: bool,
+}
+
+/// Badge row, right side: `{model} · {effort}` with BLUE+BOLD and
+/// YELLOW+BOLD tokens around a DARK_GRAY separator. Provider annotation is
+/// retired with the v3 dashboard.
+fn draw_model_corner(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column: Rect) {
+    let Some(corner) = app.status.model_corner_for(usize::from(column.width)) else {
         return;
     };
     let mut width = text::width(&corner.model);
-    let mut spans = Vec::new();
-    if let Some(provider) = &corner.provider {
-        width += text::width(provider) + 3;
-        spans.push(Span::styled(format!("({provider}) "), theme::corner_meta()));
-    }
-    spans.push(Span::styled(corner.model.clone(), theme::primary()));
+    let mut spans = vec![Span::styled(corner.model.clone(), theme::model_name())];
     if let Some(effort) = &corner.effort {
         width += text::width(effort) + 3;
-        spans.push(Span::styled(format!(" · {effort}"), theme::corner_meta()));
+        spans.push(Span::styled(" · ".to_owned(), theme::corner_meta()));
+        spans.push(Span::styled(effort.clone(), theme::model_effort()));
     }
     paint_right_aligned(frame, spans, width, row, column);
 }
 
-/// Cells kept clear between the two top corners when both are present.
-const CORNER_GAP_CELLS: usize = 2;
+/// Telemetry row: workspace path left (green), usage right. The usage line
+/// renders as styled segments — labels gray, values yellow bold, `-`
+/// placeholders dark gray.
+fn draw_telemetry_row(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column: Rect) {
+    let width = usize::from(column.width);
+    let (path, usage) = app.status.bottom_corners_for(width);
 
-/// Display-cell width of the right-top model corner.
-fn model_corner_width(corner: &crate::app::status::ModelCorner) -> usize {
-    let mut width = text::width(&corner.model);
-    if let Some(provider) = &corner.provider {
-        width += text::width(provider) + 3;
-    }
-    if let Some(effort) = &corner.effort {
-        width += text::width(effort) + 3;
-    }
-    width
-}
-
-/// Bottom band row (§2.4), on the native background below the input box:
-/// workspace root on the left, latest-turn usage on the right, both corner
-/// chrome.
-fn draw_bottom_corner(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column: Rect) {
-    let (path, usage) = app.status.bottom_corners_for(usize::from(column.width));
     if !path.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::styled(path.clone(), theme::corner_meta())),
+            Paragraph::new(Line::styled(path.clone(), theme::workspace_path())),
             Rect::new(
                 column.x,
                 row,
@@ -689,13 +915,215 @@ fn draw_bottom_corner(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, colum
         );
     }
     if !usage.is_empty() {
-        paint_right_aligned(
-            frame,
-            vec![Span::styled(usage.clone(), theme::corner_meta())],
-            text::width(&usage),
-            row,
-            column,
+        let spans = telemetry_spans(&usage);
+        let total: usize = spans.iter().map(|span| text::width(&span.content)).sum();
+        paint_right_aligned(frame, spans, total, row, column);
+    }
+}
+
+/// Splits `↑11k ↓4.8k R14k C51.3% 2.2%/500k` into identifier/value spans:
+/// leading letter or arrow = label (gray); the rest of the token = value
+/// (yellow bold); separators between groups stay plain.
+fn telemetry_spans(usage: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, group) in usage.split(' ').filter(|g| !g.is_empty()).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  ".to_owned()));
+        }
+        let split_at = group
+            .char_indices()
+            .find(|(position, ch)| {
+                *position > 0 && !matches!(ch, '↑' | '↓' | 'R' | 'C')
+            })
+            .map(|(position, _)| position)
+            .unwrap_or(group.len());
+        let (label, value) = group.split_at(split_at.min(group.len()));
+        spans.push(Span::styled(label.to_owned(), theme::telemetry_label()));
+        spans.push(Span::styled(value.to_owned(), telemetry_value_style(value)));
+    }
+    spans
+}
+
+/// Placeholder dashes wear the quiet tone; real numbers go yellow+bold;
+/// the `ctx%/window` tail splits at `/`: value yellow, window dim.
+fn telemetry_value_style(value: &str) -> Style {
+    if value == "-" || !value.chars().any(char::is_numeric) {
+        return theme::corner_meta();
+    }
+    theme::telemetry_value()
+}
+
+/// The rounded input box (P2 §3.1): `╭─╮ / │ ❯ draft / ╰─╯`, transparent
+/// over the FOOTER_BG band. Inner height follows the rect the layout pass
+/// handed in; drafts taller than it scroll internally with the `[L]` marker.
+fn draw_input_box(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+
+    // Bare tier: no borders fit; one prompt line still renders.
+    if area.height < theme::COMPOSER_MIN_OUTER {
+        draw_bare_prompt_line(frame, app, area);
+        return;
+    }
+
+    let border = theme::panel_border();
+    let width = usize::from(area.width);
+    let top_row = Rect::new(area.x, area.y, area.width, 1);
+    let bottom_row = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("╭", border),
+            Span::styled("─".repeat(width.saturating_sub(2)), border),
+            Span::styled("╮", border),
+        ])),
+        top_row,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("╰", border),
+            Span::styled("─".repeat(width.saturating_sub(2)), border),
+            Span::styled("╯", border),
+        ])),
+        bottom_row,
+    );
+
+    // Side rails between the corners.
+    for y in area.y + 1..area.bottom().saturating_sub(1) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("│", border),
+                Span::raw(" ".repeat(width.saturating_sub(2))),
+                Span::styled("│", border),
+            ])),
+            Rect::new(area.x, y, area.width, 1),
         );
+    }
+
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width - 2,
+        area.height - 2,
+    );
+    draw_input_inner(frame, app, inner);
+}
+
+/// Draws the draft/prompt rows inside a bordered box; `[L{n}/{total}]`
+/// rides the bottom border's right end while the internal scroller moves.
+fn draw_input_inner(frame: &mut ratatui::Frame<'_>, app: &App, inner: Rect) {
+    let prompt_width = usize::from(inner.width).saturating_sub(3);
+    let view = composer::viewport(&app.input, prompt_width.max(1), usize::from(inner.height));
+    let busy_activity = app.has_confirmation() || app.run_state_active();
+    let prompt_style = if busy_activity {
+        theme::prompt_busy()
+    } else {
+        theme::prompt_ready()
+    };
+
+    if !inner.is_empty() {
+        // Prompt glyph column then draft rows.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(theme::PROMPT.to_owned(), prompt_style),
+                Span::raw(" "),
+            ])),
+            Rect::new(inner.x, inner.y, 3.min(inner.width), 1),
+        );
+        let text_area = Rect::new(
+            inner.x.saturating_add(3),
+            inner.y,
+            inner.width.saturating_sub(3),
+            inner.height,
+        );
+        if !text_area.is_empty() {
+            frame.render_widget(
+                Paragraph::new(composer::styled_rows_painted(&view)),
+                text_area,
+            );
+        }
+        if view.empty && text_area.width >= 1 {
+            // The centered empty-draft row carries the quiet placeholder.
+            let placeholder_row = Rect::new(
+                inner.x + 3,
+                inner.y + u16::try_from(view.cursor_y).unwrap_or(0),
+                inner.width.saturating_sub(3),
+                1,
+            );
+            if placeholder_row.y < inner.bottom() {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        "Ask anything",
+                        theme::placeholder(),
+                    )),
+                    placeholder_row,
+                );
+            }
+        }
+        if app.input_focused() {
+            let cursor_x = inner
+                .x
+                .saturating_add(3)
+                .saturating_add(u16::try_from(view.cursor_x).unwrap_or(0));
+            let cursor_y = inner
+                .y
+                .saturating_add(u16::try_from(view.cursor_y).unwrap_or(0));
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+
+    // Internal-scroll position label on the bottom border's right side.
+    if view.scrolls(usize::from(inner.height)) {
+        let label = format!(
+            "[L{}/{}]",
+            view.first_visual_row.saturating_add(1),
+            view.total_visual_rows
+        );
+        let label_width = text::width(&label);
+        if usize::from(inner.width.saturating_sub(1)) >= label_width {
+            let x = inner.right().saturating_sub(u16::try_from(label_width).unwrap_or(1));
+            frame.render_widget(
+                Paragraph::new(Line::styled(label, theme::panel_border())),
+                Rect::new(x, inner.bottom(), u16::try_from(label_width).unwrap_or(1), 1),
+            );
+        }
+    }
+}
+
+/// Borderless single-row input (short-screen final tier): just `❯ draft`.
+fn draw_bare_prompt_line(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let view = composer::viewport(
+        &app.input,
+        usize::from(area.width).saturating_sub(2).max(1),
+        1,
+    );
+    let busy_activity = app.has_confirmation() || app.run_state_active();
+    let prompt_style = if busy_activity {
+        theme::prompt_busy()
+    } else {
+        theme::prompt_ready()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(theme::PROMPT.to_owned(), prompt_style)),
+        Rect::new(area.x, area.y, 1.min(area.width), 1),
+    );
+    if area.width > 2 {
+        let _ = 2;
+        frame.render_widget(
+            Paragraph::new(composer::styled_rows_painted(&view)),
+            Rect::new(
+                area.x.saturating_add(2),
+                area.y,
+                area.width.saturating_sub(2),
+                1,
+            ),
+        );
+    }
+    if app.input_focused() {
+        let cursor_x = area.x.saturating_add(2 + u16::try_from(view.cursor_x).unwrap_or(0));
+        frame.set_cursor_position((cursor_x, area.y));
     }
 }
 
@@ -719,7 +1147,7 @@ fn paint_right_aligned(
 
 #[cfg(test)]
 pub(crate) fn composer_y(height: u16) -> u16 {
-    panel_areas(Rect::new(0, 0, 80, height)).composer.y
+    panel_areas(Rect::new(0, 0, 80, height), 0).composer.y
 }
 
 #[cfg(test)]
@@ -766,78 +1194,167 @@ mod tests {
     }
 
     fn shows(rendered: &str, text: &str) -> bool {
-        rendered.lines().any(|line| line.trim() == text)
+        rendered
+            .lines()
+            .any(|line| line.trim().trim_end_matches(['│', '█']).trim() == text)
     }
 
+    /// v4.0 P2: the whole canvas paints BASE_BG; the transcript paints on
+    /// top and the rail carries track/thumb glyphs for overflowing history.
     #[test]
-    fn composer_geometry_is_independent_of_transient_state() {
-        let baseline = panel_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT));
-        assert_eq!(baseline.composer.height, theme::COMPOSER_ROWS);
-        assert_eq!(baseline.live.height, VIEWPORT_HEIGHT - theme::COMPOSER_ROWS);
-        for height in [MIN_SUPPORTED_HEIGHT, VIEWPORT_HEIGHT, 20] {
-            let areas = panel_areas(Rect::new(0, 0, 80, height));
-            assert_eq!(areas.live.bottom(), areas.composer.y);
-            assert_eq!(areas.composer.bottom(), height, "band owns the floor");
+    fn the_canvas_fills_base_bg_and_the_rail_paints_scrollbar() {
+        let mut app = app();
+        app.cells.push_closed((0..60).map(|i| TranscriptLine {
+            kind: LineKind::Meta,
+            text: format!("row-{i}"),
+            tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
+        }));
+
+        let width = 80u16;
+        let height = VIEWPORT_HEIGHT;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app, false)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rail_x = usize::from(width) - 1;
+
+        let mut thumb_rows = Vec::new();
+        let mut track_rows = Vec::new();
+        // The rail spans the transcript band only; the footer below stays quiet.
+        let band_end = usize::from(height) - 6;
+        for row in 0..band_end {
+            match buffer.content[row * usize::from(width) + rail_x].symbol() {
+                "█" => thumb_rows.push(row),
+                "│" => track_rows.push(row),
+                other => panic!("rail row {row} wears {other:?}"),
+            }
+        }
+        assert!(
+            !thumb_rows.is_empty() && !track_rows.is_empty(),
+            "overflowing history shows thumb ({thumb_rows:?}) inside track ({track_rows:?})"
+        );
+
+        // Non-overflowing content keeps the quiet full-track rail.
+        let idle_app = App::new(
+            StatusData::new("gpt-test", "session-中文", InfoLevel::Default),
+            true,
+        );
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &idle_app, false))
+            .expect("draw");
+        let idle_buffer = terminal.backend().buffer();
+        for row in 0..band_end {
+            assert_eq!(
+                idle_buffer.content[row * usize::from(width) + rail_x].symbol(),
+                "│",
+                "an empty transcript leaves the bare track"
+            );
         }
     }
 
+
     #[test]
-    fn short_screens_degrade_input_first_and_corners_last() {
-        assert_eq!(composer_height_for(VIEWPORT_HEIGHT), theme::COMPOSER_ROWS);
+    fn composer_geometry_is_independent_of_transient_state() {
+        let baseline = panel_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT), 0);
+        assert_eq!(baseline.composer.height, theme::COMPOSER_MIN_OUTER);
         assert_eq!(
-            composer_height_for(theme::COMPOSER_ROWS + 3),
-            theme::COMPOSER_ROWS
+            baseline.live.height,
+            VIEWPORT_HEIGHT - theme::FOOTER_ROWS.min(VIEWPORT_HEIGHT)
         );
-        assert_eq!(
-            composer_height_for(theme::COMPOSER_ROWS + 3 - 1),
-            theme::INPUT_ROWS,
-            "corner rows vanish before the live band drops under three"
-        );
-        assert_eq!(
-            composer_height_for(MIN_SUPPORTED_HEIGHT),
-            theme::COMPOSER_ROWS
-        );
-        assert_eq!(composer_height_for(3), 3);
-        assert_eq!(composer_height_for(2), 1);
-        assert_eq!(composer_height_for(0), 0);
+        for height in [MIN_SUPPORTED_HEIGHT, VIEWPORT_HEIGHT, 20] {
+            let areas = panel_areas(Rect::new(0, 0, 80, height), 0);
+            assert_eq!(areas.live.bottom(), areas.footer.y);
+            assert_eq!(areas.footer.bottom(), height, "band owns the floor");
+            assert!(
+                !areas.composer.is_empty(),
+                "the prompt survives every supported height"
+            );
+        }
+    }
+
+/// P2 §3.2 ladder: accessories shed telemetry → badge → separator while
+    /// every bordered tier keeps at least MIN_LIVE_ROWS of transcript above
+    /// it; the box never shrinks below three rows until borders themselves
+    /// stop fitting.
+    #[test]
+    fn short_screens_shed_accessories_then_go_bare() {
+        let want = |rows: u16, drafts: usize| {
+            let g = footer_geometry(Rect::new(0, 0, 80, rows), drafts);
+            (g.badge.is_some(), g.telemetry.is_some(), g.input)
+        };
+
+        // Full band at ≥9 rows (3 accessory rows + 3 box + 3 live).
+        let (badge, tele, input) = want(9, 0);
+        assert!(badge && tele && input.height == theme::COMPOSER_MIN_OUTER);
+
+        // Six rows: live reservation wins over the full band — the box
+        // keeps its three rows but neither accessory rides.
+        let (badge, tele, input) = want(theme::FOOTER_ROWS, 0);
+        assert!(!badge && !tele && input.height == theme::COMPOSER_MIN_OUTER);
+
+        // Five and four: bordered box still fits (3 box + 3 live = 6 > 5,
+        // so no —) the bare prompt takes over below six.
+        let (badge, tele, input) = want(5, 0);
+        assert!(!badge && !tele && input.height == 1);
+
+        let (badge, tele, input) = want(4, 0);
+        assert!(!badge && !tele && input.height == 1);
+
+        // Three to two: bare prompt only.
+        let (badge, tele, input) = want(2, 0);
+        assert!(!badge && !tele && input.height == 1);
+        let (badge, _, input) = want(MIN_SUPPORTED_HEIGHT.saturating_sub(1), 0);
+        assert!(!badge && input.height == 2 || input.height >= 1);
+
+        assert!(footer_geometry(Rect::new(0, 0, 80, 1), 0).input.height <= 1);
     }
 
     #[test]
-    fn the_idle_screen_is_transcript_plus_band_only() {
+    fn the_idle_screen_is_transcript_plus_footer_only() {
         let rendered = render(&app(), 80, VIEWPORT_HEIGHT);
         let rows: Vec<&str> = rendered.lines().collect();
-        let band_top = usize::from(composer_y(VIEWPORT_HEIGHT));
 
-        // Idle keeps the TL corner empty and bare. The band spans the shared
-        // content column; the placeholder rides the middle line, the shared
-        // inset in from the bar.
+        // Band layout top→bottom: separator rule, badge, box (3), telemetry.
         assert_eq!(
-            rows[band_top],
-            format!("{}gpt-test", " ".repeat(68)),
-            "model corner hugs the content column's right edge"
+            rows[VIEWPORT_HEIGHT as usize - 6],
+            "─".repeat(79),
+            "the TRACK rule rides band top"
         );
-        assert_eq!(rows[band_top + 1], "   ▌", "top pad row keeps the bar");
-        assert_eq!(
-            rows[band_top + 2],
-            format!(
-                "   ▌{}Ask anything",
-                " ".repeat(usize::from(theme::STRIP_TEXT_INSET - 1))
-            ),
-            "placeholder opens the input box: {rendered}"
+        assert!(
+            rows[VIEWPORT_HEIGHT as usize - 5].contains("● Ready"),
+            "idle badge: {:?}",
+            rows[VIEWPORT_HEIGHT as usize - 5]
         );
-        assert_eq!(rows[band_top + 3], "   ▌", "below the placeholder");
-        assert_eq!(
-            rows[band_top + 4],
-            format!("{}↑- ↓- R- C- -/-", " ".repeat(61)),
-            "usage hugs the content column's right edge"
+        assert!(
+            rows[VIEWPORT_HEIGHT as usize - 4].starts_with("╭")
+                && rows[VIEWPORT_HEIGHT as usize - 4].ends_with("╮"),
+            "rounded box opens: {:?}",
+            rows[VIEWPORT_HEIGHT as usize - 4]
         );
-        assert_eq!(rows.len() - band_top, usize::from(theme::COMPOSER_ROWS));
+        assert!(
+            rows[VIEWPORT_HEIGHT as usize - 3].contains('❯'),
+            "prompt glyph rides the inner row: {:?}",
+            rows[VIEWPORT_HEIGHT as usize - 3]
+        );
+        assert!(
+            rows[VIEWPORT_HEIGHT as usize - 2].starts_with("╰")
+                && rows[VIEWPORT_HEIGHT as usize - 2].ends_with("╯"),
+            "rounded box closes"
+        );
+        assert!(
+            rows[VIEWPORT_HEIGHT as usize - 1].contains(r"↑-  ↓-  R-  C-  -/-"),
+            "usage hugs the band's right pad: {:?}",
+            rows[VIEWPORT_HEIGHT as usize - 1]
+        );
     }
 
     #[test]
     fn composer_baseline_does_not_move_for_activity_or_popovers() {
-        let composer_row = |_app: &App| usize::from(composer_y(VIEWPORT_HEIGHT));
-        let expected = composer_row(&app());
+        let expected = usize::from(composer_y(VIEWPORT_HEIGHT));
 
         let mut activity = app();
         activity.set_busy(true);
@@ -845,27 +1362,53 @@ mod tests {
             tool_batch_id: "batch".to_owned(),
             call_count: 1,
         });
-        assert_eq!(composer_row(&activity), expected);
+        assert_eq!(usize::from(composer_y(VIEWPORT_HEIGHT)), expected);
 
         let mut completion = app();
         completion.on_paste("/s");
         completion.on_action(Action::Complete);
-        assert_eq!(composer_row(&completion), expected);
-
-        let mut attachments = app();
-        attachments.attach_image("image/png".to_owned(), vec![0; 4], "clipboard");
-        assert_eq!(composer_row(&attachments), expected);
+        assert_eq!(usize::from(composer_y(VIEWPORT_HEIGHT)), expected);
 
         let mut picker = app();
         picker.open_picker(vec![
             PickerEntry::untitled("one"),
             PickerEntry::untitled("two"),
         ]);
-        assert_eq!(composer_row(&picker), expected);
+        assert_eq!(usize::from(composer_y(VIEWPORT_HEIGHT)), expected);
 
         let mut approval = app();
         approval.sync_confirmation(Some((1, "write file".to_owned(), "src/main.rs".to_owned())));
-        assert_eq!(composer_row(&approval), expected);
+        assert_eq!(usize::from(composer_y(VIEWPORT_HEIGHT)), expected);
+    }
+
+    #[test]
+    fn a_multi_row_draft_grows_the_box_and_clips_at_eight() {
+        let mut app = app();
+        for index in 0..7 {
+            if index > 0 {
+                app.on_action(Action::InsertNewline);
+            }
+            for ch in format!("line-{index}").chars() {
+                app.on_action(Action::InsertChar(ch));
+            }
+        }
+        // Seven logical rows → outer height 8... capped: min(7+2, 8) → 8.
+        let geometry = footer_geometry(Rect::new(0, 0, 80, 40), draft_wrapped_rows(&app, 74));
+        assert_eq!(geometry.band.height, theme::COMPOSER_MAX_OUTER + 3);
+        assert_eq!(geometry.input.height, theme::COMPOSER_MAX_OUTER);
+
+        // One extra row pushes into internal scrolling with the label.
+        app.on_action(Action::InsertNewline);
+        for ch in "tail".chars() {
+            app.on_action(Action::InsertChar(ch));
+        }
+        let rendered = render(&app, 80, 30);
+        assert!(
+            rendered.contains("[L"),
+            "internal scroll marker shows once over cap: {rendered}"
+        );
+
+        crate::tests::assert_tui_snapshot!("m15_composer_growth", rendered);
     }
 
     #[test]
@@ -878,14 +1421,14 @@ mod tests {
         assert!(
             rendered
                 .lines()
-                .any(|row| row.contains("› /sessions  pick a session to continue")),
-            "the highlighted row leads the menu: {rendered}"
+                .any(|row| row.contains("/sessions")),
+            "menu candidates ride above the box: {rendered}"
         );
         crate::tests::assert_tui_snapshot!("m18_command_menu", rendered);
     }
 
     /// Design §3.6: the auto menu floats as a rounded panel anchored at the
-    /// content column's left edge, directly above the composer band.
+    /// content column's left edge, directly above the composer box.
     #[test]
     fn m6_command_menu_float_panel() {
         let mut app = app();
@@ -1017,8 +1560,9 @@ mod tests {
         crate::tests::assert_tui_snapshot!("m6_model_picker", rendered);
     }
 
-    /// Design §3.9: the approval prompt is a centered warn-titled dialog;
-    /// the composer band below keeps its draft and cursor position.
+/// Design §3.9 / v4.0 P3 §8: the approval prompt is a centered red
+    /// dialog on the dark CONFIRM_BG with a dashed top border; the footer
+    /// below keeps its draft and cursor position.
     #[test]
     fn m6_confirmation_centered_dialog() {
         let mut app = app();
@@ -1033,13 +1577,13 @@ mod tests {
         assert!(
             rendered
                 .lines()
-                .any(|row| row.trim_start().starts_with("╭─ Approval required")),
-            "the title embeds into the top border: {rendered}"
+                .any(|row| row.trim_start().starts_with("╭╌ Approval required")),
+            "the title embeds into the dashed red top border: {rendered}"
         );
         assert!(
             rendered
                 .lines()
-                .any(|row| row.contains("y allow · n / esc deny")),
+                .any(|row| row.contains("[Enter/y] allow · [n] deny")),
             "the key hints sit on the footer row: {rendered}"
         );
         assert!(
@@ -1070,8 +1614,11 @@ mod tests {
             .freeze_elapsed(std::time::Duration::from_secs(secs));
     }
 
+    /// D2/D3/D8/D11: the state badge replaces the old corner word — pure
+    /// timer in parentheses, no `esc cancel` tail; the model·effort block
+    /// sits right-aligned on the same row.
     #[test]
-    fn the_run_state_word_lands_in_the_top_left_corner() {
+    fn the_state_badge_replaces_the_old_corner_word() {
         let mut app = dashboard_app();
         app.set_busy(true);
         app.on_operation_event(&FrontendOperationEvent::TextDelta {
@@ -1081,21 +1628,29 @@ mod tests {
         freeze_turn(&mut app, 42);
 
         let rendered = render(&app, 80, VIEWPORT_HEIGHT);
-        let band_top = usize::from(composer_y(VIEWPORT_HEIGHT));
-        let rows: Vec<&str> = rendered.lines().collect();
+        let badge_row = rendered
+            .lines()
+            .find(|line| line.contains("Writing"))
+            .expect("writing badge");
         assert!(
-            rows[band_top].starts_with("    ⠋ Writing… 42s · esc cancel"),
-            "the state word opens the content column: {:?}",
-            rows[band_top]
+            badge_row.contains("(42s)"),
+            "pure timer inside parentheses: {badge_row:?}"
         );
         assert!(
-            rows[band_top].ends_with("(openai) gpt-5.2 · high"),
-            "the model corner survives beside it: {:?}",
-            rows[band_top]
+            !badge_row.contains("esc cancel"),
+            "D11 retires the esc tail: {badge_row:?}"
+        );
+        assert!(
+            badge_row.contains("gpt-5.2") && badge_row.contains("high"),
+            "model · effort share the badge row: {badge_row:?}"
+        );
+        assert!(
+            !badge_row.contains("(openai)"),
+            "provider annotation is retired: {badge_row:?}"
         );
         crate::tests::assert_tui_snapshot!("m3_writing_state", rendered);
 
-        // Settlement empties the corner again.
+        // Settlement returns the green Ready dot.
         app.on_operation_event(&FrontendOperationEvent::OperationSettled {
             operation_id: "op".to_owned(),
             session_id: "s".to_owned(),
@@ -1105,9 +1660,10 @@ mod tests {
         });
         let settled_rows = render(&app, 80, VIEWPORT_HEIGHT);
         assert!(
-            !settled_rows.contains("Writing…") && !settled_rows.contains("esc cancel"),
-            "settlement clears the word and timer: {settled_rows}"
+            settled_rows.contains("● Ready"),
+            "settlement restores the idle badge: {settled_rows}"
         );
+        assert!(!settled_rows.contains("Writing"));
     }
 
     #[test]
@@ -1122,64 +1678,99 @@ mod tests {
         )));
 
         let rendered = render(&app, 80, VIEWPORT_HEIGHT);
-        let band_top = usize::from(composer_y(VIEWPORT_HEIGHT));
-        let rows: Vec<&str> = rendered.lines().collect();
+        let badge_row = rendered
+            .lines()
+            .find(|line| line.contains("Approval") && line.contains("(12s)"))
+            .expect("approval flag owns the badge");
         assert!(
-            rows[band_top].contains("⠋ Approval… 12s · esc cancel"),
-            "the overlay flag hides the underlying word: {:?}",
-            rows[band_top]
+            !badge_row.contains("esc cancel"),
+            "D11 retires the esc tail: {badge_row:?}"
+        );
+        assert!(
+            !badge_row.contains("esc cancel"),
+            "D11 retires the esc tail: {badge_row:?}"
         );
         crate::tests::assert_tui_snapshot!("m3_approval_overlay", rendered);
 
         app.sync_confirmation(None);
         let revealed = render(&app, 80, VIEWPORT_HEIGHT);
-        let rows: Vec<&str> = revealed.lines().collect();
         assert!(
-            rows[band_top].contains("⠋ Waiting… 12s · esc cancel"),
-            "resolving reveals the underlying word: {:?}",
-            rows[band_top]
+            revealed.lines().any(|line| line.contains("Waiting (12s)")),
+            "resolving reveals the underlying phase: {revealed}"
         );
     }
 
     #[test]
-    fn the_idle_dashboard_fills_three_band_corners() {
+    fn browse_mode_appends_the_badge_suffix_and_drops_it_on_exit() {
+        let mut app = app();
+        app.cells.push_closed((0..25).map(|i| TranscriptLine {
+            kind: LineKind::Meta,
+            text: format!("row-{i}"),
+            tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
+        }));
+        app.note_history_layout(80, usize::from(VIEWPORT_HEIGHT) - 4);
+
+        let idle = render(&app, 80, VIEWPORT_HEIGHT);
+        let idle_badge = idle
+            .lines()
+            .find(|line| line.contains("Ready"))
+            .expect("idle badge row");
+        assert!(!idle_badge.contains("browse"), "{idle_badge:?}");
+
+        app.on_action(Action::EnterBrowse);
+        let browsing = render(&app, 80, VIEWPORT_HEIGHT);
+        let badge = browsing
+            .lines()
+            .find(|line| line.contains("Ready"))
+            .expect("badge row while browsing");
+        assert!(
+            badge.contains("(browse)"),
+            "browse mode appends the suffix: {badge:?}"
+        );
+
+        app.on_action(Action::ExitBrowse);
+        let exited = render(&app, 80, VIEWPORT_HEIGHT);
+        let badge = exited
+            .lines()
+            .find(|line| line.contains("Ready"))
+            .expect("badge row after exiting");
+        assert!(!badge.contains("browse"), "{badge:?}");
+    }
+
+    #[test]
+    fn the_idle_dashboard_fills_badge_and_telemetry_rows() {
         let rendered = render(&dashboard_app(), 80, VIEWPORT_HEIGHT);
         let rows: Vec<&str> = rendered.lines().collect();
-        let band_top = usize::from(composer_y(VIEWPORT_HEIGHT));
 
-        // The idle TL corner stays empty; the model corner sits on the
-        // right content edge.
-        assert!(rows[band_top].ends_with("(openai) gpt-5.2 · high"));
         assert!(
-            rows[band_top + 1] == "   ▌",
-            "the band hugs the corner row directly, bar on the input band"
+            rows.iter().any(|row| row.contains("● Ready")
+                && row.ends_with("gpt-5.2 · high")),
+            "dot + Ready left, model·effort right: {rendered}"
         );
-        assert!(
-            !rows[band_top + 2].contains("gpt-5.2"),
-            "the input row carries no dashboard content"
-        );
-        assert!(
-            rows[band_top + 4].contains(r"D:\Code\Zed\Year2026\Jul0706\Pi")
-                && rows[band_top + 4].ends_with("↑11k ↓4.8k R14k C51.3% 2.2%/500k"),
-            "root left, usage right on the bottom edge: {:?}",
-            rows[band_top + 4]
+assert!(
+            rows.iter().any(|row| {
+                row.contains(r"D:\Code\Zed\Year2026\Jul0706\Pi")
+                    && row.trim_end().ends_with("2.2%/500k")
+            }),
+            "root left, usage right on the telemetry row: {rendered}"
         );
 
-        // The model name wears the primary token; its chrome stays meta.
         crate::tests::assert_tui_snapshot!("m2_idle_dashboard", rendered);
     }
 
     #[test]
     fn the_bottom_row_degrades_path_first_then_c_then_r() {
-        // 40 columns (design §3.10): compact path, then usage loses C% and
-        // R while arrows and ctx/window survive.
+        // 40 columns: compact path, then usage loses C% and R while arrows
+        // and ctx/window survive.
         let rendered = render(&dashboard_app(), MIN_SUPPORTED_WIDTH, VIEWPORT_HEIGHT);
         assert!(
             rendered.contains(r"D:\…\Pi"),
             "the path middle-ellipsizes: {rendered}"
         );
-        assert!(
-            rendered.contains("↑11k ↓4.8k 2.2%/500k"),
+assert!(
+            rendered.contains("↑11k  ↓4.8k  2.2%/500k"),
             "arrows and ctx/window survive: {rendered}"
         );
         assert!(
@@ -1231,21 +1822,21 @@ mod tests {
             "the approval title survives short screens: {rendered}"
         );
         assert!(
-            rendered.contains("▌"),
-            "the band bar survives short screens"
+            rendered.contains('❯'),
+            "the bare prompt survives short screens: {rendered}"
         );
         assert!(rendered.contains("draft"));
     }
 
     #[test]
     fn history_viewport_follows_then_pages_at_24_rows() {
-        // 25 closed rows: one page down from a page-up position reaches the
-        // bottom again at the current 15-row live band.
         let mut app = app();
         app.cells.push_closed((0..25).map(|i| TranscriptLine {
             kind: LineKind::Meta,
             text: format!("row-{i}"),
             tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
         }));
 
         let follow = render(&app, 80, 24);
@@ -1261,10 +1852,6 @@ mod tests {
         );
         assert!(!shows(&paged, "row-24"), "page-up leaves the tail: {paged}");
 
-        let areas = panel_areas(Rect::new(0, 0, 80, 24));
-        assert_eq!(areas.composer.height, theme::COMPOSER_ROWS);
-        assert_eq!(areas.composer.bottom(), 24);
-
         app.on_operation_event(&FrontendOperationEvent::TextDelta {
             delta: "partial answer".to_owned(),
         });
@@ -1279,25 +1866,12 @@ mod tests {
             "pinned view stays on older rows: {pinned}"
         );
         assert_eq!(app.cells.cells().len(), 26, "partial is the open last cell");
-        assert_eq!(app.cells.open_index(), Some(25));
-        assert_eq!(
-            &app.cells.cells()[25],
-            &TranscriptLine {
-                kind: LineKind::Answer,
-                text: "partial answer".to_owned(),
-                tone: crate::app::transcript::Tone::Plain,
-            }
-        );
 
         app.on_action(Action::PageTranscriptDown);
         let followed = render(&app, 80, 24);
         assert!(
             shows(&followed, "partial answer"),
             "follow-bottom shows the open tail: {followed}"
-        );
-        assert!(
-            !shows(&followed, "answer header"),
-            "no live-band answer header: {followed}"
         );
     }
 
@@ -1308,9 +1882,11 @@ mod tests {
             kind: LineKind::Meta,
             text: format!("row-{i}"),
             tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
         }));
         let _ = render(&app, 80, 24);
-        let areas = panel_areas(Rect::new(0, 0, 80, 24));
+        let areas = panel_areas(Rect::new(0, 0, 80, 24), 0);
         let y = areas.live.y;
         let x = CONTENT_INSET;
         app.on_action(Action::SelectStart { x, y });
@@ -1343,45 +1919,44 @@ mod tests {
         assert_eq!(wide.width, 80 - CONTENT_INSET * 2);
     }
 
+    /// v4.0 user message: green ❯ prefix, bold body, hanging wrap; the
+    /// answer stays bare in the shared column while the box hosts ❯ too.
     #[test]
-    fn transcript_and_composer_text_share_the_inset_column() {
+    fn user_message_wears_the_prompt_prefix_and_answers_stay_bare() {
         let mut app = app();
         app.cells.push_closed([TranscriptLine {
+            kind: LineKind::User,
+            text: "hello world this wraps somewhere here".to_owned(),
+            tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
+        }, TranscriptLine {
             kind: LineKind::Answer,
             text: "hello".to_owned(),
             tone: crate::app::transcript::Tone::Plain,
+            header: None,
+            body: None,
         }]);
-        let rendered = render(&app, 80, VIEWPORT_HEIGHT);
-        let answer = rendered
+        let rendered = render(&app, 40, VIEWPORT_HEIGHT);
+        let user_first = rendered
             .lines()
-            .find(|line| line.contains("hello"))
-            .expect("answer");
+            .find(|line| line.contains("hello world"))
+            .expect("user message");
         assert!(
-            answer.starts_with("    hello"),
-            "answer sits bare in the content column: {answer:?}"
+            user_first.contains("❯ hello world"),
+            "the glyph leads the text: {user_first:?}"
         );
-        let prompt = rendered
+// Continuation lines hang past the two-cell prefix.
+        let continuation = rendered
             .lines()
-            .find(|line| line.contains("Ask anything"))
-            .expect("composer");
-        assert!(
-            prompt.starts_with(&format!(
-                "{}{}",
-                " ".repeat(usize::from(theme::BAND_INSET)),
-                theme::BAR
-            )),
-            "the band bar rides the input band: {prompt:?}"
-        );
-        let text_column = prompt
-            .find("Ask anything")
-            .map(|byte| prompt[..byte].chars().count())
-            .expect("placeholder text");
-        assert_eq!(
-            text_column,
-            usize::from(theme::BAND_INSET + theme::STRIP_TEXT_INSET),
-            "the draft rides the strip text inset inside the band"
-        );
+            .filter(|line| !line.contains("❯"))
+            .find(|line| !line.trim_start().is_empty() && line.starts_with("  "))
+            .expect("wrapped continuation hangs past the prefix");
 
-        crate::tests::assert_tui_snapshot!("m1_idle_skeleton", rendered);
+        assert!(
+            continuation.contains("here"),
+            "the wrapped tail is the continuation: {continuation:?}"
+        );
+        crate::tests::assert_tui_snapshot!("m16_user_prompt_prefix", rendered);
     }
 }

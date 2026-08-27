@@ -2,5 +2,5 @@
 source: crates/philo-tui/src/tests/tool_cards.rs
 expression: dump
 ---
-Title: edit
-Failure:   ↳ Failed. not_unique · old_string matches 3 locations
+Title: action=edit target= status=✗ failed
+Failure:

@@ -14,7 +14,7 @@ use ratatui::backend::Backend;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::api::types::{TuiLaunchConfig, TuiOutcome, TuiRecovery, TuiRunReport, TuiScreen};
+use crate::api::types::{TuiLaunchConfig, TuiOutcome, TuiRecovery, TuiRunReport};
 use crate::app::action::Action;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::overlay::Preview;
@@ -43,9 +43,7 @@ const SESSION_LOAD_RETRY_BUDGET: u8 = 3;
 
 /// Production entry: enter the terminal, drive the loop, restore on every path.
 pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRunReport {
-    crate::render::theme::init_palette(config.terminal_palette);
-    let screen = config.screen;
-    let mut session = match TerminalSession::enter(screen) {
+    let mut session = match TerminalSession::enter() {
         Ok(session) => session,
         Err(error) => {
             return TuiRunReport {
@@ -59,15 +57,8 @@ pub async fn run_async(client: FrontendClient, config: TuiLaunchConfig) -> TuiRu
     };
     let shift_enter = session.shift_enter;
     let mut input = CrosstermInputSource::new();
-    let report = run_loop_report(
-        client,
-        config,
-        &mut session.terminal,
-        &mut input,
-        shift_enter,
-        screen,
-    )
-    .await;
+    let report = run_loop_report(client, config, &mut session.terminal, &mut input, shift_enter)
+        .await;
     let restore = session.finish();
     TuiRunReport {
         outcome: report.outcome,
@@ -330,6 +321,8 @@ fn notice_effect(text: impl Into<String>) -> Effect {
         kind: LineKind::Notice,
         text: text.into(),
         tone: crate::app::transcript::Tone::Plain,
+        header: None,
+        body: None,
     }])
 }
 
@@ -458,9 +451,8 @@ pub(crate) async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     input: &mut impl TerminalInputSource,
     shift_enter: bool,
-    screen: TuiScreen,
 ) -> TuiOutcome {
-    run_loop_report(client, config, terminal, input, shift_enter, screen)
+    run_loop_report(client, config, terminal, input, shift_enter)
         .await
         .outcome
 }
@@ -471,7 +463,6 @@ async fn run_loop_report<B: Backend>(
     terminal: &mut Terminal<B>,
     input: &mut impl TerminalInputSource,
     shift_enter: bool,
-    screen: TuiScreen,
 ) -> LoopReport {
     let mut status = StatusData::new(
         &config.model_name,
@@ -624,7 +615,6 @@ async fn run_loop_report<B: Backend>(
                 &mut app,
                 &mut tasks,
                 &mut scheduler,
-                screen,
                 event_time,
                 &mut pending_zero_resize,
                 event,
@@ -671,7 +661,7 @@ async fn run_loop_report<B: Backend>(
             Step::FrameDeadline => Vec::new(),
             Step::AnimationDeadline => {
                 if scheduler.take_animation_tick(event_time)
-                    && app.on_tick(super::scheduler::ANIMATION_INTERVAL)
+                    && app.on_tick(crate::render::theme::THINKING_SPINNER.interval())
                 {
                     scheduler.invalidate_background(event_time);
                 }
@@ -870,6 +860,8 @@ fn apply_updates(
                 kind: LineKind::Error,
                 text: format!("error: model list unavailable: {reason}"),
                 tone: crate::app::transcript::Tone::Plain,
+                header: None,
+                body: None,
             }])]));
             continue;
         }
@@ -1072,7 +1064,6 @@ fn apply_input(
     app: &mut App,
     tasks: &mut PendingTasks,
     scheduler: &mut FrameScheduler,
-    screen: TuiScreen,
     event_time: Instant,
     pending_zero_resize: &mut bool,
     event: TerminalInput,
@@ -1080,7 +1071,7 @@ fn apply_input(
     match event {
         TerminalInput::Key(key) => {
             scheduler.invalidate_immediate(event_time);
-            let action = keymap::interpret(&key);
+            let action = keymap::interpret(&key, app.focus_mode());
             if matches!(action, crate::app::action::Action::Escape) {
                 tasks.cancel_transient();
             }
@@ -1101,11 +1092,7 @@ fn apply_input(
         }
         TerminalInput::Resize { .. } => {
             *pending_zero_resize = false;
-            if screen == TuiScreen::Alternate {
-                scheduler.request_hard_redraw(event_time);
-            } else {
-                scheduler.invalidate_immediate(event_time);
-            }
+            scheduler.request_hard_redraw(event_time);
             Vec::new()
         }
     }
@@ -1290,8 +1277,6 @@ mod tests {
             verbose: false,
             show_reasoning: true,
             context_window: None,
-            screen: TuiScreen::Inline,
-            terminal_palette: None,
             interrupt: None,
             workspace_root: ".".to_owned(),
             recovery: None,
@@ -1322,7 +1307,6 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert_eq!(outcome, TuiOutcome::UserExit);
@@ -1339,7 +1323,6 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert!(matches!(
@@ -1374,7 +1357,6 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert_eq!(outcome, TuiOutcome::UserExit);
@@ -1400,6 +1382,24 @@ mod tests {
         });
     }
 
+    /// Waits until the service actor has consumed at least `target` runtime
+    /// events. The actor publishes the corresponding `FrontendUpdate`s right
+    /// after consuming, so once this returns the update is in flight to the
+    /// run loop. Yield-based (never sleeps) so the run loop's input-rebuild
+    /// backoff timers cannot fire ahead of the injected presses.
+    async fn wait_consumed(
+        runtime: &philo_agent_service::testing::FakeRuntimeHandle,
+        target: u64,
+    ) {
+        for _ in 0..100_000 {
+            if runtime.consumed() >= target {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("service never consumed {target} runtime events");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn input_rebuild_backoff_consumes_forced_signal() {
         let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
@@ -1423,13 +1423,12 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert_eq!(outcome, TuiOutcome::UserExit);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn busy_second_interrupt_requests_forced_exit() {
         let (service, client, runtime) = philo_agent_service::testing::start_test_service();
         let (tx, rx) = tokio::sync::watch::channel(0u64);
@@ -1443,6 +1442,9 @@ mod tests {
         let inject = async move {
             notified.notified().await;
             busy_events(&runtime, "op-1");
+            wait_consumed(&runtime, 2).await;
+            // A short yield tail so the run loop picks the busy update up
+            // before the first press lands.
             for _ in 0..32 {
                 tokio::task::yield_now().await;
             }
@@ -1460,14 +1462,13 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert_eq!(outcome, TuiOutcome::ForcedExitRequested { code: 130 });
         drop(service);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn settled_operation_resets_interrupt_to_first_press() {
         let (service, client, runtime) = philo_agent_service::testing::start_test_service();
         let (tx, rx) = tokio::sync::watch::channel(0u64);
@@ -1481,6 +1482,7 @@ mod tests {
         let inject = async move {
             notified.notified().await;
             busy_events(&runtime, "op-1");
+            wait_consumed(&runtime, 2).await;
             for _ in 0..32 {
                 tokio::task::yield_now().await;
             }
@@ -1492,7 +1494,11 @@ mod tests {
                 availability: philo_agent_runtime::AgentAvailability::Idle,
                 queued: 0,
             });
-            for _ in 0..16 {
+            wait_consumed(&runtime, 3).await;
+            // The idle observation must reach the run loop before the
+            // second press, or the second press counts as the second of
+            // two busy presses.
+            for _ in 0..32 {
                 tokio::task::yield_now().await;
             }
             tx.send_modify(|n| *n = n.saturating_add(1));
@@ -1505,7 +1511,6 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert_eq!(outcome, TuiOutcome::UserExit);
@@ -1540,7 +1545,6 @@ mod tests {
             &mut terminal,
             &mut input,
             false,
-            TuiScreen::Inline,
         )
         .await;
         assert_eq!(outcome, TuiOutcome::ForcedExitRequested { code: 130 });

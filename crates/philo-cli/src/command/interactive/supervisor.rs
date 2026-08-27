@@ -395,8 +395,6 @@ fn launch_config(
         verbose: bootstrap.settings.verbosity == Verbosity::Verbose,
         show_reasoning: bootstrap.settings.show_reasoning,
         context_window: bootstrap.settings.context_window,
-        screen: bootstrap.settings.screen,
-        terminal_palette: bootstrap.settings.terminal_bg,
         interrupt: Some(interrupt),
         workspace_root: bootstrap.workspace_root.clone(),
         recovery,

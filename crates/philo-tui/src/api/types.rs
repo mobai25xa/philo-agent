@@ -83,14 +83,6 @@ pub struct TuiRunReport {
     pub recovery: Option<TuiRecovery>,
 }
 
-/// Alternate screen versus an inline viewport on the main buffer.
-/// Chosen by the composition root; a session never switches modes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TuiScreen {
-    Alternate,
-    Inline,
-}
-
 /// Deployment inputs for one interactive session (from the composition
 /// root's configuration chain).
 #[derive(Clone, Debug)]
@@ -103,13 +95,6 @@ pub struct TuiLaunchConfig {
     pub show_reasoning: bool,
     /// Context-budget hint for the usage corner.
     pub context_window: Option<u64>,
-    /// Screen mode for this session. Hot reload must not change it.
-    pub screen: TuiScreen,
-    /// Terminal background RGB detected by the composition root (OSC 11),
-    /// used to derive band and diff surface colors relative to the theme.
-    /// `None` keeps stable fallback surfaces; the TUI never queries the
-    /// terminal itself.
-    pub terminal_palette: Option<(u8, u8, u8)>,
     /// Supervisor-owned Ctrl+C pulse counter. `None` in tests that do not
     /// inject signals. The TUI never writes the terminal or exits the process.
     pub interrupt: Option<tokio::sync::watch::Receiver<u64>>,

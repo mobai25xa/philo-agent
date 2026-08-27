@@ -16,7 +16,10 @@ use std::collections::HashSet;
 
 use super::action::Action;
 use super::attachment::Attachments;
-use super::cells::{ScrollState, TranscriptStore, VisibleSlice};
+use super::cells::{
+    ScrollState, TranscriptStore, VisibleSlice, clamp_cursor, logical_index, move_cursor,
+    position_at_index, start_from_tail,
+};
 use super::effect::Effect;
 use super::input::{InputEditor, InputHistory};
 use super::overlay::{ConfirmPrompt, OverlayFrame, Picker};
@@ -32,17 +35,14 @@ pub(crate) use commands::CommandMenuFrame;
 
 pub(crate) use overlays::SessionLoadIntent;
 
-/// Streaming viewport anchor (v2.2, plan T4.7–T4.9): lifted output grows
-/// from the 40% line and pins at the 80% line while busy; after settlement
-/// the viewport animates back down to the full band.
+/// Keyboard focus owner (P5 §1, new-tui.md §3): the composer by default,
+/// the history browse mode while the user inspects old rows. The two
+/// transient overlays (confirmation, pickers) have their own routing
+/// priority above both and never set this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StreamAnchor {
-    /// Captured the wrapped-row total at lift time; appended rows grow the
-    /// visible window from the 40% base toward the 80% cap.
-    Lift { base_total: usize },
-    /// Post-settlement drop animation: ticks remaining until the viewport
-    /// reaches the full band again.
-    Settle { left: u16 },
+pub(crate) enum FocusMode {
+    Input,
+    Browse,
 }
 
 /// Pure interaction state for one TUI session.
@@ -92,25 +92,35 @@ pub(crate) struct App {
     /// Stream smoothing valve (v2.2): live deltas queue here and animation
     /// ticks release them into the cells at an even cadence.
     pacer: StreamPacer,
-    /// Streaming viewport anchor state (v2.2); `None` means the plain
-    /// full-band, bottom-follow layout.
-    stream_anchor: Option<StreamAnchor>,
-    /// Last rendered full-frame height — the 40%/80% anchors are shares of
-    /// it. Written by the render pass through a cell, like the band layout.
-    pub(crate) frame_height: Cell<u16>,
     /// Transcript cells for the TUI-owned viewport.
     pub(crate) cells: TranscriptStore,
     scroll: ScrollState,
     /// Think blocks the user manually expanded. Every reasoning run —
     /// streaming or sealed (v2.2) — starts folded; only this set opens one.
     reasoning_manually_expanded: HashSet<usize>,
+    /// The in-flight default-mode tool batch (v4.0 P3): one live card cell
+    /// or a tree cell, rewritten in place as its events land. `None` while
+    /// idle, verbose, or settled.
+    tool_batch: Option<super::live_tool::LiveBatch>,
+    /// Tool-card bodies the user manually expanded (v4.0 P3 §6 state API).
+    tool_cards_expanded: HashSet<usize>,
+    /// Tool-card bodies the user manually folded.
+    tool_cards_folded: HashSet<usize>,
     layout_width: Cell<usize>,
     layout_history_height: Cell<usize>,
     history_band: Cell<BandLayout>,
     /// Full transcript-band height (independent of the painted sub-area,
-    /// which shrinks when sparse content hangs from its tail).
+    /// which shrinks when sparse content lays out from the band top).
     band_height: Cell<u16>,
+    /// Wall clock of the most recent transcript scroll (P2 scrollbar heat).
+    /// `None` once the 800 ms highlight window elapsed.
+    scroll_hot_until: Cell<Option<std::time::Instant>>,
     selection: Option<Selection>,
+    /// Keyboard focus owner (P5 §1): the composer, or history browse mode.
+    focus_mode: FocusMode,
+    /// Logical cursor `(cell, row_in_cell)` while browse mode owns the
+    /// focus — the row Space/o hit-tests against foldable elements.
+    browse_cursor: (usize, usize),
 }
 
 impl App {
@@ -140,24 +150,41 @@ impl App {
             automatic_compacting: false,
             run_state: RunState::default(),
             pacer: StreamPacer::default(),
-            stream_anchor: None,
-            frame_height: Cell::new(0),
             cells: TranscriptStore::new(),
             scroll: ScrollState::follow(),
             reasoning_manually_expanded: HashSet::new(),
+            tool_batch: None,
+            tool_cards_expanded: HashSet::new(),
+            tool_cards_folded: HashSet::new(),
             layout_width: Cell::new(80),
             layout_history_height: Cell::new(0),
             history_band: Cell::new(BandLayout::default()),
             band_height: Cell::new(0),
+            scroll_hot_until: Cell::new(None),
             selection: None,
+            focus_mode: FocusMode::Input,
+            browse_cursor: (0, 0),
         }
     }
 
     pub(crate) fn history_slice(&self, width: usize, height: usize) -> VisibleSlice {
         self.cells
             .visible_slice(width, height, &self.scroll, &|index| {
-                self.reasoning_collapsed(index)
+                self.collapser(index)
             })
+    }
+
+    /// Scrollbar inputs (P2 §1.3): total wrapped rows, top offset, and
+    /// whether a scroll landed recently enough to light the thumb. Computed
+    /// against the live wrap cache; the render pass calls this right after
+    /// `history_slice` so the cache is already fresh.
+    pub(crate) fn scrollbar_metrics(&self, width: usize, height: usize) -> (usize, usize) {
+        self.cells.refresh_wraps(width, &|index| {
+            self.collapser(index)
+        });
+        let wrapped = self.cells.wrap_rows();
+        let total = wrapped.iter().map(Vec::len).sum();
+        (total, self.scroll.scroll_offset(&wrapped, height))
     }
 
     /// Fold state of the reasoning run starting at `head` (v2.2): every
@@ -166,6 +193,69 @@ impl App {
     /// expands it.
     fn reasoning_collapsed(&self, head: usize) -> bool {
         !self.reasoning_manually_expanded.contains(&head)
+    }
+
+    /// Combined fold state handed to the wrap cache: reasoning runs fold by
+    /// their run head, tool-card bodies by their own cell (v4.0 P3 §6).
+    fn collapser(&self, index: usize) -> bool {
+        match self.cells.display_kind(index) {
+            LineKind::Reasoning => self.reasoning_collapsed(index),
+            LineKind::Tool => self.tool_card_collapsed(index),
+            _ => false,
+        }
+    }
+
+    /// Fold state of a tool-card body cell: cards settle folded past their
+    /// threshold by default; the manual sets override that default.
+    fn tool_card_collapsed(&self, index: usize) -> bool {
+        let Some(line) = self.cells.cell_at(index) else {
+            return false;
+        };
+        let Some(body) = &line.body else {
+            return false;
+        };
+        if body.lines.len() <= body.threshold {
+            return false;
+        }
+        if self.tool_cards_folded.contains(&index) {
+            return true;
+        }
+        if self.tool_cards_expanded.contains(&index) {
+            return false;
+        }
+        body.fold_default_collapsed
+    }
+
+    /// Fold/unfold a tool-card body by its cell index. Returns whether the
+    /// cell actually was a foldable card (P3 §6 state API; Space/o wiring
+    /// belongs to P5 — exercised by tests until then).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn toggle_tool_card_fold(&mut self, index: usize) -> bool {
+        let Some(line) = self.cells.cell_at(index) else {
+            return false;
+        };
+        let Some(body) = &line.body else {
+            return false;
+        };
+        if body.lines.len() <= body.threshold {
+            return false;
+        }
+        if body.fold_default_collapsed {
+            if !self.tool_cards_expanded.remove(&index) {
+                self.tool_cards_expanded.insert(index);
+            }
+        } else if !self.tool_cards_folded.remove(&index) {
+            self.tool_cards_folded.insert(index);
+        }
+        self.cells.bump_wrap_revision();
+        true
+    }
+
+    /// Whether the tool-card body at `index` is currently folded (the
+    /// default applies until the user flips the manual sets).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn tool_card_collapsed_at(&self, index: usize) -> bool {
+        self.tool_card_collapsed(index)
     }
 
     /// Click on a think header row: fold/unfold that block. Returns whether
@@ -232,102 +322,18 @@ impl App {
         true
     }
 
-    // -- Streaming viewport anchors (v2.2, plan T4.7–T4.10) ---------------
+    // -- Streaming viewport policy (v4.1) ---------------------------------
 
-    /// Ticks the post-settlement drop animation spreads over (~500ms at the
-    /// 100ms animation cadence).
-    pub(crate) const SETTLE_ANIM_TICKS: u16 = 5;
-
-    /// Render pass records the full-frame height so event-side lift logic
-    /// can evaluate the 40%/80% shares without owning geometry.
-    pub(crate) fn note_frame_height(&self, height: u16) {
-        self.frame_height.set(height);
-    }
-
-    /// Whether the streaming viewport (lift/pin/settle) currently owns the
-    /// transcript window.
-    pub(crate) fn stream_anchor_active(&self) -> bool {
-        self.stream_anchor.is_some()
-    }
-
-    /// Visible transcript height for this frame: the full column except
-    /// while streaming is lifted (`base + grown`, capped at the 80% line),
-    /// busy-follow pins at the cap, and the settle animation walks back to
-    /// full. Manual scroll cancels the anchor entirely.
-    pub(crate) fn transcript_viewport_height(&self, full: u16, anchors: Option<(u16, u16)>) -> u16 {
-        let Some((base, cap)) = anchors else {
-            return full;
-        };
-        let cap = cap.min(full);
-        let base = base.min(cap.saturating_sub(1)).max(1);
-        let height = match self.stream_anchor {
-            Some(StreamAnchor::Lift { base_total }) => {
-                let grown = self.wrapped_row_total().saturating_sub(base_total);
-                u16::try_from(usize::from(base) + grown)
-                    .unwrap_or(u16::MAX)
-                    .min(cap)
-            }
-            Some(StreamAnchor::Settle { left }) => {
-                let span = full - cap;
-                let done = Self::SETTLE_ANIM_TICKS.saturating_sub(left);
-                cap + span * done / Self::SETTLE_ANIM_TICKS
-            }
-            None if self.status.busy => cap,
-            None => full,
-        };
-        height.clamp(1, full)
-    }
-
-    /// Total wrapped rows at the last-known width (the lift's growth ruler).
-    fn wrapped_row_total(&self) -> usize {
-        let width = self.layout_width.get();
-        self.cells
-            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
-        self.cells.wrap_rows().iter().map(Vec::len).sum()
-    }
-
-    /// Lifts the viewport to the 40% line for a new turn: only when the
-    /// screen shows content (blank screens start at the top), the user is
-    /// following, the layout is known, and the anchors fit.
-    fn try_begin_stream_lift(&mut self) {
-        if self.stream_anchor.is_some() || !self.scroll.follow_bottom() {
-            return;
-        }
-        if self.cells.display_len() == 0 {
-            return;
-        }
-        if crate::render::stream_anchor_rows(self.frame_height.get(), self.band_height.get())
-            .is_none()
-        {
-            return;
-        }
-        let base_total = self.wrapped_row_total();
-        self.stream_anchor = Some(StreamAnchor::Lift { base_total });
-    }
-
-    /// Settlement ends the lift: animate the tail down to the band bottom.
-    /// Turns that never lifted simply stay where they are.
-    pub(crate) fn begin_settle_drop(&mut self) {
-        if matches!(self.stream_anchor, Some(StreamAnchor::Lift { .. })) {
-            self.stream_anchor = Some(StreamAnchor::Settle {
-                left: Self::SETTLE_ANIM_TICKS,
-            });
-        }
-    }
-
-    /// User scrolling takes over: drop any lift/settle animation so the
-    /// automatic anchoring never fights the operator.
-    fn cancel_stream_anchor(&mut self) {
-        self.stream_anchor = None;
-    }
+    // The v2.2 40%/80% lift/pin/settle anchors are retired: the transcript
+    // viewport is now the whole band. Sparse content lays out from the band
+    // top; once it overflows, the follow-bottom slice naturally pushes new
+    // rows in from the bottom edge. No state machine is needed.
 
     pub(crate) fn page_transcript_up(&mut self, width: usize, height: usize) {
-        self.cancel_stream_anchor();
         self.scroll_transcript(width, height, -(height as isize));
     }
 
     pub(crate) fn page_transcript_down(&mut self, width: usize, height: usize) {
-        self.cancel_stream_anchor();
         self.scroll_transcript(width, height, height as isize);
     }
 
@@ -335,25 +341,249 @@ impl App {
         if delta == 0 {
             return;
         }
-        self.cancel_stream_anchor();
+        self.note_scroll_activity();
         self.cells
-            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
+            .refresh_wraps(width, &|index| self.collapser(index));
         self.scroll
             .scroll_wrapped(&self.cells.wrap_rows(), height, delta);
     }
 
     pub(crate) fn jump_transcript_top(&mut self) {
-        self.cancel_stream_anchor();
+        self.note_scroll_activity();
         let width = self.layout_width.get();
         let height = self.layout_history_height.get();
         self.cells
-            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
+            .refresh_wraps(width, &|index| self.collapser(index));
         self.scroll.jump_top(&self.cells.wrap_rows(), height);
     }
 
     pub(crate) fn jump_transcript_bottom(&mut self) {
-        self.cancel_stream_anchor();
+        self.note_scroll_activity();
         self.scroll.jump_bottom();
+    }
+
+    /// Marks the scrollbar thumb "recently scrolled" (P2 §1.2): the 800 ms
+    /// highlight window starts now. A driving animation deadline exists
+    /// whenever the window is open.
+    fn note_scroll_activity(&self) {
+        self.scroll_hot_until.set(Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(crate::render::theme::SCROLL_ACTIVE_MS),
+        ));
+    }
+
+    /// Whether the thumb highlight is currently lit; also clears the
+    /// stale timestamp so idle rails stop asking for frames.
+    pub(crate) fn scrollbar_active(&self) -> bool {
+        match self.scroll_hot_until.get() {
+            Some(until) if std::time::Instant::now() < until => true,
+            Some(_) => {
+                self.scroll_hot_until.set(None);
+                false
+            }
+            None => false,
+        }
+    }
+
+    // -- History browse mode (P5 §2) --------------------------------------
+
+    pub(crate) fn focus_mode(&self) -> FocusMode {
+        self.focus_mode
+    }
+
+    /// Whether history browse mode currently owns the keyboard focus.
+    pub(crate) fn in_browse_mode(&self) -> bool {
+        self.focus_mode == FocusMode::Browse
+    }
+
+    /// The logical cursor position while browse mode is active — the row
+    /// the renderer lifts with the MENU_ACTIVE_BG tint. `None` outside
+    /// browse mode.
+    pub(crate) fn browse_cursor(&self) -> Option<(usize, usize)> {
+        self.in_browse_mode().then_some(self.browse_cursor)
+    }
+
+    /// `PgUp` / `Ctrl+U`: leave the composer and take the current scroll
+    /// position over as the browse origin. The draft, attachments and input
+    /// cursor survive untouched; a pending command menu closes. The view
+    /// pins here so live output never yanks the reading place.
+    fn enter_browse(&mut self) {
+        if self.focus_mode == FocusMode::Browse {
+            return;
+        }
+        self.clear_selection();
+        self.completion = None;
+        let width = self.layout_width.get();
+        let height = self.layout_history_height.get();
+        self.cells
+            .refresh_wraps(width, &|index| self.collapser(index));
+        if !self.cells.wrap_rows().is_empty() && height > 0 {
+            let wrapped = self.cells.wrap_rows();
+            self.scroll.unfollow_keep_wrapped(&wrapped, height);
+        }
+        self.focus_mode = FocusMode::Browse;
+        let wrapped = self.cells.wrap_rows();
+        self.browse_cursor = if self.scroll.follow_bottom() && !wrapped.is_empty() {
+            start_from_tail(&wrapped, height)
+        } else {
+            self.scroll.pin().unwrap_or((0, 0))
+        };
+    }
+
+    /// `i` / `Esc`: return the focus to the composer. The scroll position
+    /// is preserved — the reading place survives the round-trip.
+    fn exit_browse(&mut self) {
+        if self.focus_mode != FocusMode::Browse {
+            return;
+        }
+        self.focus_mode = FocusMode::Input;
+        self.clear_selection();
+    }
+
+    /// `k`/`↑` and `j`/`↓`: move the logical cursor by one wrapped row and
+    /// chase it with the viewport.
+    fn browse_step(&mut self, delta: isize) -> Vec<Effect> {
+        let width = self.layout_width.get();
+        let height = self.layout_history_height.get();
+        self.cells
+            .refresh_wraps(width, &|index| self.collapser(index));
+        let wrapped = self.cells.wrap_rows();
+        if wrapped.is_empty() {
+            return vec![];
+        }
+        let next = move_cursor(&wrapped, self.browse_cursor, delta);
+        drop(wrapped);
+        self.browse_cursor = next;
+        self.scroll_cursor_into_view(height);
+        vec![]
+    }
+
+    /// `PgUp` / `PgDn`: page the cursor by a whole viewport (页 = 视口高 - 2).
+    /// The viewport ride reuses the page-scroll engine; the cursor follows
+    /// on the residual half-page and the view chase clamps the edges.
+    fn browse_page(&mut self, delta: isize) -> Vec<Effect> {
+        let width = self.layout_width.get();
+        let height = self.layout_history_height.get();
+        if delta < 0 {
+            self.page_transcript_up(width, height);
+        } else {
+            self.page_transcript_down(width, height);
+        }
+        let page = isize::try_from(height.saturating_sub(2).max(1)).unwrap_or(1);
+        self.browse_step(delta * page)
+    }
+
+    /// `Space` / `o`: toggle the foldable element under the cursor — a
+    /// think header, or any body row of a foldable tool card. Rows that are
+    /// neither leave the transcript untouched.
+    fn browse_toggle_fold(&mut self) -> Vec<Effect> {
+        let (cell, row) = self.browse_cursor;
+        let toggled = if self.is_think_head(cell, row) {
+            self.toggle_reasoning_block(cell, row)
+        } else if self.is_tool_card_body(cell, row) {
+            self.toggle_tool_card_fold(cell)
+        } else {
+            false
+        };
+        if toggled {
+            self.rewrap_cursor();
+        }
+        vec![]
+    }
+
+    /// `Home` in browse mode: jump the viewport and cursor to the head.
+    fn browse_home(&mut self) -> Vec<Effect> {
+        self.jump_transcript_top();
+        self.browse_cursor = (0, 0);
+        vec![]
+    }
+
+    /// `End` in browse mode: jump the viewport and cursor to the tail.
+    fn browse_end(&mut self) -> Vec<Effect> {
+        self.jump_transcript_bottom();
+        let width = self.layout_width.get();
+        self.cells
+            .refresh_wraps(width, &|index| self.collapser(index));
+        let wrapped = self.cells.wrap_rows();
+        self.browse_cursor = if wrapped.is_empty() {
+            (0, 0)
+        } else {
+            let last = wrapped.len() - 1;
+            (last, wrapped[last].len().saturating_sub(1))
+        };
+        vec![]
+    }
+
+    /// Whether the cursor sits on a reasoning-run head row (row 0 of the
+    /// run's first cell) — the think block Space toggles.
+    fn is_think_head(&self, cell: usize, row: usize) -> bool {
+        if row != 0 || cell >= self.cells.display_len() {
+            return false;
+        }
+        if self.cells.display_kind(cell) != LineKind::Reasoning {
+            return false;
+        }
+        cell == 0 || self.cells.display_kind(cell - 1) != LineKind::Reasoning
+    }
+
+    /// Whether the cursor sits on a body row of a foldable tool card (any
+    /// row past its header), so Space may fold or unfold the body.
+    fn is_tool_card_body(&self, cell: usize, row: usize) -> bool {
+        let Some(line) = self.cells.cell_at(cell) else {
+            return false;
+        };
+        if line.kind != LineKind::Tool {
+            return false;
+        }
+        let Some(body) = &line.body else {
+            return false;
+        };
+        if body.lines.len() <= body.threshold {
+            return false;
+        }
+        if line.header.is_some() {
+            row > 0
+        } else {
+            true
+        }
+    }
+
+    /// A fold toggle just changed the target cell's row count: re-clamp the
+    /// cursor onto the rebuilt wraps and keep it inside the viewport.
+    fn rewrap_cursor(&mut self) {
+        let width = self.layout_width.get();
+        let height = self.layout_history_height.get();
+        self.cells
+            .refresh_wraps(width, &|index| self.collapser(index));
+        let wrapped = self.cells.wrap_rows();
+        self.browse_cursor = clamp_cursor(&wrapped, self.browse_cursor);
+        drop(wrapped);
+        self.scroll_cursor_into_view(height);
+    }
+
+    /// Chases the viewport so the browse cursor row stays visible: pinned
+    /// to the top when the cursor steps above it, to the bottom when it
+    /// steps past it.
+    fn scroll_cursor_into_view(&mut self, height: usize) {
+        if height == 0 {
+            return;
+        }
+        let width = self.layout_width.get();
+        self.cells
+            .refresh_wraps(width, &|index| self.collapser(index));
+        let wrapped = self.cells.wrap_rows();
+        if wrapped.is_empty() {
+            return;
+        }
+        let cursor_index = logical_index(&wrapped, self.browse_cursor);
+        let view_top = self.scroll.scroll_offset(&wrapped, height);
+        if cursor_index < view_top {
+            let target = position_at_index(&wrapped, cursor_index);
+            self.scroll.pin_at(&wrapped, height, target);
+        } else if cursor_index >= view_top + height {
+            let target = position_at_index(&wrapped, cursor_index.saturating_sub(height - 1));
+            self.scroll.pin_at(&wrapped, height, target);
+        }
     }
 
     #[cfg(test)]
@@ -417,6 +647,12 @@ impl App {
         self.run_state.corner(max_width, self.confirm.is_some())
     }
 
+    /// Whether any run phase currently owns the state badge (P2 footer):
+    /// the composer prompt dims while a turn is on the wire.
+    pub(crate) fn run_state_active(&self) -> bool {
+        self.run_state.is_active()
+    }
+
     #[cfg(test)]
     pub(crate) fn run_state_mut(&mut self) -> &mut RunState {
         &mut self.run_state
@@ -427,7 +663,9 @@ impl App {
     }
 
     pub(crate) fn input_focused(&self) -> bool {
-        self.confirm.is_none() && self.picker.is_none()
+        self.confirm.is_none()
+            && self.picker.is_none()
+            && self.focus_mode == FocusMode::Input
     }
 
     /// The menu frame to paint above the composer, while it is open.
@@ -472,6 +710,11 @@ impl App {
                 _ => {}
             }
         }
+        // P4 history browse mode: below the overlays and the command menu,
+        // above the composer's input dispatch.
+        if self.focus_mode == FocusMode::Browse {
+            return self.on_browse_action(action);
+        }
         // Any interaction other than the quit chord disarms the two-step
         // exit; anything but another `/quit` disarms the running-turn exit.
         if !matches!(action, Action::CtrlC) {
@@ -500,6 +743,10 @@ impl App {
             }
             Action::ToggleLevel => vec![Effect::Append(vec![self.toggle_level()])],
             Action::Redraw => vec![Effect::HardRedraw],
+            Action::EnterBrowse => {
+                self.enter_browse();
+                vec![]
+            }
             Action::PageTranscriptUp => {
                 self.page_transcript_up(self.layout_width.get(), self.layout_history_height.get());
                 vec![]
@@ -547,7 +794,54 @@ impl App {
             Action::CompactionCancelDispatchFinished { result } => {
                 self.on_compaction_cancel_dispatch_finished(result)
             }
+            // Browse-mode keys never reach the composer: the keymap only
+            // produces them while browse mode owns the focus, and a stray
+            // programmatic dispatch is inert here.
+            Action::BrowseStep(_) | Action::BrowsePage(_) | Action::BrowseToggleFold
+            | Action::ExitBrowse => vec![],
             Action::None => vec![],
+        }
+    }
+
+    /// P4 history browse mode (P5 §1): keyboard dispatch while the focus
+    /// sits on the transcript. The composer, overlays and the command menu
+    /// are all below this layer. Mouse events pass straight through — wheel
+    /// scrolls, click-select and think-header clicks keep working.
+    fn on_browse_action(&mut self, action: Action) -> Vec<Effect> {
+        // Any interaction other than Ctrl+C disarms the two-step exit, so
+        // browsing history never counts toward a quit chord.
+        if !matches!(action, Action::CtrlC) {
+            self.exit_armed = false;
+        }
+        match action {
+            Action::BrowseStep(delta) => self.browse_step(delta),
+            Action::BrowsePage(delta) => self.browse_page(delta),
+            Action::BrowseToggleFold => self.browse_toggle_fold(),
+            Action::Home => self.browse_home(),
+            Action::End => self.browse_end(),
+            Action::ExitBrowse | Action::Escape => {
+                self.exit_browse();
+                vec![]
+            }
+            Action::Submit => self.submit(),
+            Action::CtrlC => {
+                let effects = self.ctrl_c();
+                self.exit_browse();
+                effects
+            }
+            Action::ScrollTranscript(delta) => {
+                self.scroll_transcript(
+                    self.layout_width.get(),
+                    self.layout_history_height.get(),
+                    delta,
+                );
+                vec![]
+            }
+            Action::SelectStart { x, y } => self.select_start(x, y),
+            Action::SelectDrag { x, y } => self.select_drag(x, y),
+            Action::SelectEnd { x, y } => self.select_end(x, y),
+            Action::None => vec![],
+            _ => vec![],
         }
     }
 
@@ -569,5 +863,7 @@ fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
         kind,
         text: text.into(),
         tone: crate::app::transcript::Tone::Plain,
+        header: None,
+        body: None,
     }
 }

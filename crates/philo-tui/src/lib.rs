@@ -18,7 +18,7 @@ mod tests;
 
 pub use api::{
     RestoreFailure, RestoreReport, TerminalCapability, TuiLaunchConfig, TuiOutcome, TuiRecovery,
-    TuiRecoveryAttachment, TuiRunReport, TuiScreen,
+    TuiRecoveryAttachment, TuiRunReport,
 };
 pub use driver::{run, run_async};
 pub use platform::input::{TerminalInput, TerminalInputFault, TerminalInputSource};

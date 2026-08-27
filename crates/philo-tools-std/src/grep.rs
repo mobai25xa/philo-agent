@@ -10,7 +10,7 @@ use philo_tools::{
 };
 
 use crate::args::{optional_bool, optional_string, required_string};
-use crate::display::card;
+use crate::display::{CardFacts, card};
 use crate::error_code;
 use crate::helpers::{field_error, path_error, stopped_if_requested};
 use crate::path::resolve_in_root;
@@ -249,7 +249,9 @@ impl GrepTool {
         } else {
             locs.join("\n")
         };
-        let display = card("Searched", format!("'{pattern}' in {path}"), "locs", detail)
+        let display = card("Grep", "Searched", "locs", detail)
+            .subject(format!("\"{pattern}\""))
+            .count("1 search")
             .with_fact("files_scanned", files_scanned.to_string())
             .with_fact("matches_total", total_matches.to_string())
             .with_fact("limit_reached", limit_reached.to_string())

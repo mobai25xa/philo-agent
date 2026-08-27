@@ -1,9 +1,10 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
+assertion_line: 161
 expression: "render(&[\"```rust\", \"fn main() {}\", \"```\", \"between blocks\",\n\"```not-a-language\", \"* not a list *\", \"```\", \"after\",])"
 ---
 ```rust
-  -> "```rust"{darkgray}
+  -> "```"{darkgray} "rust"{rgb(222, 137, 72)}
 fn main() {}
   -> "│ "{darkgray} "fn"{rgb(180, 142, 173)} " "{rgb(192, 197, 206)} "main"{rgb(143, 161, 179)} "("{rgb(192, 197, 206)} ")"{rgb(192, 197, 206)} " "{rgb(192, 197, 206)} "{"{rgb(192, 197, 206)} "}"{rgb(192, 197, 206)}
 ```
@@ -11,9 +12,9 @@ fn main() {}
 between blocks
   -> "between blocks"
 ```not-a-language
-  -> "```not-a-language"{darkgray}
+  -> "```"{darkgray} "not-a-language"{rgb(222, 137, 72)}
 * not a list *
-  -> "│ "{darkgray} "* not a list *"{lightgreen}
+  -> "│ "{darkgray} "* not a list *"{indexed(108)}
 ```
   -> "```"{darkgray}
 after

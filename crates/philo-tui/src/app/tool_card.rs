@@ -1,13 +1,22 @@
 //! Default-mode tool cards as a generic `FrontendToolDisplay` projection.
 //!
+//! Cards are sequences of `Tool` cells whose [`Tone`] carries the paint
+//! structure (design §3.3): a `Title` header opens the card, `Detail` rows
+//! carry the `↳` details, `Failure` marks the red failure row, and diff
+//! bodies use `DiffDel`/`DiffIns` so the shell washes their background.
+//! The TUI holds zero tool knowledge — everything comes from the frozen
+//! facts vocabulary (`title` / repeatable `subject` / `count` / `result` /
+//! `body`) supplied by tools-std.
+//!
 //! Session replay keeps the older `ok · {content}` summary in `session.rs`.
-//! Live default cards read frozen facts (`verb`, `subject`, `body`, counts)
-//! and never dump `FrontendToolResult` content.
+//! Verbose mode keeps its structure (full args, model-facing result,
+//! detail/facts) and only swaps tokens.
 
 use philo_agent_service::{FrontendToolDisplay, FrontendToolResult};
 
 use super::text;
-use super::transcript::{TranscriptLine, compact_args, preview};
+use super::transcript::{LineKind, Tone, TranscriptLine, compact_args, preview};
+use crate::render::theme::DETAIL;
 
 const CARD_WIDTH: usize = 120;
 const KEY_WIDTH: usize = 40;
@@ -21,20 +30,206 @@ pub(crate) fn default_card(
     result: &FrontendToolResult,
     display: Option<&FrontendToolDisplay>,
 ) -> Vec<TranscriptLine> {
-    let verb = fact(display, "verb").unwrap_or(tool_name);
-    let subject = subject(arguments, display);
-    let counts = counts(result, display);
-    let mut lines = vec![line(text::truncate(
-        &header(verb, subject.as_deref(), &counts),
-        CARD_WIDTH,
-    ))];
+    let title = fact(display, "title").unwrap_or(tool_name);
+    let subjects: Vec<String> = display
+        .map(|display| {
+            display
+                .facts
+                .iter()
+                .filter(|(name, _)| name.as_str() == "subject")
+                .map(|(_, value)| value.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let count = fact(display, "count").filter(|count| !count.is_empty());
+    // Count-bearing headers list their subjects below (`Read 2 files` +
+    // four paths); a subject header already names its target and never
+    // repeats it (`Edit src/app.rs`).
+    let header_used_subject = count.is_none() && !subjects.is_empty();
+    let mut lines = vec![header_line(title, count, &subjects, arguments)];
     if let FrontendToolResult::Error { code, message } = result {
-        lines.push(line(format!("  └ error {code} · {}", preview(message, 80))));
+        lines.push(card_line(
+            format!("  ↳ Failed. {code} · {}", preview(message, 80)),
+            Tone::Failure,
+        ));
         return lines;
     }
-    let extra = push_body(&mut lines, display);
-    push_markers(&mut lines, extra, success_marker(display));
+    if !header_used_subject {
+        push_subjects(&mut lines, &subjects);
+    }
+    if let Some(result) = fact(display, "result") {
+        lines.push(card_line(format!("  ↳ {result}"), Tone::Detail));
+    }
+    let body_kind = fact(display, "body");
+    let extra = push_body(&mut lines, display, body_kind);
+    if let Some(extra) = extra.filter(|_| body_kind != Some("locs")) {
+        lines.push(card_line(format!("  ↳ … +{extra} lines"), Tone::Detail));
+    }
     lines
+}
+
+/// Repeatable subject rows: the first carries the `↳` prefix, continuations
+/// align under it.
+fn push_subjects(lines: &mut Vec<TranscriptLine>, subjects: &[String]) {
+    for (index, subject) in subjects.iter().enumerate() {
+        if index == 0 {
+            lines.push(card_line(format!("  {DETAIL} {subject}"), Tone::Detail));
+        } else {
+            lines.push(card_line(format!("    {subject}"), Tone::Detail));
+        }
+    }
+}
+
+/// `{title} {count}`, else `{title} {subject}`, else the bare display name.
+/// Without facts the primary argument key stands in for the subject so even
+/// undisplayed failures anchor to their target.
+fn header_line(
+    title: &str,
+    count: Option<&str>,
+    subjects: &[String],
+    arguments: &str,
+) -> TranscriptLine {
+    let rest = match count {
+        Some(count) => Some(count.to_owned()),
+        None => match subjects.first() {
+            Some(subject) => Some(preview(subject, KEY_WIDTH)),
+            None => primary_key(arguments),
+        },
+    };
+    let text = match rest {
+        Some(rest) if !rest.is_empty() => format!("{title} {rest}"),
+        _ => title.to_owned(),
+    };
+    card_line(text::truncate(&text, CARD_WIDTH), Tone::Title)
+}
+
+fn push_body(
+    lines: &mut Vec<TranscriptLine>,
+    display: Option<&FrontendToolDisplay>,
+    body_kind: Option<&str>,
+) -> Option<usize> {
+    let display = display?;
+    let rows = match body_kind {
+        Some("diff") => diff_rows(&display.detail),
+        Some("output") => indented_rows(&display.detail, BODY_LINES),
+        Some("locs") => indented_rows(&display.detail, LOCS_LINES),
+        _ => return None,
+    };
+    let extra = rows.extra;
+    if !rows.lines.is_empty() {
+        // One blank row between the details and the body (design §3.3).
+        lines.push(card_line("", Tone::Plain));
+        lines.extend(rows.lines);
+    }
+    extra
+}
+
+struct BodyRows {
+    lines: Vec<TranscriptLine>,
+    /// Hidden rows beyond the cap, reported by the `… +N lines` footer.
+    extra: Option<usize>,
+}
+
+/// Diff body with a right-aligned line-number gutter: deletions carry their
+/// old number, insertions and context their new one, both derived from the
+/// unified hunk header (`@@ -a,b +a,c @@`). Write-style `+` blocks have no
+/// header and number from 1. The header itself never renders.
+fn diff_rows(source: &str) -> BodyRows {
+    let mut state: Option<(usize, usize)> = None;
+    let rendered: Vec<TranscriptLine> = source
+        .lines()
+        .filter_map(|row| numbered_diff_row(row, &mut state))
+        .map(|(tone, number, content)| {
+            card_line(format!("    {} | {content}", number.unwrap_or(0)), tone)
+        })
+        .collect();
+    finish(rendered, BODY_LINES)
+}
+
+/// Classifies one hunk row against the rolling `(old_next, new_next)`
+/// counters seeded by the hunk header: `-` consumes an old line (shown),
+/// `+` consumes a new line (shown), context consumes both (new shown).
+fn numbered_diff_row(
+    row: &str,
+    state: &mut Option<(usize, usize)>,
+) -> Option<(Tone, Option<usize>, String)> {
+    if let Some((old_start, new_start)) = parse_hunk_header(row) {
+        *state = Some((old_start, new_start));
+        return None;
+    }
+    let (deletes, inserts, content) = match row.chars().next() {
+        Some('-') => (true, false, &row[1..]),
+        Some('+') => (false, true, &row[1..]),
+        Some(' ') => (false, false, &row[1..]),
+        _ => (false, false, row),
+    };
+    let counters = state.get_or_insert((1, 1));
+    match (deletes, inserts) {
+        // Deletion: consumes an old line, shown with its old number.
+        (true, false) => {
+            let old_number = counters.0;
+            counters.0 += 1;
+            Some((Tone::DiffDel, Some(old_number), truncate_content(content)))
+        }
+        // Insertion: consumes a new line, shown with its new number.
+        (false, true) => {
+            let new_number = counters.1;
+            counters.1 += 1;
+            Some((Tone::DiffIns, Some(new_number), truncate_content(content)))
+        }
+        // Context: consumes both sides; shows its new number.
+        _ => {
+            counters.0 += 1;
+            let new_number = counters.1;
+            counters.1 += 1;
+            Some((Tone::Plain, Some(new_number), truncate_content(content)))
+        }
+    }
+}
+
+fn truncate_content(content: &str) -> String {
+    text::truncate(content.trim_end(), BODY_COLS)
+}
+
+/// Parses `@@ -a[,b] +c[,d] @@` into `(a, c)`.
+fn parse_hunk_header(row: &str) -> Option<(usize, usize)> {
+    let rest = row.strip_prefix("@@ -")?;
+    let (old_part, rest) = rest.split_once(' ')?;
+    let new_part = rest.strip_prefix('+')?.trim_end();
+    let new_part = new_part.strip_suffix("@@")?.trim_end();
+    let old_start = old_part
+        .split_once(',')
+        .map_or(old_part, |(start, _)| start);
+    let new_start = new_part
+        .split_once(',')
+        .map_or(new_part, |(start, _)| start);
+    Some((old_start.parse().ok()?, new_start.parse().ok()?))
+}
+
+/// Bounded `output` / `locs` body: blank rows drop out, each row indents by
+/// four and truncates horizontally.
+fn indented_rows(source: &str, cap: usize) -> BodyRows {
+    finish(
+        source
+            .lines()
+            .filter(|row| !row.trim().is_empty())
+            .map(|row| {
+                card_line(
+                    format!("    {}", text::truncate(row, BODY_COLS.saturating_sub(4))),
+                    Tone::Plain,
+                )
+            })
+            .collect(),
+        cap,
+    )
+}
+
+fn finish(all: Vec<TranscriptLine>, cap: usize) -> BodyRows {
+    let extra = all.len().checked_sub(cap).filter(|extra| *extra > 0);
+    BodyRows {
+        lines: all.into_iter().take(cap).collect(),
+        extra,
+    }
 }
 
 pub(crate) fn verbose_card(
@@ -46,24 +241,43 @@ pub(crate) fn verbose_card(
     display: Option<&FrontendToolDisplay>,
 ) -> Vec<TranscriptLine> {
     let total = batch_size.max(index + 1);
-    let mut lines = vec![line(format!("▸ {tool_name}  {}/{total}", index + 1))];
+    let mut lines = vec![card_line(
+        format!("{tool_name} {}/{}", index + 1, total),
+        Tone::Title,
+    )];
     if !arguments.trim().is_empty() {
-        lines.push(line(format!("  args  {}", compact_args(arguments))));
+        lines.push(card_line(
+            format!("  args  {}", compact_args(arguments)),
+            Tone::Detail,
+        ));
     }
     match result {
         FrontendToolResult::Success { content } => {
-            lines.push(line("  ok"));
-            lines.extend(content.lines().map(|row| line(format!("  {row}"))));
+            lines.push(card_line("  ok", Tone::Detail));
+            lines.extend(
+                content
+                    .lines()
+                    .map(|row| card_line(format!("  {row}"), Tone::Plain)),
+            );
         }
         FrontendToolResult::Error { code, message } => {
-            lines.push(line(format!("  error {code}")));
-            lines.extend(message.lines().map(|row| line(format!("  {row}"))));
+            lines.push(card_line(format!("  error {code}"), Tone::Failure));
+            lines.extend(
+                message
+                    .lines()
+                    .map(|row| card_line(format!("  {row}"), Tone::Plain)),
+            );
         }
     }
     if let Some(display) = display {
         if !display.detail.is_empty() {
-            lines.push(line("  detail"));
-            lines.extend(display.detail.lines().map(|row| line(format!("    {row}"))));
+            lines.push(card_line("  detail", Tone::Detail));
+            lines.extend(
+                display
+                    .detail
+                    .lines()
+                    .map(|row| card_line(format!("    {row}"), Tone::Plain)),
+            );
         }
         if !display.facts.is_empty() {
             let facts = display
@@ -72,38 +286,18 @@ pub(crate) fn verbose_card(
                 .map(|(name, value)| format!("{name}={value}"))
                 .collect::<Vec<_>>()
                 .join("  ");
-            lines.push(line(format!("  facts  {facts}")));
+            lines.push(card_line(format!("  facts  {facts}"), Tone::Detail));
         }
     }
     lines
 }
 
-fn line(text: impl Into<String>) -> TranscriptLine {
+fn card_line(text: impl Into<String>, tone: Tone) -> TranscriptLine {
     TranscriptLine {
-        kind: super::transcript::LineKind::Tool,
+        kind: LineKind::Tool,
         text: text.into(),
+        tone,
     }
-}
-
-fn header(verb: &str, subject: Option<&str>, counts: &str) -> String {
-    let mut parts = vec![verb];
-    if let Some(subject) = subject.filter(|subject| !subject.is_empty()) {
-        parts.push(subject);
-    }
-    if !counts.is_empty() {
-        parts.push(counts);
-    }
-    format!("• {}", parts.join("  "))
-}
-
-fn subject(arguments: &str, display: Option<&FrontendToolDisplay>) -> Option<String> {
-    if let Some(value) = fact(display, "subject") {
-        let preview = preview(value, KEY_WIDTH);
-        if !preview.is_empty() {
-            return Some(preview);
-        }
-    }
-    primary_key(arguments)
 }
 
 fn primary_key(arguments: &str) -> Option<String> {
@@ -147,122 +341,6 @@ fn fact<'a>(display: Option<&'a FrontendToolDisplay>, name: &str) -> Option<&'a 
         .map(|(_, value)| value.as_str())
 }
 
-fn counts(result: &FrontendToolResult, display: Option<&FrontendToolDisplay>) -> String {
-    if let FrontendToolResult::Error { code, .. } = result {
-        return format!("error {code}");
-    }
-    let mut parts = Vec::new();
-    if let (Some(start), Some(end)) = (fact(display, "start_line"), fact(display, "end_line")) {
-        let mut range = format!("L{start}–L{end}");
-        let shown = fact(display, "lines_shown");
-        let total = fact(display, "lines_total");
-        let truncated = fact(display, "truncated") == Some("true");
-        if let (Some(shown), Some(total)) = (shown, total)
-            && (truncated || shown != total)
-        {
-            range.push_str(&format!(" · {shown} of {total}"));
-        }
-        parts.push(range);
-    }
-    if let Some(n) = fact(display, "entries_total") {
-        parts.push(format!("{n} entries"));
-    }
-    if let Some(n) = fact(display, "matches_total") {
-        parts.push(format!("{n} matches"));
-    }
-    if fact(display, "added").is_some() || fact(display, "removed").is_some() {
-        let added = fact(display, "added").unwrap_or("0");
-        let removed = fact(display, "removed").unwrap_or("0");
-        parts.push(format!("(+{added} -{removed})"));
-    }
-    if let Some(code) = fact(display, "exit_code") {
-        match fact(display, "duration_ms") {
-            Some(ms) => parts.push(format!("exit {code} · {}", format_ms(ms))),
-            None => parts.push(format!("exit {code}")),
-        }
-    }
-    parts.join("  ")
-}
-
-fn push_body(
-    lines: &mut Vec<TranscriptLine>,
-    display: Option<&FrontendToolDisplay>,
-) -> Option<usize> {
-    let display = display?;
-    match fact(Some(display), "body") {
-        Some("diff") => push_capped_body(lines, &display.detail, false),
-        Some("output") => push_capped_body(lines, &display.detail, true),
-        Some("locs") => {
-            push_locs_body(lines, &display.detail);
-            None
-        }
-        _ => None,
-    }
-}
-
-fn push_capped_body(lines: &mut Vec<TranscriptLine>, source: &str, indent: bool) -> Option<usize> {
-    let rows: Vec<&str> = source.lines().collect();
-    if rows.is_empty() || (rows.len() == 1 && rows[0].is_empty()) {
-        return None;
-    }
-    let extra = rows.len().saturating_sub(BODY_LINES);
-    for row in rows.iter().take(BODY_LINES) {
-        lines.push(line(body_row(row, indent)));
-    }
-    (extra > 0).then_some(extra)
-}
-
-fn push_locs_body(lines: &mut Vec<TranscriptLine>, source: &str) {
-    for row in source
-        .lines()
-        .filter(|row| !row.trim().is_empty())
-        .take(LOCS_LINES)
-    {
-        lines.push(line(body_row(row, true)));
-    }
-}
-
-fn body_row(row: &str, indent: bool) -> String {
-    let truncated = text::truncate(row, BODY_COLS);
-    if indent && !truncated.starts_with("  ") {
-        format!("  {truncated}")
-    } else {
-        truncated
-    }
-}
-
-fn success_marker(display: Option<&FrontendToolDisplay>) -> Option<String> {
-    let truncated = fact(display, "truncated") == Some("true");
-    let exit = fact(display, "exit_code");
-    let failed_exit = exit.is_some_and(|value| value != "0");
-    match (truncated, failed_exit, exit) {
-        (true, true, Some(code)) => Some(format!("exit {code} · truncated")),
-        (true, false, _) => Some("truncated".to_owned()),
-        (false, true, Some(code)) => Some(format!("exit {code}")),
-        _ => None,
-    }
-}
-
-fn push_markers(lines: &mut Vec<TranscriptLine>, extra: Option<usize>, marker: Option<String>) {
-    match (extra, marker) {
-        (Some(n), Some(marker)) => lines.push(line(format!("  └ … +{n} lines · {marker}"))),
-        (Some(n), None) => lines.push(line(format!("  └ … +{n} lines"))),
-        (None, Some(marker)) => lines.push(line(format!("  └ {marker}"))),
-        (None, None) => {}
-    }
-}
-
-fn format_ms(ms: &str) -> String {
-    let Ok(value) = ms.parse::<u64>() else {
-        return format!("{ms}ms");
-    };
-    if value >= 1000 {
-        format!("{:.1}s", value as f64 / 1000.0)
-    } else {
-        format!("{value}ms")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use philo_agent_service::{FrontendToolDisplay, FrontendToolResult};
@@ -271,6 +349,10 @@ mod tests {
 
     fn texts(lines: &[TranscriptLine]) -> Vec<&str> {
         lines.iter().map(|line| line.text.as_str()).collect()
+    }
+
+    fn tones(lines: &[TranscriptLine]) -> Vec<Tone> {
+        lines.iter().map(|line| line.tone).collect()
     }
 
     fn display(detail: impl Into<String>, facts: &[(&str, &str)]) -> FrontendToolDisplay {
@@ -297,62 +379,160 @@ mod tests {
     }
 
     #[test]
-    fn read_with_body_none_is_header_only() {
-        let display = display(
-            "fn main() {}",
+    fn read_card_counts_files_and_lists_subjects() {
+        let read = display(
+            "",
             &[
+                ("title", "Read"),
                 ("verb", "Read"),
-                ("subject", "src/main.rs"),
                 ("body", "none"),
-                ("start_line", "1"),
-                ("end_line", "40"),
+                ("subject", "src/routes/users.ts"),
+                ("subject", "src/routes/users.test.ts"),
+                ("count", "2 files"),
             ],
         );
         let lines = default_card(
             "read",
-            r#"{"path":"src/main.rs"}"#,
-            &success("1| fn main() {}"),
-            Some(&display),
+            r#"{"paths":["src/routes/users.ts"]}"#,
+            &success("contents"),
+            Some(&read),
         );
-        assert_eq!(texts(&lines), ["• Read  src/main.rs  L1–L40"]);
-        assert!(lines.iter().all(|line| !line.text.contains("fn main")));
+        assert_eq!(
+            texts(&lines),
+            [
+                "Read 2 files",
+                "  ↳ src/routes/users.ts",
+                "    src/routes/users.test.ts"
+            ]
+        );
+        assert_eq!(tones(&lines), [Tone::Title, Tone::Detail, Tone::Detail]);
+        assert!(lines.iter().all(|line| !line.text.contains("contents")));
     }
 
     #[test]
-    fn edit_diff_shows_plus_and_minus_lines() {
-        let edit = display(
-            "-foo\n+bar",
+    fn grep_card_keeps_pattern_detail_and_stays_silent_about_the_dump() {
+        let locs = (1..=8)
+            .map(|i| format!("src/lib.rs:{i}: hit {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let grep = display(
+            locs,
             &[
+                ("title", "Grep"),
+                ("verb", "Searched"),
+                ("body", "locs"),
+                ("subject", "\"hit\""),
+                ("count", "1 search"),
+                ("matches_total", "8"),
+            ],
+        );
+        let lines = default_card(
+            "grep",
+            r#"{"pattern":"hit","path":"src"}"#,
+            &success("dump of every match for the model"),
+            Some(&grep),
+        );
+        assert_eq!(
+            texts(&lines),
+            [
+                "Grep 1 search",
+                "  ↳ \"hit\"",
+                "",
+                "    src/lib.rs:1: hit 1",
+                "    src/lib.rs:2: hit 2",
+                "    src/lib.rs:3: hit 3",
+                "    src/lib.rs:4: hit 4",
+                "    src/lib.rs:5: hit 5",
+            ]
+        );
+        assert!(tones(&lines)[3] == Tone::Plain);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.text.contains("dump of every match"))
+        );
+        assert!(lines.iter().all(|line| !line.text.contains("hit 8")));
+    }
+
+    #[test]
+    fn list_card_is_header_plus_directory_subject_only() {
+        let list = display(
+            "src/main.rs\nsrc/lib.rs",
+            &[
+                ("title", "List Directory"),
+                ("verb", "Listed"),
+                ("body", "none"),
+                ("subject", "."),
+                ("count", "1 directory"),
+            ],
+        );
+        let lines = default_card(
+            "list",
+            r#"{"path":"."}"#,
+            &success("src/main.rs"),
+            Some(&list),
+        );
+        assert_eq!(texts(&lines), ["List Directory 1 directory", "  ↳ ."]);
+        assert!(lines.iter().all(|line| !line.text.contains("src/main.rs")));
+    }
+
+    #[test]
+    fn edit_card_renders_result_row_and_numbered_gutter() {
+        let detail = "@@ -6,3 +6,3 @@\n-const limit = page * 10;\n+const limit = Math.min(page * 10, 50);\n+const offset = page * limit;\n return paginate(page);";
+        let edit = display(
+            detail,
+            &[
+                ("title", "Edit"),
                 ("verb", "Edited"),
-                ("subject", "src/lib.rs"),
                 ("body", "diff"),
-                ("added", "1"),
-                ("removed", "1"),
+                ("subject", "src/routes/users.ts"),
+                ("result", "Succeeded. File edited.  (+2 added, -1 removed)"),
             ],
         );
         let lines = default_card(
             "edit",
-            r#"{"path":"src/lib.rs"}"#,
-            &success("replaced src/lib.rs (12 → 34 bytes)"),
+            r#"{"path":"src/routes/users.ts"}"#,
+            &success("replaced src/routes/users.ts"),
             Some(&edit),
         );
         assert_eq!(
             texts(&lines),
-            ["• Edited  src/lib.rs  (+1 -1)", "-foo", "+bar"]
+            [
+                "Edit src/routes/users.ts",
+                "  ↳ Succeeded. File edited.  (+2 added, -1 removed)",
+                "",
+                "    6 | const limit = page * 10;",
+                "    6 | const limit = Math.min(page * 10, 50);",
+                "    7 | const offset = page * limit;",
+                "    8 | return paginate(page);",
+            ]
         );
+        assert_eq!(
+            tones(&lines),
+            [
+                Tone::Title,
+                Tone::Detail,
+                Tone::Plain,
+                Tone::DiffDel,
+                Tone::DiffIns,
+                Tone::DiffIns,
+                Tone::Plain,
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.text.contains("@@")));
         assert!(lines.iter().all(|line| !line.text.contains("replaced src")));
     }
 
     #[test]
-    fn write_diff_shows_added_lines_not_model_confirmation() {
+    fn write_cards_number_plus_lines_from_one_without_a_header() {
         let write = display(
             "+hello\n+world",
             &[
+                ("title", "Write"),
                 ("verb", "Added"),
-                ("subject", "src/a.rs"),
                 ("body", "diff"),
-                ("added", "2"),
-                ("removed", "0"),
+                ("subject", "src/a.rs"),
+                ("result", "Succeeded. File created.  (+2 added)"),
             ],
         );
         let lines = default_card(
@@ -363,103 +543,66 @@ mod tests {
         );
         assert_eq!(
             texts(&lines),
-            ["• Added  src/a.rs  (+2 -0)", "+hello", "+world"]
-        );
-        assert!(lines.iter().all(|line| !line.text.contains("wrote src")));
-    }
-
-    #[test]
-    fn grep_locs_are_capped_and_ignore_model_dump() {
-        let locs = (1..=8)
-            .map(|i| format!("src/lib.rs:{i}: hit {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let display = display(
-            locs,
-            &[
-                ("verb", "Searched"),
-                ("subject", "'hit' in src"),
-                ("body", "locs"),
-                ("matches_total", "8"),
-            ],
-        );
-        let lines = default_card(
-            "grep",
-            r#"{"pattern":"hit","path":"src"}"#,
-            &success("dump of every match for the model"),
-            Some(&display),
-        );
-        assert_eq!(
-            texts(&lines),
             [
-                "• Searched  'hit' in src  8 matches",
-                "  src/lib.rs:1: hit 1",
-                "  src/lib.rs:2: hit 2",
-                "  src/lib.rs:3: hit 3",
-                "  src/lib.rs:4: hit 4",
-                "  src/lib.rs:5: hit 5",
+                "Write src/a.rs",
+                "  ↳ Succeeded. File created.  (+2 added)",
+                "",
+                "    1 | hello",
+                "    2 | world",
             ]
         );
-        assert!(
-            lines
-                .iter()
-                .all(|line| !line.text.contains("dump of every match"))
+        assert_eq!(
+            tones(&lines),
+            [
+                Tone::Title,
+                Tone::Detail,
+                Tone::Plain,
+                Tone::DiffIns,
+                Tone::DiffIns,
+            ]
         );
-        assert!(lines.iter().all(|line| !line.text.contains("hit 8")));
     }
 
     #[test]
-    fn list_with_body_none_is_header_only() {
-        let display = display(
-            "src/main.rs\nsrc/lib.rs",
-            &[
-                ("verb", "Listed"),
-                ("subject", "."),
-                ("body", "none"),
-                ("entries_total", "8"),
-            ],
-        );
-        let lines = default_card(
-            "list",
-            r#"{"path":"."}"#,
-            &success("src/main.rs\nsrc/lib.rs"),
-            Some(&display),
-        );
-        assert_eq!(texts(&lines), ["• Listed  .  8 entries"]);
-        assert!(lines.iter().all(|line| !line.text.contains("src/main.rs")));
-    }
-
-    #[test]
-    fn shell_output_is_indented_and_nonzero_exit_keeps_a_footer() {
-        let ok = display(
+    fn run_card_reports_exit_and_duration_with_bounded_output() {
+        let run = display(
             "ok\npassed",
             &[
+                ("title", "Run"),
                 ("verb", "Ran"),
-                ("subject", "cargo test"),
                 ("body", "output"),
-                ("exit_code", "0"),
-                ("duration_ms", "1200"),
+                ("subject", "pnpm test"),
+                ("count", "1 command"),
+                ("result", "exit 0 · 4.2s"),
             ],
         );
         let lines = default_card(
             "shell",
-            r#"{"command":"cargo test"}"#,
+            r#"{"command":"pnpm test"}"#,
             &success("exit_code: 0\nok"),
-            Some(&ok),
+            Some(&run),
         );
         assert_eq!(
             texts(&lines),
-            ["• Ran  cargo test  exit 0 · 1.2s", "  ok", "  passed"]
+            [
+                "Run 1 command",
+                "  ↳ pnpm test",
+                "  ↳ exit 0 · 4.2s",
+                "",
+                "    ok",
+                "    passed",
+            ]
         );
 
         let failed = display(
             "boom",
             &[
+                ("title", "Run"),
                 ("verb", "Ran"),
-                ("subject", "cargo test"),
                 ("body", "output"),
-                ("exit_code", "1"),
-                ("duration_ms", "1200"),
+                ("subject", "cargo test"),
+                ("count", "1 command"),
+                ("result", "exit 1 · 1.2s"),
             ],
         );
         let lines = default_card(
@@ -470,41 +613,47 @@ mod tests {
         );
         assert_eq!(
             texts(&lines),
-            ["• Ran  cargo test  exit 1 · 1.2s", "  boom", "  └ exit 1",]
+            [
+                "Run 1 command",
+                "  ↳ cargo test",
+                "  ↳ exit 1 · 1.2s",
+                "",
+                "    boom",
+            ]
         );
         assert!(lines.iter().all(|line| !line.text.contains("bloom")));
     }
 
     #[test]
-    fn error_is_two_lines() {
-        let error = default_card(
+    fn failure_keeps_the_header_shape_and_adds_a_red_row() {
+        let lines = default_card(
             "edit",
             r#"{"path":"src/lib.rs"}"#,
             &error("not_unique", "3 matches"),
             None,
         );
         assert_eq!(
-            texts(&error),
-            [
-                "• edit  src/lib.rs  error not_unique",
-                "  └ error not_unique · 3 matches",
-            ]
+            texts(&lines),
+            ["edit src/lib.rs", "  ↳ Failed. not_unique · 3 matches"]
         );
+        assert_eq!(tones(&lines), [Tone::Title, Tone::Failure]);
     }
 
     #[test]
-    fn output_body_is_capped_at_sixteen_lines() {
+    fn output_body_caps_at_sixteen_lines_with_a_footer() {
         let detail = (1..=20)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let display = display(
+        let run = display(
             detail,
             &[
+                ("title", "Run"),
                 ("verb", "Ran"),
-                ("subject", "seq"),
                 ("body", "output"),
-                ("exit_code", "0"),
+                ("subject", "seq"),
+                ("count", "1 command"),
+                ("result", "exit 0"),
                 ("truncated", "true"),
             ],
         );
@@ -512,31 +661,88 @@ mod tests {
             "shell",
             r#"{"command":"seq"}"#,
             &success("model dump 20"),
-            Some(&display),
+            Some(&run),
         );
-        assert_eq!(lines[0].text, "• Ran  seq  exit 0");
-        assert_eq!(lines[1].text, "  line 1");
-        assert_eq!(lines[16].text, "  line 16");
-        assert_eq!(lines[17].text, "  └ … +4 lines · truncated");
-        assert_eq!(lines.len(), 18);
+        assert_eq!(lines[0].text, "Run 1 command");
+        assert_eq!(lines[4].text, "    line 1");
+        assert_eq!(lines[19].text, "    line 16");
+        assert_eq!(lines[20].text, "  ↳ … +4 lines");
+        assert_eq!(lines.len(), 21);
+        assert!(tones(&lines)[20] == Tone::Detail);
         assert!(lines.iter().all(|line| !line.text.contains("line 20")));
         assert!(lines.iter().all(|line| !line.text.contains("model dump")));
     }
 
     #[test]
     fn missing_body_fact_never_dumps_display_detail() {
-        let display = display("read completed\nfull display detail", &[("bytes", "840")]);
+        let read = display("read completed\nfull display detail", &[("bytes", "840")]);
         let lines = default_card(
             "read_file",
             r#"{"path":"src/main.rs"}"#,
             &success("fn main() {}"),
-            Some(&display),
+            Some(&read),
         );
-        assert_eq!(texts(&lines), ["• read_file  src/main.rs"]);
+        assert_eq!(texts(&lines), ["read_file src/main.rs"]);
         assert!(
             lines
                 .iter()
                 .all(|line| !line.text.contains("full display detail"))
+        );
+    }
+
+    #[test]
+    fn missing_title_falls_back_to_the_tool_name() {
+        let read = display(
+            "",
+            &[
+                ("body", "none"),
+                ("subject", "src/main.rs"),
+                ("count", "1 file"),
+            ],
+        );
+        let lines = default_card(
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+            &success(""),
+            Some(&read),
+        );
+        assert_eq!(texts(&lines), ["read_file 1 file", "  ↳ src/main.rs"]);
+    }
+
+    #[test]
+    fn verbose_card_keeps_its_structure_with_new_tokens() {
+        let verbose = display("read 12 bytes", &[("bytes", "12")]);
+        let lines = verbose_card(
+            "read_file",
+            0,
+            2,
+            r#"{"path":"src/main.rs"}"#,
+            &success("fn main() {}"),
+            Some(&verbose),
+        );
+        assert_eq!(
+            texts(&lines),
+            [
+                "read_file 1/2",
+                "  args  path: src/main.rs",
+                "  ok",
+                "  fn main() {}",
+                "  detail",
+                "    read 12 bytes",
+                "  facts  bytes=12",
+            ]
+        );
+        assert_eq!(
+            tones(&lines),
+            [
+                Tone::Title,
+                Tone::Detail,
+                Tone::Detail,
+                Tone::Plain,
+                Tone::Detail,
+                Tone::Plain,
+                Tone::Detail,
+            ]
         );
     }
 }

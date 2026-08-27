@@ -1,17 +1,17 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
-assertion_line: 488
+assertion_line: 880
 expression: rendered
 ---
 
 
 
-
-
-> /sessions  pick a session to continue
-  /status    session, model, usage and the tool lineup
-
-
-    › /s
-
-gpt-test · session-中 文
+   ╭────────────────────────────────────────────────────────────────────────╮
+   │ › /sessions  pick a session to continue                                │
+   │   /status    session, model, usage and the tool lineup                 │
+   ╰────────────────────────────────────────────────────────────────────────╯
+                                                                    gpt-test
+   ▌
+   ▌ /s
+   ▌
+                                                             ↑- ↓- R- C- -/-

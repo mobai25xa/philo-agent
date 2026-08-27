@@ -1,41 +1,37 @@
 //! Semantic transcript lines mapped to Ratatui styles.
+//!
+//! The pre-redesign glyph family (`▸` tool headers, `•` verb bullets,
+//! `│` think gutter, `└` detail rows) is gone: tool cards carry their
+//! structure as [`Tone`]s (M5), user strips and answers render bare
+//! (M4), and think bodies hang from a `│ ` gutter that lives only in
+//! wrap/paint.
 
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use crate::app::transcript::{LineKind, TranscriptLine};
+use crate::app::transcript::{LineKind, Tone, TranscriptLine};
 
-use super::theme;
+use super::theme::{self, DETAIL};
 
 pub(crate) fn styled_line(line: &TranscriptLine) -> Line<'static> {
     match line.kind {
         LineKind::User => user_line(&line.text),
         LineKind::Reasoning => reasoning_line(&line.text),
-        LineKind::Tool => tool_line(&line.text),
-        LineKind::Answer => Line::styled(line.text.clone(), theme::answer()),
+        LineKind::Tool => tool_line(line),
+        LineKind::Answer => Line::styled(line.text.clone(), theme::primary()),
         LineKind::Notice => Line::styled(line.text.clone(), theme::notice()),
         LineKind::Error => Line::styled(line.text.clone(), theme::error()),
         LineKind::Meta => Line::styled(line.text.clone(), theme::meta()),
     }
 }
 
+/// User strip rows carry no prefix and no own background here: the frame
+/// pre-paints the full-width surface band and the accent bar under them.
 fn user_line(text: &str) -> Line<'static> {
     if text.is_empty() {
-        return Line::from("").style(theme::user_band());
+        return Line::from("");
     }
-    if let Some(rest) = text.strip_prefix("› ") {
-        return Line::from(vec![
-            Span::styled("› ".to_owned(), theme::user_gutter()),
-            Span::styled(rest.to_owned(), theme::user()),
-        ]);
-    }
-    if let Some(rest) = text.strip_prefix("  ") {
-        return Line::from(vec![
-            Span::styled("  ".to_owned(), theme::user_band()),
-            Span::styled(rest.to_owned(), theme::user()),
-        ]);
-    }
-    Line::styled(text.to_owned(), theme::user())
+    Line::styled(text.to_owned(), theme::primary())
 }
 
 fn reasoning_line(text: &str) -> Line<'static> {
@@ -55,125 +51,76 @@ fn reasoning_line(text: &str) -> Line<'static> {
     ])
 }
 
-fn tool_line(text: &str) -> Line<'static> {
-    if let Some(rest) = text.strip_prefix("• ") {
-        return default_tool_header(rest);
+/// Tool cards paint by tone: the header's leading display name is accent
+/// bold, `↳` details are meta, failures red, diff rows carry their wash
+/// style for the history layer to fill across the content column.
+fn tool_line(line: &TranscriptLine) -> Line<'static> {
+    match line.tone {
+        Tone::Title => title_line(&line.text),
+        Tone::Detail => detail_line(&line.text),
+        Tone::Failure => Line::styled(line.text.clone(), theme::err()),
+        Tone::DiffDel => Line::styled(line.text.clone(), theme::diff_del()),
+        Tone::DiffIns => Line::styled(line.text.clone(), theme::diff_add()),
+        Tone::Plain => plain_tool_line(&line.text),
     }
-    if let Some(rest) = text.strip_prefix("▸ ") {
-        let (name, detail) = rest
-            .split_once("  ")
-            .map(|(name, detail)| (name, Some(detail)))
-            .unwrap_or((rest, None));
-        let mut spans = vec![
-            Span::styled("▸ ", theme::tool()),
-            Span::styled(name.to_owned(), theme::tool().add_modifier(Modifier::BOLD)),
-        ];
-        if let Some(detail) = detail {
-            let style = if detail.contains("error") {
-                theme::tool_err()
-            } else if detail.starts_with("ok")
-                || detail.contains("lines")
-                || detail.contains("matches")
-                || detail.contains("entries")
-                || detail.contains("exit 0")
-                || detail.contains("replaced")
-                || detail.contains("created")
-                || detail.contains("overwrote")
-                || detail.contains("wrote")
-            {
-                theme::tool_ok()
-            } else {
-                theme::meta()
-            };
-            spans.push(Span::styled(format!("  {detail}"), style));
-        }
-        return Line::from(spans);
-    }
-    if let Some(rest) = text.strip_prefix("  └ ") {
-        let style = if rest.contains("error") || rest.starts_with("exit ") {
-            theme::tool_err()
-        } else {
-            theme::meta()
-        };
-        return Line::from(vec![
-            Span::styled("  └ ", theme::meta()),
-            Span::styled(rest.to_owned(), style),
-        ]);
-    }
-    if let Some(rest) = text.strip_prefix('-') {
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        return Line::from(vec![
-            Span::styled("- ".to_owned(), theme::diff_del()),
-            Span::styled(rest.to_owned(), theme::diff_del()),
-        ]);
-    }
-    if let Some(rest) = text.strip_prefix('+') {
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        return Line::from(vec![
-            Span::styled("+ ".to_owned(), theme::diff_add()),
-            Span::styled(rest.to_owned(), theme::diff_add()),
-        ]);
-    }
-    if let Some(rest) = text.strip_prefix("  ") {
-        return Line::from(vec![
-            Span::styled("  ".to_owned(), theme::meta()),
-            Span::styled(rest.to_owned(), theme::meta()),
-        ]);
-    }
-    Line::styled(text.to_owned(), theme::tool())
 }
 
-fn default_tool_header(rest: &str) -> Line<'static> {
-    let (verb, detail) = rest
-        .split_once("  ")
-        .map(|(verb, detail)| (verb, Some(detail)))
-        .unwrap_or((rest, None));
+/// `{title} {rest}` with the display name accent bold; wrapped continuation
+/// rows fall back to plain default foreground.
+fn title_line(text: &str) -> Line<'static> {
+    let Some((title, rest)) = text.split_once(' ') else {
+        return Line::styled(
+            text.to_owned(),
+            theme::accent().add_modifier(Modifier::BOLD),
+        );
+    };
+    if rest.is_empty() {
+        return Line::from(vec![
+            Span::styled(
+                title.to_owned(),
+                theme::accent().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ".to_owned(), theme::primary()),
+        ]);
+    }
+    Line::from(vec![
+        Span::styled(
+            title.to_owned(),
+            theme::accent().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {rest}"), theme::primary()),
+    ])
+}
+
+fn detail_line(text: &str) -> Line<'static> {
+    let Some(rest) = text.trim_start().strip_prefix(DETAIL) else {
+        return Line::styled(text.to_owned(), theme::meta());
+    };
+    let indent_len = text.len() - text.trim_start().len();
+    let indent = &text[..indent_len];
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
     let mut spans = vec![
-        Span::styled("• ".to_owned(), theme::tool()),
-        Span::styled(verb.to_owned(), theme::tool().add_modifier(Modifier::BOLD)),
+        Span::styled(indent.to_owned(), theme::meta()),
+        Span::styled(format!("{DETAIL} "), theme::meta()),
     ];
-    if let Some(detail) = detail {
-        spans.extend(header_rest_spans(detail));
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_owned(), theme::meta()));
     }
     Line::from(spans)
 }
 
-fn header_rest_spans(rest: &str) -> Vec<Span<'static>> {
-    if rest.contains("error") {
-        return vec![Span::styled(format!("  {rest}"), theme::tool_err())];
+/// Card body rows (output / locs / context lines) read as normal content.
+fn plain_tool_line(text: &str) -> Line<'static> {
+    if text.is_empty() {
+        return Line::from("");
     }
-    let mut spans = vec![Span::styled("  ".to_owned(), theme::meta())];
-    if let Some(open) = rest.find("(+")
-        && let Some(rel_close) = rest[open..].find(')')
-    {
-        let close = open + rel_close;
-        let before = &rest[..open];
-        let inner = &rest[open + 1..close];
-        let after = &rest[close + 1..];
-        if !before.is_empty() {
-            spans.push(Span::styled(before.to_owned(), theme::meta()));
-        }
-        spans.push(Span::styled("(".to_owned(), theme::meta()));
-        if let Some((added, removed)) = inner.split_once(' ') {
-            spans.push(Span::styled(added.to_owned(), theme::diff_add()));
-            spans.push(Span::styled(" ".to_owned(), theme::meta()));
-            spans.push(Span::styled(removed.to_owned(), theme::diff_del()));
-        } else {
-            spans.push(Span::styled(inner.to_owned(), theme::meta()));
-        }
-        spans.push(Span::styled(")".to_owned(), theme::meta()));
-        if !after.is_empty() {
-            spans.push(Span::styled(after.to_owned(), theme::meta()));
-        }
-        return spans;
-    }
-    spans.push(Span::styled(rest.to_owned(), theme::meta()));
-    spans
+    Line::styled(text.to_owned(), theme::primary())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::transcript::line;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -182,40 +129,86 @@ mod tests {
             .collect()
     }
 
+    fn toned(kind: LineKind, text: &str, tone: Tone) -> TranscriptLine {
+        TranscriptLine {
+            kind,
+            text: text.to_owned(),
+            tone,
+        }
+    }
+
     #[test]
     fn think_block_paints_bar_on_body_not_header() {
-        let header = styled_line(&TranscriptLine {
-            kind: LineKind::Reasoning,
-            text: "think".to_owned(),
-        });
+        let header = styled_line(&line(LineKind::Reasoning, "think"));
         assert_eq!(line_text(&header), "think");
         assert!(!line_text(&header).contains('│'));
 
-        let body = styled_line(&TranscriptLine {
-            kind: LineKind::Reasoning,
-            text: "  hello".to_owned(),
-        });
+        let body = styled_line(&line(LineKind::Reasoning, "  hello"));
         assert_eq!(line_text(&body), "│ hello");
 
-        let wrapped = styled_line(&TranscriptLine {
-            kind: LineKind::Reasoning,
-            text: "│ more".to_owned(),
-        });
+        let wrapped = styled_line(&line(LineKind::Reasoning, "│ more"));
         assert_eq!(line_text(&wrapped), "│ more");
 
-        let answer = styled_line(&TranscriptLine {
-            kind: LineKind::Answer,
-            text: "• the actual answer".to_owned(),
-        });
+        let answer = styled_line(&line(LineKind::Answer, "• the actual answer"));
         assert!(line_text(&answer).starts_with("• "));
         assert!(!line_text(&answer).contains('│'));
     }
 
     #[test]
-    fn tool_diff_paints_a_two_cell_gutter_without_doubling() {
-        assert_eq!(line_text(&tool_line("+bar")), "+ bar");
-        assert_eq!(line_text(&tool_line("+ bar")), "+ bar");
-        assert_eq!(line_text(&tool_line("-old")), "- old");
-        assert_eq!(line_text(&tool_line("- old")), "- old");
+    fn card_headers_accent_the_display_name_only() {
+        let spans = styled_line(&toned(LineKind::Tool, "Grep 1 search", Tone::Title)).spans;
+        assert_eq!(spans[0].style, theme::accent().add_modifier(Modifier::BOLD));
+        assert_eq!(spans[0].content.as_ref(), "Grep");
+        assert_eq!(spans[1].content.as_ref(), " 1 search");
+
+        let bare = styled_line(&toned(LineKind::Tool, "read_file", Tone::Title));
+        assert_eq!(line_text(&bare), "read_file");
+        assert_eq!(bare.style, theme::accent().add_modifier(Modifier::BOLD));
+    }
+
+    #[test]
+    fn detail_rows_and_failures_wear_their_tones() {
+        let detail = styled_line(&toned(LineKind::Tool, "  ↳ pnpm test", Tone::Detail));
+        assert_eq!(line_text(&detail), "  ↳ pnpm test");
+        assert_eq!(detail.spans[0].style, theme::meta());
+
+        let failure = styled_line(&toned(
+            LineKind::Tool,
+            "  ↳ Failed. not_unique · 3 matches",
+            Tone::Failure,
+        ));
+        assert_eq!(failure.style, theme::err());
+    }
+
+    #[test]
+    fn diff_rows_carry_their_wash_styles() {
+        let del = styled_line(&toned(
+            LineKind::Tool,
+            "    6 | const limit = page * 10;",
+            Tone::DiffDel,
+        ));
+        assert_eq!(del.style, theme::diff_del());
+
+        let ins = styled_line(&toned(
+            LineKind::Tool,
+            "    7 | const offset = page * limit;",
+            Tone::DiffIns,
+        ));
+        assert_eq!(ins.style, theme::diff_add());
+
+        let context = styled_line(&toned(
+            LineKind::Tool,
+            "    8 | return paginate(page);",
+            Tone::Plain,
+        ));
+        assert_ne!(context.style, theme::diff_add());
+        assert_ne!(context.style, theme::diff_del());
+    }
+
+    #[test]
+    fn session_summaries_stay_plain_tool_rows() {
+        let summary = styled_line(&line(LineKind::Tool, "ok · fn main() {}"));
+        assert_eq!(summary.style, theme::primary());
+        assert!(!line_text(&summary).contains('↳'));
     }
 }

@@ -116,6 +116,9 @@ fn list_truncates_with_a_marker_and_reports_totals() {
         "marker tells the model how to see more: {content}"
     );
     let display = result.display().expect("display present");
+    assert_eq!(fact(display, "title"), "List Directory");
+    assert_eq!(fact(display, "subject"), ".");
+    assert_eq!(fact(display, "count"), "1 directory");
     assert!(
         display
             .facts()
@@ -294,6 +297,9 @@ fn grep_skips_binaries_reports_no_matches_and_truncates() {
     );
     assert_eq!(fact(display, "matches_total"), "2");
     assert_eq!(fact(display, "limit_reached"), "true");
+    assert_eq!(fact(display, "title"), "Grep");
+    assert_eq!(fact(display, "count"), "1 search");
+    assert_eq!(fact(display, "subject"), "\"needle\"");
     assert_eq!(fact(display, "verb"), "Searched");
     assert_eq!(fact(display, "body"), "locs");
 }
@@ -389,6 +395,12 @@ fn write_creates_with_parents_and_reports_overwrites() {
         "display carries plus-prefixed written lines"
     );
     assert!(!display.detail().contains("wrote "));
+    assert_eq!(fact(display, "title"), "Write");
+    assert_eq!(fact(display, "subject"), "new/dir/file.txt");
+    assert_eq!(
+        fact(display, "result"),
+        "Succeeded. File overwritten.  (+1 added)"
+    );
     assert_eq!(fact(display, "verb"), "Wrote");
     assert_eq!(fact(display, "body"), "diff");
 }
@@ -455,6 +467,12 @@ fn edit_replaces_exactly_one_occurrence() {
         display.detail().contains("call(old_value);"),
         "hunk includes file context: {}",
         display.detail()
+    );
+    assert_eq!(fact(display, "title"), "Edit");
+    assert_eq!(fact(display, "subject"), "code.rs");
+    assert_eq!(
+        fact(display, "result"),
+        "Succeeded. File edited.  (+1 added, -1 removed)"
     );
     assert_eq!(fact(display, "verb"), "Edited");
     assert_eq!(fact(display, "body"), "diff");
@@ -570,6 +588,14 @@ fn shell_reports_exit_code_zero_with_output() {
     assert!(content.starts_with("exit_code: 0\n"), "{content}");
     assert!(content.contains("shell-probe"));
     let display = result.display().expect("display present");
+    assert_eq!(fact(display, "title"), "Run");
+    assert_eq!(fact(display, "subject"), "echo shell-probe");
+    assert_eq!(fact(display, "count"), "1 command");
+    let result_phrase = fact(display, "result");
+    assert!(
+        result_phrase.starts_with("exit 0 · "),
+        "shell result names the exit code: {result_phrase}"
+    );
     assert!(
         display
             .facts()
@@ -623,6 +649,13 @@ fn shell_timeout_is_a_business_error_with_display() {
     assert!(
         result.display().is_some(),
         "timeout may carry display facts"
+    );
+    let display = result.display().expect("timeout carries display");
+    assert_eq!(fact(display, "title"), "Run");
+    assert_eq!(fact(display, "count"), "1 command");
+    assert!(
+        !display.facts().iter().any(|f| f.name() == "result"),
+        "timeout emits no result phrase; the error channel reports it"
     );
 }
 

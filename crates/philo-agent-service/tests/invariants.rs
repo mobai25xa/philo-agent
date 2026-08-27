@@ -395,7 +395,8 @@ async fn generation_install_failure_keeps_previous() {
 
     let request_id = match client.try_command(FrontendCommand::InstallModel {
         name: "broken".into(),
-    }) {
+        effort: None,
+        }) {
         CommandDispatch::Enqueued(id) => id,
         other => panic!("{other:?}"),
     };
@@ -427,10 +428,12 @@ async fn stale_install_success_does_not_overwrite_newer_generation() {
 
     let slow = client.try_command(FrontendCommand::InstallModel {
         name: "slow".into(),
-    });
+        effort: None,
+        });
     let fast = client.try_command(FrontendCommand::InstallModel {
         name: "fast".into(),
-    });
+        effort: None,
+        });
     assert!(matches!(slow, CommandDispatch::Enqueued(_)));
     assert!(matches!(fast, CommandDispatch::Enqueued(_)));
 

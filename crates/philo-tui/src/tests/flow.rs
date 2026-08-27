@@ -83,7 +83,7 @@ fn frontend_complete_interaction_snapshot() {
     }
     output.push(format!(
         "overlay:\n{}",
-        app.overlay_frame(5).expect("picker").to_text()
+        app.overlay_frame(12).expect("picker").to_text()
     ));
     for effect in app.on_action(Action::MoveDown) {
         if let Effect::Host(crate::app::effect::HostRequest::LoadPreview(id)) = effect {
@@ -121,7 +121,7 @@ fn frontend_complete_interaction_snapshot() {
     );
     output.push(format!(
         "overlay:\n{}",
-        app.overlay_frame(5).expect("confirmation").to_text()
+        app.overlay_frame(12).expect("confirmation").to_text()
     ));
     let effects = app.on_action(Action::InsertChar('y'));
     let answered = effects.iter().any(|effect| {
@@ -159,7 +159,7 @@ fn frontend_complete_interaction_snapshot() {
             }
         }
     }
-    app.set_busy(true, 0);
+    app.set_busy(true);
     type_text(&mut app, "queued follow-up");
     for effect in app.on_action(Action::Submit) {
         if let Effect::Append(lines) = effect {
@@ -231,12 +231,26 @@ fn frontend_complete_interaction_snapshot() {
             session_revision: philo_agent_service::SettlementRevision::Unchanged,
         },
     ] {
+        if matches!(event, FrontendOperationEvent::OperationSettled { .. }) {
+            // Freeze the run clock so the settlement line's duration is exact.
+            app.run_state_mut()
+                .freeze_elapsed(std::time::Duration::from_secs(7));
+        }
         let before = app.cells.cells().len();
         let effects = app.on_operation_event(&event);
         for effect in effects {
             if let Effect::Append(lines) = effect {
                 collect(lines, &mut output);
             }
+        }
+        // Paced deltas land on the next tick in production; tests replay
+        // them here so the dump keeps its unpaced ordering.
+        if matches!(
+            event,
+            FrontendOperationEvent::TextDelta { .. }
+                | FrontendOperationEvent::ReasoningDelta { .. }
+        ) {
+            assert!(app.flush_stream());
         }
         collect(app.cells.cells()[before..].to_vec(), &mut output);
     }

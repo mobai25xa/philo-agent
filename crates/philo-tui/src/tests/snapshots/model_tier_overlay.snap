@@ -1,0 +1,15 @@
+---
+source: crates/philo-tui/src/app/overlay.rs
+expression: picker.frame(11).to_text()
+---
+╭─ Reasoning · openai/gpt-5.2 ─────────────────────────────────────────────────────────╮
+│                                                                                      │
+│   low                                                                                │
+│ • medium                                                                     current │
+│ › high                                                                               │
+│   xhigh                                                                              │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│ enter confirm · tab models · ↑↓ move · esc back                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────╯

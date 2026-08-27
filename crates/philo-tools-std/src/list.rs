@@ -9,7 +9,7 @@ use philo_tools::{
 };
 
 use crate::args::{optional_string, optional_u64};
-use crate::display::card;
+use crate::display::{CardFacts, card};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, path_error, stopped_if_requested};
 use crate::path::resolve_in_root;
@@ -190,7 +190,9 @@ impl ListTool {
             ));
         }
 
-        let display = card("Listed", path, "none", "")
+        let display = card("List Directory", "Listed", "none", "")
+            .subject(&path)
+            .count("1 directory")
             .with_fact("entries_total", total.to_string())
             .with_fact("truncated", truncated.to_string());
         ToolInvokeEnd::Done(

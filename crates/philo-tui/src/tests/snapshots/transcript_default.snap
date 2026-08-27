@@ -3,11 +3,10 @@ source: crates/philo-tui/src/app/transcript.rs
 expression: "render(InfoLevel::Default)"
 ---
 lines:
-Notice: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
+Meta: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Reasoning: think
 Reasoning:   checking workspace
 Answer: answer line\nfinal
-Tool: • read_file  src/main.rs
-Notice: turn cancelled (timeout)
-Meta: done (cancelled)
+Tool: read_file src/main.rs
+Meta: · turn cancelled (timeout)
 open: None

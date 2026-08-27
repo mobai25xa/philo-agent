@@ -17,6 +17,7 @@ use crate::args::Cli;
 use crate::error::UsageError;
 
 pub use resolve::{Credential, Deployment, Settings, Verbosity, deployment_for};
+pub(crate) use resolve::effort_label;
 pub use watch::{ResolveFlags, WatchIntervals, WatchTask, spawn};
 
 /// Loaded global/project file layers. Raw keys and source bookkeeping remain

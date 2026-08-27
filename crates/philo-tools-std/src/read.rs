@@ -10,7 +10,7 @@ use philo_tools::{
 };
 
 use crate::args::{optional_u64, required_string};
-use crate::display::card;
+use crate::display::{CardFacts, card};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
 use crate::path::resolve_in_root;
@@ -146,7 +146,9 @@ impl ReadTool {
         // boundary re-truncates.
         let lines_total = text.lines().count();
         if lines_total == 0 {
-            let display = card("Read", path, "none", "")
+            let display = card("Read", "Read", "none", "")
+                .subject(&path)
+                .count("1 file")
                 .with_fact("start_line", "0")
                 .with_fact("end_line", "0")
                 .with_fact("lines_shown", "0")
@@ -212,7 +214,9 @@ impl ReadTool {
             }
         }
 
-        let display = card("Read", path, "none", "")
+        let display = card("Read", "Read", "none", "")
+            .subject(&path)
+            .count("1 file")
             .with_fact("start_line", start_line.to_string())
             .with_fact("end_line", end_line.to_string())
             .with_fact("lines_shown", emitted_lines.to_string())

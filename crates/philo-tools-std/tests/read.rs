@@ -121,7 +121,10 @@ fn reads_with_line_number_prefixes() {
     );
     let display = result.display().expect("read carries display");
     assert!(display.detail().is_empty());
+    assert_eq!(fact(display, "title"), "Read");
     assert_eq!(fact(display, "verb"), "Read");
+    assert_eq!(fact(display, "subject"), "hello.txt");
+    assert_eq!(fact(display, "count"), "1 file");
     assert_eq!(fact(display, "body"), "none");
     assert_eq!(fact(display, "start_line"), "1");
     assert_eq!(fact(display, "end_line"), "2");

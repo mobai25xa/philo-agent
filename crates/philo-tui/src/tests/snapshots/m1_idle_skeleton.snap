@@ -1,0 +1,17 @@
+---
+source: crates/philo-tui/src/render/frame.rs
+assertion_line: 1364
+expression: rendered
+---
+    hello
+
+
+
+
+
+
+                                                                    gpt-test
+   ▌
+   ▌ Ask anything
+   ▌
+                                                             ↑- ↓- R- C- -/-

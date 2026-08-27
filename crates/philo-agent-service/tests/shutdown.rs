@@ -129,7 +129,8 @@ async fn cancel_and_install_terminal_updates_are_not_dropped() {
 
     let install_id = match client.try_command(FrontendCommand::InstallModel {
         name: "fast".into(),
-    }) {
+        effort: None,
+        }) {
         CommandDispatch::Enqueued(id) => id,
         other => panic!("install {other:?}"),
     };

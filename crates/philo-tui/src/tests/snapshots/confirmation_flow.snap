@@ -2,7 +2,11 @@
 source: crates/philo-tui/src/driver/host_effects.rs
 expression: frame
 ---
-approval required  ·  write workspace file
-path: src/main.rs
-operation: replace
-y allow  ·  n / esc deny
+╭─ Approval required ────╮
+│                        │
+│ write workspace file   │
+│ path: src/main.rs      │
+│ operation: replace     │
+│                        │
+│ y allow · n / esc deny │
+╰────────────────────────╯

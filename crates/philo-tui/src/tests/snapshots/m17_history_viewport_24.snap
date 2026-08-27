@@ -1,7 +1,13 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
+assertion_line: 1232
 expression: follow
 ---
+    row-6
+    row-7
+    row-8
+    row-9
+    row-10
     row-11
     row-12
     row-13
@@ -16,13 +22,8 @@ expression: follow
     row-22
     row-23
     row-24
-    row-25
-    row-26
-    row-27
-    row-28
-    row-29
-
-
-    › Ask anything
-
-gpt-test · session-中 文
+                                                                    gpt-test
+   ▌
+   ▌ Ask anything
+   ▌
+                                                             ↑- ↓- R- C- -/-

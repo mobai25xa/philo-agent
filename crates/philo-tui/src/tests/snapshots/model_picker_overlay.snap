@@ -1,0 +1,16 @@
+---
+source: crates/philo-tui/src/app/overlay.rs
+expression: frame.to_text()
+---
+╭─ Models · 1/2 ───────────────────────────────────────────────────────────────────────╮
+│                                                                                      │
+│   ANTHROPIC                                                                          │
+│ › claude-sonnet-4-5                                                          current │
+│   OPENAI                                                                             │
+│   gpt-5.2                                                                            │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│ enter select · tab reasoning · ↑↓ move · type filter · esc close                     │
+╰──────────────────────────────────────────────────────────────────────────────────────╯

@@ -1,26 +1,33 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-expression: "render(&[\"# Title\", \"### Smaller\", \"plain paragraph text\", \"- first item\",\n\"  - nested item\", \"1. ordered item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"---\", \"\",])"
+assertion_line: 138
+expression: "render(&[\"# Title\", \"## Middle\", \"### Smaller\", \"plain paragraph text\",\n\"- first item\", \"  - nested item\", \"1. ordered item\", \"- [x] done deal\",\n\"- [ ] open item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"---\", \"\",])"
 ---
-# Title
-  -> "▍ "{magenta,bold,underlined} "Title"{magenta,bold,underlined}
-### Smaller
-  -> "▍ "{magenta,bold} "Smaller"{magenta,bold}
+▍ Title
+  -> "▍ Title"{rgb(222, 137, 72),bold,underlined}
+▍ Middle
+  -> "▍ Middle"{rgb(222, 137, 72),bold}
+▍ Smaller
+  -> "▍ Smaller"{bold}
 plain paragraph text
   -> "plain paragraph text"
 - first item
-  -> "- "{green} "first item"
+  -> "- "{darkgray} "first item"
   - nested item
-  -> "  - "{green} "nested item"
+  -> "  - "{darkgray} "nested item"
 1. ordered item
-  -> "1. "{green} "ordered item"
-> quoted remark
-  -> "| "{darkgray} "quoted remark"{gray,italic}
-text with **bold**, *italic*, ~~struck~~ and `inline code`
-  -> "text with " "bold"{bold} ", " "italic"{italic} ", " "struck"{crossed} " and " "inline code"{lightgreen}
-see [docs](https://example.test/guide)
+  -> "1. "{darkgray} "ordered item"
+- [x] done deal
+  -> "- "{darkgray} "[x] "{rgb(222, 137, 72)} "done deal"{darkgray,crossed}
+- [ ] open item
+  -> "- [ ] "{darkgray} "open item"
+│ quoted remark
+  -> "│ "{rgb(222, 137, 72)} "quoted remark"
+text with bold, italic, struck and inline code
+  -> "text with " "bold"{bold} ", " "italic"{italic} ", " "struck"{crossed} " and " "inline code"{indexed(108)}
+see docs
   -> "see " "docs"{blue,underlined}
----
-  -> "------------------------"{darkgray}
+────────────────────────
+  -> "────────────────────────"{darkgray}
 
-  -> ""
+  ->

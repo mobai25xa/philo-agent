@@ -1,5 +1,6 @@
 ---
 source: crates/philo-tui/src/tests/integration.rs
+assertion_line: 364
 expression: "format!(\"HISTORY\\n{history}\\n\\nTOOL\\n{tool_screen}\\n\\nCANCELLING\\n{cancelling_screen}\\n\\nAPPROVAL\\n{approval_screen}\")"
 ---
 HISTORY
@@ -10,51 +11,50 @@ Answer: 012345678901234567890123456789012345678901234567890123456789012345678...
 Answer: ```rust
 Answer: fn main() { println!("稳定"); }
 Answer: ```
-Tool: • read_file  src/中文.rs
+Tool: read_file src/中文.rs
 Meta: context compacted
 Answer: after tool
 Answer:  late-but-preserved
-Notice: turn cancelled (user)
-Meta: done (cancelled)
+Meta: · turn cancelled (user) · 12s
 
 TOOL
-00:       中 文  é 👩‍💻
-01:       ```rust
-02:       fn main() { println!("稳 定 ");
-03:       }
-04:       ```
+00:     89012345678901234567890123456789
+01:      中 文  é 👩‍💻
+02:     ```rust
+03:     │ fn main() { println!("稳 定 ");
+04:     ```
 05: 
-06:     read_file  path: src/中 文 .rs
-07:     | tool  read_file
-08:       long composer draft 中 文  é 👩‍💻
-09:       long composer draft 中 文  é 👩‍💻
-10:       long composer draft
-11: model-m14 · session-m14 · queued 1
+06: 
+07:     ⠋ Running…             model-m14
+08:    ▌ long composer draft 中 文  é 👩‍💻
+09:    ▌ long composer draft 中 文  é 👩‍💻
+10:    ▌ long composer draft
+11:                      ↑- ↓- R- C- -/-
 
 CANCELLING
 00: 
-01: 
-02:     • read_file  src/中 文 .rs
-03:     context compacted
-04:     • after tool
-05: 
-06:     • late-but-preserved
-07:     | cancel  user
-08:       long composer draft 中 文  é 👩‍💻
-09:       long composer draft 中 文  é 👩‍💻
-10:       long composer draft
-11: model-m14 · session-m14 · queued 1
+01:     read_file src/中 文 .rs
+02:     context compacted
+03:     after tool
+04: 
+05:     late-but-preserved
+06: 
+07:     ⠋ Cancelling…          model-m14
+08:    ▌ long composer draft 中 文  é 👩‍💻
+09:    ▌ long composer draft 中 文  é 👩‍💻
+10:    ▌ long composer draft
+11:                      ↑- ↓- R- C- -/-
 
 APPROVAL
-00: approval required  ·  write workspace...
-01: src/中 文 .rs
-02: y allow  ·  n / esc deny
-03: 
-04: 
-05: 
-06: 
-07:     ! Approval required
-08:       long composer draft 中 文  é 👩‍💻
-09:       long composer draft 中 文  é 👩‍💻
-10:       long composer draft
-11: model-m14 · session-m14
+00:        ╭─ Approval required ────╮
+01:        │                        │
+02:        │ write workspace file   │
+03:        │ src/中 文 .rs            │
+04:        │                        │
+05:        │ y allow · n / esc deny │
+06:        ╰────────────────────────╯
+07:                            model-m14
+08:    ▌ long composer draft 中 文  é 👩‍💻
+09:    ▌ long composer draft 中 文  é 👩‍💻
+10:    ▌ long composer draft
+11:                      ↑- ↓- R- C- -/-

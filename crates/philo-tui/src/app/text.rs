@@ -66,11 +66,6 @@ pub(crate) fn tail(text: &str, max_width: usize) -> String {
     format!("{prefix}{}", kept.concat())
 }
 
-/// Soft-wraps an answer, keeping `• ` on the lead row and hanging indent.
-pub(crate) fn wrap_answer(text: &str, max_width: usize, lead: bool) -> Vec<String> {
-    wrap_prefixed(text, max_width, if lead { "• " } else { "  " }, "  ")
-}
-
 /// Soft-wraps a hanging-indented tool line (`• ` / `  ` / `  └ ` / `+ ` / `- `).
 pub(crate) fn wrap_hanging(text: &str, max_width: usize) -> Vec<String> {
     if let Some(rest) = text.strip_prefix("  └ ") {
@@ -104,7 +99,7 @@ pub(crate) fn wrap_hanging(text: &str, max_width: usize) -> Vec<String> {
 /// rows hang with a `│ ` gutter (U+2502 + space) and never write that bar
 /// back into the cell store.
 pub(crate) fn wrap_reasoning(text: &str, max_width: usize) -> Vec<String> {
-    if text == "think" || text.starts_with("think · ") {
+    if text == "think" {
         wrap(text, max_width)
     } else {
         let rest = text.strip_prefix("  ").unwrap_or(text);
@@ -126,36 +121,6 @@ fn wrap_prefixed(
     }
     let content_width = max_width.saturating_sub(width(first_gutter)).max(1);
     wrap(text, content_width)
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let gutter = if index == 0 {
-                first_gutter
-            } else {
-                rest_gutter
-            };
-            format!("{gutter}{row}")
-        })
-        .collect()
-}
-
-/// Soft-wraps a user transcript line, keeping `› ` / hanging indent.
-pub(crate) fn wrap_user(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return Vec::new();
-    }
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let (first_gutter, rest_gutter, content) = if let Some(rest) = text.strip_prefix("› ") {
-        ("› ", "  ", rest)
-    } else if let Some(rest) = text.strip_prefix("  ") {
-        ("  ", "  ", rest)
-    } else {
-        return wrap(text, max_width);
-    };
-    let content_width = max_width.saturating_sub(width(first_gutter)).max(1);
-    wrap(content, content_width)
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
@@ -219,16 +184,6 @@ pub(crate) fn slice_columns(text: &str, start: usize, end: usize) -> String {
     result
 }
 
-/// Last `height` visual rows of `text` after wrapping to `max_width`.
-pub(crate) fn tail_rows(text: &str, max_width: usize, height: usize) -> Vec<String> {
-    if height == 0 || max_width == 0 {
-        return Vec::new();
-    }
-    let rows = wrap(text, max_width);
-    let skip = rows.len().saturating_sub(height);
-    rows.into_iter().skip(skip).collect()
-}
-
 pub(crate) fn pad(text: &str, target_width: usize) -> String {
     let mut result = truncate(text, target_width);
     result.extend(std::iter::repeat_n(
@@ -256,26 +211,11 @@ mod tests {
     }
 
     #[test]
-    fn wrap_and_tail_rows_keep_cjk_cells() {
+    fn wrap_keeps_cjk_cells() {
         assert_eq!(wrap("中文ab", 4), ["中文", "ab"]);
-        assert_eq!(tail_rows("one\ntwo\nthree", 8, 2), ["two", "three"]);
         assert_eq!(slice_columns("中文ab", 0, 4), "中文");
         assert_eq!(slice_columns("中文ab", 2, 6), "文ab");
         assert_eq!(slice_columns("abc", 1, 1), "");
-    }
-
-    #[test]
-    fn wrap_user_keeps_a_hanging_gutter() {
-        assert_eq!(wrap_user("", 8), [""]);
-        assert_eq!(wrap_user("› abcdefgh", 6), ["› abcd", "  efgh"]);
-        assert_eq!(wrap_user("  abcdefgh", 6), ["  abcd", "  efgh"]);
-    }
-
-    #[test]
-    fn wrap_answer_keeps_a_hanging_gutter() {
-        assert_eq!(wrap_answer("abcdefgh", 6, true), ["• abcd", "  efgh"]);
-        assert_eq!(wrap_answer("abcdefgh", 6, false), ["  abcd", "  efgh"]);
-        assert_eq!(wrap_answer("", 6, true), ["• "]);
     }
 
     #[test]
@@ -292,7 +232,6 @@ mod tests {
     #[test]
     fn wrap_reasoning_hangs_body_with_a_bar() {
         assert_eq!(wrap_reasoning("think", 20), ["think"]);
-        assert_eq!(wrap_reasoning("think · high", 20), ["think · high"]);
         assert_eq!(
             wrap_reasoning("  abcdefghijkl", 6),
             ["│ abcd", "│ efgh", "│ ijkl"]

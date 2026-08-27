@@ -1,0 +1,82 @@
+---
+source: crates/philo-tui/src/tests/matrix.rs
+assertion_line: 182
+expression: matrix_render(build)
+---
+40 columns
+
+   ▌ Find the homepage button and ma
+   ▌ ke it blue
+
+    think · 8s
+    The guard belongs right before
+    the redirect.
+
+
+
+
+
+
+
+
+
+
+
+
+    ⠋ Writ…  (openai) gpt-5.2 · high
+   ▌
+   ▌ Ask anything
+   ▌
+    D:\…\Pi     ↑11k ↓4.8k 2.2%/500k
+
+80 columns
+
+   ▌ Find the homepage button and make it blue
+
+    think · 8s
+    The guard belongs right before the redirect.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ⠋ Writing… 42s · esc cancel                      (openai) gpt-5.2 · high
+   ▌
+   ▌ Ask anything
+   ▌
+    D:\Code\Zed\Year2026\Jul0706\Pi         ↑11k ↓4.8k R14k C51.3% 2.2%/500k
+
+120 columns
+
+   ▌ Find the homepage button and make it blue
+
+    think · 8s
+    The guard belongs right before the redirect.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ⠋ Writing… 42s · esc cancel                                                              (openai) gpt-5.2 · high
+   ▌
+   ▌ Ask anything
+   ▌
+    D:\Code\Zed\Year2026\Jul0706\Pi                                                 ↑11k ↓4.8k R14k C51.3% 2.2%/500k

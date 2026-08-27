@@ -12,7 +12,7 @@ use philo_tools::{
 };
 
 use crate::args::required_string;
-use crate::display::{card, edit_hunk};
+use crate::display::{CardFacts, card, edit_hunk};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, not_found, path_error, stopped_if_cancelled};
 use crate::mutation::with_file_mutation;
@@ -142,7 +142,11 @@ impl EditTool {
                 final_text.len()
             );
             let (hunk, added, removed) = edit_hunk(&normalized, &old_normalized, &new_string);
-            let display = card("Edited", path, "diff", hunk)
+            let display = card("Edit", "Edited", "diff", hunk)
+                .subject(&path)
+                .result(format!(
+                    "Succeeded. File edited.  (+{added} added, -{removed} removed)"
+                ))
                 .with_fact("added", added.to_string())
                 .with_fact("removed", removed.to_string())
                 .with_fact("bytes_before", full_text.len().to_string())

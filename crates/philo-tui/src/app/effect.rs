@@ -11,11 +11,22 @@ use super::transcript::TranscriptLine;
 pub(crate) enum HostRequest {
     NewSession,
     OpenSessions,
+    /// `/models`: load the catalog and open the picker.
     OpenModels,
+    /// Silent catalog refresh so the dashboard's provider fact stays
+    /// current after a model install.
+    RefreshModels,
     LoadPreview(String),
     SwitchSession(String),
-    RenameSession { title: String },
-    RebuildModel(String),
+    RenameSession {
+        title: String,
+    },
+    /// Install a model generation, optionally freezing a reasoning tier
+    /// into it atomically.
+    RebuildModel {
+        name: String,
+        effort: Option<FrontendReasoningEffort>,
+    },
     SetReasoning(FrontendReasoningEffort),
     ShowConfig,
     ShowStatus,

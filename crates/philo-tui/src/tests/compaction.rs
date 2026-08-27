@@ -60,6 +60,13 @@ fn starts_compaction(effects: &[Effect]) -> bool {
         .any(|effect| matches!(effect, Effect::StartCompaction))
 }
 
+/// The composer's top-left state word; `(idle)` once the corner clears.
+fn corner_word(app: &App) -> String {
+    app.run_state_corner(80)
+        .map(|corner| corner.word)
+        .unwrap_or_else(|| "(idle)".to_owned())
+}
+
 fn settled(message: &str) -> FrontendUpdateKind {
     FrontendUpdateKind::MaintenanceChanged(FrontendMaintenance {
         id: "maint-1".to_owned(),
@@ -79,7 +86,7 @@ fn manual_compaction_success_and_nothing_to_compact() {
 
     let first = submit_command(&mut app, "/compact");
     assert!(starts_compaction(&first));
-    let waiting = app.status.line();
+    let waiting = corner_word(&app);
     let completed = app.apply_update(&frontend_update(
         1,
         settled(r#"Compacted { covers_up_to: "entry-42" }"#),
@@ -88,7 +95,7 @@ fn manual_compaction_success_and_nothing_to_compact() {
         app.status.usage.is_none(),
         "stale pre-compaction usage drops"
     );
-    let completed_status = app.status.line();
+    let completed_corner = corner_word(&app);
 
     let second = submit_command(&mut app, "/compact");
     assert!(starts_compaction(&second));
@@ -97,13 +104,12 @@ fn manual_compaction_success_and_nothing_to_compact() {
     crate::tests::assert_tui_snapshot!(
         "m13_manual_compaction_results",
         format!(
-            "FIRST\n{}\nSTATUS {waiting}\n{}\nSTATUS {}\n\nSECOND\n{}\n{}\nSTATUS {}",
+            "FIRST\n{}\nCORNER {waiting}\n{}\nCORNER {completed_corner}\n\nSECOND\n{}\n{}\nCORNER {}",
             appended(&first).join("\n"),
             appended(&completed).join("\n"),
-            completed_status,
             appended(&second).join("\n"),
             appended(&nothing).join("\n"),
-            app.status.line(),
+            corner_word(&app),
         )
     );
 }
@@ -114,9 +120,19 @@ fn spinner_rejection_and_escape_are_visible() {
 
     let started = submit_command(&mut app, "/compact");
     assert!(starts_compaction(&started));
-    let frame_zero = app.status.line();
-    app.on_tick();
-    let frame_one = app.status.line();
+    let frame_zero = app
+        .run_state_corner(80)
+        .map(|corner| (corner.spinner, corner.word))
+        .expect("manual compaction owns the corner");
+    app.on_tick(std::time::Duration::from_millis(100));
+    let frame_one = app
+        .run_state_corner(80)
+        .map(|corner| (corner.spinner, corner.word))
+        .expect("the corner stays through the tick");
+    assert_ne!(
+        frame_zero.0, frame_one.0,
+        "the run-state spinner advances on ticks"
+    );
 
     let duplicate = submit_command(&mut app, "/compact");
     assert!(!starts_compaction(&duplicate));
@@ -125,18 +141,18 @@ fn spinner_rejection_and_escape_are_visible() {
     assert!(matches!(cancelled.first(), Some(Effect::CancelCompaction)));
 
     let mut busy = test_app();
-    busy.set_busy(true, 0);
+    busy.set_busy(true);
     let refused_busy = submit_command(&mut busy, "/compact");
     assert!(!starts_compaction(&refused_busy));
 
     crate::tests::assert_tui_snapshot!(
         "m13_compaction_spinner_cancel_and_rejection",
         format!(
-            "START\n{}\n{frame_zero}\n{frame_one}\n\nDUPLICATE\n{}\n\nESC\n{}\nSTATUS {}\n\nBUSY\n{}",
+            "START\n{}\n{frame_zero:?}\n{frame_one:?}\n\nDUPLICATE\n{}\n\nESC\n{}\nCORNER {}\n\nBUSY\n{}",
             appended(&started).join("\n"),
             appended(&duplicate).join("\n"),
             appended(&cancelled).join("\n"),
-            app.status.line(),
+            corner_word(&app),
             appended(&refused_busy).join("\n"),
         )
     );
@@ -194,7 +210,7 @@ fn compaction_cancel_enqueued_then_clears() {
 #[test]
 fn automatic_events_render_and_update_status_without_breaking_the_flow() {
     let mut app = test_app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     app.status.usage = Some(FrontendTokenUsage {
         input_tokens: Some(9_000),
         ..FrontendTokenUsage::default()
@@ -210,7 +226,7 @@ fn automatic_events_render_and_update_status_without_breaking_the_flow() {
     ] {
         app.on_operation_event(&event);
         collect_closed_cells(&app, &mut seen, &mut output);
-        output.push(format!("status: {}", app.status.line()));
+        output.push(format!("corner: {}", corner_word(&app)));
     }
     assert!(app.status.usage.is_none());
 
@@ -231,6 +247,7 @@ fn automatic_events_render_and_update_status_without_breaking_the_flow() {
         },
     ] {
         app.on_operation_event(&event);
+        app.flush_stream();
         collect_closed_cells(&app, &mut seen, &mut output);
     }
     output.push(format!(
@@ -240,7 +257,7 @@ fn automatic_events_render_and_update_status_without_breaking_the_flow() {
             (cell.kind, cell.text.as_str())
         })
     ));
-    output.push(format!("status: {}", app.status.line()));
+    output.push(format!("corner: {}", corner_word(&app)));
 
     crate::tests::assert_tui_snapshot!("m13_automatic_compaction_events", output.join("\n"));
 }

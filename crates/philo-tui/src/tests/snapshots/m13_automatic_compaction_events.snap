@@ -2,9 +2,9 @@
 source: crates/philo-tui/src/tests/compaction.rs
 expression: "output.join(\"\\n\")"
 ---
-status: model-a · s-1 · compact | · in 9.0k
+corner: Compacting…
 Meta: context compacted
-status: model-a · s-1
+corner: Waiting…
 Error: compaction failed: summary model unavailable; continuing without compaction
 open: Some((Answer, "turn continues"))
-status: model-a · s-1 · in 4.0k
+corner: Writing…

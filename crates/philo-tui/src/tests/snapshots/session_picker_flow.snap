@@ -1,30 +1,39 @@
 ---
 source: crates/philo-tui/src/driver/host_effects.rs
-assertion_line: 266
 expression: "format!(\"FIRST\\n{first}\\n\\nSECOND\\n{second}\\n\\nSWITCHED\\n{}\",\nhistory.join(\"\\n\"))"
 ---
 FIRST
-sessions  1/2
-  first session                                                                 
-› count the files
-▸ read_file  path: src/main.rs
-└ ok · fn main() {}
-one file
-enter select  ·  ↑↓ move  ·  type to filter  ·  esc close
+╭─ Sessions · 1/2 ─────────────────────────────────────────────────────────────────────╮
+│                                                                                      │
+│ › first session                                                                      │
+│     count the files                                                                  │
+│     ▸ read_file  path: src/main.rs                                                   │
+│     └ ok · fn main() {}                                                              │
+│     one file                                                                         │
+│   s-2                                                                                │
+│                                                                                      │
+│                                                                                      │
+│ enter select · ↑↓ move · type filter · esc close                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────╯
 
 SECOND
-sessions  2/2
-  s-2                                                                           
-› count the files
-▸ read_file  path: src/main.rs
-└ ok · fn main() {}
-one file
-enter select  ·  ↑↓ move  ·  type to filter  ·  esc close
+╭─ Sessions · 2/2 ─────────────────────────────────────────────────────────────────────╮
+│                                                                                      │
+│   first session                                                                      │
+│ › s-2                                                                                │
+│     count the files                                                                  │
+│     ▸ read_file  path: src/main.rs                                                   │
+│     └ ok · fn main() {}                                                              │
+│     one file                                                                         │
+│                                                                                      │
+│                                                                                      │
+│ enter select · ↑↓ move · type filter · esc close                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────╯
 
 SWITCHED
 session s-2
 
-› count the files
+count the files
 
 ▸ read_file  path: src/main.rs
   └ ok · fn main() {}

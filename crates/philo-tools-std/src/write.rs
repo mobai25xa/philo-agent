@@ -9,7 +9,7 @@ use philo_tools::{
 };
 
 use crate::args::required_string;
-use crate::display::{MAX_PLUS_DISPLAY_LINES, card, plus_lines};
+use crate::display::{MAX_PLUS_DISPLAY_LINES, CardFacts, card, plus_lines};
 use crate::error_code;
 use crate::helpers::{field_error, io_error, path_error, stopped_if_cancelled};
 use crate::mutation::with_file_mutation;
@@ -84,11 +84,17 @@ impl WriteTool {
             let created = previous_bytes.is_none();
             let (detail, added, truncated) = plus_lines(&content, MAX_PLUS_DISPLAY_LINES);
             let display = card(
+                "Write",
                 if created { "Added" } else { "Wrote" },
-                path,
                 "diff",
                 detail,
             )
+            .subject(&path)
+            .result(if created {
+                format!("Succeeded. File created.  (+{added} added)")
+            } else {
+                format!("Succeeded. File overwritten.  (+{added} added)")
+            })
             .with_fact("added", added.to_string())
             .with_fact("removed", "0")
             .with_fact("bytes", bytes.to_string())

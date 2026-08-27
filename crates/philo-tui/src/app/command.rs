@@ -39,19 +39,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "rename the current session",
     },
     CommandSpec {
-        name: "model",
-        usage: "/model <id>",
-        summary: "switch model by id; bare /model opens the picker",
-    },
-    CommandSpec {
         name: "models",
         usage: "/models",
-        summary: "pick a model across configured providers",
-    },
-    CommandSpec {
-        name: "reasoning",
-        usage: "/reasoning <level>",
-        summary: "reasoning effort, from the next turn on",
+        summary: "pick a model and its reasoning tier",
     },
     CommandSpec {
         name: "compact",
@@ -85,9 +75,6 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-/// The reasoning levels `/reasoning` accepts, for error messages.
-pub const REASONING_LEVELS: &str = "minimal | low | medium | high | xhigh | max";
-
 /// One parsed command. Argument-taking commands keep the raw argument so
 /// the state machine can report a usage error itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,9 +83,7 @@ pub enum Command {
     New,
     Sessions,
     Rename { title: Option<String> },
-    Model { name: Option<String> },
     Models,
-    Reasoning { level: Option<String> },
     Compact,
     Image { path: Option<String> },
     Verbose,
@@ -137,9 +122,7 @@ pub fn parse(input: &str) -> Result<Command, UnknownCommand> {
         "new" => Ok(Command::New),
         "sessions" => Ok(Command::Sessions),
         "rename" => Ok(Command::Rename { title: argument }),
-        "model" => Ok(Command::Model { name: argument }),
         "models" => Ok(Command::Models),
-        "reasoning" => Ok(Command::Reasoning { level: argument }),
         "compact" => Ok(Command::Compact),
         "image" => Ok(Command::Image { path: argument }),
         "verbose" => Ok(Command::Verbose),
@@ -248,9 +231,7 @@ mod tests {
                 "new",
                 "sessions",
                 "rename",
-                "model",
                 "models",
-                "reasoning",
                 "compact",
                 "image",
                 "verbose",
@@ -274,20 +255,7 @@ mod tests {
             })
         );
         assert_eq!(parse("/rename"), Ok(Command::Rename { title: None }));
-        assert_eq!(
-            parse("/model gpt-test"),
-            Ok(Command::Model {
-                name: Some("gpt-test".to_owned())
-            })
-        );
-        assert_eq!(parse("/model"), Ok(Command::Model { name: None }));
         assert_eq!(parse("/models"), Ok(Command::Models));
-        assert_eq!(
-            parse("/reasoning high"),
-            Ok(Command::Reasoning {
-                level: Some("high".to_owned())
-            })
-        );
         assert_eq!(parse("/compact"), Ok(Command::Compact));
         assert_eq!(
             parse("/image  a b/c.png "),
@@ -321,7 +289,7 @@ mod tests {
         assert_eq!(names("/se"), ["sessions"]);
         assert!(names("/zzz").is_empty());
         assert!(
-            names("/model gpt").is_empty(),
+            names("/models gpt").is_empty(),
             "arguments are not completed"
         );
         assert!(names("plain text").is_empty());

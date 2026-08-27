@@ -28,7 +28,6 @@ use crate::platform::input::{
 };
 use crate::platform::keymap;
 use crate::platform::terminal::TerminalSession;
-use crate::render::markdown::MarkdownRenderer;
 
 use super::events::{self, Step};
 use super::interrupt::{self, CtrlCDecision, CtrlCPhase};
@@ -283,6 +282,14 @@ fn begin_snapshot_resync(state: &mut LoopState) -> Result<Vec<Effect>, TuiOutcom
     try_request_snapshot(state)
 }
 
+/// Silent catalog load for the dashboard's provider fact. Backpressure and
+/// disconnection degrade the corner to "unknown" instead of failing.
+fn request_model_catalog(state: &mut LoopState) {
+    if let CommandDispatch::Enqueued(id) = state.send(FrontendCommand::ListModels) {
+        state.sync.models_list_request = Some(id);
+    }
+}
+
 fn cancel_dispatch_result(dispatch: CommandDispatch<FrontendRequestId>) -> CancelDispatchResult {
     match dispatch {
         CommandDispatch::Enqueued(id) => CancelDispatchResult::Enqueued(id),
@@ -322,6 +329,7 @@ fn notice_effect(text: impl Into<String>) -> Effect {
     Effect::Append(vec![TranscriptLine {
         kind: LineKind::Notice,
         text: text.into(),
+        tone: crate::app::transcript::Tone::Plain,
     }])
 }
 
@@ -475,11 +483,11 @@ async fn run_loop_report<B: Backend>(
         },
     );
     status.context_window = config.context_window;
+    status.workspace_root = config.workspace_root.clone();
     let mut app = App::new(status, config.show_reasoning);
     if let Some(recovery) = config.recovery.take() {
         app.apply_recovery(recovery);
     }
-    let mut markdown = MarkdownRenderer::new();
 
     let start = Instant::now();
     let mut scheduler = FrameScheduler::new(start);
@@ -527,20 +535,16 @@ async fn run_loop_report<B: Backend>(
             Err(outcome) => return finish_loop(outcome, app),
         }
     }
+    // One-shot catalog fetch so the dashboard's provider fact is populated
+    // without user action. Dashboard-only: failures degrade silently.
+    request_model_catalog(&mut state);
 
     loop {
         let now = Instant::now();
         scheduler.sync_animation(app.animation_active(), now);
 
         if !pending_zero_resize {
-            let report = output.flush(
-                terminal,
-                &app,
-                &mut markdown,
-                shift_enter,
-                &mut scheduler,
-                now,
-            );
+            let report = output.flush(terminal, &app, shift_enter, &mut scheduler, now);
             assert_single_round_writes(report);
             if report.failed {
                 draw_failures = draw_failures.saturating_add(1);
@@ -594,18 +598,11 @@ async fn run_loop_report<B: Backend>(
         let effects = match step {
             Step::Update(first) => {
                 let updates = events::drain_ready_updates(&state.client, first);
-                apply_update_batch(
-                    &mut app,
-                    &mut markdown,
-                    &mut state,
-                    &mut scheduler,
-                    event_time,
-                    updates,
-                )
-                .unwrap_or_else(|outcome| {
-                    exit_requested = Some(outcome);
-                    Vec::new()
-                })
+                apply_update_batch(&mut app, &mut state, &mut scheduler, event_time, updates)
+                    .unwrap_or_else(|outcome| {
+                        exit_requested = Some(outcome);
+                        Vec::new()
+                    })
             }
             Step::UpdatesDisconnected => {
                 exit_requested = Some(TuiOutcome::FrontendRestartRequested {
@@ -641,7 +638,6 @@ async fn run_loop_report<B: Backend>(
                 ) {
                     Ok(InputFaultAction::Continue) => Vec::new(),
                     Ok(InputFaultAction::ScheduleRebuild(deadline)) => {
-                        app.status.input_rebuilding = true;
                         rebuild_deadline = Some(deadline);
                         scheduler.invalidate_immediate(event_time);
                         Vec::new()
@@ -662,7 +658,6 @@ async fn run_loop_report<B: Backend>(
                 rebuild_deadline = None;
                 match input.rebuild() {
                     Ok(()) => {
-                        app.status.input_rebuilding = false;
                         scheduler.invalidate_immediate(event_time);
                     }
                     Err(error) => {
@@ -675,7 +670,9 @@ async fn run_loop_report<B: Backend>(
             }
             Step::FrameDeadline => Vec::new(),
             Step::AnimationDeadline => {
-                if scheduler.take_animation_tick(event_time) && app.on_tick() {
+                if scheduler.take_animation_tick(event_time)
+                    && app.on_tick(super::scheduler::ANIMATION_INTERVAL)
+                {
                     scheduler.invalidate_background(event_time);
                 }
                 Vec::new()
@@ -833,13 +830,12 @@ async fn run_loop_report<B: Backend>(
 
 fn apply_update_batch(
     app: &mut App,
-    markdown: &mut MarkdownRenderer,
     state: &mut LoopState,
     scheduler: &mut FrameScheduler,
     event_time: Instant,
     updates: Vec<FrontendUpdate>,
 ) -> Result<Vec<Effect>, TuiOutcome> {
-    let effects = apply_updates(app, markdown, state, updates)?;
+    let effects = apply_updates(app, state, updates)?;
     // Most frontend updates mutate App directly and intentionally return no
     // append effect. They still need a final frame after activity stops.
     scheduler.invalidate_background(event_time);
@@ -848,7 +844,6 @@ fn apply_update_batch(
 
 fn apply_updates(
     app: &mut App,
-    markdown: &mut MarkdownRenderer,
     state: &mut LoopState,
     updates: Vec<FrontendUpdate>,
 ) -> Result<Vec<Effect>, TuiOutcome> {
@@ -862,12 +857,6 @@ fn apply_updates(
         if let Some(outcome) = outcome {
             return Err(outcome);
         }
-        if matches!(
-            update.kind,
-            FrontendUpdateKind::SessionLoaded { .. } | FrontendUpdateKind::SnapshotReady(_)
-        ) {
-            markdown.reset();
-        }
         if let FrontendUpdateKind::ResyncRequired { .. } = &update.kind {
             effects.extend(app.ingest_appends(begin_snapshot_resync(state)?));
             continue;
@@ -880,6 +869,7 @@ fn apply_updates(
             effects.extend(app.ingest_appends(vec![Effect::Append(vec![TranscriptLine {
                 kind: LineKind::Error,
                 text: format!("error: model list unavailable: {reason}"),
+                tone: crate::app::transcript::Tone::Plain,
             }])]));
             continue;
         }
@@ -1165,7 +1155,7 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
     let command = match request {
         HostRequest::NewSession => FrontendCommand::CreateSession,
         HostRequest::OpenSessions => FrontendCommand::ListSessions,
-        HostRequest::OpenModels => FrontendCommand::ListModels,
+        HostRequest::OpenModels | HostRequest::RefreshModels => FrontendCommand::ListModels,
         HostRequest::LoadPreview(session_id) => {
             state.preview_generation = state.preview_generation.saturating_add(1);
             state.sync.preview_session_id = Some(session_id.clone());
@@ -1179,7 +1169,9 @@ fn dispatch_host(state: &mut LoopState, app: &mut App, request: HostRequest) -> 
             session_id: app.status.session.clone(),
             title,
         },
-        HostRequest::RebuildModel(name) => FrontendCommand::InstallModel { name },
+        HostRequest::RebuildModel { name, effort } => {
+            FrontendCommand::InstallModel { name, effort }
+        }
         HostRequest::SetReasoning(effort) => FrontendCommand::SetReasoning { effort },
         HostRequest::ShowConfig => FrontendCommand::ReadConfig,
         HostRequest::ShowStatus => FrontendCommand::ReadStatus,
@@ -1301,6 +1293,7 @@ mod tests {
             screen: TuiScreen::Inline,
             terminal_palette: None,
             interrupt: None,
+            workspace_root: ".".to_owned(),
             recovery: None,
         }
     }
@@ -1584,13 +1577,7 @@ mod tests {
                 turn_id: "turn-stale".to_owned(),
             },
         };
-        let effects = apply_updates(
-            &mut app,
-            &mut MarkdownRenderer::new(),
-            &mut state,
-            vec![unmatched],
-        )
-        .expect("apply");
+        let effects = apply_updates(&mut app, &mut state, vec![unmatched]).expect("apply");
         assert!(effects.is_empty());
         assert!(matches!(
             app.submit_state(),
@@ -1623,7 +1610,6 @@ mod tests {
     async fn effectless_terminal_update_batch_keeps_a_final_frame_scheduled() {
         let (_service, client, _runtime) = philo_agent_service::testing::start_test_service();
         let mut app = App::new(StatusData::new("m", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut state = loop_state(client);
         let start = Instant::now();
         let mut scheduler = FrameScheduler::new(start);
@@ -1676,21 +1662,14 @@ mod tests {
             },
         ];
         let event_time = start + std::time::Duration::from_millis(1);
-        let effects = apply_update_batch(
-            &mut app,
-            &mut markdown,
-            &mut state,
-            &mut scheduler,
-            event_time,
-            updates,
-        )
-        .expect("apply terminal batch");
+        let effects = apply_update_batch(&mut app, &mut state, &mut scheduler, event_time, updates)
+            .expect("apply terminal batch");
 
         assert!(
             effects.is_empty(),
             "the state-only update path is intentional"
         );
-        assert!(!app.animation_active(), "settlement stops the activity row");
+        assert!(!app.animation_active(), "settlement stops the state word");
         assert!(!app.status.busy, "idle clears the busy status");
         assert!(
             app.cells
@@ -1827,13 +1806,7 @@ mod tests {
                 turn_id: "turn-late".to_owned(),
             },
         };
-        apply_updates(
-            &mut app,
-            &mut MarkdownRenderer::new(),
-            &mut state,
-            vec![resync, accepted],
-        )
-        .expect("apply");
+        apply_updates(&mut app, &mut state, vec![resync, accepted]).expect("apply");
         assert!(matches!(
             app.submit_state(),
             crate::app::submit::SubmitState::Accepted { .. }
@@ -1859,13 +1832,7 @@ mod tests {
                 crate::tests::support::busy_snapshot("s", "op-snap"),
             )),
         };
-        apply_updates(
-            &mut app,
-            &mut MarkdownRenderer::new(),
-            &mut state,
-            vec![update],
-        )
-        .expect("apply");
+        apply_updates(&mut app, &mut state, vec![update]).expect("apply");
         assert_eq!(state.active_operation_id.as_deref(), Some("op-snap"));
         let decision = ctrl_c_decision(&mut state, true);
         assert!(matches!(
@@ -1915,13 +1882,7 @@ mod tests {
                 turn_id: "turn-1".to_owned(),
             },
         };
-        apply_updates(
-            &mut app,
-            &mut MarkdownRenderer::new(),
-            &mut state,
-            vec![accepted],
-        )
-        .expect("apply");
+        apply_updates(&mut app, &mut state, vec![accepted]).expect("apply");
         assert!(matches!(
             app.submit_state(),
             crate::app::submit::SubmitState::Accepted { .. }

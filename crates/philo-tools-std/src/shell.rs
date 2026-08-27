@@ -15,7 +15,7 @@ use philo_tools::{
 use tokio::io::AsyncReadExt;
 
 use crate::args::{optional_u64, required_string};
-use crate::display::card;
+use crate::display::{CardFacts, card, format_elapsed_ms};
 use crate::error_code;
 use crate::helpers::{field_error, stopped_if_cancelled};
 
@@ -233,8 +233,11 @@ impl ShellTool {
         } else {
             display_text
         };
-        let display = card("Ran", &command_line, "output", detail)
-            .with_fact("exit_code", exit_code)
+        let display = card("Run", "Ran", "output", detail)
+            .subject(&command_line)
+            .count("1 command")
+            .result(format!("exit {exit_code} · {}", format_elapsed_ms(elapsed_ms)))
+            .with_fact("exit_code", &exit_code)
             .with_fact("duration_ms", elapsed_ms.to_string())
             .with_fact("truncated", (truncated || display_truncated).to_string());
         ToolInvokeEnd::Done(
@@ -378,8 +381,8 @@ fn timeout_result(
     )
     .with_display(
         card(
+            "Run",
             "Ran",
-            command_line,
             "output",
             if display_text.is_empty() {
                 format!("timed out after {elapsed_ms}ms")
@@ -387,6 +390,8 @@ fn timeout_result(
                 display_text
             },
         )
+        .subject(command_line)
+        .count("1 command")
         .with_fact("duration_ms", elapsed_ms.to_string())
         .with_fact("timeout_secs", timeout_secs.to_string())
         .with_fact("truncated", display_truncated.to_string()),

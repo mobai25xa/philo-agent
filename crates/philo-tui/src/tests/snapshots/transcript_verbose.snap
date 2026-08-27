@@ -4,20 +4,19 @@ expression: "render(InfoLevel::Verbose)"
 ---
 lines:
 Meta: operation op-1 started
-Notice: previous turn old-turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
+Meta: previous turn old-turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Meta: turn turn-1 started
 Meta: model call call-1
 Reasoning: think
 Reasoning:   checking workspace
 Answer: answer line\nfinal
-Tool: ▸ read_file  1/1
+Tool: read_file 1/1
 Tool:   args  path: src/main.rs
 Tool:   ok
 Tool:   fn main() {}
 Tool:   detail
 Tool:     read 12 bytes
 Tool:   facts  bytes=12
-Notice: cancelling (timeout)...
-Notice: turn cancelled (timeout)
-Meta: done (cancelled)
+Meta: cancelling (timeout)...
+Meta: · turn cancelled (timeout)
 open: None

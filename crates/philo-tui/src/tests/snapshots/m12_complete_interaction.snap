@@ -1,38 +1,47 @@
 ---
 source: crates/philo-tui/src/tests/flow.rs
-assertion_line: 244
 expression: "output.join(\"\\n\")"
 ---
 Meta: /sessions
 overlay:
-sessions  1/2
-> count the files                                                               
-loading preview...
-  s-image                                                                       
-enter select  ·  ↑↓ move  ·  type to filter  ·  esc close
+╭─ Sessions · 1/2 ─────────────────────────────────────────────────────────────────────╮
+│                                                                                      │
+│ › count the files                                                                    │
+│     loading preview...                                                               │
+│   s-image                                                                            │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│ enter select · ↑↓ move · type filter · esc close                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────╯
 Meta: session s-image
 User: 
-User: › look at this
-User:   [image image/png, 4 bytes]
+User: look at this
+User: [image image/png, 4 bytes]
 User: 
 overlay:
-approval required  ·  write workspace file
-path: src/main.rs
-y allow  ·  n / esc deny
+╭─ Approval required ────╮
+│                        │
+│ write workspace file   │
+│ path: src/main.rs      │
+│                        │
+│ y allow · n / esc deny │
+╰────────────────────────╯
 Meta: allowed: write workspace file
 confirmation: Allow
 User: 
-User: › first prompt
+User: first prompt
 User: 
-Notice: busy: the message is queued behind the active turn
+Meta: busy: the message is queued behind the active turn
 User: 
-User: › queued follow-up
+User: queued follow-up
 User: 
-Notice: queued behind the active turn
-Notice: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
+Meta: queued behind the active turn
+Meta: previous turn did not end cleanly and was sealed; its tool calls may have executed without recorded results
 Reasoning: think
 Reasoning:   checking
 Answer: answer line
-Tool: • read  src/main.rs
-Notice: turn cancelled (user)
-Meta: done (cancelled)
+Tool: read src/main.rs
+Meta: · turn cancelled (user) · 7s

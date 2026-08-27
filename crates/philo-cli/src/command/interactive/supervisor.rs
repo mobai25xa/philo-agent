@@ -398,6 +398,7 @@ fn launch_config(
         screen: bootstrap.settings.screen,
         terminal_palette: bootstrap.settings.terminal_bg,
         interrupt: Some(interrupt),
+        workspace_root: bootstrap.workspace_root.clone(),
         recovery,
     }
 }

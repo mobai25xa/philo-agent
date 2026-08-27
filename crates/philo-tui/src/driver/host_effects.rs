@@ -85,22 +85,30 @@ mod tests {
                     },
                 ],
             },
-            HostRequest::OpenModels => FrontendUpdateKind::ModelListLoaded {
-                models: vec![
+            HostRequest::OpenModels | HostRequest::RefreshModels => {
+                // The catalog mirrors the real service: the entry matching
+                // the installed generation carries the `current` flag.
+                let current = app.status.model.clone();
+                let listing = |id: &str, model: &str, tiers: Vec<&str>| {
                     philo_agent_service::FrontendModelListing {
-                        id: "test/model-a".to_owned(),
+                        id: id.to_owned(),
                         provider: "test".to_owned(),
-                        model: "model-a".to_owned(),
-                        current: true,
-                    },
-                    philo_agent_service::FrontendModelListing {
-                        id: "test/model-b".to_owned(),
-                        provider: "test".to_owned(),
-                        model: "model-b".to_owned(),
-                        current: false,
-                    },
-                ],
-            },
+                        model: model.to_owned(),
+                        reasoning_tiers: tiers.into_iter().map(str::to_owned).collect(),
+                        current: current == id,
+                    }
+                };
+                FrontendUpdateKind::ModelListLoaded {
+                    models: vec![
+                        listing("test/model-a", "model-a", Vec::new()),
+                        listing(
+                            "test/model-b",
+                            "model-b",
+                            vec!["low", "medium", "high"],
+                        ),
+                    ],
+                }
+            }
             HostRequest::LoadPreview(id) => FrontendUpdateKind::SessionPreviewed {
                 session_id: id.clone(),
                 view: session_view(&id),
@@ -110,11 +118,11 @@ mod tests {
                 view: session_view(&id),
             },
             HostRequest::RenameSession { .. } => FrontendUpdateKind::CommandAccepted,
-            HostRequest::RebuildModel(name) => FrontendUpdateKind::GenerationInstalled {
+            HostRequest::RebuildModel { name, effort } => FrontendUpdateKind::GenerationInstalled {
                 display: FrontendGeneration {
                     generation_id: "g-1".to_owned(),
                     model_name: name,
-                    reasoning_effort: None,
+                    reasoning_effort: effort.map(|effort| format!("{effort:?}")),
                     image_input: true,
                     tool_names: Vec::new(),
                 },
@@ -186,18 +194,42 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        for command in [
-            "/new",
-            "/model model-b",
-            "/reasoning high",
-            "/image shots/diagram.png",
-            "/verbose",
-            "/status",
-            "/config",
-            "/quit",
-        ] {
+        for command in ["/new", "/image shots/diagram.png", "/verbose", "/status"] {
             output.extend(run_command(&mut app, command));
         }
+
+        // Model × tier switch through the two-level picker: Enter on a
+        // tiered model steps into the tier level, and confirming installs
+        // the model with the tier frozen in (middle tier by default).
+        output.extend(run_command(&mut app, "/models"));
+        for action in [Action::MoveDown, Action::Submit, Action::Submit] {
+            for effect in app.on_action(action) {
+                match effect {
+                    Effect::Append(lines) => {
+                        output.extend(lines.into_iter().map(|line| line.text));
+                    }
+                    Effect::Host(request) => output.extend(apply_host(&mut app, request)),
+                    other => panic!("picker produced an unexpected effect: {other:?}"),
+                }
+            }
+        }
+
+        // Same model, new tier: the picker takes the SetReasoning path.
+        output.extend(run_command(&mut app, "/models"));
+        for action in [Action::MoveDown, Action::Submit, Action::MoveUp, Action::Submit] {
+            for effect in app.on_action(action) {
+                match effect {
+                    Effect::Append(lines) => {
+                        output.extend(lines.into_iter().map(|line| line.text));
+                    }
+                    Effect::Host(request) => output.extend(apply_host(&mut app, request)),
+                    other => panic!("picker produced an unexpected effect: {other:?}"),
+                }
+            }
+        }
+
+        output.extend(run_command(&mut app, "/config"));
+        output.extend(run_command(&mut app, "/quit"));
 
         crate::tests::assert_tui_snapshot!("host_backed_commands", output.join("\n"));
     }
@@ -205,19 +237,20 @@ mod tests {
     #[test]
     fn model_rebuild_failure_keeps_the_old_model() {
         let mut app = app();
-        type_text(&mut app, "/model broken");
-        let mut output = Vec::new();
+        let mut output = run_command(&mut app, "/models");
+        assert!(app.picker().is_some(), "the models picker is open");
+        // The highlighted current model is tier-less, so Enter installs it.
         for effect in app.on_action(Action::Submit) {
             match effect {
                 Effect::Append(lines) => {
                     output.extend(lines.into_iter().map(|line| line.text));
                 }
-                Effect::Host(HostRequest::RebuildModel(_)) => {
+                Effect::Host(HostRequest::RebuildModel { .. }) => {
                     output.extend(
                         app.apply_update(&frontend_update(
                             1,
                             FrontendUpdateKind::GenerationInstallFailed {
-                                name: "broken".to_owned(),
+                                name: "test/model-a".to_owned(),
                                 message: "adapter rejected the name".to_owned(),
                             },
                         ))
@@ -237,7 +270,8 @@ mod tests {
         assert_eq!(
             output,
             [
-                "/model broken",
+                "/models",
+                "switching model to test/model-a...",
                 "error: model not switched: adapter rejected the name; still on model-a",
             ]
         );
@@ -248,7 +282,7 @@ mod tests {
         let mut app = app();
         let follow = apply_host(&mut app, HostRequest::OpenSessions);
         assert!(follow.is_empty());
-        let first = app.overlay_frame(5).expect("picker opened").to_text();
+        let first = app.overlay_frame(12).expect("picker opened").to_text();
 
         let effects = app.on_action(Action::MoveDown);
         assert_eq!(effects.len(), 1);
@@ -256,7 +290,7 @@ mod tests {
             panic!("moving the picker must load a preview")
         };
         apply_host(&mut app, request);
-        let second = app.overlay_frame(5).expect("picker stays open").to_text();
+        let second = app.overlay_frame(12).expect("picker stays open").to_text();
 
         let effects = app.on_action(Action::Submit);
         let Effect::Host(request) = effects.into_iter().next().expect("switch request") else {
@@ -287,7 +321,7 @@ mod tests {
             },
         ));
         let frame = app
-            .overlay_frame(5)
+            .overlay_frame(12)
             .expect("request opens overlay")
             .to_text();
 
@@ -318,7 +352,7 @@ mod tests {
                 decision: ConfirmationDecision::Deny,
             },
         ));
-        assert!(app.overlay_frame(5).is_none());
+        assert!(app.overlay_frame(12).is_none());
     }
 
     #[test]

@@ -101,7 +101,7 @@ pub struct TuiLaunchConfig {
     pub verbose: bool,
     /// Whether visible reasoning reaches the transcript at all.
     pub show_reasoning: bool,
-    /// Context-budget hint for the status bar.
+    /// Context-budget hint for the usage corner.
     pub context_window: Option<u64>,
     /// Screen mode for this session. Hot reload must not change it.
     pub screen: TuiScreen,
@@ -113,6 +113,10 @@ pub struct TuiLaunchConfig {
     /// Supervisor-owned Ctrl+C pulse counter. `None` in tests that do not
     /// inject signals. The TUI never writes the terminal or exits the process.
     pub interrupt: Option<tokio::sync::watch::Receiver<u64>>,
+    /// Workspace root path resolved once by the composition root and shown
+    /// verbatim in the composer dashboard. The TUI never probes the cwd or
+    /// reads environment variables itself.
+    pub workspace_root: String,
     /// One-shot composer contents from the previous TUI instance.
     pub recovery: Option<TuiRecovery>,
 }

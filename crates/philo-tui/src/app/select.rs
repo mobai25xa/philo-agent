@@ -5,6 +5,7 @@
 //! Native terminal selection is not used: mouse capture owns the screen.
 
 use super::cells::{VisibleSlice, wrap_line};
+use super::prose::ProjectedRow;
 use super::text;
 use super::transcript::TranscriptLine;
 
@@ -137,7 +138,7 @@ pub(crate) fn clamp_pos(pos: SelectPos, cells: &[TranscriptLine], width: usize) 
     let index = pos.cell.min(cells.len() - 1);
     let prev = (index > 0).then(|| cells[index - 1].kind);
     let wrapped = if width == 0 {
-        vec![String::new()]
+        vec![ProjectedRow::plain(String::new())]
     } else {
         wrap_line(&cells[index], width, prev)
     };
@@ -148,7 +149,7 @@ pub(crate) fn clamp_pos(pos: SelectPos, cells: &[TranscriptLine], width: usize) 
     };
     let col = wrapped
         .get(row)
-        .map(|text| pos.col.min(text::width(text)))
+        .map(|row| pos.col.min(text::width(&row.text)))
         .unwrap_or(0);
     SelectPos {
         cell: index,
@@ -187,9 +188,11 @@ pub(crate) fn extract_text(cells: &[TranscriptLine], width: usize, selection: Se
     for (index, cell) in cells.iter().enumerate() {
         let wrapped = wrap_line(cell, width, prev);
         prev = Some(cell.kind);
-        for (row, text) in wrapped.iter().enumerate() {
-            if let Some((from, to)) = selection.columns_on_row(index, row, text::width(text)) {
-                parts.push(text::slice_columns(text, from, to));
+        for (row, projected) in wrapped.iter().enumerate() {
+            if let Some((from, to)) =
+                selection.columns_on_row(index, row, text::width(&projected.text))
+            {
+                parts.push(text::slice_columns(&projected.text, from, to));
             }
         }
     }

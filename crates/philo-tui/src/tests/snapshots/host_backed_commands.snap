@@ -4,21 +4,22 @@ expression: "output.join(\"\\n\")"
 ---
 /new
 new session: fresh
-/model model-b
-model: model-b
-/reasoning high
-reasoning: high (from the next turn on)
 /image shots/diagram.png
 image queued: shots/diagram.png (1 waiting for the next message)
 /verbose
 info level: verbose
 /status
-model-b · fresh · verbose
+model-a · session fresh · ↑- ↓- R- C- -/128k
 shots/diagram.png
 tools (3):
   read_file [read-only]
   write_file [workspace]
   shell [system]
+/models
+switching model to test/model-b (reasoning medium)...
+model: test/model-b
+/models
+reasoning: low (from the next turn on)
 /config
 config (effective):
   model       = model-b  [project]

@@ -7,7 +7,7 @@ use ratatui::backend::Backend;
 use tokio::time::Instant;
 
 use crate::app::state::App;
-use crate::render::{frame, markdown::MarkdownRenderer};
+use crate::render::frame;
 
 use super::scheduler::FrameScheduler;
 
@@ -30,7 +30,6 @@ impl PendingOutput {
         &mut self,
         terminal: &mut Terminal<B>,
         app: &App,
-        markdown: &mut MarkdownRenderer,
         shift_enter: bool,
         scheduler: &mut FrameScheduler,
         now: Instant,
@@ -57,7 +56,7 @@ impl PendingOutput {
             report.clears = 1;
         }
         match terminal.draw(|terminal_frame| {
-            frame::draw(terminal_frame, app, markdown, shift_enter);
+            frame::draw(terminal_frame, app, shift_enter);
         }) {
             Ok(_) => {
                 scheduler.commit_frame(permit, now);
@@ -96,6 +95,7 @@ mod tests {
         TranscriptLine {
             kind: LineKind::Meta,
             text: text.to_owned(),
+            tone: crate::app::transcript::Tone::Plain,
         }
     }
 
@@ -119,7 +119,6 @@ mod tests {
         let start = Instant::now();
         let mut terminal = test_terminal();
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
         let mut output = PendingOutput;
 
@@ -127,14 +126,7 @@ mod tests {
             line("first completed"),
             line("second completed"),
         ])]);
-        let initial = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        let initial = output.flush(&mut terminal, &app, false, &mut scheduler, start);
         assert_eq!(
             initial,
             FlushReport {
@@ -149,14 +141,7 @@ mod tests {
         app.ingest_appends(vec![Effect::Append(vec![line("third completed")])]);
         scheduler.invalidate_background(first_delta);
         assert_eq!(
-            output.flush(
-                &mut terminal,
-                &app,
-                &mut markdown,
-                false,
-                &mut scheduler,
-                first_delta,
-            ),
+            output.flush(&mut terminal, &app, false, &mut scheduler, first_delta,),
             FlushReport::default()
         );
 
@@ -165,7 +150,6 @@ mod tests {
         let batched = output.flush(
             &mut terminal,
             &app,
-            &mut markdown,
             false,
             &mut scheduler,
             start + super::super::scheduler::FRAME_INTERVAL,
@@ -183,8 +167,7 @@ mod tests {
         let screen = screen_text(&terminal);
         assert!(screen.contains("third completed"), "{screen}");
         assert!(screen.contains("fourth completed"), "{screen}");
-        assert!(screen.contains("model-a"), "{screen}");
-        assert!(screen.contains("s-1"), "{screen}");
+        assert!(screen.contains("Ask anything"), "{screen}");
     }
 
     #[test]
@@ -192,20 +175,12 @@ mod tests {
         let start = Instant::now();
         let mut terminal = test_terminal();
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
         let mut output = PendingOutput;
 
         app.cells
             .push_closed((0..40).map(|i| line(&format!("row-{i}"))));
-        output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        output.flush(&mut terminal, &app, false, &mut scheduler, start);
 
         let screen = screen_text(&terminal);
         assert!(screen.contains("row-39"), "{screen}");
@@ -220,41 +195,19 @@ mod tests {
         let start = Instant::now();
         let mut terminal = test_terminal();
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
         let mut output = PendingOutput;
         app.ingest_appends(vec![Effect::Append(vec![line("keep-me")])]);
-        output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        output.flush(&mut terminal, &app, false, &mut scheduler, start);
 
         let background = start + super::super::scheduler::FRAME_INTERVAL;
         scheduler.invalidate_background(background);
-        let ordinary = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            background,
-        );
+        let ordinary = output.flush(&mut terminal, &app, false, &mut scheduler, background);
         assert_eq!(ordinary.clears, 0);
 
         let recovery = background + Duration::from_millis(1);
         scheduler.request_hard_redraw(recovery);
-        let explicit = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            recovery,
-        );
+        let explicit = output.flush(&mut terminal, &app, false, &mut scheduler, recovery);
         assert_eq!(explicit.clears, 1);
         assert_eq!(explicit.draws, 1);
         assert_eq!(explicit.inserts, 0);
@@ -270,17 +223,9 @@ mod tests {
         let start = Instant::now();
         let mut terminal = test_terminal();
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
         let mut output = PendingOutput;
-        let mut operations = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        let mut operations = output.flush(&mut terminal, &app, false, &mut scheduler, start);
 
         let expected = "x".repeat(1_000);
         for millis in 1..=1_000 {
@@ -289,28 +234,18 @@ mod tests {
             });
             let now = start + Duration::from_millis(millis);
             scheduler.invalidate_background(now);
-            let report = output.flush(
-                &mut terminal,
-                &app,
-                &mut markdown,
-                false,
-                &mut scheduler,
-                now,
-            );
+            let report = output.flush(&mut terminal, &app, false, &mut scheduler, now);
             operations.clears += report.clears;
             operations.inserts += report.inserts;
             operations.draws += report.draws;
         }
 
+        // The pacer held the flood; a structural boundary (here, the test)
+        // flushes it so the final frame carries the whole tail.
+        assert!(app.flush_stream(), "the flood buffered in the pacer");
+        scheduler.invalidate_background(start + Duration::from_millis(1001));
         let final_deadline = scheduler.frame_deadline().expect("final dirty frame");
-        let report = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            final_deadline,
-        );
+        let report = output.flush(&mut terminal, &app, false, &mut scheduler, final_deadline);
         operations.clears += report.clears;
         operations.inserts += report.inserts;
         operations.draws += report.draws;
@@ -427,33 +362,18 @@ mod tests {
         })
         .expect("flaky terminal");
         let mut app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
         let mut output = PendingOutput;
         app.ingest_appends(vec![Effect::Append(vec![line("first-pass")])]);
 
-        let failed = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        let failed = output.flush(&mut terminal, &app, false, &mut scheduler, start);
         assert!(failed.failed);
         assert_eq!(failed.draws, 0);
         assert!(scheduler.prepare_frame(start).is_some(), "dirty is kept");
 
         app.ingest_appends(vec![Effect::Append(vec![line("latest-pass")])]);
         scheduler.invalidate_immediate(start);
-        let ok = output.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        let ok = output.flush(&mut terminal, &app, false, &mut scheduler, start);
         assert!(!ok.failed);
         assert_eq!(ok.draws, 1);
 
@@ -480,17 +400,9 @@ mod tests {
         .expect("tracking terminal");
         terminal.backend_mut().cursor_ops.clear();
         let app = App::new(StatusData::new("model-a", "s-1", InfoLevel::Default), true);
-        let mut markdown = MarkdownRenderer::new();
         let mut scheduler = FrameScheduler::new(start);
 
-        let report = PendingOutput.flush(
-            &mut terminal,
-            &app,
-            &mut markdown,
-            false,
-            &mut scheduler,
-            start,
-        );
+        let report = PendingOutput.flush(&mut terminal, &app, false, &mut scheduler, start);
 
         assert_eq!(report.draws, 1);
         assert_eq!(

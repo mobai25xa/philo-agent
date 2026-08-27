@@ -5,6 +5,7 @@
 //! Per-op flags live here; `store.clear()` is the App's job on session switch.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use philo_agent_service::{
     FailureLineStyle, FrontendOperationEvent, retry_scheduled_lines, turn_failed_lines,
@@ -13,6 +14,7 @@ use philo_agent_service::{
 use super::cells::TranscriptStore;
 use super::text;
 use super::tool_card;
+use crate::app::run_state::format_elapsed;
 
 /// Information tier of the transcript (the TUI has no quiet tier; `Ctrl+O`
 /// toggles between these two).
@@ -43,32 +45,49 @@ pub enum LineKind {
     User,
 }
 
+/// Paint intent for one transcript line, layered over its [`LineKind`].
+/// Kinds stay the coarse semantic tier; tones carry the tool-card structure
+/// (design §3.3) so paint never re-parses card text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Tone {
+    #[default]
+    /// No extra intent: kind styling only.
+    Plain,
+    /// Card header row: the leading display name paints accent bold.
+    Title,
+    /// `↳` detail / result rows and their aligned continuations.
+    Detail,
+    /// `↳ Failed. …` failure row (red).
+    Failure,
+    /// Diff deletion row (red background wash across the content column).
+    DiffDel,
+    /// Diff insertion row (green background wash across the content column).
+    DiffIns,
+}
+
 /// One append-only transcript line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
+    pub(crate) tone: Tone,
 }
 
 pub(crate) fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     TranscriptLine {
         kind,
         text: text.into(),
+        tone: Tone::Plain,
     }
 }
 
-/// One user turn: blank, `›` first row, hanging continuations, blank.
+/// One user turn: a blank strip row, the message rows themselves, and a
+/// blank strip row. The band shell (frame) paints the full-width surface
+/// and the column-0 accent bar over the non-empty rows; the store carries
+/// no prefixes.
 pub(crate) fn user_block(rows: impl IntoIterator<Item = String>) -> Vec<TranscriptLine> {
     let mut lines = vec![line(LineKind::User, "")];
-    let mut first = true;
-    for row in rows {
-        if first {
-            lines.push(line(LineKind::User, format!("› {row}")));
-            first = false;
-        } else {
-            lines.push(line(LineKind::User, format!("  {row}")));
-        }
-    }
+    lines.extend(rows.into_iter().map(|row| line(LineKind::User, row)));
     lines.push(line(LineKind::User, ""));
     lines
 }
@@ -98,6 +117,9 @@ pub struct Transcript {
     /// than rendered dim (the model still receives them).
     show_reasoning: bool,
     wrote_answer_this_call: bool,
+    /// Reason of the most recent `TurnCancelled`, kept for the settlement
+    /// line (`· turn cancelled (user) · 12s`).
+    last_cancel_reason: Option<String>,
 }
 
 impl Transcript {
@@ -109,21 +131,26 @@ impl Transcript {
     }
 
     /// Applies `[ui].show_reasoning` from a config reload without rebuilding
-    /// the rest of the transcript.
-    pub fn set_show_reasoning(&mut self, show_reasoning: bool) {
+    /// the rest of the transcript. Hiding reasoning also seals any live
+    /// think timer: the block can no longer receive deltas.
+    pub fn set_show_reasoning(&mut self, store: &mut TranscriptStore, show_reasoning: bool) {
         self.show_reasoning = show_reasoning;
         if !show_reasoning {
             self.think_header_written = false;
+            store.seal_think();
         }
     }
 
     /// Projects one event into the ordered store. Resets per-op flags on
-    /// settle; the App clears the store on session switch.
+    /// settle; the App clears the store on session switch. `turn_elapsed`
+    /// carries the run clock's frozen value for terminal events so the
+    /// settlement line can cite the turn duration (design §2.4).
     pub fn apply(
         &mut self,
         store: &mut TranscriptStore,
         event: &FrontendOperationEvent,
         level: InfoLevel,
+        turn_elapsed: Option<Duration>,
     ) {
         let verbose = level == InfoLevel::Verbose;
         match event {
@@ -133,7 +160,8 @@ impl Transcript {
                 self.apply_reasoning_delta(store, text)
             }
             FrontendOperationEvent::OperationQueued { .. } => {
-                store.push_closed([line(LineKind::Notice, "queued behind the active turn")]);
+                // queued 不展示: enqueue hints live only as meta lines.
+                store.push_closed([line(LineKind::Meta, "queued behind the active turn")]);
             }
             FrontendOperationEvent::OperationStarted { operation_id } => {
                 if verbose {
@@ -150,6 +178,7 @@ impl Transcript {
             }
             FrontendOperationEvent::ModelCallStarted { model_call_id } => {
                 store.close_open();
+                store.seal_think();
                 self.wrote_answer_this_call = false;
                 self.think_header_written = false;
                 if verbose {
@@ -176,6 +205,7 @@ impl Transcript {
             FrontendOperationEvent::ModelUsageUpdated { .. } => {}
             FrontendOperationEvent::ToolBatchRequested { call_count, .. } => {
                 store.close_open();
+                store.seal_think();
                 self.tool_batch_size = *call_count;
                 self.tool_args.clear();
             }
@@ -210,6 +240,7 @@ impl Transcript {
             }
             FrontendOperationEvent::AssistantMessageCompleted { content, .. } => {
                 store.close_open();
+                store.seal_think();
                 if !self.wrote_answer_this_call && !content.is_empty() {
                     store.push_closed([line(LineKind::Answer, content)]);
                 }
@@ -217,7 +248,7 @@ impl Transcript {
             FrontendOperationEvent::PriorTurnSealed { turn_id } => {
                 if verbose {
                     store.push_closed([line(
-                        LineKind::Notice,
+                        LineKind::Meta,
                         format!(
                             "previous turn {turn_id} did not end cleanly and was sealed; \
                              its tool calls may have executed without recorded results"
@@ -225,7 +256,7 @@ impl Transcript {
                     )]);
                 } else {
                     store.push_closed([line(
-                        LineKind::Notice,
+                        LineKind::Meta,
                         "previous turn did not end cleanly and was sealed; its tool \
                          calls may have executed without recorded results",
                     )]);
@@ -233,7 +264,7 @@ impl Transcript {
             }
             FrontendOperationEvent::ContextCompactionStarted => {
                 if verbose {
-                    store.push_closed([line(LineKind::Notice, "compacting context...")]);
+                    store.push_closed([line(LineKind::Meta, "compacting context...")]);
                 }
             }
             FrontendOperationEvent::ContextCompactionCompleted { covers_up_to } => {
@@ -261,6 +292,7 @@ impl Transcript {
                 // open view and reset per-call flags so the retry renders
                 // cleanly. Wording comes from the service's shared template.
                 store.close_open();
+                store.seal_think();
                 self.wrote_answer_this_call = false;
                 self.think_header_written = false;
                 let lines = retry_scheduled_lines(failure, *attempt, *max_retries, *delay_ms);
@@ -280,19 +312,20 @@ impl Transcript {
             }
             FrontendOperationEvent::CancellationRequested { reason, .. } => {
                 store.close_open();
+                store.seal_think();
                 if verbose {
                     store.push_closed([line(
-                        LineKind::Notice,
+                        LineKind::Meta,
                         format!("cancelling ({})...", reason_text(reason)),
                     )]);
                 }
             }
             FrontendOperationEvent::TurnCancelled { reason, .. } => {
                 store.close_open();
-                store.push_closed([line(
-                    LineKind::Notice,
-                    format!("turn cancelled ({})", reason_text(reason)),
-                )]);
+                store.seal_think();
+                // The fact lands once, at settlement, with the duration:
+                // `· turn cancelled (user) · 12s` (design §3.4).
+                self.last_cancel_reason = Some(reason_text(reason));
             }
             FrontendOperationEvent::TurnFailed { failure, .. } => {
                 store.close_open();
@@ -320,7 +353,16 @@ impl Transcript {
                 if status.eq_ignore_ascii_case("failed") {
                     store.push_closed([line(LineKind::Meta, "done (failed)")]);
                 } else if status.eq_ignore_ascii_case("cancelled") {
-                    store.push_closed([line(LineKind::Meta, "done (cancelled)")]);
+                    let reason = self.last_cancel_reason.take();
+                    store.push_closed([line(
+                        LineKind::Meta,
+                        settlement_line("turn cancelled", reason.as_deref(), turn_elapsed),
+                    )]);
+                } else if let Some(elapsed) = turn_elapsed {
+                    store.push_closed([line(
+                        LineKind::Meta,
+                        format!("· turn finished · {}", format_elapsed(elapsed)),
+                    )]);
                 }
                 if durability.eq_ignore_ascii_case("unconfirmed") {
                     store.push_closed([line(
@@ -329,14 +371,32 @@ impl Transcript {
                          have durably recorded this outcome",
                     )]);
                 }
-                self.clear_ephemeral();
+                self.clear_ephemeral(store);
             }
+        }
+    }
+
+    /// Writes one paced streaming piece (v2.2): the same reducer paths as
+    /// live deltas, so think/answer cell transitions behave identically to
+    /// unpaced delivery. Run-state bookkeeping is deliberately absent —
+    /// the corner word updates on arrival, not at display time.
+    pub(crate) fn write_stream_piece(
+        &mut self,
+        store: &mut TranscriptStore,
+        kind: LineKind,
+        text: &str,
+    ) {
+        match kind {
+            LineKind::Answer => self.apply_text_delta(store, text),
+            LineKind::Reasoning => self.apply_reasoning_delta(store, text),
+            _ => debug_assert!(false, "the pacer carries only streaming kinds"),
         }
     }
 
     fn apply_text_delta(&mut self, store: &mut TranscriptStore, delta: &str) {
         if store.open_kind() == Some(LineKind::Reasoning) {
             store.close_open();
+            store.seal_think();
             self.think_header_written = false;
         }
         if store.open_kind() != Some(LineKind::Answer) {
@@ -352,7 +412,12 @@ impl Transcript {
         }
         if !self.think_header_written {
             store.push_closed([line(LineKind::Reasoning, "think")]);
+            store.begin_think(store.display_len().saturating_sub(1));
             self.think_header_written = true;
+        } else {
+            // The header's duration is the wall clock from the block's
+            // first to its latest ReasoningDelta (design §3.2).
+            store.extend_think();
         }
 
         let mut raw = String::new();
@@ -374,11 +439,26 @@ impl Transcript {
         }
     }
 
-    fn clear_ephemeral(&mut self) {
+    fn clear_ephemeral(&mut self, store: &mut TranscriptStore) {
+        store.seal_think();
         self.tool_batch_size = 0;
         self.tool_args.clear();
         self.think_header_written = false;
         self.wrote_answer_this_call = false;
+    }
+}
+
+/// Settlement meta line (design §2.4/§3.4): `· turn finished · {elapsed}`,
+/// with the cancel variant keeping the reason: `· turn cancelled (user)
+/// · 12s`. An unknown duration drops the suffix rather than inventing one.
+fn settlement_line(fact: &str, reason: Option<&str>, elapsed: Option<Duration>) -> String {
+    let subject = match reason {
+        Some(reason) => format!("{fact} ({reason})"),
+        None => fact.to_owned(),
+    };
+    match elapsed {
+        Some(elapsed) => format!("· {subject} · {}", format_elapsed(elapsed)),
+        None => format!("· {subject}"),
     }
 }
 
@@ -427,7 +507,7 @@ mod tests {
         let mut transcript = Transcript::new(show_reasoning);
         let mut store = TranscriptStore::new();
         for event in events {
-            transcript.apply(&mut store, event, level);
+            transcript.apply(&mut store, event, level, None);
         }
         store
     }
@@ -545,6 +625,7 @@ mod tests {
                 text: "hello".to_owned(),
             },
             InfoLevel::Default,
+            None,
         );
         assert_eq!(
             store.cells(),
@@ -562,6 +643,7 @@ mod tests {
                 text: " world\nmore".to_owned(),
             },
             InfoLevel::Default,
+            None,
         );
         assert_eq!(
             store.cells(),
@@ -585,6 +667,7 @@ mod tests {
                 text: "thinking\n".to_owned(),
             },
             InfoLevel::Verbose,
+            None,
         );
         assert!(store.is_empty(), "no reasoning reaches the transcript");
         assert!(!store.has_open());
@@ -601,7 +684,7 @@ mod tests {
             tool_name: "读取文件".repeat(40),
             arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
         };
-        transcript.apply(&mut store, &started, InfoLevel::Default);
+        transcript.apply(&mut store, &started, InfoLevel::Default, None);
         assert!(
             store.is_empty(),
             "started belongs only to Activity in default mode"
@@ -617,7 +700,7 @@ mod tests {
             },
             display: None,
         };
-        transcript.apply(&mut store, &completed, InfoLevel::Default);
+        transcript.apply(&mut store, &completed, InfoLevel::Default, None);
         assert_eq!(store.cells().len(), 1);
         assert!(text::width(&store.cells()[0].text) <= 120);
         assert!(
@@ -636,10 +719,128 @@ mod tests {
             index: 0,
             tail: "live output that must stay off scrollback".to_owned(),
         };
-        transcript.apply(&mut store, &progress, InfoLevel::Default);
+        transcript.apply(&mut store, &progress, InfoLevel::Default, None);
         assert!(store.is_empty());
-        transcript.apply(&mut store, &progress, InfoLevel::Verbose);
+        transcript.apply(&mut store, &progress, InfoLevel::Verbose, None);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn settlement_writes_one_duration_line_per_outcome() {
+        use philo_agent_service::SettlementRevision;
+
+        fn settled(status: &str) -> FrontendOperationEvent {
+            FrontendOperationEvent::OperationSettled {
+                operation_id: "op".to_owned(),
+                session_id: "s".to_owned(),
+                status: status.to_owned(),
+                durability: "Confirmed".to_owned(),
+                session_revision: SettlementRevision::Unchanged,
+            }
+        }
+
+        // Success cites the finished fact with its duration.
+        let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
+        transcript.apply(&mut store, &settled("Succeeded"), InfoLevel::Default, None);
+        assert!(store.is_empty(), "unknown duration writes no success line");
+        transcript.apply(
+            &mut store,
+            &settled("Succeeded"),
+            InfoLevel::Default,
+            Some(Duration::from_secs(42)),
+        );
+        assert_eq!(
+            store.cells().last().map(|cell| cell.text.as_str()),
+            Some("· turn finished · 42s")
+        );
+        assert_eq!(
+            store.cells().last().map(|cell| cell.kind),
+            Some(LineKind::Meta)
+        );
+
+        // Cancellation keeps the reason beside the duration.
+        let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
+        transcript.apply(
+            &mut store,
+            &FrontendOperationEvent::TurnCancelled {
+                turn_id: "turn".to_owned(),
+                reason: "User".to_owned(),
+            },
+            InfoLevel::Default,
+            None,
+        );
+        assert!(
+            !store
+                .cells()
+                .iter()
+                .any(|cell| cell.text.contains("cancelled")),
+            "the cancel fact waits for settlement"
+        );
+        transcript.apply(
+            &mut store,
+            &settled("Cancelled"),
+            InfoLevel::Default,
+            Some(Duration::from_secs(12)),
+        );
+        assert_eq!(
+            store.cells().last().map(|cell| cell.text.as_str()),
+            Some("· turn cancelled (user) · 12s")
+        );
+
+        // Without a timer the reason still lands.
+        let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
+        transcript.apply(
+            &mut store,
+            &FrontendOperationEvent::TurnCancelled {
+                turn_id: "turn".to_owned(),
+                reason: "Timeout".to_owned(),
+            },
+            InfoLevel::Default,
+            None,
+        );
+        transcript.apply(&mut store, &settled("Cancelled"), InfoLevel::Default, None);
+        assert_eq!(
+            store.cells().last().map(|cell| cell.text.as_str()),
+            Some("· turn cancelled (timeout)")
+        );
+
+        // Failures keep their three-tier structure and the legacy marker.
+        let mut transcript = Transcript::new(true);
+        let mut store = TranscriptStore::new();
+        transcript.apply(
+            &mut store,
+            &FrontendOperationEvent::TurnFailed {
+                turn_id: "turn".to_owned(),
+                failure: philo_agent_service::FrontendFailure {
+                    code: "model.empty_response".to_owned(),
+                    domain: "model".to_owned(),
+                    stage: "stream".to_owned(),
+                    retry: "safe".to_owned(),
+                    summary: "the model did not return a usable response".to_owned(),
+                    diagnostic: String::new(),
+                },
+            },
+            InfoLevel::Default,
+            Some(Duration::from_secs(9)),
+        );
+        transcript.apply(&mut store, &settled("Failed"), InfoLevel::Default, None);
+        assert!(
+            store
+                .cells()
+                .iter()
+                .any(|cell| cell.text == "done (failed)"),
+            "failed turns keep the failure marker"
+        );
+        assert!(
+            !store
+                .cells()
+                .iter()
+                .any(|cell| cell.text.contains("finished")),
+            "failures do not masquerade as finished turns"
+        );
     }
 
     #[test]
@@ -672,7 +873,7 @@ mod tests {
             },
         ];
         for event in &events {
-            transcript.apply(&mut store, event, InfoLevel::Default);
+            transcript.apply(&mut store, event, InfoLevel::Default, None);
         }
 
         let answers: Vec<&TranscriptLine> = store

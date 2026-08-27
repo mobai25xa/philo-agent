@@ -1,0 +1,17 @@
+---
+source: crates/philo-tui/src/tests/streaming.rs
+expression: "format!(\"RETRY WORD\\n{retry_word:?}\\n\\nFAILED\\n{failed_dump}\\n\\nCANCELLED\\n{cancelled_dump}\")"
+---
+RETRY WORD
+CornerWord { spinner: "⠋", word: "Retrying…", timing: "0s · esc cancel", warning: false }
+
+FAILED
+Error: model call interrupted; retrying (attempt 1/3, waiting 2.0s): upstream timeout after 30s
+Meta: [network · model_call · TIMEOUT]
+Error: turn failed: upstream timeout after 30s
+Meta: [network · model_call · TIMEOUT]
+Meta: detail: 
+Meta: done (failed)
+
+CANCELLED
+Meta: · turn cancelled (user) · 12s

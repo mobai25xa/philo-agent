@@ -10,7 +10,7 @@ use philo_agent_service::{
 use super::App;
 use super::line;
 use super::overlays::SessionLoadIntent;
-use crate::app::effect::Effect;
+use crate::app::effect::{Effect, HostRequest};
 use crate::app::listings;
 use crate::app::overlay::{PickerEntry, Preview};
 use crate::app::session;
@@ -21,36 +21,48 @@ use crate::app::transcript::{InfoLevel, LineKind};
 const PREVIEW_ROWS: usize = 5;
 
 impl App {
-    /// Presentation busy/queued flags. Production sets these only from
+    /// Presentation busy flag. Production sets this only from
     /// `AvailabilityChanged`; tests may call this directly.
-    pub fn set_busy(&mut self, busy: bool, queued: usize) {
+    pub fn set_busy(&mut self, busy: bool) {
         self.status.busy = busy;
-        self.status.queued = queued;
         if !busy {
             self.automatic_compacting = false;
             self.sync_compacting_status();
             if !self.manual_compacting {
-                self.activity.clear();
+                self.run_state.clear();
             }
-        } else if !self.activity.is_active() {
-            self.activity.wait_for_model();
+        } else {
+            self.run_state.ensure_waiting();
         }
     }
 
-    /// Whether presentation currently has a time-based animation.
+    /// Whether presentation currently has a time-based animation: the
+    /// run-state spinner, pending paced stream text, or the settle
+    /// drop-to-bottom animation (v2.2).
     pub(crate) fn animation_active(&self) -> bool {
-        self.activity.is_active()
+        self.run_state.is_active()
+            || !self.pacer.is_empty()
+            || matches!(self.stream_anchor, Some(super::StreamAnchor::Settle { .. }))
     }
 
-    /// Advances the manual/automatic compaction spinner. The driver owns
-    /// invalidation; a tick never requests a terminal clear.
-    pub(crate) fn on_tick(&mut self) -> bool {
-        if !self.animation_active() {
-            return false;
+    /// Advances one animation tick: the spinner, the pacer's release of
+    /// buffered stream characters, and the settle drop animation. `dt` is
+    /// the driver's animation cadence; a tick never requests a clear.
+    pub(crate) fn on_tick(&mut self, dt: std::time::Duration) -> bool {
+        let mut dirty = false;
+        if self.run_state.is_active() {
+            self.run_state.advance_spinner();
+            dirty = true;
         }
-        self.status.advance_spinner();
-        self.activity.advance_spinner();
-        true
+        if let Some(super::StreamAnchor::Settle { left }) = &mut self.stream_anchor {
+            *left = left.saturating_sub(1);
+            dirty = true;
+            if *left == 0 {
+                self.stream_anchor = None;
+            }
+        }
+        let pieces = self.pacer.drain(dt);
+        dirty | self.write_paced(pieces)
     }
 
     /// Starts rendering a different session: fresh transcript, cells, and
@@ -59,10 +71,11 @@ impl App {
         self.status.session = session_id.to_owned();
         self.status.usage = None;
         self.transcript = crate::app::transcript::Transcript::new(self.show_reasoning);
-        self.activity.clear();
+        self.run_state.clear();
+        self.clear_stream();
+        self.stream_anchor = None;
         self.cells.clear();
         self.reasoning_manually_expanded.clear();
-        self.reasoning_manually_collapsed.clear();
         self.scroll = crate::app::cells::ScrollState::follow();
         self.clear_selection();
     }
@@ -74,8 +87,25 @@ impl App {
 
     /// Projects one mapped operation event into the transcript store.
     /// Overlays never intercept this path: terminal facts must render.
+    ///
+    /// v2.2: streaming deltas detour through the pacer; every other event
+    /// flushes the backlog first, so structural boundaries observe the full
+    /// text — cancellation reveals it instantly and settlement dedups the
+    /// completed-message echo exactly like an unpaced run.
     pub fn on_operation_event(&mut self, event: &FrontendOperationEvent) -> Vec<Effect> {
-        self.activity.on_event(event);
+        // Peek the turn clock before terminal events stop it, so the
+        // settlement line can cite the duration (design §2.4).
+        let turn_elapsed = terminal_event_elapsed(&self.run_state, event);
+        self.run_state.on_event(event);
+        // A new operation lifts the viewport to the 40% line (v2.2 T4.7);
+        // terminal events start the drop back to the band bottom (T4.9).
+        match event {
+            FrontendOperationEvent::OperationStarted { .. }
+            | FrontendOperationEvent::TurnStarted { .. } => self.try_begin_stream_lift(),
+            FrontendOperationEvent::OperationSettled { .. }
+            | FrontendOperationEvent::TurnFailed { .. } => self.begin_settle_drop(),
+            _ => {}
+        }
         match event {
             FrontendOperationEvent::ModelUsageUpdated { usage, .. } => {
                 self.status.usage = Some(*usage);
@@ -95,7 +125,22 @@ impl App {
             }
             _ => {}
         }
-        self.transcript.apply(&mut self.cells, event, self.level);
+        match event {
+            FrontendOperationEvent::TextDelta { delta } => {
+                self.pace_delta(crate::app::transcript::LineKind::Answer, delta);
+                return vec![];
+            }
+            // Reasoning dropped by `[ui].show_reasoning=false` never paces.
+            FrontendOperationEvent::ReasoningDelta { .. } if !self.show_reasoning => {}
+            FrontendOperationEvent::ReasoningDelta { text, .. } => {
+                self.pace_delta(crate::app::transcript::LineKind::Reasoning, text);
+                return vec![];
+            }
+            _ => {}
+        }
+        self.flush_stream();
+        self.transcript
+            .apply(&mut self.cells, event, self.level, turn_elapsed);
         vec![]
     }
 
@@ -127,7 +172,10 @@ impl App {
                 Vec::new()
             }
             Kind::SessionListLoaded { sessions } => self.apply_session_list(sessions),
-            Kind::ModelListLoaded { models } => self.apply_model_list(models),
+            Kind::ModelListLoaded { models } => {
+                let open_picker = std::mem::take(&mut self.expect_models_picker);
+                self.apply_model_catalog(models, open_picker)
+            }
             Kind::GenerationInstalled { display } => self.apply_generation_installed(display),
             Kind::GenerationInstallFailed { message, .. } => {
                 self.pending_model_switch = false;
@@ -163,9 +211,13 @@ impl App {
             Kind::SnapshotReady(snapshot) => self.apply_snapshot(snapshot),
             Kind::ResyncRequired { .. } => Vec::new(),
             Kind::ServiceHealthChanged { health } => self.apply_health(health),
-            Kind::StatusReady(status) => self.ingest_appends(vec![Effect::Append(
-                listings::status_lines(&self.status.line(), self.attachments().summary(), status),
-            )]),
+            Kind::StatusReady(status) => {
+                self.ingest_appends(vec![Effect::Append(listings::status_lines(
+                    &self.status.summary_line(),
+                    self.attachments().summary(),
+                    status,
+                ))])
+            }
         }
     }
 
@@ -196,24 +248,23 @@ impl App {
         )])])
     }
 
-    fn apply_availability(&mut self, availability: &FrontendAvailability, queued: usize) {
+    fn apply_availability(&mut self, availability: &FrontendAvailability, _queued: usize) {
         match availability {
             FrontendAvailability::Idle => {
                 self.manual_compacting = false;
                 self.automatic_compacting = false;
-                self.set_busy(false, queued);
+                self.set_busy(false);
             }
             FrontendAvailability::Busy { .. } => {
                 self.automatic_compacting = false;
                 self.sync_compacting_status();
-                self.set_busy(true, queued);
+                self.set_busy(true);
             }
             FrontendAvailability::Compacting { .. } => {
                 self.status.busy = false;
-                self.status.queued = queued;
                 if !self.manual_compacting && !self.automatic_compacting {
                     self.manual_compacting = true;
-                    self.activity.start_manual_compaction();
+                    self.run_state.start_manual_compaction();
                 }
                 self.sync_compacting_status();
             }
@@ -227,7 +278,7 @@ impl App {
             | FrontendMaintenancePhase::Progress => {
                 if !self.manual_compacting {
                     self.manual_compacting = true;
-                    self.activity.start_manual_compaction();
+                    self.run_state.start_manual_compaction();
                     self.sync_compacting_status();
                 }
                 Vec::new()
@@ -252,7 +303,7 @@ impl App {
                 }
                 self.clear_manual_compaction();
                 self.ingest_appends(vec![Effect::Append(vec![line(
-                    LineKind::Notice,
+                    LineKind::Meta,
                     "context compaction cancelled",
                 )])])
             }
@@ -262,7 +313,7 @@ impl App {
     fn apply_session_list(&mut self, summaries: &[FrontendSessionSummary]) -> Vec<Effect> {
         if summaries.is_empty() {
             return self.ingest_appends(vec![Effect::Append(vec![line(
-                LineKind::Notice,
+                LineKind::Meta,
                 "no sessions recorded yet; this one starts with the first message",
             )])]);
         }
@@ -281,16 +332,30 @@ impl App {
                     .unwrap_or_default(),
                 group: String::new(),
                 marked: summary.session_id == self.status.session,
+                tiers: Vec::new(),
             })
             .collect();
         self.open_picker(entries);
         self.refresh_picker_preview()
     }
 
-    fn apply_model_list(&mut self, models: &[FrontendModelListing]) -> Vec<Effect> {
+    /// Model-catalog load: tracks the dashboard's provider fact from the
+    /// current entry, then optionally opens the `/models` picker. Catalog
+    /// loads that were not user-opened stay silent.
+    pub(crate) fn apply_model_catalog(
+        &mut self,
+        models: &[FrontendModelListing],
+        open_picker: bool,
+    ) -> Vec<Effect> {
+        if let Some(current) = models.iter().find(|listing| listing.current) {
+            self.status.provider = Some(current.provider.clone());
+        }
+        if !open_picker {
+            return Vec::new();
+        }
         if models.is_empty() {
             return self.ingest_appends(vec![Effect::Append(vec![line(
-                LineKind::Notice,
+                LineKind::Meta,
                 "no models configured; add [providers.<id>] sections to config.toml",
             )])]);
         }
@@ -299,9 +364,12 @@ impl App {
             .map(|listing| PickerEntry {
                 id: listing.id.clone(),
                 primary: listing.id.clone(),
-                secondary: String::new(),
+                // The active model is flagged with the `current` word rather
+                // than the session marker dot (contract §4.2).
+                secondary: if listing.current { "current" } else { "" }.to_owned(),
                 group: listing.provider.clone(),
                 marked: listing.current,
+                tiers: listing.reasoning_tiers.clone(),
             })
             .collect();
         self.open_model_picker(entries);
@@ -342,6 +410,7 @@ impl App {
     fn apply_generation_installed(&mut self, display: &FrontendGeneration) -> Vec<Effect> {
         let previous = self.status.model.clone();
         self.status.model.clone_from(&display.model_name);
+        self.status.effort = effort_value(display.reasoning_effort.as_deref());
         self.pending_model_switch = false;
         let text = if previous != display.model_name {
             format!("model: {}", display.model_name)
@@ -357,7 +426,12 @@ impl App {
         } else {
             format!("model: {}", display.model_name)
         };
-        self.ingest_appends(vec![Effect::Append(vec![line(LineKind::Meta, text)])])
+        // The catalog's current entry moved with the install; one refresh
+        // keeps the dashboard's provider fact honest.
+        let mut effects =
+            self.ingest_appends(vec![Effect::Append(vec![line(LineKind::Meta, text)])]);
+        effects.push(Effect::Host(HostRequest::RefreshModels));
+        effects
     }
 
     fn apply_config_changed(&mut self, entries: &[FrontendConfigEntry]) -> Vec<Effect> {
@@ -378,8 +452,13 @@ impl App {
             match entry.key.as_str() {
                 "ui.show_reasoning" | "show_reasoning" => {
                     if let Some(value) = parse_bool(&entry.value) {
+                        if !value {
+                            // Hiding reasoning seals live think timers; the
+                            // backlog must not resurrect hidden text.
+                            self.flush_stream();
+                        }
                         self.show_reasoning = value;
-                        self.transcript.set_show_reasoning(value);
+                        self.transcript.set_show_reasoning(&mut self.cells, value);
                     }
                 }
                 "verbose" | "ui.verbose" => {
@@ -426,6 +505,7 @@ impl App {
         self.status
             .model
             .clone_from(&snapshot.generation.model_name);
+        self.status.effort = effort_value(snapshot.generation.reasoning_effort.as_deref());
         if let Some(front) = snapshot.pending_confirmations.first() {
             self.sync_confirmation(Some((
                 front.confirmation_id,
@@ -454,7 +534,7 @@ impl App {
         if let Some(operation_id) = operation_for_pending_intent(snapshot, &pending) {
             return self.on_submit_accepted(pending.intent_id, operation_id);
         }
-        self.restore_pending_after_interrupt(line(LineKind::Notice, "提交未确认，内容已恢复"))
+        self.restore_pending_after_interrupt(line(LineKind::Meta, "提交未确认，内容已恢复"))
     }
 
     fn apply_live(&mut self, live: &LiveOperationSnapshot) {
@@ -503,14 +583,18 @@ impl App {
     fn clear_runtime_presence(&mut self) {
         self.manual_compacting = false;
         self.automatic_compacting = false;
-        self.set_busy(false, 0);
+        self.run_state.clear();
+        // A runtime epoch end orphans any buffered text; drop it with the
+        // presence it belonged to.
+        self.clear_stream();
+        self.set_busy(false);
     }
 
     fn finish_manual_compaction_message(&mut self, message: Option<&str>) -> Vec<Effect> {
         self.clear_manual_compaction();
         let text = match message {
             Some(message) if message.contains("NothingToCompact") => line(
-                LineKind::Notice,
+                LineKind::Meta,
                 "nothing to compact: no older completed turns are available",
             ),
             Some(message) => {
@@ -535,7 +619,7 @@ impl App {
 
     fn clear_manual_compaction(&mut self) {
         self.manual_compacting = false;
-        self.activity.finish_manual_compaction();
+        self.run_state.finish_manual_compaction();
         self.sync_compacting_status();
     }
 
@@ -576,14 +660,13 @@ impl App {
         }
         self.exit_armed = true;
         vec![Effect::Append(vec![line(
-            LineKind::Notice,
+            LineKind::Meta,
             "press Ctrl+C again to exit",
         )])]
     }
 
     pub(crate) fn sync_compacting_status(&mut self) {
-        self.status
-            .set_compacting(self.manual_compacting || self.automatic_compacting);
+        self.status.compacting = self.manual_compacting || self.automatic_compacting;
     }
 
     fn cancel_manual_compaction(&mut self) -> Vec<Effect> {
@@ -598,7 +681,7 @@ impl App {
             CancelDispatchResult::Enqueued(_) => {
                 self.clear_manual_compaction();
                 vec![Effect::Append(vec![line(
-                    LineKind::Notice,
+                    LineKind::Meta,
                     "context compaction cancelled",
                 )])]
             }
@@ -684,6 +767,22 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Terminal events read the turn clock one last time before the run-state
+/// machine stops it; every other event leaves the line out.
+fn terminal_event_elapsed(
+    run_state: &crate::app::run_state::RunState,
+    event: &FrontendOperationEvent,
+) -> Option<std::time::Duration> {
+    if matches!(
+        event,
+        FrontendOperationEvent::OperationSettled { .. } | FrontendOperationEvent::TurnFailed { .. }
+    ) {
+        run_state.elapsed()
+    } else {
+        None
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -749,4 +848,11 @@ fn effort_label(effort: &str) -> String {
         other => other,
     }
     .to_owned()
+}
+
+/// Dashboard effort fact: unset/default configurations render nothing.
+fn effort_value(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|effort| !effort.is_empty() && *effort != "default")
+        .map(effort_label)
 }

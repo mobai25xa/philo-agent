@@ -334,7 +334,9 @@ where
                 request_generation,
             } => self.handle_preview_session(request_id, session_id, request_generation),
             FrontendCommand::CreateSession => self.handle_create_session(request_id),
-            FrontendCommand::InstallModel { name } => self.handle_install_model(request_id, name),
+            FrontendCommand::InstallModel { name, effort } => {
+                self.handle_install_model(request_id, name, effort)
+            }
             FrontendCommand::SetReasoning { effort } => {
                 self.handle_set_reasoning(request_id, effort)
             }

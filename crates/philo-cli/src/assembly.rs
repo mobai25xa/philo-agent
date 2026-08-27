@@ -55,6 +55,9 @@ pub(crate) struct Bootstrap {
     pub sessions: Arc<JsonlSessionStore>,
     pub assembler: Arc<CliGenerationAssembler>,
     pub settings: Settings,
+    /// Process working directory resolved once at assembly and injected into
+    /// `TuiLaunchConfig.workspace_root`; the TUI never probes the cwd itself.
+    pub workspace_root: String,
 }
 
 struct AssemblerState {
@@ -106,6 +109,12 @@ impl AssemblerState {
         let runtime_config =
             runtime_config_for(&self.flags.to_cli(), &settings, &deployment, &request.name)
                 .map_err(|error| AssembleError::new(error.0))?;
+        // An explicit install-time effort (model picker tier) freezes into
+        // the new generation atomically and outranks flag/model defaults.
+        let mut runtime_config = runtime_config;
+        if let Some(effort) = request.effort {
+            runtime_config.generation.reasoning_effort = Some(effort);
+        }
         let model: Arc<dyn ModelPort> = Arc::new(
             build_model(&deployment, &wire_model, self.replay_store.clone())
                 .map_err(|error| AssembleError::new(format!("{error}")))?,
@@ -357,6 +366,11 @@ impl GenerationAssembler for CliGenerationAssembler {
                 id: choice.id.clone(),
                 provider: choice.provider_id.clone(),
                 model: choice.model.clone(),
+                reasoning_tiers: choice
+                    .reasoning_tiers
+                    .iter()
+                    .map(|tier| crate::config::effort_label(*tier).to_owned())
+                    .collect(),
             })
             .collect()
     }
@@ -384,6 +398,7 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
     let assembled = assembler
         .assemble_sync(AssembleRequest {
             name: display_settings.deployment.model.clone(),
+            effort: None,
         })
         .map_err(|error| UsageError::new(format!("model assembly failed: {}", error.message)))?;
     let initial_generation = Arc::new(RuntimeGeneration {
@@ -417,7 +432,16 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
         sessions,
         assembler,
         settings: display_settings,
+        workspace_root: workspace_root()?,
     })
+}
+
+/// Resolves the composition root's working directory for `TuiLaunchConfig`.
+/// Tool roots go through [`coding_profile`]; this only feeds the TUI.
+fn workspace_root() -> Result<String, UsageError> {
+    std::env::current_dir()
+        .map_err(|error| UsageError::new(format!("cannot resolve the working directory: {error}")))
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// Graceful service + store shutdown with a process-wide deadline.
@@ -587,7 +611,11 @@ pub(crate) fn apply_config_reload(
         Err(error) => {
             assembler.set_reload_fault(format!("config not reloaded: {}", error.0));
             let name = assembler.current_settings().deployment.model;
-            enqueue_generation_command(client, assembler, FrontendCommand::InstallModel { name });
+            enqueue_generation_command(
+                client,
+                assembler,
+                FrontendCommand::InstallModel { name, effort: None },
+            );
         }
         Ok((settings, _warnings)) => {
             if settings.data_dir != *assembler.data_dir() {
@@ -598,7 +626,7 @@ pub(crate) fn apply_config_reload(
                 enqueue_generation_command(
                     client,
                     assembler,
-                    FrontendCommand::InstallModel { name },
+                    FrontendCommand::InstallModel { name, effort: None },
                 );
                 return;
             }
@@ -634,6 +662,7 @@ pub(crate) fn apply_config_reload(
                 assembler,
                 FrontendCommand::InstallModel {
                     name: settings.deployment.model,
+                    effort: None,
                 },
             );
         }
@@ -973,6 +1002,7 @@ mod tests {
         assembler.store_settings(next);
         let Err(error) = assembler.assemble_sync(AssembleRequest {
             name: "model-a".to_owned(),
+            effort: None,
         }) else {
             panic!("data_dir must fail");
         };
@@ -986,6 +1016,7 @@ mod tests {
         let assembler = assembler(&dir, "not-a-url");
         let Err(error) = assembler.assemble_sync(AssembleRequest {
             name: "model-a".to_owned(),
+            effort: None,
         }) else {
             panic!("bad endpoint");
         };
@@ -1083,6 +1114,7 @@ mod tests {
         assembler.set_reload_fault("config not reloaded: invalid TOML");
         let Err(error) = assembler.assemble_sync(AssembleRequest {
             name: "model-a".to_owned(),
+            effort: None,
         }) else {
             panic!("fault");
         };
@@ -1091,6 +1123,7 @@ mod tests {
         // fail on model construction in tests without a real endpoint.
         let _ = assembler.assemble_sync(AssembleRequest {
             name: "model-a".to_owned(),
+            effort: None,
         });
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1193,6 +1226,7 @@ mod tests {
             &assembler,
             AssembleRequest {
                 name: "model-a".to_owned(),
+                effort: None,
             },
         )
         .await;

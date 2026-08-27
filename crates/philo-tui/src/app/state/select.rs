@@ -22,6 +22,13 @@ impl App {
         self.layout_width.set(usize::from(history.width));
         self.layout_history_height.set(usize::from(history.height));
         self.history_band.set(history);
+        self.band_height.set(history.height);
+    }
+
+    /// Render pass records the true transcript-band height; the painted
+    /// sub-area (which hangs from its tail while streaming) may be shorter.
+    pub(crate) fn note_band_height(&self, height: u16) {
+        self.band_height.set(height);
     }
 
     pub(crate) fn note_history_layout(&self, width: usize, history_height: usize) {

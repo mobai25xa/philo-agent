@@ -44,7 +44,7 @@ fn message_lines(message: &FrontendContextMessage) -> Vec<TranscriptLine> {
     match message {
         FrontendContextMessage::Summary { text } => text
             .split('\n')
-            .map(|text| line(LineKind::Notice, format!("[summary] {text}")))
+            .map(|text| line(LineKind::Meta, format!("[summary] {text}")))
             .collect(),
         FrontendContextMessage::User { parts } => user_block(parts.iter().map(user_part_text)),
         FrontendContextMessage::Assistant { blocks } => assistant_block_lines(blocks, false),
@@ -122,7 +122,7 @@ mod tests {
             rendered,
             [
                 "User: ",
-                "User: › count the files",
+                "User: count the files",
                 "User: ",
                 "Tool: ▸ read_file  path: src/main.rs",
                 "Tool:   └ ok · fn main() {}",
@@ -138,7 +138,7 @@ mod tests {
         let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
             texts,
-            ["", "› look at this", "  [image image/png, 4 bytes]", ""]
+            ["", "look at this", "[image image/png, 4 bytes]", ""]
         );
     }
 
@@ -178,8 +178,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                line(LineKind::Notice, "[summary] earlier request"),
-                line(LineKind::Notice, "[summary] earlier answer"),
+                line(LineKind::Meta, "[summary] earlier request"),
+                line(LineKind::Meta, "[summary] earlier answer"),
             ]
         );
     }
@@ -189,7 +189,7 @@ mod tests {
         let view = session_view("s-1");
         assert_eq!(
             preview_lines(&view, 2),
-            ["› count the files".to_owned(), "...".to_owned()]
+            ["count the files".to_owned(), "...".to_owned()]
         );
         let empty = empty_session_view("s-empty");
         assert_eq!(preview_lines(&empty, 4), ["(empty session)".to_owned()]);

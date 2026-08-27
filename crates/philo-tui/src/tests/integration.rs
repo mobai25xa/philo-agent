@@ -12,7 +12,7 @@ use crate::app::state::App;
 use crate::app::status::StatusData;
 use crate::app::text;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
-use crate::render::{composer, frame, markdown::MarkdownRenderer};
+use crate::render::{composer, frame};
 
 fn app() -> App {
     App::new(
@@ -69,9 +69,8 @@ fn history_dump(cells: &[TranscriptLine]) -> String {
 fn render(app: &App, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    let markdown = MarkdownRenderer::new();
     terminal
-        .draw(|terminal_frame| frame::draw(terminal_frame, app, &markdown, false))
+        .draw(|terminal_frame| frame::draw(terminal_frame, app, false))
         .expect("test frame");
     terminal
         .backend()
@@ -144,7 +143,7 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     let expected_rows =
         [40, 80, 120].map(|width| (width, composer_row(&app, width, frame::VIEWPORT_HEIGHT)));
 
-    app.set_busy(true, 1);
+    app.set_busy(true);
     apply_event(
         &mut app,
         FrontendOperationEvent::ReasoningDelta {
@@ -165,6 +164,10 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             },
         );
     }
+    // Replay the paced backlog so the block boundaries exist, then pin the
+    // sealed think span for a deterministic header.
+    assert!(app.flush_stream());
+    app.cells.freeze_think(std::time::Duration::from_secs(3));
 
     apply_event(
         &mut app,
@@ -187,15 +190,16 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     assert_eq!(
         app.cells.cells().len(),
         before_started,
-        "Started is Activity-only"
+        "Started only moves the state word, no transcript cell"
     );
+    let running = app.run_state_corner(40).expect("running corner");
     assert!(
-        app.activity_view(40)
-            .expect("tool activity")
-            .text
-            .contains("tool  read_file")
+        running.word.starts_with("Running"),
+        "tools share one unified word: {running:?}"
     );
     assert_responsive_composer(&app, &expected_rows);
+    app.run_state_mut()
+        .freeze_elapsed(std::time::Duration::from_secs(57));
     let tool_screen = indexed_screen(&app, 40, frame::VIEWPORT_HEIGHT);
 
     apply_event(
@@ -221,12 +225,12 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         .filter(|line| line.kind == LineKind::Tool)
         .collect::<Vec<_>>();
     assert!(
-        tool_lines[0].text.starts_with("• read_file"),
-        "Completed keeps the fact summary: {:?}",
-        tool_lines[0].text
+        tool_lines[0].tone == crate::app::transcript::Tone::Title,
+        "Completed keeps a titled header: {:?}",
+        tool_lines[0].tone
     );
     assert_eq!(
-        tool_lines[0].text, "• read_file  src/中文.rs",
+        tool_lines[0].text, "read_file src/中文.rs",
         "old displays without verb/body become a header-only card"
     );
     assert_eq!(
@@ -249,11 +253,10 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
     assert!(text::width(&tool_lines[0].text) <= 120);
 
     apply_event(&mut app, FrontendOperationEvent::ContextCompactionStarted);
+    let compacting = app.run_state_corner(40).expect("compaction corner");
     assert!(
-        app.activity_view(40)
-            .expect("compaction activity")
-            .text
-            .contains("compact")
+        compacting.word.starts_with("Compacting"),
+        "compaction owns the word: {compacting:?}"
     );
     apply_event(
         &mut app,
@@ -281,12 +284,13 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             delta: " late-but-preserved".to_owned(),
         },
     );
+    // Reveal the late text now (production flushes it on the next
+    // structural event or tick) so the cancelling screen shows it.
+    assert!(app.flush_stream());
+    let cancelling = app.run_state_corner(40).expect("cancellation corner");
     assert!(
-        app.activity_view(40)
-            .expect("cancellation activity")
-            .text
-            .contains("cancel  user"),
-        "a late delta cannot replace the higher-priority cancellation",
+        cancelling.word.starts_with("Cancelling") && cancelling.warning,
+        "a late delta cannot replace the sticky cancellation: {cancelling:?}"
     );
     assert_responsive_composer(&app, &expected_rows);
     let cancelling_screen = indexed_screen(&app, 40, frame::VIEWPORT_HEIGHT);
@@ -298,6 +302,9 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             reason: "User".to_owned(),
         },
     );
+    // Freeze the run clock so the settlement line's duration is exact.
+    app.run_state_mut()
+        .freeze_elapsed(std::time::Duration::from_secs(12));
     apply_event(
         &mut app,
         FrontendOperationEvent::OperationSettled {
@@ -308,8 +315,8 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
             session_revision: philo_agent_service::SettlementRevision::Unchanged,
         },
     );
-    app.set_busy(false, 0);
-    assert!(app.activity_view(40).is_none());
+    app.set_busy(false);
+    assert!(app.run_state_corner(40).is_none());
     assert!(!app.cells.has_open());
 
     let cells = app.cells.cells();
@@ -331,8 +338,8 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
         .expect("late text was committed");
     let cancelled = cells
         .iter()
-        .position(|line| line.text == "turn cancelled (user)")
-        .expect("cancellation fact was committed");
+        .position(|line| line.text == "· turn cancelled (user) · 12s")
+        .expect("cancellation fact was committed at settlement");
     assert!(
         late_text < cancelled,
         "a terminal cancellation fact cannot overtake accepted text",
@@ -365,11 +372,13 @@ fn streaming_tool_compaction_and_cancel_form_one_stable_flow() {
 #[test]
 fn animation_and_cancel_stay_live_without_runtime_handles() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     app.on_paste("草稿 e\u{301} 👩‍💻");
-    let before_tick = app.activity_view(40).expect("waiting activity").text;
-    assert!(app.on_tick());
-    let after_tick = app.activity_view(40).expect("animated activity").text;
+    let waiting = app.run_state_corner(40).expect("waiting corner");
+    assert!(waiting.word.starts_with("Waiting"));
+    let before_tick = waiting.spinner;
+    assert!(app.on_tick(std::time::Duration::from_millis(100)));
+    let after_tick = app.run_state_corner(40).expect("animated corner").spinner;
     assert_ne!(
         before_tick, after_tick,
         "spinner advances while the frontend waits"

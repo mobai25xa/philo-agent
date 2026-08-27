@@ -1,0 +1,82 @@
+---
+source: crates/philo-tui/src/tests/matrix.rs
+assertion_line: 148
+expression: matrix_render(app)
+---
+40 columns
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+             (openai) gpt-5.2 · high
+   ▌
+   ▌ Ask anything
+   ▌
+    D:\…\Pi     ↑11k ↓4.8k 2.2%/500k
+
+80 columns
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                     (openai) gpt-5.2 · high
+   ▌
+   ▌ Ask anything
+   ▌
+    D:\Code\Zed\Year2026\Jul0706\Pi         ↑11k ↓4.8k R14k C51.3% 2.2%/500k
+
+120 columns
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                             (openai) gpt-5.2 · high
+   ▌
+   ▌ Ask anything
+   ▌
+    D:\Code\Zed\Year2026\Jul0706\Pi                                                 ↑11k ↓4.8k R14k C51.3% 2.2%/500k

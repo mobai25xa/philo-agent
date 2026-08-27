@@ -1,14 +1,14 @@
 ---
 source: crates/philo-tui/src/tests/compaction.rs
-expression: "format!(\"FIRST\\n{}\\nSTATUS {waiting}\\n{}\\nSTATUS {}\\n\\nSECOND\\n{}\\n{}\\nSTATUS {}\",\nappended(&first).join(\"\\n\"), appended(&completed).join(\"\\n\"),\ncompleted_status, appended(&second).join(\"\\n\"), appended(&nothing).join(\"\\n\"),\napp.status.line(),)"
+expression: "format!(\"FIRST\\n{}\\nCORNER {waiting}\\n{}\\nCORNER {completed_corner}\\n\\nSECOND\\n{}\\n{}\\nCORNER {}\",\nappended(&first).join(\"\\n\"), appended(&completed).join(\"\\n\"),\nappended(&second).join(\"\\n\"), appended(&nothing).join(\"\\n\"),\ncorner_word(&app),)"
 ---
 FIRST
 Meta: /compact
-STATUS model-a · s-1 · compact | · in 8.0k
+CORNER Compacting…
 Meta: context compacted through entry-42
-STATUS model-a · s-1
+CORNER (idle)
 
 SECOND
 Meta: /compact
-Notice: nothing to compact: no older completed turns are available
-STATUS model-a · s-1
+Meta: nothing to compact: no older completed turns are available
+CORNER (idle)

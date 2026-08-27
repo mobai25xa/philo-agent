@@ -1,252 +1,84 @@
-//! Markdown projection for answer text.
+//! Answer-row painter: semantic prose spans to ratatui lines.
 //!
-//! The transcript is line-oriented and append-only, so rendering is too: a
-//! committed line is styled once and never revisited. Only fenced code
-//! blocks need memory across lines, and that is the whole of this
-//! renderer's state. Answer lines go through markdown; every other line
-//! kind keeps its semantic styling.
+//! Projection (`app::prose`) bakes fully styled [`ProseSpan`]s into the
+//! wrap cache — markdown parsing happens once per width change, never per
+//! frame. This module only realizes semantics through the [`theme`] token
+//! set, plus fenced code bodies, which stay raw text so syntect paints
+//! them here (their language rides the row's role).
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::app::transcript::{LineKind, TranscriptLine};
+use crate::app::prose::{BlockRole, ProseColor, ProseSpan, ProseStyle};
 
-use super::highlight::{CodeHighlighter, code_style};
-use super::line::styled_line;
+use super::highlight::CodeHighlighter;
 use super::theme;
 
-/// An open fenced code block.
-struct Fence {
-    marker: char,
-    language: String,
-    #[cfg(test)]
-    highlighter: CodeHighlighter,
-}
-
-/// Renders transcript lines, remembering only the open code fence.
-#[derive(Default)]
-pub(crate) struct MarkdownRenderer {
-    fence: Option<Fence>,
-}
-
-impl MarkdownRenderer {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Drops block state at a session boundary, so an unterminated fence
-    /// cannot bleed into the next session's answers.
-    pub(crate) fn reset(&mut self) {
-        self.fence = None;
-    }
-
-    /// Renders a line that is now part of history, advancing block state.
-    /// History paint uses [`Self::preview`]; this stays for markdown tests.
-    #[cfg(test)]
-    pub(crate) fn commit(&mut self, line: &TranscriptLine) -> Line<'static> {
-        if line.kind != LineKind::Answer {
-            return styled_line(line);
-        }
-        let text = line.text.as_str();
-        if let Some(fence) = self.fence.as_mut() {
-            if closes(text, fence.marker) {
-                self.fence = None;
-                return delimiter(text);
-            }
-            let mut spans = vec![Span::styled("│ ", theme::rule())];
-            match fence.highlighter.line(text) {
-                Some(regions) => spans.extend(
-                    regions
-                        .into_iter()
-                        .map(|(style, fragment)| Span::styled(fragment, style)),
-                ),
-                None => spans.push(Span::styled(text.to_owned(), code_style())),
-            }
-            return Line::from(spans);
-        }
-        match opens(text) {
-            Some((marker, language)) => {
-                self.fence = Some(Fence {
-                    marker,
-                    language: language.clone(),
-                    highlighter: CodeHighlighter::for_language(&language),
-                });
-                delimiter(text)
-            }
-            None => inline(text),
-        }
-    }
-
-    /// Renders the streaming line without touching block state: it is still
-    /// being written and will be committed again once complete.
-    pub(crate) fn preview(&self, line: &TranscriptLine) -> Line<'static> {
-        if line.kind != LineKind::Answer {
-            return styled_line(line);
-        }
-        let text = line.text.as_str();
-        if let Some(fence) = self.fence.as_ref() {
-            if closes(text, fence.marker) {
-                return delimiter(text);
-            }
-            let mut spans = vec![Span::styled("│ ", theme::rule())];
-            match CodeHighlighter::preview_line(&fence.language, text) {
-                Some(regions) => spans.extend(
-                    regions
-                        .into_iter()
-                        .map(|(style, fragment)| Span::styled(fragment, style)),
-                ),
-                None => spans.push(Span::styled(text.to_owned(), code_style())),
-            }
-            return Line::from(spans);
-        }
-        if opens(text).is_some() {
-            return delimiter(text);
-        }
-        inline(text)
+/// Paints one projected answer row. Pure: same inputs, same line.
+pub(crate) fn answer_row(
+    text: &str,
+    role: &BlockRole,
+    spans: Option<&[ProseSpan]>,
+) -> Line<'static> {
+    match spans {
+        Some(spans) => Line::from(spans.iter().map(realize).collect::<Vec<_>>()),
+        None => match role {
+            BlockRole::FenceBody { lang } => fence_body(text, lang),
+            _ => Line::from(Span::raw(text.to_owned())),
+        },
     }
 }
 
-/// The fence line itself, shown as the dim marker it is.
-fn delimiter(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_owned(),
-        Style::default().fg(Color::DarkGray),
-    ))
+/// Maps one semantic span onto theme tokens. This is the only place prose
+/// semantics become colors.
+fn realize(span: &ProseSpan) -> Span<'static> {
+    Span::styled(span.text.clone(), resolve(span.style))
 }
 
-/// A fence opener and its info string, if this line is one.
-fn opens(text: &str) -> Option<(char, String)> {
-    let (marker, rest) = fence_run(text)?;
-    Some((marker, rest.trim().to_owned()))
-}
-
-/// Whether this line closes a fence opened with `marker` (a closing fence
-/// carries no info string).
-fn closes(text: &str, marker: char) -> bool {
-    match fence_run(text) {
-        Some((found, rest)) => found == marker && rest.trim().is_empty(),
-        None => false,
+fn resolve(style: ProseStyle) -> Style {
+    let resolved = match style.color {
+        ProseColor::Default => Style::default(),
+        ProseColor::Meta => theme::meta(),
+        ProseColor::Link => theme::link(),
+        ProseColor::Code => theme::inline_code(),
+        ProseColor::Accent => theme::accent(),
+    };
+    let mut modifiers = Modifier::empty();
+    if style.bold {
+        modifiers |= Modifier::BOLD;
     }
+    if style.italic {
+        modifiers |= Modifier::ITALIC;
+    }
+    if style.underline {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if style.crossed {
+        modifiers |= Modifier::CROSSED_OUT;
+    }
+    resolved.add_modifier(modifiers)
 }
 
-/// Splits a fence line into its marker and info string.
-fn fence_run(text: &str) -> Option<(char, &str)> {
-    let trimmed = text.trim_start();
-    let marker = trimmed
-        .chars()
-        .next()
-        .filter(|ch| *ch == '`' || *ch == '~')?;
-    let run = trimmed.chars().take_while(|ch| *ch == marker).count();
-    if run < 3 {
-        return None;
-    }
-    Some((marker, &trimmed[run..]))
-}
-
-/// Renders one markdown line: block prefix plus inline styling.
-fn inline(text: &str) -> Line<'static> {
-    let indent: String = text.chars().take_while(|ch| *ch == ' ').collect();
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut styles = vec![Style::default()];
-    let mut ordered: Option<u64> = None;
-
-    for event in Parser::new_ext(text, options) {
-        match event {
-            Event::Start(Tag::Heading { level, .. }) => {
-                spans.push(Span::styled("▍ ", heading_style(level)));
-                styles.push(heading_style(level));
-            }
-            Event::End(TagEnd::Heading(_)) => pop(&mut styles),
-            Event::Start(Tag::List(start)) => ordered = start,
-            Event::Start(Tag::Item) => {
-                let marker = match ordered {
-                    Some(number) => format!("{number}. "),
-                    None => "- ".to_owned(),
-                };
-                spans.push(Span::styled(
-                    format!("{indent}{marker}"),
-                    Style::default().fg(Color::Green),
-                ));
-            }
-            Event::Start(Tag::BlockQuote(_)) => {
-                spans.push(Span::styled(
-                    format!("{indent}| "),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                styles.push(top(&styles).fg(Color::Gray).add_modifier(Modifier::ITALIC));
-            }
-            Event::End(TagEnd::BlockQuote(_)) => pop(&mut styles),
-            Event::Start(Tag::Emphasis) => {
-                styles.push(top(&styles).add_modifier(Modifier::ITALIC));
-            }
-            Event::End(TagEnd::Emphasis) => pop(&mut styles),
-            Event::Start(Tag::Strong) => styles.push(top(&styles).add_modifier(Modifier::BOLD)),
-            Event::End(TagEnd::Strong) => pop(&mut styles),
-            Event::Start(Tag::Strikethrough) => {
-                styles.push(top(&styles).add_modifier(Modifier::CROSSED_OUT));
-            }
-            Event::End(TagEnd::Strikethrough) => pop(&mut styles),
-            Event::Start(Tag::Link { .. }) => {
-                styles.push(
-                    top(&styles)
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::UNDERLINED),
-                );
-            }
-            Event::End(TagEnd::Link) => pop(&mut styles),
-            // Indented code: styled like a fenced block, without a language.
-            Event::Start(Tag::CodeBlock(_)) => styles.push(code_style()),
-            Event::End(TagEnd::CodeBlock) => pop(&mut styles),
-            Event::Code(code) => spans.push(Span::styled(code.to_string(), code_style())),
-            Event::Text(text) => spans.push(Span::styled(text.to_string(), top(&styles))),
-            Event::SoftBreak | Event::HardBreak => spans.push(Span::raw(" ")),
-            Event::Rule => spans.push(Span::styled(
-                "-".repeat(24),
-                Style::default().fg(Color::DarkGray),
-            )),
-            _ => {}
-        }
-    }
-    if spans.is_empty() {
-        return Line::from(Span::raw(text.to_owned()));
+/// One fenced body row: guttered code, highlighted when the language is
+/// known. An unrecognised language is not an error — the row degrades to
+/// the soft code green so the text always reaches the user unchanged.
+fn fence_body(text: &str, lang: &str) -> Line<'static> {
+    let mut spans = vec![Span::styled("│ ", theme::rule())];
+    match CodeHighlighter::for_language(lang).line(text) {
+        Some(regions) => spans.extend(
+            regions
+                .into_iter()
+                .map(|(style, fragment)| Span::styled(fragment, style)),
+        ),
+        None => spans.push(Span::styled(text.to_owned(), theme::inline_code())),
     }
     Line::from(spans)
-}
-
-fn heading_style(level: HeadingLevel) -> Style {
-    let base = Style::default()
-        .fg(Color::Magenta)
-        .add_modifier(Modifier::BOLD);
-    match level {
-        HeadingLevel::H1 | HeadingLevel::H2 => base.add_modifier(Modifier::UNDERLINED),
-        _ => base,
-    }
-}
-
-fn top(styles: &[Style]) -> Style {
-    styles.last().copied().unwrap_or_default()
-}
-
-fn pop(styles: &mut Vec<Style>) {
-    if styles.len() > 1 {
-        styles.pop();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn answer(text: &str) -> TranscriptLine {
-        TranscriptLine {
-            kind: LineKind::Answer,
-            text: text.to_owned(),
-        }
-    }
+    use crate::app::prose;
 
     /// Compact dump of a rendered line: `text{styles}` per span.
     fn dump(line: &Line<'_>) -> String {
@@ -256,6 +88,9 @@ mod tests {
                 let mut marks: Vec<String> = Vec::new();
                 if let Some(color) = span.style.fg {
                     marks.push(format!("{color:?}").to_lowercase());
+                }
+                if let Some(color) = span.style.bg {
+                    marks.push(format!("on {color:?}").to_lowercase());
                 }
                 for (modifier, name) in [
                     (Modifier::BOLD, "bold"),
@@ -277,13 +112,25 @@ mod tests {
             .join(" ")
     }
 
+    /// Projects the joined lines exactly as production would (wide enough
+    /// to skip wrapping), then paints each row.
     fn render(lines: &[&str]) -> String {
-        let mut renderer = MarkdownRenderer::new();
-        lines
+        prose::project_answer(&lines.join("\n"), 2000)
             .iter()
-            .map(|text| format!("{text}\n  -> {}", dump(&renderer.commit(&answer(text)))))
+            .map(|row| {
+                format!(
+                    "{text}\n  -> {}",
+                    dump(&answer_row(&row.text, &row.role, row.spans.as_deref())),
+                    text = row.text
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn one(lines: &[&str]) -> Line<'static> {
+        let rows = prose::project_answer(&lines.join("\n"), 2000);
+        answer_row(&rows[0].text, &rows[0].role, rows[0].spans.as_deref())
     }
 
     #[test]
@@ -292,11 +139,14 @@ mod tests {
             "markdown_elements",
             render(&[
                 "# Title",
+                "## Middle",
                 "### Smaller",
                 "plain paragraph text",
                 "- first item",
                 "  - nested item",
                 "1. ordered item",
+                "- [x] done deal",
+                "- [ ] open item",
                 "> quoted remark",
                 "text with **bold**, *italic*, ~~struck~~ and `inline code`",
                 "see [docs](https://example.test/guide)",
@@ -324,53 +174,174 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_keeps_markdown_from_touching_its_body() {
-        let mut renderer = MarkdownRenderer::new();
-        renderer.commit(&answer("```"));
-        let inside = renderer.commit(&answer("# not a heading"));
+    fn table_grid_snapshot() {
+        crate::tests::assert_tui_snapshot!(
+            "markdown_table_grid",
+            render(&[
+                "| plan | latency | notes |",
+                "|---|---|---|",
+                "| fast | 2ms | cached path |",
+                "| slow | 200ms | hits the network every single time |",
+                "",
+                "back to prose",
+            ])
+        );
+    }
+
+    #[test]
+    fn fence_bodies_are_code_not_markdown() {
+        let rows = prose::project_answer("```\n# not a heading\n```", 80);
+        let body = answer_row(&rows[1].text, &rows[1].role, rows[1].spans.as_deref());
         assert_eq!(
-            inside
-                .spans
+            body.spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
             "│ # not a heading"
         );
         assert!(
-            !inside.spans[0].style.add_modifier.contains(Modifier::BOLD),
-            "code is not styled as markdown"
+            !body.spans[0].style.add_modifier.contains(Modifier::BOLD)
+                && body.spans[0].style.fg == Some(ratatui::style::Color::DarkGray),
+            "code keeps its semantic styling"
         );
-        renderer.commit(&answer("```"));
-        let outside = renderer.commit(&answer("# heading again"));
-        assert!(outside.spans[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let prose_line = one(&["# heading"]);
+        assert!(prose_line.spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn an_unterminated_fence_does_not_survive_a_session_switch() {
-        let mut renderer = MarkdownRenderer::new();
-        renderer.commit(&answer("```rust"));
-        renderer.reset();
-        let after = renderer.commit(&answer("# heading"));
-        assert!(after.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    fn checked_tasks_strike_and_dim_only_their_own_body() {
+        let line = one(&["- [x] done deal"]);
+        // The `- ` marker stays meta; the checked `[x] ` lights up accent.
+        let texts: Vec<&str> = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, ["- ", "[x] ", "done deal"]);
+        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::DarkGray));
+        let check = &line.spans[1].style;
+        assert_eq!(check.fg, Some(theme::accent().fg.expect("accent fg")));
+        let body = &line.spans[2].style;
+        assert!(
+            body.add_modifier.contains(Modifier::CROSSED_OUT)
+                && body.fg == Some(ratatui::style::Color::DarkGray),
+            "done body is struck and dimmed"
+        );
+
+        let open = one(&["- [ ] open item"]);
+        // Adjacent meta runs merge: marker and open box share one span.
+        let texts: Vec<&str> = open.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, ["- [ ] ", "open item"]);
+        assert!(
+            !open.spans[1].style.add_modifier.contains(Modifier::CROSSED_OUT),
+            "open tasks stay primary"
+        );
+
+        // Strike state cannot leak across logical lines.
+        let done = one(&["- [x] done"]);
+        assert!(
+            done.spans
+                .last()
+                .expect("body span")
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        let next = one(&["plain tail"]);
+        let last = next.spans.last().expect("tail span");
+        assert_eq!(last.content.as_ref(), "plain tail");
+        assert!(!last.style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]
-    fn the_preview_renders_without_advancing_block_state() {
-        let mut renderer = MarkdownRenderer::new();
-        let preview = renderer.preview(&answer("```rust"));
-        assert_eq!(preview.spans[0].content.as_ref(), "```rust");
-        // Still outside a fence: the streaming line was not committed.
-        let heading = renderer.commit(&answer("# heading"));
-        assert!(heading.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    fn quotes_keep_an_accent_bar_and_never_steal_the_reasoning_italic() {
+        let line = one(&["> quoted remark"]);
+        assert_eq!(
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "│ quoted remark"
+        );
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(theme::accent().fg.expect("accent fg")),
+            "quote bar rides brand orange"
+        );
+        assert!(
+            !line.spans[1].style.add_modifier.contains(Modifier::ITALIC),
+            "quote bodies stay upright; italic belongs to think blocks"
+        );
+        assert_eq!(line.spans[1].style.fg, None, "quote body rides primary");
     }
 
     #[test]
-    fn other_line_kinds_keep_their_semantic_styling() {
-        let mut renderer = MarkdownRenderer::new();
-        let notice = TranscriptLine {
-            kind: LineKind::Notice,
-            text: "# not markdown".to_owned(),
-        };
-        assert_eq!(dump(&renderer.commit(&notice)), dump(&styled_line(&notice)));
+    fn headings_step_down_the_ladder() {
+        let accent_fg = theme::accent().fg.expect("accent fg");
+        let h1 = one(&["# Title"]);
+        assert!(h1.spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(h1.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(h1.spans[0].style.fg, Some(accent_fg), "H1 rides accent");
+
+        let h2 = one(&["## Mid"]);
+        assert!(h2.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!h2.spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(h2.spans[0].style.fg, Some(accent_fg), "H2 rides accent");
+
+        let h3 = one(&["### Small"]);
+        assert!(h3.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(h3.spans[0].style.fg, None, "H3+ falls back to primary weight");
+    }
+
+    #[test]
+    fn rules_become_a_dim_horizontal_run() {
+        let line = one(&["---"]);
+        assert_eq!(
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "────────────────────────"
+        );
+        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::DarkGray));
+    }
+
+    #[test]
+    fn inline_code_rides_green_text_and_links_stay_blue() {
+        let line = one(&["use `fast_path` now"]);
+        assert_eq!(line.spans[1].content.as_ref(), "fast_path");
+        assert_eq!(
+            line.spans[1].style.fg,
+            Some(theme::code_fg()),
+            "inline code is soft green text"
+        );
+        assert_eq!(
+            line.spans[1].style.bg, None,
+            "code is font color only — no background block"
+        );
+
+        let link = one(&["see [docs](https://example.test/guide)"]);
+        let docs = link.spans.iter().find(|s| s.content.as_ref() == "docs").expect("link text");
+        assert_eq!(docs.style.fg, Some(ratatui::style::Color::Blue));
+        assert!(docs.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn tables_paint_an_accent_header_inside_meta_frames() {
+        let rows = prose::project_answer("| a | bb |\n|---|---|\n| 1 | 2 |", 80);
+        assert_eq!(rows[0].text, "╭───┬────╮");
+        let header = answer_row(&rows[1].text, &rows[1].role, rows[1].spans.as_deref());
+        assert_eq!(header.spans[0].content.as_ref(), "│ ");
+        assert_eq!(header.spans[0].style.fg, Some(ratatui::style::Color::DarkGray));
+        assert!(header.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            header.spans[1].style.fg,
+            Some(theme::accent().fg.expect("accent fg")),
+            "header text rides brand orange"
+        );
+
+        let separator = answer_row(&rows[2].text, &rows[2].role, rows[2].spans.as_deref());
+        assert_eq!(
+            separator.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            "├───┼────┤"
+        );
+        assert!(separator.spans.iter().all(|s| s.style.fg == Some(ratatui::style::Color::DarkGray)));
     }
 }

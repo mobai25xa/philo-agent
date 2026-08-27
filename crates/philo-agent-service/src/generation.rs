@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use philo_agent_runtime::{
-    GenerationDisplay, GenerationId, ModelPort, RuntimeConfig, RuntimeGeneration,
+    GenerationDisplay, GenerationId, ModelPort, ReasoningEffort, RuntimeConfig, RuntimeGeneration,
 };
 use philo_tools::ToolPort;
 
@@ -18,6 +18,9 @@ use crate::mapping;
 pub struct AssembleRequest {
     /// Requested model name.
     pub name: String,
+    /// Reasoning effort to freeze into the assembled generation. `None`
+    /// keeps the resolution order: flag > model default tier.
+    pub effort: Option<ReasoningEffort>,
 }
 
 /// Successful assembly result. The service assigns the new [`GenerationId`].
@@ -60,6 +63,9 @@ pub struct ModelListingEntry {
     pub provider: String,
     /// Model name within the provider (display).
     pub model: String,
+    /// Declared reasoning tiers, ordered light to heavy. Empty means the
+    /// model has no reasoning capability.
+    pub reasoning_tiers: Vec<String>,
 }
 
 /// Injected by CLI (Wave 2) or tests. The service crate does not build models.

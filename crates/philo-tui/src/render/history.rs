@@ -1,20 +1,24 @@
 //! Style and paint a display `VisibleSlice`. No scroll policy.
+//!
+//! User strip rows arrive as bare primary text: the full-width surface band
+//! and column-0 accent bar are pre-painted by the frame under them (design
+//! §3.1), so this layer never fills their background. Answer rows paint
+//! from their projected block role (`app::prose`) — pure, per row.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::app::cells::VisibleSlice;
+use crate::app::cells::{VisibleRow, VisibleSlice};
 use crate::app::select::Selection;
 use crate::app::text;
-use crate::app::transcript::{LineKind, TranscriptLine};
+use crate::app::transcript::{LineKind, Tone};
 
-use super::markdown::MarkdownRenderer;
+use super::markdown;
 use super::theme;
 
-/// Project each visible row with preview styling. History never calls
-/// `markdown.commit`.
+/// Project each visible row with role-driven styling. Pure: no renderer
+/// state exists anywhere on this path.
 pub(crate) fn paint_slice(
-    markdown: &MarkdownRenderer,
     slice: &VisibleSlice,
     selection: Option<Selection>,
     width: usize,
@@ -24,69 +28,60 @@ pub(crate) fn paint_slice(
         .iter()
         .map(|row| {
             let painted = match row.kind {
-                LineKind::Answer => paint_answer(markdown, &row.text),
-                _ => crate::render::line::styled_line(&TranscriptLine {
-                    kind: row.kind,
-                    text: row.text.clone(),
-                }),
+                LineKind::Answer => paint_answer(row),
+                _ => styled_row(row),
             };
-            let painted = match row.kind {
-                LineKind::User => fill_user_line(painted, width),
-                LineKind::Tool => fill_diff_line(painted, &row.text, width),
+            let painted = match row.tone {
+                Tone::DiffDel | Tone::DiffIns => fill_diff_line(painted, width),
                 _ => painted,
             };
-            highlight_row(
+            let painted = highlight_row(
                 painted,
                 selection,
                 row.cell_index,
                 row.row_in_cell,
                 text::width(&row.text),
-            )
+            );
+            // User strips ride the band's bar-gap rhythm: one space of air
+            // after the pre-painted bar (v2.3). Applied after selection so
+            // the highlight offsets stay text-relative.
+            match row.kind {
+                LineKind::User if !row.text.is_empty() => prefixed_line(painted),
+                _ => painted,
+            }
         })
         .collect()
 }
 
-fn paint_answer(markdown: &MarkdownRenderer, text: &str) -> Line<'static> {
-    let (gutter, content) = split_answer_gutter(text);
-    let painted = markdown.preview(&TranscriptLine {
-        kind: LineKind::Answer,
-        text: content.to_owned(),
-    });
-    if gutter.is_empty() {
-        return painted;
-    }
-    let mut spans = vec![Span::styled(gutter.to_owned(), theme::answer_gutter())];
-    spans.extend(painted.spans);
+/// Prepends one blank cell to a painted line (paint-time only; the stored
+/// wrap rows and copied text stay untouched).
+fn prefixed_line(line: Line<'static>) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw(" "));
+    spans.extend(line.spans);
     Line::from(spans)
 }
 
-fn split_answer_gutter(text: &str) -> (&str, &str) {
-    if let Some(rest) = text.strip_prefix("• ") {
-        ("• ", rest)
-    } else if let Some(rest) = text.strip_prefix("  ") {
-        ("  ", rest)
-    } else {
-        ("", text)
-    }
+fn styled_row(row: &VisibleRow) -> Line<'static> {
+    crate::render::line::styled_line(&crate::app::transcript::TranscriptLine {
+        kind: row.kind,
+        text: row.text.clone(),
+        tone: row.tone,
+    })
 }
 
-fn fill_user_line(line: Line<'static>, width: usize) -> Line<'static> {
-    let used = line.width();
-    let mut spans = line.spans;
-    if used < width {
-        spans.push(Span::styled(" ".repeat(width - used), theme::user_band()));
-    }
-    Line::from(spans).style(theme::user_band())
+/// Answer rows go straight into the content column — no gutter — and paint
+/// from their baked spans (or syntect, for fenced bodies): design §3.2,
+/// plan P0/P2.
+fn paint_answer(row: &VisibleRow) -> Line<'static> {
+    markdown::answer_row(&row.text, &row.role, row.spans.as_deref())
 }
 
-fn fill_diff_line(line: Line<'static>, text: &str, width: usize) -> Line<'static> {
-    let style = if text.starts_with('+') {
-        theme::diff_add()
-    } else if text.starts_with('-') {
-        theme::diff_del()
-    } else {
+fn fill_diff_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let style = line.style;
+    if style.bg.is_none() {
         return line;
-    };
+    }
     let used = line.width();
     let mut spans = line.spans;
     if used < width {
@@ -157,19 +152,21 @@ fn split_span(span: &Span<'_>, from: usize, to: usize, style: Style, out: &mut V
 
 #[cfg(test)]
 mod tests {
-    use crate::app::cells::{VisibleRow, VisibleSlice};
+    use crate::app::prose::BlockRole;
     use crate::app::transcript::LineKind;
-    use crate::render::markdown::MarkdownRenderer;
+    use ratatui::style::Modifier;
 
     use super::*;
 
-    fn paint_tool(text: &str, width: usize) -> Line<'static> {
-        let markdown = MarkdownRenderer::new();
+    fn paint_tool(text: &str, tone: Tone, width: usize) -> Line<'static> {
         let slice = VisibleSlice {
             rows: vec![VisibleRow {
                 cell_index: 0,
                 row_in_cell: 0,
                 kind: LineKind::Tool,
+                tone,
+                role: BlockRole::Plain,
+                spans: None,
                 text: text.to_owned(),
             }],
             total_rows: 1,
@@ -177,44 +174,94 @@ mod tests {
             at_top: true,
             at_bottom: true,
         };
-        let mut lines = paint_slice(&markdown, &slice, None, width);
+        let mut lines = paint_slice(&slice, None, width);
         assert_eq!(lines.len(), 1);
         lines.remove(0)
     }
 
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
+    /// A selection overlay splits styled spans without losing their base
+    /// styles (plan TP2.4).
+    #[test]
+    fn selection_cuts_through_styled_answer_spans() {
+        use crate::app::prose;
+        use crate::app::select::SelectPos;
+
+        let rows = prose::project_answer("**bold words** tail", 80);
+        let row = &rows[0];
+        assert!(row.spans.as_ref().expect("styled").len() > 1);
+
+        let mut selection = Selection::start(SelectPos {
+            cell: 0,
+            row: 0,
+            col: 0,
+        });
+        selection.head = SelectPos {
+            cell: 0,
+            row: 0,
+            col: 6,
+        };
+        selection.dragging = false;
+
+        let slice = VisibleSlice {
+            rows: vec![VisibleRow {
+                cell_index: 0,
+                row_in_cell: 0,
+                kind: LineKind::Answer,
+                tone: Tone::Plain,
+                role: row.role.clone(),
+                spans: row.spans.clone(),
+                text: row.text.clone(),
+            }],
+            total_rows: 1,
+            follow_bottom: true,
+            at_top: true,
+            at_bottom: true,
+        };
+        let painted = paint_slice(&slice, Some(selection), 80).remove(0);
+        let bolds: String = painted
+            .spans
             .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
+            .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bolds, "bold words", "the bold run survives span splitting");
+        let reversed: String = painted
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(reversed, "bold w", "exactly the selected range highlights");
+        let rest: String = painted
+            .spans
+            .iter()
+            .filter(|span| !span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rest, "ords tail");
     }
 
     #[test]
     fn tool_diff_rows_wash_full_content_column() {
         const WIDTH: usize = 20;
-        let add = paint_tool("+bar", WIDTH);
+        let add = paint_tool("    2 | world", Tone::DiffIns, WIDTH);
         assert_eq!(add.width(), WIDTH);
         assert_eq!(add.style, theme::diff_add());
-        assert!(line_text(&add).starts_with("+ bar"));
-        assert!(!line_text(&add).starts_with("+  bar"));
 
-        let already = paint_tool("+ bar", WIDTH);
-        assert_eq!(already.width(), WIDTH);
-        assert!(line_text(&already).starts_with("+ bar"));
-        assert!(!line_text(&already).starts_with("+  bar"));
-
-        let del = paint_tool("-foo", WIDTH);
+        let del = paint_tool("    1 | hello", Tone::DiffDel, WIDTH);
         assert_eq!(del.width(), WIDTH);
         assert_eq!(del.style, theme::diff_del());
-        assert!(line_text(&del).starts_with("- foo"));
 
-        let header = paint_tool("• Edited  src/lib.rs  (+1 -1)", 40);
-        assert_eq!(header.width(), text::width("• Edited  src/lib.rs  (+1 -1)"));
+        let header = paint_tool("Edit src/lib.rs", Tone::Title, 40);
+        assert_eq!(
+            header.spans[0].style,
+            theme::accent().add_modifier(ratatui::style::Modifier::BOLD)
+        );
         assert_ne!(header.style, theme::diff_add());
         assert_ne!(header.style, theme::diff_del());
 
-        let context = paint_tool("  foo", WIDTH);
-        assert_eq!(context.width(), text::width("  foo"));
+        let context = paint_tool("    3 | tail", Tone::Plain, WIDTH);
+        assert_eq!(context.width(), text::width("    3 | tail"));
         assert_ne!(context.style, theme::diff_add());
         assert_ne!(context.style, theme::diff_del());
     }

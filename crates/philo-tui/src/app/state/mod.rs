@@ -15,12 +15,13 @@ use std::cell::Cell;
 use std::collections::HashSet;
 
 use super::action::Action;
-use super::activity::{ActivityState, ActivityTone, ActivityView};
 use super::attachment::Attachments;
 use super::cells::{ScrollState, TranscriptStore, VisibleSlice};
 use super::effect::Effect;
 use super::input::{InputEditor, InputHistory};
 use super::overlay::{ConfirmPrompt, OverlayFrame, Picker};
+use super::pacer::{PacedPiece, StreamPacer};
+use super::run_state::{CornerWord, RunState};
 use super::select::{BandLayout, Selection};
 use super::status::StatusData;
 use super::submit::SubmitState;
@@ -30,6 +31,19 @@ use commands::CommandMenu;
 pub(crate) use commands::CommandMenuFrame;
 
 pub(crate) use overlays::SessionLoadIntent;
+
+/// Streaming viewport anchor (v2.2, plan T4.7–T4.9): lifted output grows
+/// from the 40% line and pins at the 80% line while busy; after settlement
+/// the viewport animates back down to the full band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamAnchor {
+    /// Captured the wrapped-row total at lift time; appended rows grow the
+    /// visible window from the 40% base toward the 80% cap.
+    Lift { base_total: usize },
+    /// Post-settlement drop animation: ticks remaining until the viewport
+    /// reaches the full band again.
+    Settle { left: u16 },
+}
 
 /// Pure interaction state for one TUI session.
 pub(crate) struct App {
@@ -64,24 +78,38 @@ pub(crate) struct App {
     session_load_intent: Option<SessionLoadIntent>,
     /// `/config` is waiting for a listing rather than a hot-reload notice.
     expect_config_listing: bool,
+    /// `/models` is waiting for a catalog listing that should open the
+    /// picker; silent refreshes (startup, post-install) leave it unset.
+    expect_models_picker: bool,
     /// `/model` is waiting for install success or rejection.
     pending_model_switch: bool,
     /// Manual compaction has a standalone future owned by the driver.
     manual_compacting: bool,
     /// Automatic compaction belongs to the front operation handle.
     automatic_compacting: bool,
-    /// Ephemeral operation projection; never enters transcript or Session.
-    activity: ActivityState,
+    /// Ephemeral run-state word; never enters transcript or Session.
+    run_state: RunState,
+    /// Stream smoothing valve (v2.2): live deltas queue here and animation
+    /// ticks release them into the cells at an even cadence.
+    pacer: StreamPacer,
+    /// Streaming viewport anchor state (v2.2); `None` means the plain
+    /// full-band, bottom-follow layout.
+    stream_anchor: Option<StreamAnchor>,
+    /// Last rendered full-frame height — the 40%/80% anchors are shares of
+    /// it. Written by the render pass through a cell, like the band layout.
+    pub(crate) frame_height: Cell<u16>,
     /// Transcript cells for the TUI-owned viewport.
     pub(crate) cells: TranscriptStore,
     scroll: ScrollState,
-    /// Think blocks the user manually expanded. Sealed blocks start folded.
+    /// Think blocks the user manually expanded. Every reasoning run —
+    /// streaming or sealed (v2.2) — starts folded; only this set opens one.
     reasoning_manually_expanded: HashSet<usize>,
-    /// Streaming think blocks the user manually folded before their seal.
-    reasoning_manually_collapsed: HashSet<usize>,
     layout_width: Cell<usize>,
     layout_history_height: Cell<usize>,
     history_band: Cell<BandLayout>,
+    /// Full transcript-band height (independent of the painted sub-area,
+    /// which shrinks when sparse content hangs from its tail).
+    band_height: Cell<u16>,
     selection: Option<Selection>,
 }
 
@@ -106,17 +134,21 @@ impl App {
             show_reasoning,
             session_load_intent: None,
             expect_config_listing: false,
+            expect_models_picker: false,
             pending_model_switch: false,
             manual_compacting: false,
             automatic_compacting: false,
-            activity: ActivityState::default(),
+            run_state: RunState::default(),
+            pacer: StreamPacer::default(),
+            stream_anchor: None,
+            frame_height: Cell::new(0),
             cells: TranscriptStore::new(),
             scroll: ScrollState::follow(),
             reasoning_manually_expanded: HashSet::new(),
-            reasoning_manually_collapsed: HashSet::new(),
             layout_width: Cell::new(80),
             layout_history_height: Cell::new(0),
             history_band: Cell::new(BandLayout::default()),
+            band_height: Cell::new(0),
             selection: None,
         }
     }
@@ -128,20 +160,12 @@ impl App {
             })
     }
 
-    /// Fold state of the reasoning run starting at `head`: a streaming run
-    /// stays open unless the user folded it; sealed runs start folded.
+    /// Fold state of the reasoning run starting at `head` (v2.2): every
+    /// run — streaming or sealed — starts folded; the header (with its
+    /// live or frozen duration) is all that renders until the user
+    /// expands it.
     fn reasoning_collapsed(&self, head: usize) -> bool {
-        let open = self.cells.open_cell();
-        let streaming_run = open.is_some_and(|open| {
-            open >= head
-                && self.cells.display_kind(head) == LineKind::Reasoning
-                && (head..=open).all(|index| self.cells.display_kind(index) == LineKind::Reasoning)
-        });
-        if streaming_run {
-            self.reasoning_manually_collapsed.contains(&head)
-        } else {
-            !self.reasoning_manually_expanded.contains(&head)
-        }
+        !self.reasoning_manually_expanded.contains(&head)
     }
 
     /// Click on a think header row: fold/unfold that block. Returns whether
@@ -154,13 +178,10 @@ impl App {
         if !is_head {
             return false;
         }
-        let collapsed_now = self.reasoning_collapsed(cell);
-        self.reasoning_manually_expanded.remove(&cell);
-        self.reasoning_manually_collapsed.remove(&cell);
-        if collapsed_now {
+        // Default is folded, so an expanded run can only be one this set
+        // holds: toggle by inserting/removing.
+        if !self.reasoning_manually_expanded.remove(&cell) {
             self.reasoning_manually_expanded.insert(cell);
-        } else {
-            self.reasoning_manually_collapsed.insert(cell);
         }
         self.cells.bump_wrap_revision();
         true
@@ -179,18 +200,142 @@ impl App {
         effects
     }
 
+    // -- Stream pacing (v2.2, plan T4.11) ---------------------------------
+
+    /// Queues one live streaming delta for even-cadence display.
+    pub(crate) fn pace_delta(&mut self, kind: LineKind, text: &str) {
+        self.pacer.push(kind, text);
+    }
+
+    /// Emits any buffered stream text into the transcript immediately, in
+    /// order. Every structural boundary calls this before applying its own
+    /// event — cancellation reveals everything at once and settlement sees
+    /// exactly what an unpaced run would have seen.
+    pub(crate) fn flush_stream(&mut self) -> bool {
+        let pieces = self.pacer.flush();
+        self.write_paced(pieces)
+    }
+
+    /// Drops buffered text without displaying (session switches).
+    pub(crate) fn clear_stream(&mut self) {
+        self.pacer.clear();
+    }
+
+    fn write_paced(&mut self, pieces: Vec<PacedPiece>) -> bool {
+        if pieces.is_empty() {
+            return false;
+        }
+        for piece in pieces {
+            self.transcript
+                .write_stream_piece(&mut self.cells, piece.kind, &piece.text);
+        }
+        true
+    }
+
+    // -- Streaming viewport anchors (v2.2, plan T4.7–T4.10) ---------------
+
+    /// Ticks the post-settlement drop animation spreads over (~500ms at the
+    /// 100ms animation cadence).
+    pub(crate) const SETTLE_ANIM_TICKS: u16 = 5;
+
+    /// Render pass records the full-frame height so event-side lift logic
+    /// can evaluate the 40%/80% shares without owning geometry.
+    pub(crate) fn note_frame_height(&self, height: u16) {
+        self.frame_height.set(height);
+    }
+
+    /// Whether the streaming viewport (lift/pin/settle) currently owns the
+    /// transcript window.
+    pub(crate) fn stream_anchor_active(&self) -> bool {
+        self.stream_anchor.is_some()
+    }
+
+    /// Visible transcript height for this frame: the full column except
+    /// while streaming is lifted (`base + grown`, capped at the 80% line),
+    /// busy-follow pins at the cap, and the settle animation walks back to
+    /// full. Manual scroll cancels the anchor entirely.
+    pub(crate) fn transcript_viewport_height(&self, full: u16, anchors: Option<(u16, u16)>) -> u16 {
+        let Some((base, cap)) = anchors else {
+            return full;
+        };
+        let cap = cap.min(full);
+        let base = base.min(cap.saturating_sub(1)).max(1);
+        let height = match self.stream_anchor {
+            Some(StreamAnchor::Lift { base_total }) => {
+                let grown = self.wrapped_row_total().saturating_sub(base_total);
+                u16::try_from(usize::from(base) + grown)
+                    .unwrap_or(u16::MAX)
+                    .min(cap)
+            }
+            Some(StreamAnchor::Settle { left }) => {
+                let span = full - cap;
+                let done = Self::SETTLE_ANIM_TICKS.saturating_sub(left);
+                cap + span * done / Self::SETTLE_ANIM_TICKS
+            }
+            None if self.status.busy => cap,
+            None => full,
+        };
+        height.clamp(1, full)
+    }
+
+    /// Total wrapped rows at the last-known width (the lift's growth ruler).
+    fn wrapped_row_total(&self) -> usize {
+        let width = self.layout_width.get();
+        self.cells
+            .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
+        self.cells.wrap_rows().iter().map(Vec::len).sum()
+    }
+
+    /// Lifts the viewport to the 40% line for a new turn: only when the
+    /// screen shows content (blank screens start at the top), the user is
+    /// following, the layout is known, and the anchors fit.
+    fn try_begin_stream_lift(&mut self) {
+        if self.stream_anchor.is_some() || !self.scroll.follow_bottom() {
+            return;
+        }
+        if self.cells.display_len() == 0 {
+            return;
+        }
+        if crate::render::stream_anchor_rows(self.frame_height.get(), self.band_height.get())
+            .is_none()
+        {
+            return;
+        }
+        let base_total = self.wrapped_row_total();
+        self.stream_anchor = Some(StreamAnchor::Lift { base_total });
+    }
+
+    /// Settlement ends the lift: animate the tail down to the band bottom.
+    /// Turns that never lifted simply stay where they are.
+    pub(crate) fn begin_settle_drop(&mut self) {
+        if matches!(self.stream_anchor, Some(StreamAnchor::Lift { .. })) {
+            self.stream_anchor = Some(StreamAnchor::Settle {
+                left: Self::SETTLE_ANIM_TICKS,
+            });
+        }
+    }
+
+    /// User scrolling takes over: drop any lift/settle animation so the
+    /// automatic anchoring never fights the operator.
+    fn cancel_stream_anchor(&mut self) {
+        self.stream_anchor = None;
+    }
+
     pub(crate) fn page_transcript_up(&mut self, width: usize, height: usize) {
+        self.cancel_stream_anchor();
         self.scroll_transcript(width, height, -(height as isize));
     }
 
     pub(crate) fn page_transcript_down(&mut self, width: usize, height: usize) {
+        self.cancel_stream_anchor();
         self.scroll_transcript(width, height, height as isize);
     }
 
     pub(crate) fn scroll_transcript(&mut self, width: usize, height: usize, delta: isize) {
-        if height == 0 || delta == 0 {
+        if delta == 0 {
             return;
         }
+        self.cancel_stream_anchor();
         self.cells
             .refresh_wraps(width, &|index| self.reasoning_collapsed(index));
         self.scroll
@@ -198,6 +343,7 @@ impl App {
     }
 
     pub(crate) fn jump_transcript_top(&mut self) {
+        self.cancel_stream_anchor();
         let width = self.layout_width.get();
         let height = self.layout_history_height.get();
         self.cells
@@ -206,6 +352,7 @@ impl App {
     }
 
     pub(crate) fn jump_transcript_bottom(&mut self) {
+        self.cancel_stream_anchor();
         self.scroll.jump_bottom();
     }
 
@@ -236,6 +383,10 @@ impl App {
 
     /// The overlay content to paint, if any. The approval prompt wins over
     /// the session picker: an answer is what unblocks the running turn.
+    ///
+    /// The parameters' meaning depends on which overlay is live: the
+    /// approval keeps them as caps around its content-sized panel, while a
+    /// picker treats them as the exact fixed dialog targets (v0.44 §4.2).
     #[cfg(test)]
     pub fn overlay_frame(&self, height: usize) -> Option<OverlayFrame> {
         if let Some(confirm) = &self.confirm {
@@ -253,32 +404,22 @@ impl App {
             .map(|picker| picker.frame_for(height, width))
     }
 
-    pub(crate) fn activity_view(&self, width: usize) -> Option<ActivityView> {
-        if self.confirm.is_some() {
-            return Some(ActivityView {
-                text: super::text::truncate("! Approval required", width),
-                tone: ActivityTone::Warning,
-            });
-        }
-        self.activity.view(width)
+    /// Whether an approval prompt currently owns the overlay slot. Pickers
+    /// float at fixed size instead; the renderer picks the matching budget.
+    pub(crate) fn has_confirmation(&self) -> bool {
+        self.confirm.is_some()
     }
 
-    pub(crate) fn activity_detail_rows(&self, width: usize, height: usize) -> Vec<String> {
-        if self.confirm.is_some() || self.picker.is_some() {
-            return Vec::new();
-        }
-        let tail_lines = match self.level {
-            InfoLevel::Verbose => 20,
-            InfoLevel::Default => 5,
-        };
-        self.activity.detail_rows(width, height, tail_lines)
+    /// Composer top-left corner (§2.4): the run-state word with the
+    /// `Approval…` overlay flag applied while a confirmation is pending.
+    /// The flag hides the underlying word without replacing it.
+    pub(crate) fn run_state_corner(&self, max_width: usize) -> Option<CornerWord> {
+        self.run_state.corner(max_width, self.confirm.is_some())
     }
 
-    pub(crate) fn activity_timeline_row(&self, width: usize) -> Option<String> {
-        if self.confirm.is_some() || self.picker.is_some() {
-            return None;
-        }
-        self.activity.timeline_row(width)
+    #[cfg(test)]
+    pub(crate) fn run_state_mut(&mut self) -> &mut RunState {
+        &mut self.run_state
     }
 
     pub(crate) fn has_overlay(&self) -> bool {
@@ -427,5 +568,6 @@ fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     TranscriptLine {
         kind,
         text: text.into(),
+        tone: crate::app::transcript::Tone::Plain,
     }
 }

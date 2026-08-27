@@ -1189,8 +1189,8 @@ pub(super) fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, Usa
     }
 }
 
-/// The `/config` label for a resolved reasoning effort.
-fn effort_label(effort: ReasoningEffort) -> &'static str {
+/// The canonical lowercase label for a resolved reasoning effort.
+pub(crate) fn effort_label(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Minimal => "minimal",
         ReasoningEffort::Low => "low",

@@ -109,7 +109,7 @@ impl App {
     /// leaving the draft untouched.
     pub(crate) fn clipboard_unavailable(&self, reason: &str) -> Vec<Effect> {
         vec![Effect::Append(vec![line(
-            LineKind::Notice,
+            LineKind::Meta,
             format!("no image on the clipboard ({reason}); attach a file with /image <path>"),
         )])]
     }
@@ -244,12 +244,12 @@ impl App {
         let mut notices = Vec::new();
         if self.status.compacting {
             notices.push(line(
-                LineKind::Notice,
+                LineKind::Meta,
                 "compacting: the message is queued behind context maintenance",
             ));
         } else if self.status.busy {
             notices.push(line(
-                LineKind::Notice,
+                LineKind::Meta,
                 "busy: the message is queued behind the active turn",
             ));
         }

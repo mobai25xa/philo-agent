@@ -2,7 +2,9 @@
 //!
 //! syntect is built on fancy-regex (no C dependency). An unrecognised
 //! language is not an error: the block degrades to plain code styling, so
-//! the text always reaches the user unchanged.
+//! the text always reaches the user unchanged. The highlight theme follows
+//! the detected terminal background (dark / light); without a palette the
+//! dark theme keeps tests and unknown terminals deterministic.
 
 use std::sync::OnceLock;
 
@@ -11,14 +13,21 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-/// Plain styling for code that has no highlighter.
-pub(crate) fn code_style() -> Style {
-    Style::default().fg(Color::LightGreen)
-}
+use super::theme;
 
 struct Assets {
     syntaxes: SyntaxSet,
     theme: Theme,
+}
+
+/// Theme name for a background preference. Pure so both branches stay
+/// testable — the process-global palette can only be set once.
+fn theme_name(prefers_light: bool) -> &'static str {
+    if prefers_light {
+        "base16-ocean.light"
+    } else {
+        "base16-ocean.dark"
+    }
 }
 
 /// The default syntax and theme sets, loaded once on the first code block
@@ -27,9 +36,10 @@ fn assets() -> &'static Assets {
     static ASSETS: OnceLock<Assets> = OnceLock::new();
     ASSETS.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults();
+        let name = theme_name(theme::prefers_light());
         let theme = themes
             .themes
-            .remove("base16-ocean.dark")
+            .remove(name)
             .or_else(|| themes.themes.values().next().cloned())
             .unwrap_or_default();
         Assets {
@@ -69,12 +79,6 @@ impl CodeHighlighter {
         self.inner.is_some()
     }
 
-    /// Highlights one streaming preview line without touching commit state.
-    pub(crate) fn preview_line(language: &str, text: &str) -> Option<Vec<(Style, String)>> {
-        let mut highlighter = Self::for_language(language);
-        highlighter.line(text)
-    }
-
     /// Styled fragments for one line, or `None` when the caller should fall
     /// back to plain code styling.
     pub(crate) fn line(&mut self, text: &str) -> Option<Vec<(Style, String)>> {
@@ -110,6 +114,14 @@ fn convert(style: syntect::highlighting::Style) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_selection_follows_the_background_preference() {
+        assert_eq!(theme_name(false), "base16-ocean.dark");
+        assert_eq!(theme_name(true), "base16-ocean.light");
+        // Tests never initialize the palette: the fallback must be dark.
+        assert!(!theme::prefers_light());
+    }
 
     #[test]
     fn a_known_language_produces_several_coloured_regions() {

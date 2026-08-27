@@ -4,8 +4,11 @@ mod attachments;
 mod compaction;
 mod flow;
 mod integration;
+mod matrix;
+mod streaming;
 mod style_baseline;
 pub(crate) mod support;
+mod tool_cards;
 
 macro_rules! assert_tui_snapshot {
     ($name:literal, $value:expr) => {

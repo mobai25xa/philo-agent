@@ -96,6 +96,9 @@ pub struct FrontendModelListing {
     pub provider: String,
     /// Model name within the provider (display).
     pub model: String,
+    /// Declared reasoning tiers, ordered light to heavy. Empty means the
+    /// model has no reasoning capability.
+    pub reasoning_tiers: Vec<String>,
     /// Whether this listing matches the currently installed generation.
     pub current: bool,
 }

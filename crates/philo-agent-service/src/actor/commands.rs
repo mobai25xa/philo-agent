@@ -141,6 +141,7 @@ where
                 id: entry.id,
                 provider: entry.provider,
                 model: entry.model,
+                reasoning_tiers: entry.reasoning_tiers,
             })
             .collect();
         self.emit(
@@ -149,7 +150,12 @@ where
         );
     }
 
-    pub(super) fn handle_install_model(&mut self, request_id: FrontendRequestId, name: String) {
+    pub(super) fn handle_install_model(
+        &mut self,
+        request_id: FrontendRequestId,
+        name: String,
+        effort: Option<FrontendReasoningEffort>,
+    ) {
         if !self.is_accepting_work() {
             self.reject_not_accepting(request_id);
             return;
@@ -159,7 +165,7 @@ where
             return;
         }
         self.generation.note_install(request_id);
-        self.spawn_install(request_id, name);
+        self.spawn_install(request_id, name, effort);
     }
 
     pub(super) fn handle_install(
@@ -224,12 +230,21 @@ where
         }
     }
 
-    fn spawn_install(&mut self, request_id: FrontendRequestId, name: String) {
+    fn spawn_install(
+        &mut self,
+        request_id: FrontendRequestId,
+        name: String,
+        effort: Option<FrontendReasoningEffort>,
+    ) {
         let assembler = self.assembler.clone();
         let epoch = self.epoch;
+        let effort = effort.map(mapping::reasoning_effort);
         self.spawn_work(request_id, async move {
             let result = assembler
-                .assemble(AssembleRequest { name: name.clone() })
+                .assemble(AssembleRequest {
+                    name: name.clone(),
+                    effort,
+                })
                 .await;
             ServiceTaskResult::Install {
                 request_id,

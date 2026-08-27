@@ -1,45 +1,46 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
+assertion_line: 1194
 expression: snapshot
 ---
 40 columns
-    path: src/中 文 .rs
 
 
 
 
 
-    read_file  path: src/中 文 .rs
-    | tool  read_file
 
-    › 中 文  é 👩‍💻  and a long draft tha
-      t wraps inside the composer
-gpt-test · session-中 文
+
+    ⠋ Running…              gpt-test
+   ▌ 中 文  é 👩‍💻  and a long draft tha
+   ▌ t wraps inside the composer
+   ▌
+                     ↑- ↓- R- C- -/-
 
 80 columns
-    path: src/中 文 .rs
 
 
 
 
 
-    read_file  path: src/中 文 .rs
-    | tool  read_file
 
-    › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
 
-gpt-test · session-中 文
+    ⠋ Running… 57s · esc cancel                                     gpt-test
+   ▌
+   ▌ 中 文  é 👩‍💻  and a long draft that wraps inside the composer
+   ▌
+                                                             ↑- ↓- R- C- -/-
 
 120 columns
-    path: src/中 文 .rs
 
 
 
 
 
-    read_file  path: src/中 文 .rs
-    | tool  read_file
 
-    › 中 文  é 👩‍💻  and a long draft that wraps inside the composer
 
-gpt-test · session-中 文
+    ⠋ Running… 57s · esc cancel                                                                             gpt-test
+   ▌
+   ▌ 中 文  é 👩‍💻  and a long draft that wraps inside the composer
+   ▌
+                                                                                                     ↑- ↓- R- C- -/-

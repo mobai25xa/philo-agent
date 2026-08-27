@@ -8,6 +8,7 @@ fn line(kind: LineKind, text: impl Into<String>) -> TranscriptLine {
     TranscriptLine {
         kind,
         text: text.into(),
+        tone: crate::app::transcript::Tone::Plain,
     }
 }
 

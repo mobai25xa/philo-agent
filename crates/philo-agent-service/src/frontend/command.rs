@@ -90,10 +90,14 @@ pub enum FrontendCommand {
     },
     /// Mint a new session id and make it current.
     CreateSession,
-    /// Assemble and install a new model generation in the background.
+    /// Assemble and install a new model generation in the background. The
+    /// optional effort is frozen into the new generation atomically; `None`
+    /// keeps the resolution order (flag > model default tier).
     InstallModel {
         /// Requested model name.
         name: String,
+        /// Reasoning effort installed with the model.
+        effort: Option<FrontendReasoningEffort>,
     },
     /// Install a new generation that differs only by reasoning effort.
     SetReasoning {

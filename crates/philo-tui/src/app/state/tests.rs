@@ -1,7 +1,7 @@
 //! App state-machine tests.
 
 use philo_agent_service::{
-    ConfirmationDecision, FrontendOperationEvent, FrontendReasoningEffort, FrontendTokenUsage,
+    ConfirmationDecision, FrontendOperationEvent, FrontendTokenUsage,
     FrontendUpdateKind, ServiceHealth,
 };
 
@@ -11,7 +11,7 @@ use crate::app::command;
 use crate::app::effect::{Effect, HostRequest};
 use crate::app::overlay::PickerEntry;
 use crate::app::status::StatusData;
-use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
+use crate::app::transcript::{InfoLevel, LineKind, Tone, TranscriptLine};
 use crate::tests::support::{frontend_update, idle_snapshot, session_view};
 
 fn app() -> App {
@@ -90,7 +90,7 @@ fn submit_holds_pending_intent_without_transcript_commit() {
         intent_id: 1,
         operation_id: "op-1".to_owned(),
     });
-    assert_eq!(texts(&appended(&committed)), ["", "› hello", ""]);
+    assert_eq!(texts(&appended(&committed)), ["", "hello", ""]);
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn epoch_ended_while_dispatching_restores_draft_and_attachments() {
     let mut app = app();
     run(&mut app, "/image shots/a.png");
     run(&mut app, "draft");
-    app.set_busy(true, 0);
+    app.set_busy(true);
     let effects = app.apply_update(&frontend_update(
         1,
         FrontendUpdateKind::ServiceHealthChanged {
@@ -439,7 +439,7 @@ fn epoch_ended_while_dispatching_restores_draft_and_attachments() {
 #[test]
 fn busy_submit_notes_the_queueing() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     let effects = run(&mut app, "next");
     let lines = appended(&effects);
     assert!(lines.iter().any(|line| line.text.contains("queued")));
@@ -505,46 +505,38 @@ fn new_and_sessions_go_through_the_host() {
 #[test]
 fn a_new_session_is_refused_while_a_turn_runs() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     let effects = run(&mut app, "/new");
     assert!(host_requests(&effects).is_empty());
     assert_eq!(appended(&effects)[1].kind, LineKind::Error);
 }
 
 #[test]
-fn bare_model_opens_the_picker_and_a_name_works_while_busy() {
+fn models_opens_the_picker_even_while_busy() {
     let mut app = app();
+    app.set_busy(true);
     assert_eq!(
-        host_requests(&run(&mut app, "/model")),
+        host_requests(&run(&mut app, "/models")),
         vec![HostRequest::OpenModels]
-    );
-
-    app.set_busy(true, 0);
-    assert_eq!(
-        host_requests(&run(&mut app, "/model other")),
-        vec![HostRequest::RebuildModel("other".to_owned())]
     );
 }
 
 #[test]
-fn reasoning_maps_levels_and_reports_bad_ones() {
+fn removed_model_and_reasoning_commands_are_unknown() {
     let mut app = app();
-    assert_eq!(
-        host_requests(&run(&mut app, "/reasoning high")),
-        vec![HostRequest::SetReasoning(FrontendReasoningEffort::High)]
-    );
-    let effects = run(&mut app, "/reasoning turbo");
-    assert!(host_requests(&effects).is_empty());
-    assert!(
-        appended(&effects)[1]
-            .text
-            .starts_with("unknown reasoning level: turbo")
-    );
-    assert!(
-        appended(&run(&mut app, "/reasoning"))[1]
-            .text
-            .starts_with("usage: /reasoning")
-    );
+    // Bare `/model` never reaches the parser: it is a prefix of `/models`,
+    // so the completion menu executes `/models`. Argument forms are truly
+    // gone and report themselves.
+    for command in ["/model other", "/reasoning high", "/reasoning"] {
+        let effects = run(&mut app, command);
+        assert!(host_requests(&effects).is_empty());
+        assert!(
+            appended(&effects)[1]
+                .text
+                .starts_with("unknown command: /"),
+            "{command} must no longer be in the table"
+        );
+    }
 }
 
 #[test]
@@ -589,9 +581,9 @@ fn a_clipboard_image_joins_the_queue_and_rides_the_next_message() {
         texts(&appended(&committed)),
         [
             "",
-            "› what is this?",
-            "  [attached shots/a.png]",
-            "  [attached clipboard image (image/png, 2.0 KB)]",
+            "what is this?",
+            "[attached shots/a.png]",
+            "[attached clipboard image (image/png, 2.0 KB)]",
             "",
         ]
     );
@@ -658,7 +650,7 @@ fn status_and_config_go_through_the_host() {
 #[test]
 fn quit_asks_once_while_a_turn_runs() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     let effects = run(&mut app, "/quit");
     assert!(!effects.contains(&Effect::Quit), "the first ask warns");
     assert!(appended(&effects)[1].text.contains("/quit again"));
@@ -674,7 +666,7 @@ fn quit_leaves_immediately_when_idle() {
 #[test]
 fn anything_between_two_quits_disarms_the_running_turn_exit() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     run(&mut app, "/quit");
     app.on_action(Action::InsertChar('x'));
     app.on_action(Action::Backspace);
@@ -713,7 +705,7 @@ fn typing_a_slash_opens_the_menu_and_typing_filters_it() {
     type_text(&mut app, "s");
     let frame = app.command_menu_frame(80, 10).expect("menu is open");
     assert_eq!(frame.rows.len(), 2);
-    assert!(frame.rows[0].usage.starts_with("> /sessions"));
+    assert!(frame.rows[0].usage.starts_with("› /sessions"));
     assert_eq!(frame.rows[0].summary, "pick a session to continue");
     assert!(frame.rows[1].usage.starts_with("  /status"));
 
@@ -779,7 +771,7 @@ fn menu_navigation_moves_the_highlight_only() {
 #[test]
 fn escape_closes_the_completion_menu_without_cancelling() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     type_text(&mut app, "/s");
     assert!(app.on_action(Action::Escape).is_empty(), "no cancel");
     assert!(app.command_menu_frame(80, 10).is_none());
@@ -915,7 +907,7 @@ fn the_picker_switches_on_enter_and_closes_on_escape() {
 #[test]
 fn the_picker_refuses_to_switch_while_a_turn_runs() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     app.open_picker(vec![PickerEntry::untitled("s-1")]);
     let effects = app.on_action(Action::Submit);
     assert!(host_requests(&effects).is_empty());
@@ -980,11 +972,11 @@ fn the_approval_overlay_wins_over_the_picker() {
     let (title, body) = request("run_command");
     app.sync_confirmation(Some((7, title, body)));
     let frame = app.overlay_frame(4).expect("an overlay is painted");
-    assert!(frame.title.starts_with("approval required"));
+    assert!(frame.title.starts_with("Approval required"));
     // Answering restores the picker underneath.
     app.on_action(Action::InsertChar('n'));
     let frame = app.overlay_frame(4).expect("the picker is still open");
-    assert!(frame.title.starts_with("sessions"));
+    assert!(frame.title.starts_with("Sessions"));
 }
 
 #[test]
@@ -1018,7 +1010,7 @@ fn ctrl_c_clears_nonempty_input_first() {
 #[test]
 fn ctrl_c_cancels_while_busy() {
     let mut app = app();
-    app.set_busy(true, 0);
+    app.set_busy(true);
     assert_eq!(app.on_action(Action::CtrlC), vec![Effect::InterruptCancel]);
 }
 
@@ -1046,7 +1038,7 @@ fn any_other_key_disarms_the_exit() {
 fn escape_cancels_only_while_busy() {
     let mut app = app();
     assert!(app.on_action(Action::Escape).is_empty());
-    app.set_busy(true, 0);
+    app.set_busy(true);
     assert_eq!(app.on_action(Action::Escape), vec![Effect::CancelActive]);
 }
 
@@ -1104,7 +1096,7 @@ fn toggle_level_flips_and_reports() {
 }
 
 #[test]
-fn usage_events_update_the_status_bar() {
+fn usage_events_update_the_usage_corner() {
     let mut app = app();
     let usage = FrontendTokenUsage {
         input_tokens: Some(5),
@@ -1208,14 +1200,17 @@ fn submit_ingests_append_payloads_into_cells() {
             TranscriptLine {
                 kind: LineKind::User,
                 text: String::new(),
+                tone: Tone::Plain,
             },
             TranscriptLine {
                 kind: LineKind::User,
-                text: "› hello".to_owned(),
+                text: "hello".to_owned(),
+                tone: Tone::Plain,
             },
             TranscriptLine {
                 kind: LineKind::User,
                 text: String::new(),
+                tone: Tone::Plain,
             },
         ]
     );
@@ -1237,14 +1232,16 @@ fn agent_events_apply_into_cells() {
         app.cells.cells(),
         [
             TranscriptLine {
-                kind: LineKind::Notice,
+                kind: LineKind::Meta,
                 text: "queued behind the active turn".to_owned(),
+                tone: Tone::Plain,
             },
             TranscriptLine {
-                kind: LineKind::Notice,
+                kind: LineKind::Meta,
                 text: "previous turn did not end cleanly and was sealed; its tool \
                        calls may have executed without recorded results"
                     .to_owned(),
+                tone: Tone::Plain,
             },
         ]
     );
@@ -1257,6 +1254,7 @@ fn begin_session_clears_ingested_cells() {
     app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "partial".to_owned(),
     });
+    app.flush_stream();
     assert!(!app.cells.is_empty());
     assert!(app.cells.has_open());
     app.begin_session("other");
@@ -1272,6 +1270,7 @@ fn page_up_unfollows_after_layout_is_noted() {
     app.cells.push_closed((0..20).map(|i| TranscriptLine {
         kind: LineKind::Meta,
         text: format!("row-{i}"),
+        tone: Tone::Plain,
     }));
     app.note_history_layout(80, 3);
     assert!(app.follow_bottom());
@@ -1299,6 +1298,7 @@ fn seed_rows(app: &mut App, count: usize) {
     app.cells.push_closed((0..count).map(|i| TranscriptLine {
         kind: LineKind::Meta,
         text: format!("row-{i}"),
+        tone: Tone::Plain,
     }));
 }
 
@@ -1354,7 +1354,7 @@ fn ctrl_c_copies_before_clearing_input_or_cancelling() {
     app.on_action(Action::SelectStart { x: 0, y: 0 });
     app.on_action(Action::SelectDrag { x: 3, y: 0 });
     app.on_action(Action::SelectEnd { x: 3, y: 0 });
-    app.set_busy(true, 0);
+    app.set_busy(true);
 
     assert_eq!(
         app.on_action(Action::CtrlC),
@@ -1383,7 +1383,7 @@ fn typing_clears_selection_and_escape_clears_then_cancels() {
     app.on_action(Action::SelectStart { x: 0, y: 0 });
     app.on_action(Action::SelectDrag { x: 3, y: 0 });
     app.on_action(Action::SelectEnd { x: 3, y: 0 });
-    app.set_busy(true, 0);
+    app.set_busy(true);
     assert_eq!(app.on_action(Action::Escape), vec![Effect::CancelActive]);
     assert!(!app.has_selection());
 }
@@ -1441,18 +1441,22 @@ fn think_run() -> Vec<TranscriptLine> {
         TranscriptLine {
             kind: LineKind::Meta,
             text: "before".to_owned(),
+            tone: Tone::Plain,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "think".to_owned(),
+            tone: Tone::Plain,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "  hidden thought".to_owned(),
+            tone: Tone::Plain,
         },
         TranscriptLine {
             kind: LineKind::Meta,
             text: "after".to_owned(),
+            tone: Tone::Plain,
         },
     ]
 }
@@ -1464,17 +1468,17 @@ fn sealed_think_blocks_fold_and_toggle_reopens() {
     app.note_history_layout(80, 10);
     assert_eq!(
         slice_texts(&app, 80, 10),
-        ["before", "think · 1 行", "after"],
+        ["before", "think", "after"],
         "sealed think blocks fold their body"
     );
 
     assert!(app.toggle_reasoning_block(1, 0));
     let texts = slice_texts(&app, 80, 10);
     assert!(texts.iter().any(|text| text.contains("hidden thought")));
-    assert!(!texts.iter().any(|text| text.contains("think ·")));
+    assert_eq!(*texts.get(1).expect("header row"), "think");
 
     assert!(app.toggle_reasoning_block(1, 0));
-    assert!(slice_texts(&app, 80, 10).contains(&"think · 1 行".to_owned()));
+    assert_eq!(slice_texts(&app, 80, 10), ["before", "think", "after"]);
 }
 
 #[test]
@@ -1489,31 +1493,44 @@ fn toggle_ignores_body_rows_and_non_reasoning_heads() {
 }
 
 #[test]
-fn streaming_think_stays_open_then_folds_and_seals_folded() {
+fn streaming_think_starts_folded_and_expansion_survives_the_seal() {
     let mut fresh = app();
     let mut app = app();
-    app.cells.begin(LineKind::Reasoning, "think");
-    app.cells.write_open("\n  partial thought");
+    // Reducer shape: a sealed `think` header cell followed by the open body.
+    app.cells.push_closed([TranscriptLine {
+        kind: LineKind::Reasoning,
+        text: "think".to_owned(),
+        tone: Tone::Plain,
+    }]);
+    app.cells.begin(LineKind::Reasoning, "  partial thought");
+    assert_eq!(
+        slice_texts(&app, 80, 10),
+        ["think"],
+        "a streaming block stays folded until the user expands it"
+    );
+
+    app.toggle_reasoning_block(0, 0);
     let texts = slice_texts(&app, 80, 10);
     assert!(texts.iter().any(|text| text.contains("partial thought")));
 
-    app.toggle_reasoning_block(0, 0);
-    assert_eq!(slice_texts(&app, 80, 10), ["think · 1 行"]);
-
     app.cells.close_open();
-    assert_eq!(
-        slice_texts(&app, 80, 10),
-        ["think · 1 行"],
-        "manual fold survives the seal"
+    let texts = slice_texts(&app, 80, 10);
+    assert!(
+        texts.iter().any(|text| text.contains("partial thought")),
+        "manual expansion survives the seal"
     );
 
-    fresh.cells.begin(LineKind::Reasoning, "think");
-    fresh.cells.write_open("\n  partial thought");
+    fresh.cells.push_closed([TranscriptLine {
+        kind: LineKind::Reasoning,
+        text: "think".to_owned(),
+        tone: Tone::Plain,
+    }]);
+    fresh.cells.begin(LineKind::Reasoning, "  partial thought");
     fresh.cells.close_open();
     assert_eq!(
         slice_texts(&fresh, 80, 10),
-        ["think · 1 行"],
-        "sealing folds an untouched stream"
+        ["think"],
+        "sealing leaves an untouched stream folded"
     );
 }
 
@@ -1524,14 +1541,17 @@ fn plain_click_on_a_think_header_toggles_it() {
         TranscriptLine {
             kind: LineKind::Meta,
             text: "row-0".to_owned(),
+            tone: Tone::Plain,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "think".to_owned(),
+            tone: Tone::Plain,
         },
         TranscriptLine {
             kind: LineKind::Reasoning,
             text: "  body".to_owned(),
+            tone: Tone::Plain,
         },
     ]);
     app.note_history_layout(80, 4);
@@ -1566,6 +1586,7 @@ fn text_delta_without_close_stays_open() {
         delta: "partial answer".to_owned(),
     });
     assert!(effects.is_empty(), "agent events write the store directly");
+    app.flush_stream();
     assert_eq!(app.cells.open_index(), Some(0));
     assert!(app.cells.has_open());
     assert_eq!(
@@ -1573,6 +1594,7 @@ fn text_delta_without_close_stays_open() {
         [TranscriptLine {
             kind: LineKind::Answer,
             text: "partial answer".to_owned(),
+            tone: Tone::Plain,
         }]
     );
     let slice = app.history_slice(80, 3);
@@ -1582,7 +1604,7 @@ fn text_delta_without_close_stays_open() {
             .iter()
             .map(|row| row.text.as_str())
             .collect::<Vec<_>>(),
-        ["• partial answer"]
+        ["partial answer"]
     );
     assert_eq!(slice.rows[0].cell_index, 0);
 }
@@ -1593,6 +1615,7 @@ fn newline_stays_inside_one_open_answer_cell() {
     app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "hello\nworld".to_owned(),
     });
+    app.flush_stream();
     assert_eq!(app.cells.open_index(), Some(0));
     assert!(app.cells.has_open());
     assert_eq!(
@@ -1600,6 +1623,7 @@ fn newline_stays_inside_one_open_answer_cell() {
         [TranscriptLine {
             kind: LineKind::Answer,
             text: "hello\nworld".to_owned(),
+            tone: Tone::Plain,
         }]
     );
     let texts: Vec<_> = app
@@ -1608,9 +1632,9 @@ fn newline_stays_inside_one_open_answer_cell() {
         .iter()
         .map(|row| row.text.clone())
         .collect();
-    assert_eq!(texts, ["• hello", "  world"]);
-    assert_eq!(texts.iter().filter(|text| *text == "• hello").count(), 1);
-    assert_eq!(texts.iter().filter(|text| *text == "  world").count(), 1);
+    assert_eq!(texts, ["hello", "world"]);
+    assert_eq!(texts.iter().filter(|text| *text == "hello").count(), 1);
+    assert_eq!(texts.iter().filter(|text| *text == "world").count(), 1);
 }
 
 #[test]
@@ -1642,6 +1666,7 @@ fn open_rows_do_not_yank_a_pinned_view() {
     app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "streaming tail".to_owned(),
     });
+    app.flush_stream();
     let after: Vec<_> = app
         .history_slice(80, 3)
         .rows
@@ -1661,10 +1686,11 @@ fn copy_includes_open_text_via_display_cell_indices() {
     app.on_operation_event(&FrontendOperationEvent::TextDelta {
         delta: "live tail".to_owned(),
     });
+    app.flush_stream();
     app.note_history_layout(80, 5);
     let slice = app.history_slice(80, 5);
     let last = slice.rows.last().expect("open cell visible");
-    assert_eq!(last.text, "• live tail");
+    assert_eq!(last.text, "live tail");
     assert_eq!(last.cell_index, 3);
 
     app.on_action(Action::SelectStart { x: 0, y: 3 });
@@ -1672,7 +1698,7 @@ fn copy_includes_open_text_via_display_cell_indices() {
     app.on_action(Action::SelectEnd { x: 11, y: 3 });
     assert_eq!(
         app.on_action(Action::CtrlC),
-        vec![Effect::WriteClipboard("• live tail".to_owned())]
+        vec![Effect::WriteClipboard("live tail".to_owned())]
     );
 }
 
@@ -1736,4 +1762,112 @@ fn overlay_ignores_home_and_end() {
     app.on_action(Action::End);
     assert!(app.follow_bottom());
     assert!(app.picker().is_some());
+}
+
+#[test]
+fn stream_anchor_viewport_heights_follow_the_lifecycle() {
+    let mut app = app();
+    let full = 90u16;
+    let anchors = Some((40u16, 80u16));
+    assert_eq!(
+        app.transcript_viewport_height(full, anchors),
+        full,
+        "idle without an anchor shows the whole band"
+    );
+
+    app.set_busy(true);
+    assert_eq!(
+        app.transcript_viewport_height(full, anchors),
+        80,
+        "busy follow pins the window at the 80% cap"
+    );
+
+    seed_rows(&mut app, 3);
+    app.note_frame_height(100);
+    app.note_history_layout(80, usize::from(full));
+    app.on_operation_event(&FrontendOperationEvent::OperationStarted {
+        operation_id: "op".to_owned(),
+    });
+    assert!(app.stream_anchor_active(), "a non-blank busy turn lifts");
+    assert_eq!(
+        app.transcript_viewport_height(full, anchors),
+        40,
+        "the lift starts with a base window at the 40% line"
+    );
+    seed_rows(&mut app, 25);
+    assert_eq!(
+        app.transcript_viewport_height(full, anchors),
+        65,
+        "the window grows one row per wrapped row"
+    );
+    seed_rows(&mut app, 100);
+    assert_eq!(
+        app.transcript_viewport_height(full, anchors),
+        80,
+        "growth stops at the 80% cap"
+    );
+
+    app.run_state_mut()
+        .freeze_elapsed(std::time::Duration::from_secs(7));
+    app.on_operation_event(&FrontendOperationEvent::OperationSettled {
+        operation_id: "op".to_owned(),
+        session_id: "s-1".to_owned(),
+        status: "Succeeded".to_owned(),
+        durability: "Confirmed".to_owned(),
+        session_revision: philo_agent_service::SettlementRevision::Unchanged,
+    });
+    assert!(app.animation_active(), "settlement starts the settle drop");
+    for expected in [82, 84, 86, 88] {
+        assert!(app.on_tick(std::time::Duration::from_millis(100)));
+        assert_eq!(
+            app.transcript_viewport_height(full, anchors),
+            expected,
+            "settle interpolates toward the full band"
+        );
+    }
+    assert!(app.on_tick(std::time::Duration::from_millis(100)));
+    assert!(!app.stream_anchor_active(), "the settle animation ends");
+    app.set_busy(false);
+    assert_eq!(
+        app.transcript_viewport_height(full, anchors),
+        full,
+        "settled turns return to the full band"
+    );
+}
+
+#[test]
+fn blank_screens_and_unfollowed_turns_never_lift() {
+    // A blank screen keeps its top start.
+    {
+        let mut app = app();
+        app.note_frame_height(40);
+        app.note_history_layout(80, 33);
+        app.set_busy(true);
+        app.on_operation_event(&FrontendOperationEvent::OperationStarted {
+            operation_id: "op".to_owned(),
+        });
+        assert!(!app.stream_anchor_active());
+    }
+
+    // A user who scrolled up is left alone, and scrolling cancels an
+    // active lift.
+    let mut app = app();
+    seed_rows(&mut app, 50);
+    app.note_frame_height(40);
+    app.note_history_layout(80, 33);
+    app.set_busy(true);
+    app.on_action(Action::PageTranscriptUp);
+    app.on_operation_event(&FrontendOperationEvent::OperationStarted {
+        operation_id: "op".to_owned(),
+    });
+    assert!(!app.stream_anchor_active());
+
+    app.on_action(Action::End);
+    app.on_operation_event(&FrontendOperationEvent::OperationStarted {
+        operation_id: "op".to_owned(),
+    });
+    assert!(app.stream_anchor_active());
+    app.on_action(Action::PageTranscriptUp);
+    assert!(!app.stream_anchor_active());
+    assert_eq!(app.transcript_viewport_height(33, Some((13, 26))), 26);
 }

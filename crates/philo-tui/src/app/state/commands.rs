@@ -8,6 +8,8 @@ use crate::app::effect::{Effect, HostRequest};
 use crate::app::text;
 use crate::app::transcript::{InfoLevel, LineKind, TranscriptLine};
 
+use crate::app::overlay::PANEL_PAD;
+
 /// One rendered menu row: the marker-plus-usage cell and the summary cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MenuRow {
@@ -16,10 +18,14 @@ pub(crate) struct MenuRow {
 }
 
 /// The frame the renderer paints above the composer while the menu is open.
+/// `width` is the panel's inner content width; the shell adds the two border
+/// columns and anchors the rounded panel at the input band's left edge, so
+/// the menu spans exactly the composer's width (v0.44 §4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommandMenuFrame {
     pub(crate) rows: Vec<MenuRow>,
     pub(crate) selected: usize,
+    pub(crate) width: usize,
 }
 
 /// The auto command menu: live-filtered candidates plus the highlight
@@ -71,36 +77,47 @@ impl CommandMenu {
         self.candidates[self.selected]
     }
 
-    /// Projects at most `max_rows` rows for `width` cells, windowed so the
-    /// highlighted row stays visible. Each row is `{marker}{usage}  {summary}`.
-    pub(super) fn frame(&self, width: usize, max_rows: usize) -> CommandMenuFrame {
+    /// Projects at most `max_rows` rows onto a panel exactly `max_width`
+    /// outer columns wide (the input band's width), windowed so the
+    /// highlighted row stays visible. Each row is `{marker}{usage}  {summary}`;
+    /// the usage column aligns to the widest visible candidate and long
+    /// rows truncate into the fixed text zone.
+    pub(super) fn frame(&self, max_width: usize, max_rows: usize) -> CommandMenuFrame {
         let rows = max_rows.max(1).min(self.candidates.len());
         let start = if self.selected >= rows {
             self.selected + 1 - rows
         } else {
             0
         };
-        let usage_width = self
-            .candidates
+        let visible: Vec<&'static str> = self.candidates[start..start + rows].to_vec();
+        let usage_width = visible
             .iter()
             .map(|name| command::spec(name).usage.len())
             .max()
             .unwrap_or(0);
+        // The menu no longer follows its widest row: it always spans the
+        // input band's exact width (v0.44 §4.1); content fits into the
+        // constant text zone.
+        // Marker + gap + aligned usage column + gap before the summary.
+        let row_width = |summary_width: usize| 2 + usage_width + 2 + summary_width;
+        let inner = max_width.saturating_sub(2).max(3);
+        let text_zone = inner - PANEL_PAD * 2;
+        let summary_budget = text_zone.saturating_sub(row_width(0));
         let rows = (start..start + rows)
             .map(|index| {
                 let spec = command::spec(self.candidates[index]);
-                let marker = if index == self.selected { ">" } else { " " };
+                let marker = if index == self.selected { "›" } else { " " };
                 let usage = format!("{marker} {:<usage_width$}  ", spec.usage);
-                let summary_width = width.saturating_sub(text::width(&usage));
                 MenuRow {
-                    usage: text::truncate(&usage, width),
-                    summary: text::truncate(spec.summary, summary_width),
+                    usage: text::truncate(&usage, text_zone),
+                    summary: text::truncate(spec.summary, summary_budget),
                 }
             })
             .collect();
         CommandMenuFrame {
             rows,
             selected: self.selected - start,
+            width: inner,
         }
     }
 }
@@ -217,31 +234,9 @@ impl App {
                     lines.push(line(LineKind::Meta, "renaming the current session..."));
                 }
             }
-            Ok(Command::Model { name: None }) => {
+            Ok(Command::Models) => {
+                self.expect_models_picker = true;
                 effects.push(Effect::Host(HostRequest::OpenModels))
-            }
-            Ok(Command::Model { name: Some(name) }) => {
-                self.pending_model_switch = true;
-                effects.push(Effect::Host(HostRequest::RebuildModel(name)));
-            }
-            Ok(Command::Models) => effects.push(Effect::Host(HostRequest::OpenModels)),
-            Ok(Command::Reasoning { level: None }) => {
-                lines.push(line(
-                    LineKind::Error,
-                    format!("usage: /reasoning <level> ({})", command::REASONING_LEVELS),
-                ));
-            }
-            Ok(Command::Reasoning { level: Some(level) }) => {
-                match command::parse_reasoning(&level) {
-                    Some(effort) => effects.push(Effect::Host(HostRequest::SetReasoning(effort))),
-                    None => lines.push(line(
-                        LineKind::Error,
-                        format!(
-                            "unknown reasoning level: {level} (expected {})",
-                            command::REASONING_LEVELS
-                        ),
-                    )),
-                }
             }
             Ok(Command::Compact) => {
                 if self.status.compacting {
@@ -257,7 +252,7 @@ impl App {
                     ));
                 } else {
                     self.manual_compacting = true;
-                    self.activity.start_manual_compaction();
+                    self.run_state.start_manual_compaction();
                     self.sync_compacting_status();
                     effects.push(Effect::StartCompaction);
                 }

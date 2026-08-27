@@ -5,9 +5,16 @@
 //! is a real cell at its insertion point (`open` is always the last index).
 //! Wrap rows are cached per width: the closed prefix is stable; a width
 //! change rebuilds everything; the open cell is always rewrapped.
+//!
+//! The store also owns think-block timing (design §3.2): each reasoning
+//! block's header displays the wall clock from its first to its latest
+//! `ReasoningDelta`, ticking live while the block streams and freezing at
+//! its seal. Replay never records timing, so replayed headers stay bare.
 
 use std::cell::{Ref, RefCell};
+use std::time::{Duration, Instant};
 
+use super::prose::{self, ProjectedRow};
 use super::text;
 use super::transcript::{LineKind, TranscriptLine};
 
@@ -16,7 +23,7 @@ struct WrapCache {
     width: usize,
     closed_upto: usize,
     revision: u64,
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<ProjectedRow>>,
 }
 
 impl Default for WrapCache {
@@ -45,6 +52,34 @@ pub(crate) fn expanded() -> Collapser<'static> {
     &|_| false
 }
 
+/// Wall-clock timing for one think block, keyed by its header cell index
+/// (design §3.2). `live` blocks tick against the real clock at projection
+/// time; sealed blocks show the captured first-to-last delta span.
+#[derive(Clone, Debug)]
+struct ThinkTiming {
+    head: usize,
+    started_at: Instant,
+    /// Frozen first-to-last delta span once the block stops streaming.
+    elapsed: Duration,
+    live: bool,
+    #[cfg(test)]
+    frozen: Option<Duration>,
+}
+
+impl ThinkTiming {
+    fn elapsed(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(frozen) = self.frozen {
+            return frozen;
+        }
+        if self.live {
+            self.started_at.elapsed()
+        } else {
+            self.elapsed
+        }
+    }
+}
+
 /// Canonical history for one TUI session: one ordered cell list plus an
 /// optional in-place open cursor on the last cell.
 #[derive(Clone, Debug, Default)]
@@ -53,6 +88,7 @@ pub(crate) struct TranscriptStore {
     open: Option<usize>,
     wrap_revision: u64,
     cache: RefCell<WrapCache>,
+    think: Vec<ThinkTiming>,
 }
 
 impl TranscriptStore {
@@ -63,6 +99,7 @@ impl TranscriptStore {
     pub fn clear(&mut self) {
         self.cells.clear();
         self.open = None;
+        self.think.clear();
         self.wrap_revision = self.wrap_revision.wrapping_add(1);
         self.cache.borrow_mut().invalidate();
     }
@@ -70,6 +107,61 @@ impl TranscriptStore {
     /// Manual reasoning fold changes must rebuild cached rows.
     pub(crate) fn bump_wrap_revision(&mut self) {
         self.wrap_revision = self.wrap_revision.wrapping_add(1);
+    }
+
+    // -- Think timing (design §3.2) --------------------------------------
+
+    /// A reasoning block opened its header at `head`: start its wall clock.
+    pub(crate) fn begin_think(&mut self, head: usize) {
+        self.think.retain(|timing| timing.head != head);
+        self.think.push(ThinkTiming {
+            head,
+            started_at: Instant::now(),
+            elapsed: Duration::ZERO,
+            live: true,
+            #[cfg(test)]
+            frozen: None,
+        });
+    }
+
+    /// The live block received another delta: extend its frozen span.
+    pub(crate) fn extend_think(&mut self) {
+        if let Some(timing) = self.think.iter_mut().find(|timing| timing.live) {
+            timing.elapsed = timing.started_at.elapsed();
+        }
+    }
+
+    /// Streaming ended for every live block: freeze their spans and drop
+    /// the cached rows so the next projection bakes the final durations in.
+    pub(crate) fn seal_think(&mut self) {
+        let mut sealed = false;
+        for timing in &mut self.think {
+            if timing.live {
+                timing.elapsed = timing.started_at.elapsed();
+                timing.live = false;
+                sealed = true;
+            }
+        }
+        if sealed {
+            self.bump_wrap_revision();
+        }
+    }
+
+    /// Display duration of the think block whose header sits at `head`.
+    fn think_elapsed_at(&self, head: usize) -> Option<Duration> {
+        self.think
+            .iter()
+            .find(|timing| timing.head == head)
+            .map(ThinkTiming::elapsed)
+    }
+
+    /// Pins every think duration so snapshots stay deterministic (plan T3.4
+    /// clock discipline, applied to the transcript).
+    #[cfg(test)]
+    pub(crate) fn freeze_think(&mut self, elapsed: Duration) {
+        for timing in &mut self.think {
+            timing.frozen = Some(elapsed);
+        }
     }
 
     /// All cells, including the open cell when one exists.
@@ -83,6 +175,7 @@ impl TranscriptStore {
         self.cells.clone()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty()
     }
@@ -95,12 +188,13 @@ impl TranscriptStore {
         self.cells[index].kind
     }
 
-    #[cfg(test)]
-    pub fn open_index(&self) -> Option<usize> {
-        self.open
+    /// Paint intent of the cell at `index` (tool-card structure, §3.3).
+    pub(crate) fn display_tone(&self, index: usize) -> super::transcript::Tone {
+        self.cells[index].tone
     }
 
-    pub(crate) fn open_cell(&self) -> Option<usize> {
+    #[cfg(test)]
+    pub fn open_index(&self) -> Option<usize> {
         self.open
     }
 
@@ -125,6 +219,7 @@ impl TranscriptStore {
         self.cells.push(TranscriptLine {
             kind,
             text: text.into(),
+            tone: super::transcript::Tone::Plain,
         });
         self.open = Some(self.cells.len() - 1);
         self.assert_open_last();
@@ -165,7 +260,8 @@ impl TranscriptStore {
 
     /// Rebuild wrap rows when the width changes or a manual reasoning fold
     /// bumped the revision. The closed prefix is stable; always rewrap from
-    /// `open_index.unwrap_or(len)`.
+    /// the open cell — or, while a think block streams, from its header so
+    /// the live duration re-renders every frame (design §3.2).
     pub(crate) fn refresh_wraps(&self, width: usize, collapsed: Collapser<'_>) {
         self.assert_open_last();
         let mut cache = self.cache.borrow_mut();
@@ -187,7 +283,13 @@ impl TranscriptStore {
             cache.width = width;
             cache.revision = self.wrap_revision;
         }
-        let rewrap_from = self.open.unwrap_or(self.cells.len());
+        let rewrap_from = match (self.open, self.live_think_head()) {
+            (Some(open), Some(head)) => open.min(head),
+            (Some(open), None) => open,
+            (None, Some(head)) => head,
+            (None, None) => self.cells.len(),
+        }
+        .min(self.cells.len());
         if cache.closed_upto > rewrap_from {
             cache.rows.truncate(rewrap_from);
             cache.closed_upto = rewrap_from;
@@ -208,6 +310,7 @@ impl TranscriptStore {
                 &runs,
                 index,
                 collapsed,
+                self.think_elapsed_at(index),
             );
             cache.rows.push(row);
             cache.closed_upto += 1;
@@ -220,16 +323,24 @@ impl TranscriptStore {
                 &runs,
                 index,
                 collapsed,
+                self.think_elapsed_at(index),
             );
             cache.rows.push(row);
         }
+    }
+
+    fn live_think_head(&self) -> Option<usize> {
+        self.think
+            .iter()
+            .find(|timing| timing.live)
+            .map(|timing| timing.head)
     }
 
     fn prev_kind(&self, index: usize) -> Option<LineKind> {
         index.checked_sub(1).map(|prev| self.cells[prev].kind)
     }
 
-    pub(crate) fn wrap_rows(&self) -> Ref<'_, [Vec<String>]> {
+    pub(crate) fn wrap_rows(&self) -> Ref<'_, [Vec<ProjectedRow>]> {
         Ref::map(self.cache.borrow(), |cache| cache.rows.as_slice())
     }
 
@@ -293,7 +404,12 @@ impl ScrollState {
         self.scroll_wrapped(&wrapped, height, delta);
     }
 
-    pub(crate) fn scroll_wrapped(&mut self, wrapped: &[Vec<String>], height: usize, delta: isize) {
+    pub(crate) fn scroll_wrapped(
+        &mut self,
+        wrapped: &[Vec<ProjectedRow>],
+        height: usize,
+        delta: isize,
+    ) {
         if delta == 0 || height == 0 || wrapped.is_empty() {
             return;
         }
@@ -344,7 +460,7 @@ impl ScrollState {
         self.unfollow_keep_wrapped(&wrapped, height);
     }
 
-    pub(crate) fn unfollow_keep_wrapped(&mut self, wrapped: &[Vec<String>], height: usize) {
+    pub(crate) fn unfollow_keep_wrapped(&mut self, wrapped: &[Vec<ProjectedRow>], height: usize) {
         if !self.follow_bottom {
             return;
         }
@@ -357,7 +473,7 @@ impl ScrollState {
         self.pin = Some(start_from_tail(wrapped, height));
     }
 
-    pub(crate) fn jump_top(&mut self, wrapped: &[Vec<String>], height: usize) {
+    pub(crate) fn jump_top(&mut self, wrapped: &[Vec<ProjectedRow>], height: usize) {
         if height == 0 || wrapped.is_empty() || row_count(wrapped) <= height {
             *self = Self::follow();
             return;
@@ -383,6 +499,13 @@ pub(crate) struct VisibleRow {
     pub cell_index: usize,
     pub row_in_cell: usize,
     pub kind: LineKind,
+    pub tone: super::transcript::Tone,
+    /// Block role of the answer line this fragment came from (`Plain`
+    /// outside answer cells; see [`super::prose`]).
+    pub role: super::prose::BlockRole,
+    /// Baked presentation spans for answer prose rows (`None` elsewhere
+    /// and for fenced code bodies).
+    pub spans: Option<Vec<super::prose::ProseSpan>>,
     pub text: String,
 }
 
@@ -396,7 +519,7 @@ pub(crate) struct VisibleSlice {
     pub at_bottom: bool,
 }
 
-/// Pure. No Ratatui. No MarkdownRenderer.
+/// Pure. No Ratatui. No markdown painting.
 /// `width == 0` or `height == 0` yields empty rows; `total_rows` is still
 /// computed when `width > 0`.
 #[cfg(test)]
@@ -422,7 +545,7 @@ pub(crate) fn visible_slice(
 
 fn visible_from_wraps(
     store: &TranscriptStore,
-    wrapped: &[Vec<String>],
+    wrapped: &[Vec<ProjectedRow>],
     width: usize,
     height: usize,
     scroll: &ScrollState,
@@ -466,7 +589,7 @@ fn visible_from_wraps(
 #[cfg(test)]
 fn slice_from_wraps(
     cells: &[TranscriptLine],
-    wrapped: &[Vec<String>],
+    wrapped: &[Vec<ProjectedRow>],
     width: usize,
     height: usize,
     scroll: &ScrollState,
@@ -511,32 +634,36 @@ pub(crate) fn wrap_line(
     cell: &TranscriptLine,
     width: usize,
     prev: Option<LineKind>,
-) -> Vec<String> {
+) -> Vec<ProjectedRow> {
     let mut rows = match cell.kind {
-        LineKind::User => text::wrap_user(&cell.text, width),
-        LineKind::Answer => text::wrap_answer(&cell.text, width, true),
-        LineKind::Tool => text::wrap_hanging(&cell.text, width),
-        LineKind::Reasoning => text::wrap_reasoning(&cell.text, width),
-        _ => text::wrap(&cell.text, width),
+        // User rows paint one space ahead of the text (the strip's bar-gap
+        // rhythm); reserve that column in the wrap width (v2.3).
+        LineKind::User => plain_rows(text::wrap(&cell.text, width.saturating_sub(1).max(1))),
+        LineKind::Answer => prose::project_answer(&cell.text, width),
+        LineKind::Tool => plain_rows(text::wrap_hanging(&cell.text, width)),
+        LineKind::Reasoning => plain_rows(text::wrap_reasoning(&cell.text, width)),
+        _ => plain_rows(text::wrap(&cell.text, width)),
     };
-    if needs_leading_gap(prev, cell.kind) && !rows.is_empty() {
-        rows.insert(0, String::new());
+    if needs_leading_gap(prev, cell) && !rows.is_empty() {
+        rows.insert(0, ProjectedRow::plain(String::new()));
     }
     rows
 }
 
+fn plain_rows(rows: impl IntoIterator<Item = String>) -> Vec<ProjectedRow> {
+    rows.into_iter().map(ProjectedRow::plain).collect()
+}
+
 /// Consecutive Reasoning cells form one visual think block. The scan maps
-/// every reasoning index to its run head and the block's body line count
-/// (logical lines; the head's own first line is the `think` header).
+/// every reasoning index to its run head; the header's duration comes from
+/// the store's think timing, not the body shape.
 struct ReasoningRuns {
     head_of: Vec<usize>,
-    body_lines: Vec<usize>,
 }
 
 impl ReasoningRuns {
     fn scan(cells: &[TranscriptLine]) -> Self {
         let mut head_of = vec![usize::MAX; cells.len()];
-        let mut body_lines = vec![0usize; cells.len()];
         let mut index = 0;
         while index < cells.len() {
             if cells[index].kind != LineKind::Reasoning {
@@ -544,44 +671,34 @@ impl ReasoningRuns {
                 continue;
             }
             let head = index;
-            let mut total = 0usize;
             while index < cells.len() && cells[index].kind == LineKind::Reasoning {
-                let count = cells[index].text.lines().count().max(1);
-                total += if index == head {
-                    count.saturating_sub(1)
-                } else {
-                    count
-                };
                 head_of[index] = head;
                 index += 1;
             }
-            body_lines[head] = total.max(1);
         }
-        Self {
-            head_of,
-            body_lines,
-        }
-    }
-
-    fn collapsed_header(
-        &self,
-        index: usize,
-        collapsed: Collapser<'_>,
-    ) -> std::option::Option<usize> {
-        let head = self.head_of[index];
-        if head == usize::MAX || !collapsed(head) {
-            return None;
-        }
-        if head == index {
-            Some(self.body_lines[head])
-        } else {
-            None
-        }
+        Self { head_of }
     }
 }
 
-/// One display row list for a cell: normal wrap, or the collapsed
-/// `think · N 行` header / hidden body when its run is folded.
+/// The rendered header row of the think block whose header cell is `index`:
+/// `think` bare (replay, or a block that never streamed deltas) or
+/// `think · 8s` with the block's wall-clock span. Sub-second spans wear
+/// milliseconds (`think · 850ms`, v2.2) instead of collapsing to `0s`.
+fn think_header_text(elapsed: Option<Duration>) -> String {
+    match elapsed {
+        Some(elapsed) => {
+            format!(
+                "think · {}",
+                crate::app::run_state::format_think_elapsed(elapsed)
+            )
+        }
+        None => "think".to_owned(),
+    }
+}
+
+/// One display row list for a cell: normal wrap, the collapsed `think`
+/// header with hidden body when its run is folded, or the timed header of
+/// an open run.
 fn project_cell(
     cell: &TranscriptLine,
     width: usize,
@@ -589,33 +706,42 @@ fn project_cell(
     runs: &ReasoningRuns,
     index: usize,
     collapsed: Collapser<'_>,
-) -> Vec<String> {
-    if cell.kind == LineKind::Reasoning
-        && let Some(count) = runs.collapsed_header(index, collapsed)
-    {
-        return vec![format!("think · {count} 行")];
-    }
-    if cell.kind == LineKind::Reasoning && runs.head_of[index] != usize::MAX {
+    think_elapsed: Option<Duration>,
+) -> Vec<ProjectedRow> {
+    if cell.kind == LineKind::Reasoning && cell.text == "think" {
+        let header = think_header_text(think_elapsed);
         let head = runs.head_of[index];
-        if collapsed(head) {
+        if head != usize::MAX && collapsed(head) {
+            return vec![ProjectedRow::plain(header)];
+        }
+        return plain_rows(text::wrap(&header, width));
+    }
+    if cell.kind == LineKind::Reasoning {
+        let head = runs.head_of[index];
+        if head != usize::MAX && collapsed(head) {
             return Vec::new();
         }
     }
     wrap_line(cell, width, prev)
 }
 
-fn needs_leading_gap(prev: Option<LineKind>, cur: LineKind) -> bool {
-    matches!(
-        (prev, cur),
-        (
-            Some(LineKind::Tool | LineKind::Answer),
-            LineKind::Tool | LineKind::Answer
-        )
-    )
+/// Blank rows separate visual blocks. Cards own their inner spacing
+/// explicitly, so plain tool rows stay gap-free; only a new card header
+/// (`Tone::Title`) opens a gap after previous content — except after user
+/// strips, which already carry their own trailing separator.
+fn needs_leading_gap(prev: Option<LineKind>, cell: &TranscriptLine) -> bool {
+    match cell.kind {
+        LineKind::Tool => {
+            cell.tone == super::transcript::Tone::Title
+                && !matches!(prev, None | Some(LineKind::User))
+        }
+        LineKind::Answer => matches!(prev, Some(LineKind::Tool | LineKind::Answer)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
-fn wrap_all(cells: &[TranscriptLine], width: usize) -> Vec<Vec<String>> {
+fn wrap_all(cells: &[TranscriptLine], width: usize) -> Vec<Vec<ProjectedRow>> {
     cells
         .iter()
         .enumerate()
@@ -630,11 +756,11 @@ fn wrap_all(cells: &[TranscriptLine], width: usize) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn row_count(wrapped: &[Vec<String>]) -> usize {
+fn row_count(wrapped: &[Vec<ProjectedRow>]) -> usize {
     wrapped.iter().map(Vec::len).sum()
 }
 
-fn start_from_tail(wrapped: &[Vec<String>], height: usize) -> (usize, usize) {
+fn start_from_tail(wrapped: &[Vec<ProjectedRow>], height: usize) -> (usize, usize) {
     if wrapped.is_empty() {
         return (0, 0);
     }
@@ -648,7 +774,7 @@ fn start_from_tail(wrapped: &[Vec<String>], height: usize) -> (usize, usize) {
     (0, 0)
 }
 
-fn clamp_pin(pin: Option<(usize, usize)>, wrapped: &[Vec<String>]) -> (usize, usize) {
+fn clamp_pin(pin: Option<(usize, usize)>, wrapped: &[Vec<ProjectedRow>]) -> (usize, usize) {
     let Some((cell, row)) = pin else {
         return (0, 0);
     };
@@ -661,7 +787,7 @@ fn clamp_pin(pin: Option<(usize, usize)>, wrapped: &[Vec<String>]) -> (usize, us
     (cell, row)
 }
 
-fn rows_from(wrapped: &[Vec<String>], cell: usize, row: usize) -> usize {
+fn rows_from(wrapped: &[Vec<ProjectedRow>], cell: usize, row: usize) -> usize {
     if cell >= wrapped.len() {
         return 0;
     }
@@ -669,11 +795,16 @@ fn rows_from(wrapped: &[Vec<String>], cell: usize, row: usize) -> usize {
     first + wrapped[cell + 1..].iter().map(Vec::len).sum::<usize>()
 }
 
-fn window_reaches_tail(wrapped: &[Vec<String>], cell: usize, row: usize, height: usize) -> bool {
+fn window_reaches_tail(
+    wrapped: &[Vec<ProjectedRow>],
+    cell: usize,
+    row: usize,
+    height: usize,
+) -> bool {
     wrapped.is_empty() || rows_from(wrapped, cell, row) <= height
 }
 
-fn move_backward(wrapped: &[Vec<String>], cell: &mut usize, row: &mut usize, mut n: usize) {
+fn move_backward(wrapped: &[Vec<ProjectedRow>], cell: &mut usize, row: &mut usize, mut n: usize) {
     while n > 0 {
         if *row > 0 {
             let step = (*row).min(n);
@@ -689,7 +820,7 @@ fn move_backward(wrapped: &[Vec<String>], cell: &mut usize, row: &mut usize, mut
     }
 }
 
-fn move_forward(wrapped: &[Vec<String>], cell: &mut usize, row: &mut usize, mut n: usize) {
+fn move_forward(wrapped: &[Vec<ProjectedRow>], cell: &mut usize, row: &mut usize, mut n: usize) {
     while n > 0 {
         let len = wrapped.get(*cell).map(Vec::len).unwrap_or(0);
         if *row + 1 < len {
@@ -709,7 +840,7 @@ fn move_forward(wrapped: &[Vec<String>], cell: &mut usize, row: &mut usize, mut 
 #[cfg(test)]
 fn collect_rows(
     cells: &[TranscriptLine],
-    wrapped: &[Vec<String>],
+    wrapped: &[Vec<ProjectedRow>],
     start_cell: usize,
     start_row: usize,
     height: usize,
@@ -724,7 +855,10 @@ fn collect_rows(
                 cell_index: cell,
                 row_in_cell: row,
                 kind: cells[cell].kind,
-                text: rows[row].clone(),
+                tone: cells[cell].tone,
+                role: rows[row].role.clone(),
+                spans: rows[row].spans.clone(),
+                text: rows[row].text.clone(),
             });
             row += 1;
         } else {
@@ -737,7 +871,7 @@ fn collect_rows(
 
 fn collect_store_rows(
     store: &TranscriptStore,
-    wrapped: &[Vec<String>],
+    wrapped: &[Vec<ProjectedRow>],
     start_cell: usize,
     start_row: usize,
     height: usize,
@@ -753,7 +887,10 @@ fn collect_store_rows(
                 cell_index: cell,
                 row_in_cell: row,
                 kind: store.display_kind(cell),
-                text: rows[row].clone(),
+                tone: store.display_tone(cell),
+                role: rows[row].role.clone(),
+                spans: rows[row].spans.clone(),
+                text: rows[row].text.clone(),
             });
             row += 1;
         } else {
@@ -767,7 +904,7 @@ fn collect_store_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::transcript::line;
+    use crate::app::transcript::{Tone, line};
 
     fn meta(text: &str) -> TranscriptLine {
         line(LineKind::Meta, text)
@@ -775,6 +912,10 @@ mod tests {
 
     fn texts(slice: &VisibleSlice) -> Vec<&str> {
         slice.rows.iter().map(|row| row.text.as_str()).collect()
+    }
+
+    fn row_texts(rows: &[ProjectedRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.text.as_str()).collect()
     }
 
     #[test]
@@ -856,27 +997,46 @@ mod tests {
     }
 
     #[test]
-    fn user_lines_wrap_with_a_hanging_gutter() {
-        let cells = vec![line(LineKind::User, "› abcdefgh")];
+    fn user_rows_wrap_one_short_reserving_the_bar_gap() {
+        let cells = vec![line(LineKind::User, "abcdefgh")];
         let scroll = ScrollState::follow();
+        // Width 6 reserves one column for the painted bar gap, so the text
+        // wraps at 5.
         let slice = visible_slice(&cells, 6, 2, &scroll);
-        assert_eq!(texts(&slice), ["› abcd", "  efgh"]);
+        assert_eq!(texts(&slice), ["abcde", "fgh"]);
     }
 
     #[test]
     fn block_boundaries_get_a_leading_gap_row() {
+        let tool = |text: &str, tone: Tone| crate::app::transcript::TranscriptLine {
+            kind: LineKind::Tool,
+            text: text.to_owned(),
+            tone,
+        };
         let cells = vec![
             line(LineKind::Answer, "abcdefgh"),
             line(LineKind::Answer, "ijklmnop"),
-            line(LineKind::Tool, "▸ read"),
+            tool("Grep 1 search", Tone::Title),
+            tool("  ↳ \"hit\"", Tone::Detail),
             line(LineKind::Answer, "next"),
         ];
         let scroll = ScrollState::follow();
-        let slice = visible_slice(&cells, 6, 10, &scroll);
+        let slice = visible_slice(&cells, 6, 12, &scroll);
         assert_eq!(
             texts(&slice),
             [
-                "• abcd", "  efgh", "", "• ijkl", "  mnop", "", "▸ read", "", "• next"
+                "gh",
+                "",
+                "ijklmn",
+                "op",
+                "",
+                "Grep 1",
+                " searc",
+                "h",
+                "  ↳ \"h",
+                "  it\"",
+                "",
+                "next"
             ]
         );
     }
@@ -884,7 +1044,7 @@ mod tests {
     #[test]
     fn user_and_reasoning_boundaries_stay_gap_free() {
         let cells = vec![
-            line(LineKind::User, "› prompt"),
+            line(LineKind::User, "prompt"),
             line(LineKind::Answer, "reply"),
             line(LineKind::Reasoning, "think"),
             line(LineKind::Reasoning, "  more think"),
@@ -894,7 +1054,7 @@ mod tests {
         let slice = visible_slice(&cells, 20, 8, &scroll);
         assert_eq!(
             texts(&slice),
-            ["› prompt", "• reply", "think", "│ more think", "note"]
+            ["prompt", "reply", "think", "│ more think", "note"]
         );
     }
 
@@ -924,7 +1084,7 @@ mod tests {
         let slice = store.visible_slice(80, 10, &ScrollState::follow(), &|head| head == 1);
         assert_eq!(
             texts(&slice),
-            ["a", "think · 2 行", "tail"],
+            ["a", "think", "tail"],
             "the folded run renders one header row"
         );
 
@@ -932,7 +1092,45 @@ mod tests {
         store.push_closed([crate::app::transcript::line(LineKind::Reasoning, "think")]);
         store.refresh_wraps(80, &|_| true);
         let slice = store.visible_slice(80, 10, &ScrollState::follow(), &|_| true);
-        assert_eq!(texts(&slice), ["think · 1 行"]);
+        assert_eq!(texts(&slice), ["think"]);
+    }
+
+    #[test]
+    fn timed_think_headers_render_and_freeze_at_the_seal() {
+        let mut store = TranscriptStore::default();
+        store.push_closed([
+            crate::app::transcript::line(LineKind::Reasoning, "think"),
+            crate::app::transcript::line(LineKind::Reasoning, "  body"),
+            meta("after"),
+        ]);
+        let head = 0;
+
+        // Streaming: the header ticks live against the injected clock.
+        store.begin_think(head);
+        store.extend_think();
+        store.freeze_think(std::time::Duration::from_secs(8));
+        store.refresh_wraps(80, &|_| true);
+        {
+            let rows = store.wrap_rows();
+            assert_eq!(row_texts(&rows[head]), ["think · 8s"]);
+            assert_eq!(row_texts(&rows[2]), ["after"]);
+        }
+
+        // Sealed: the frozen span survives the cache rebuild.
+        store.seal_think();
+        store.freeze_think(std::time::Duration::from_secs(8));
+        store.refresh_wraps(80, &|_| false);
+        {
+            let rows = store.wrap_rows();
+            assert_eq!(row_texts(&rows[head]), ["think · 8s"]);
+            assert_eq!(row_texts(&rows[1]), ["│ body"]);
+        }
+
+        // Untimed blocks (replay) keep the bare header.
+        let mut replay = TranscriptStore::default();
+        replay.push_closed([crate::app::transcript::line(LineKind::Reasoning, "think")]);
+        replay.refresh_wraps(80, &|_| true);
+        assert_eq!(row_texts(&replay.wrap_rows()[0]), ["think"]);
     }
 
     #[test]
@@ -942,7 +1140,7 @@ mod tests {
         store.refresh_wraps(80, &|_| true);
         {
             let rows = store.wrap_rows();
-            assert_eq!(rows[0], vec!["think · 1 行".to_owned()]);
+            assert_eq!(row_texts(&rows[0]), ["think"]);
         }
         store.bump_wrap_revision();
         store.refresh_wraps(80, &|_| false);
@@ -999,7 +1197,7 @@ mod tests {
         assert_eq!(store.cached_width(), 4);
         assert_eq!(store.cached_closed_upto(), 3);
         let narrow = store.wrap_rows().to_vec();
-        assert_eq!(narrow[0], ["中文", "0"]);
+        assert_eq!(row_texts(&narrow[0]), ["中文", "0"]);
 
         store.refresh_wraps(4, expanded());
         assert_eq!(
@@ -1011,7 +1209,7 @@ mod tests {
 
         store.refresh_wraps(80, expanded());
         assert_eq!(store.cached_width(), 80);
-        assert_eq!(store.wrap_rows()[0], ["中文0"]);
+        assert_eq!(row_texts(&store.wrap_rows()[0]), ["中文0"]);
 
         store.refresh_wraps(4, expanded());
         assert_eq!(&*store.wrap_rows(), narrow.as_slice());
@@ -1019,12 +1217,12 @@ mod tests {
         store.push_closed([meta("中文3")]);
         store.refresh_wraps(4, expanded());
         assert_eq!(store.cached_closed_upto(), 4);
-        assert_eq!(store.wrap_rows()[3], ["中文", "3"]);
+        assert_eq!(row_texts(&store.wrap_rows()[3]), ["中文", "3"]);
 
         store.begin(LineKind::Meta, "中文");
         store.refresh_wraps(4, expanded());
         assert_eq!(store.cached_closed_upto(), 4);
-        assert_eq!(store.wrap_rows()[4], ["中文"]);
+        assert_eq!(row_texts(&store.wrap_rows()[4]), ["中文"]);
         store.write_open("live");
         store.refresh_wraps(4, expanded());
         assert_eq!(
@@ -1032,6 +1230,6 @@ mod tests {
             4,
             "open never advances closed cache"
         );
-        assert_eq!(store.wrap_rows()[4], ["中文", "live"]);
+        assert_eq!(row_texts(&store.wrap_rows()[4]), ["中文", "live"]);
     }
 }

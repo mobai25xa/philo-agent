@@ -10,8 +10,8 @@ use crate::artifact::sha256_hex;
 
 use super::record::{
     AssistantBlockRecord, AssistantMessageRecord, AssistantToolCallBatchRecord, EntryRecord,
-    FailureKindRecord, FailureRecord, KindRecord, OutcomeRecord, ReasonRecord, ToolOutcomeRecord,
-    ToolResultRecord, UserMessageRecord, UserPartRecord,
+    FailureKindRecord, FailureRecord, KindRecord, OutcomeRecord, ReasonRecord, TokenUsageRecord,
+    ToolOutcomeRecord, ToolResultRecord, UserMessageRecord, UserPartRecord,
 };
 
 /// An artifact newly referenced by the transaction being encoded.
@@ -37,6 +37,26 @@ fn decode_reason(reason: Option<ReasonRecord>) -> Result<CancelReason, String> {
         Some(ReasonRecord::Timeout) => Ok(CancelReason::Timeout),
         Some(ReasonRecord::Abandoned) => Ok(CancelReason::Abandoned),
         None => Err("cancelled outcome is missing required reason".to_owned()),
+    }
+}
+
+fn encode_usage(usage: philo_session::SessionTokenUsage) -> TokenUsageRecord {
+    TokenUsageRecord {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+    }
+}
+
+fn decode_usage(usage: TokenUsageRecord) -> philo_session::SessionTokenUsage {
+    philo_session::SessionTokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
     }
 }
 
@@ -196,6 +216,7 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
         SessionEntryKind::OperationSettled {
             operation_id,
             outcome,
+            usage,
         } => {
             let (outcome, reason) = match outcome {
                 OperationOutcome::Succeeded => (OutcomeRecord::Succeeded, None),
@@ -208,6 +229,7 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
                 operation_id: operation_id.as_str().to_owned(),
                 outcome,
                 reason,
+                usage: usage.map(encode_usage),
             }
         }
         SessionEntryKind::Compaction {
@@ -327,6 +349,7 @@ fn decode_kind(
             operation_id,
             outcome,
             reason,
+            usage,
         } => SessionEntryKind::OperationSettled {
             operation_id: OperationId::new(operation_id),
             outcome: match outcome {
@@ -336,6 +359,7 @@ fn decode_kind(
                     reason: decode_reason(reason)?,
                 },
             },
+            usage: usage.map(decode_usage),
         },
         KindRecord::Compaction {
             summary,

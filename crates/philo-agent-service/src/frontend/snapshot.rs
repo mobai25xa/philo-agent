@@ -70,6 +70,8 @@ pub struct DurableSessionView {
     pub settled_turn_boundaries: Vec<String>,
     /// Newest compaction boundary, if any.
     pub latest_compaction_boundary: Option<String>,
+    /// Latest token usage recorded at the newest settled turn, if any.
+    pub usage: Option<FrontendTokenUsage>,
 }
 
 /// One entry of the session catalog: identity plus advisory display facts.

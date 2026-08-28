@@ -91,6 +91,7 @@ async fn seed_turn(store: &dyn SessionStore, index: usize) -> String {
                 SessionEntryKind::OperationSettled {
                     operation_id,
                     outcome: StoredOperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         ))

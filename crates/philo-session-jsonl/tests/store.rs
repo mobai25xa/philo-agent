@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use philo_session::{
     MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock, SessionEntryKind,
-    SessionError, SessionId, SessionRevision, SessionStore, SessionToolCall, SessionToolResult,
-    SessionTransaction, SessionUserPart, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
+    SessionError, SessionId, SessionRevision, SessionStore, SessionTokenUsage,
+    SessionToolCall, SessionToolResult, SessionTransaction, SessionUserPart, ToolBatchId,
+    ToolCallId, TurnId, TurnOutcome,
 };
 use philo_session_jsonl::{JsonlOpenError, JsonlSessionStore};
 
@@ -113,6 +114,7 @@ fn settle_transaction(revision: u64) -> SessionTransaction {
             SessionEntryKind::OperationSettled {
                 operation_id: OperationId::new("op-1"),
                 outcome: OperationOutcome::Succeeded,
+                usage: None,
             },
         ],
     )
@@ -195,6 +197,72 @@ async fn golden_directory_encoding_escapes_unsafe_and_uppercase_bytes() {
 }
 
 // --- Durability and restart continuation (M5-002 / M5-007) ------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_operation_settled_with_usage_serializes_and_round_trips() {
+    let root = TempRoot::new();
+    let store = JsonlSessionStore::open(&root.path).expect("open");
+    let usage = SessionTokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(50),
+        cache_read_tokens: Some(200),
+        cache_write_tokens: None,
+        reasoning_tokens: Some(10),
+    };
+    let tx = SessionTransaction::linear(
+        session_id(),
+        SessionRevision::ZERO,
+        vec![
+            SessionEntryKind::OperationStarted {
+                operation_id: OperationId::new("op-1"),
+            },
+            SessionEntryKind::TurnStarted {
+                operation_id: OperationId::new("op-1"),
+                turn_id: TurnId::new("turn-1"),
+            },
+            SessionEntryKind::UserMessage {
+                turn_id: TurnId::new("turn-1"),
+                parts: SessionUserPart::text_parts("hi"),
+            },
+            SessionEntryKind::AssistantMessage {
+                turn_id: TurnId::new("turn-1"),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "hello".into(),
+                }],
+            },
+            SessionEntryKind::TurnTerminated {
+                turn_id: TurnId::new("turn-1"),
+                outcome: TurnOutcome::Succeeded,
+            },
+            SessionEntryKind::OperationSettled {
+                operation_id: OperationId::new("op-1"),
+                outcome: OperationOutcome::Succeeded,
+                usage: Some(usage),
+            },
+        ],
+    );
+    let commit = store.commit(tx).await.expect("commit");
+    assert_eq!(commit.revision().get(), 1);
+    drop(store);
+
+    // Pin the golden JSON line: usage fields are camelCase with
+    // skip_serializing_if for None values.
+    let log = std::fs::read_to_string(log_path(&root)).expect("read log");
+    let lines: Vec<&str> = log.lines().collect();
+    let line = lines.last().expect("transaction line");
+    assert!(line.contains("\"operation_settled\""));
+    assert!(line.contains("\"usage\":{"));
+    assert!(line.contains("\"input_tokens\":100"));
+    assert!(line.contains("\"output_tokens\":50"));
+    assert!(line.contains("\"cache_read_tokens\":200"));
+    assert!(line.contains("\"reasoning_tokens\":10"));
+    assert!(!line.contains("\"cache_write_tokens\""));
+
+    // Round-trip: reopen and verify the usage survives.
+    let store = JsonlSessionStore::open(&root.path).expect("reopen");
+    let view = store.context_view(&session_id()).await.expect("view");
+    assert_eq!(view.latest_usage(), Some(usage));
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_transactions_are_visible_to_a_fresh_store_instance() {

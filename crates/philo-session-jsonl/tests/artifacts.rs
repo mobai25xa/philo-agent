@@ -107,6 +107,7 @@ fn settle_transaction(revision: u64, operation: &str, turn: &str) -> SessionTran
             SessionEntryKind::OperationSettled {
                 operation_id: OperationId::new(operation),
                 outcome: OperationOutcome::Succeeded,
+                usage: None,
             },
         ],
     )

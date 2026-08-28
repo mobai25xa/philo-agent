@@ -7,8 +7,8 @@ use std::task::{Context, Poll, Waker};
 use philo_session::{
     EntryId, MemorySessionStore, OperationId, OperationOutcome, SessionAssistantBlock,
     SessionEntry, SessionEntryKind, SessionError, SessionId, SessionProjection, SessionRevision,
-    SessionStore, SessionToolCall, SessionToolResult, SessionTransaction, SessionUserPart,
-    SessionValidationError, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
+    SessionStore, SessionTokenUsage, SessionToolCall, SessionToolResult, SessionTransaction,
+    SessionUserPart, SessionValidationError, ToolBatchId, ToolCallId, TurnId, TurnOutcome,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -94,6 +94,7 @@ fn settle_transaction(revision: SessionRevision) -> SessionTransaction {
             SessionEntryKind::OperationSettled {
                 operation_id: OperationId::new("op-1"),
                 outcome: OperationOutcome::Succeeded,
+                usage: None,
             },
         ],
     )
@@ -329,4 +330,57 @@ fn store_busy_carries_diagnostic_text() {
         panic!("expected StoreBusy");
     };
     assert_eq!(reason, "queue full");
+}
+
+#[test]
+fn context_view_exposes_latest_settled_usage() {
+    let mut projection = SessionProjection::empty();
+    let usage = SessionTokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(50),
+        ..Default::default()
+    };
+    let settle = SessionTransaction::linear(
+        session_id(),
+        SessionRevision::ZERO,
+        vec![
+            SessionEntryKind::OperationStarted {
+                operation_id: OperationId::new("op-1"),
+            },
+            SessionEntryKind::TurnStarted {
+                operation_id: OperationId::new("op-1"),
+                turn_id: TurnId::new("turn-1"),
+            },
+            SessionEntryKind::UserMessage {
+                turn_id: TurnId::new("turn-1"),
+                parts: SessionUserPart::text_parts("hi"),
+            },
+            SessionEntryKind::AssistantMessage {
+                turn_id: TurnId::new("turn-1"),
+                blocks: vec![SessionAssistantBlock::Text {
+                    text: "hello".into(),
+                }],
+            },
+            SessionEntryKind::TurnTerminated {
+                turn_id: TurnId::new("turn-1"),
+                outcome: TurnOutcome::Succeeded,
+            },
+            SessionEntryKind::OperationSettled {
+                operation_id: OperationId::new("op-1"),
+                outcome: OperationOutcome::Succeeded,
+                usage: Some(usage),
+            },
+        ],
+    );
+    let applied = projection.apply(&settle).expect("valid transaction");
+    projection = applied.into_projection();
+    let view = projection.context_view(&session_id());
+    assert_eq!(view.latest_usage(), Some(usage));
+}
+
+#[test]
+fn context_view_usage_none_before_first_settled_turn() {
+    let projection = SessionProjection::empty();
+    let view = projection.context_view(&session_id());
+    assert_eq!(view.latest_usage(), None);
 }

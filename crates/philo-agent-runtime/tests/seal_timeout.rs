@@ -347,6 +347,7 @@ async fn dangling_batch_of_a_terminated_turn_maps_to_placeholders_without_durabl
                 SessionEntryKind::OperationSettled {
                     operation_id: philo_session::OperationId::new("stale-op-a"),
                     outcome: philo_session::OperationOutcome::Failed,
+                    usage: None,
                 },
             ],
         ))

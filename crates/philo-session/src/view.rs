@@ -5,6 +5,7 @@ use crate::entry::{
     ToolBatchId, ToolCallId, TurnId,
 };
 use crate::tool_entry::ToolResultOutcome;
+use crate::usage::SessionTokenUsage;
 
 /// A model-visible message projected from the active linear path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +90,7 @@ pub struct SessionContextView {
     pub(crate) settled_turns: Vec<(OperationId, TurnId)>,
     pub(crate) settled_turn_boundaries: Vec<EntryId>,
     pub(crate) latest_compaction_boundary: Option<EntryId>,
+    pub(crate) latest_usage: Option<SessionTokenUsage>,
 }
 
 impl SessionContextView {
@@ -139,5 +141,12 @@ impl SessionContextView {
     /// Returns the boundary of the newest durable compaction, if any.
     pub fn latest_compaction_boundary(&self) -> Option<&EntryId> {
         self.latest_compaction_boundary.as_ref()
+    }
+
+    /// Returns the token usage recorded at the newest settled turn, if any.
+    /// `None` for sessions with no settled turns or when the provider did
+    /// not report usage.
+    pub fn latest_usage(&self) -> Option<SessionTokenUsage> {
+        self.latest_usage
     }
 }

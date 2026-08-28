@@ -121,6 +121,7 @@ fn two_rounds_project_interleaved_in_source_order() {
             SessionEntryKind::OperationSettled {
                 operation_id: OperationId::new("o"),
                 outcome: OperationOutcome::Succeeded,
+                usage: None,
             },
         ],
     )

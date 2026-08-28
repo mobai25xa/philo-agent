@@ -675,6 +675,13 @@ impl App {
             .take()
             .unwrap_or(SessionLoadIntent::Switch);
         self.begin_session(session_id);
+        // Cross-process usage restore: the session store carries the last
+        // settled turn's usage, so the telemetry reads the saved value
+        // immediately on load, not `-`.
+        if let Some(usage) = view.usage {
+            self.status.usage = Some(usage);
+            self.usage_cache.insert(session_id.to_owned(), usage);
+        }
         match intent {
             SessionLoadIntent::New => self.ingest_appends(vec![Effect::Append(vec![line(
                 LineKind::Meta,
@@ -778,6 +785,11 @@ impl App {
         if let Some(session_id) = &snapshot.current_session_id {
             self.begin_session(session_id);
             if let Some(view) = &snapshot.durable_session_view {
+                // Cross-process usage restore on resync.
+                if let Some(usage) = view.usage {
+                    self.status.usage = Some(usage);
+                    self.usage_cache.insert(session_id.clone(), usage);
+                }
                 let history = session::history_lines(view);
                 if !history.is_empty() {
                     self.cells.push_closed(history);
@@ -785,6 +797,10 @@ impl App {
             }
         } else if let Some(view) = &snapshot.durable_session_view {
             self.begin_session(&view.session_id);
+            if let Some(usage) = view.usage {
+                self.status.usage = Some(usage);
+                self.usage_cache.insert(view.session_id.clone(), usage);
+            }
             let history = session::history_lines(view);
             if !history.is_empty() {
                 self.cells.push_closed(history);

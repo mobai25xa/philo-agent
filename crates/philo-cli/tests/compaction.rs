@@ -157,6 +157,7 @@ fn seed_completed_turns(root: &Path, session: &str, count: usize) {
                 SessionEntryKind::OperationSettled {
                     operation_id,
                     outcome: OperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         )))

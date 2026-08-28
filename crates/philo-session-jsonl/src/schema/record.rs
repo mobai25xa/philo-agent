@@ -58,6 +58,11 @@ pub(crate) enum KindRecord {
         outcome: OutcomeRecord,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<ReasonRecord>,
+        /// Token usage recorded at this settled turn boundary. Absent on
+        /// legacy logs and on turns that never observed usage; additive v2
+        /// field, backward-compatible via `#[serde(default)]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsageRecord>,
     },
     Compaction {
         summary: String,
@@ -164,4 +169,20 @@ pub(crate) enum ReasonRecord {
     User,
     Timeout,
     Abandoned,
+}
+
+/// Durable token-usage snapshot recorded at each settled turn boundary.
+/// All fields are optional; additive v2 record, backward-compatible.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct TokenUsageRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }

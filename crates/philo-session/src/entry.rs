@@ -1,6 +1,7 @@
 //! Durable identifiers, entry payloads, transactions and commit results.
 
 use crate::tool_entry::{SessionToolCall, SessionToolResult};
+use crate::usage::SessionTokenUsage;
 
 macro_rules! string_id {
     ($name:ident, $description:literal) => {
@@ -211,6 +212,11 @@ pub enum SessionEntryKind {
     OperationSettled {
         operation_id: OperationId,
         outcome: OperationOutcome,
+        /// Token usage observed during this turn, when known. Only the
+        /// newest settled turn's usage is projected by
+        /// [`crate::SessionContextView`]; earlier turns keep the durable
+        /// fact but do not surface it.
+        usage: Option<SessionTokenUsage>,
     },
     /// Replaces the model-visible prefix through a settled operation with a
     /// durable summary. Original entries remain unchanged and replayable.

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::entry::{EntryId, SessionEntry, SessionEntryKind};
 use crate::error::{SessionError, SessionValidationError, validation};
+use crate::usage::SessionTokenUsage;
 use crate::view::ContextMessage;
 
 #[derive(Clone, Debug, Default)]
@@ -11,6 +12,8 @@ pub(super) struct ContextProjection {
     pub(super) source_messages: Vec<ContextMessage>,
     settled_boundaries: HashMap<EntryId, SettledBoundary>,
     latest_compaction: Option<CompactionState>,
+    /// Newest settled turn's usage; `None` until the first settled turn.
+    latest_usage: Option<SessionTokenUsage>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +43,10 @@ impl ContextProjection {
         self.latest_compaction
             .as_ref()
             .map(|compaction| compaction.covers_up_to.clone())
+    }
+
+    pub(super) fn latest_usage(&self) -> Option<SessionTokenUsage> {
+        self.latest_usage
     }
 
     pub(super) fn accept(
@@ -75,7 +82,7 @@ impl ContextProjection {
                     outcome: result.outcome().clone(),
                 });
             }
-            SessionEntryKind::OperationSettled { .. } => {
+            SessionEntryKind::OperationSettled { usage, .. } => {
                 self.settled_boundaries.insert(
                     entry.id().clone(),
                     SettledBoundary {
@@ -83,6 +90,7 @@ impl ContextProjection {
                         message_count: self.source_messages.len(),
                     },
                 );
+                self.latest_usage = *usage;
             }
             SessionEntryKind::Compaction {
                 summary,

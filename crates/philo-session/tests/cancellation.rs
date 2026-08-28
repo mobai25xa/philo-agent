@@ -100,6 +100,7 @@ fn terminal_entries() -> Vec<SessionEntryKind> {
             outcome: OperationOutcome::Cancelled {
                 reason: CancelReason::User,
             },
+            usage: None,
         },
     ]
 }
@@ -443,6 +444,7 @@ fn operation_outcome_must_match_the_cancelled_turn() {
                 SessionEntryKind::OperationSettled {
                     operation_id: operation_id(),
                     outcome: OperationOutcome::Failed,
+                usage: None,
                 },
             ],
         ))
@@ -481,6 +483,7 @@ fn cancelled_operation_outcome_requires_a_cancelled_turn() {
                     outcome: OperationOutcome::Cancelled {
                         reason: CancelReason::User,
                     },
+                    usage: None,
                 },
             ],
         ))

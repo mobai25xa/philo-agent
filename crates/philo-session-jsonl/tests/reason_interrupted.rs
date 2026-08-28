@@ -103,6 +103,7 @@ fn terminal_entries(reason: CancelReason) -> Vec<SessionEntryKind> {
         SessionEntryKind::OperationSettled {
             operation_id: OperationId::new("op-1"),
             outcome: OperationOutcome::Cancelled { reason },
+            usage: None,
         },
     ]
 }

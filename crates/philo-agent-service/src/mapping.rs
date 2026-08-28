@@ -51,6 +51,18 @@ pub fn durable_session_view(view: &SessionContextView) -> DurableSessionView {
         latest_compaction_boundary: view
             .latest_compaction_boundary()
             .map(|id| id.as_str().to_owned()),
+        usage: view.latest_usage().map(session_usage_to_frontend),
+    }
+}
+
+/// Maps the session's `SessionTokenUsage` into the frontend DTO.
+fn session_usage_to_frontend(usage: philo_session::SessionTokenUsage) -> FrontendTokenUsage {
+    FrontendTokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
     }
 }
 
@@ -584,6 +596,7 @@ mod tests {
                 SessionEntryKind::OperationSettled {
                     operation_id: OperationId::new("op-1"),
                     outcome: OperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         )))

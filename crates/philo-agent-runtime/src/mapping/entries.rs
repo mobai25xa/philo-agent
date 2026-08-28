@@ -2,6 +2,7 @@
 
 use super::failure::session_failure_from_kernel;
 use super::parts::session_user_parts;
+use super::session_usage;
 use crate::{AgentFailure, OperationId, TurnId};
 use philo_agent_kernel as kernel;
 use philo_session as session;
@@ -45,6 +46,7 @@ pub(crate) fn success_entries(
     observations: &[kernel::KernelObservation],
     operation_id: &OperationId,
     turn_id: &TurnId,
+    usage: Option<crate::TokenUsage>,
 ) -> Result<Vec<session::SessionEntryKind>, AgentFailure> {
     let Some(output) = observations
         .iter()
@@ -86,6 +88,7 @@ pub(crate) fn success_entries(
         session::SessionEntryKind::OperationSettled {
             operation_id: session::OperationId::new(operation_id.as_str()),
             outcome: session::OperationOutcome::Succeeded,
+            usage: usage.map(session_usage),
         },
     ])
 }
@@ -94,6 +97,7 @@ pub(crate) fn failure_entries(
     observations: &[kernel::KernelObservation],
     operation_id: &OperationId,
     turn_id: &TurnId,
+    usage: Option<crate::TokenUsage>,
 ) -> Result<Vec<session::SessionEntryKind>, AgentFailure> {
     let Some(failure) = observations
         .iter()
@@ -116,6 +120,7 @@ pub(crate) fn failure_entries(
         session::SessionEntryKind::OperationSettled {
             operation_id: session::OperationId::new(operation_id.as_str()),
             outcome: session::OperationOutcome::Failed,
+            usage: usage.map(session_usage),
         },
     ])
 }

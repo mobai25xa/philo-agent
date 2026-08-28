@@ -6,6 +6,7 @@ mod memory;
 mod projection;
 mod store;
 mod tool_entry;
+mod usage;
 mod view;
 
 pub use entry::{
@@ -19,4 +20,5 @@ pub use memory::MemorySessionStore;
 pub use projection::{AppliedTransaction, SessionProjection};
 pub use store::{SessionFuture, SessionStore, SessionSummary};
 pub use tool_entry::{SessionToolCall, SessionToolResult, ToolResultOutcome};
+pub use usage::SessionTokenUsage;
 pub use view::{ContextMessage, OpenTurnInfo, SessionContextView, UnfilledBatch};

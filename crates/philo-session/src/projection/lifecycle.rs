@@ -293,6 +293,7 @@ impl LifecycleProjection {
             SessionEntryKind::OperationSettled {
                 operation_id,
                 outcome,
+                usage: _,
             } => {
                 let operation = self.active_operation(operation_id)?;
                 let Some(turn_id) = operation.turn_id.clone() else {

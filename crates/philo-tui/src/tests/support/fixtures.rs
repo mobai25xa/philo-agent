@@ -38,6 +38,7 @@ pub(crate) fn session_view(id: &str) -> DurableSessionView {
         open_turns: Vec::new(),
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
+        usage: None,
     }
 }
 
@@ -58,6 +59,7 @@ pub(crate) fn image_session_view(id: &str) -> DurableSessionView {
         open_turns: Vec::new(),
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
+        usage: None,
     }
 }
 
@@ -70,6 +72,7 @@ pub(crate) fn empty_session_view(id: &str) -> DurableSessionView {
         open_turns: Vec::new(),
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
+        usage: None,
     }
 }
 

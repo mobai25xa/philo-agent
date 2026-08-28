@@ -52,6 +52,7 @@ impl TurnCx<'_> {
         // The accepted reason (user request or operation timeout) becomes
         // part of the durable terminal facts; the kernel never sees it.
         let reason = self.operation.cancel_reason();
+        let usage = self.operation.shared().last_usage();
         let mut entries = completion_marks;
         entries.push(session::SessionEntryKind::TurnTerminated {
             turn_id: session::TurnId::new(self.operation.turn_id().as_str()),
@@ -60,6 +61,7 @@ impl TurnCx<'_> {
         entries.push(session::SessionEntryKind::OperationSettled {
             operation_id: session::OperationId::new(self.operation.operation_id().as_str()),
             outcome: session::OperationOutcome::Cancelled { reason },
+            usage: usage.map(crate::mapping::session_usage),
         });
         let commit = self
             .ctx
@@ -96,6 +98,7 @@ impl TurnCx<'_> {
     /// settlement; a rejected transition or failed commit degrades to an
     /// unconfirmed settlement.
     pub(super) async fn fail(self, effect_id: kernel::EffectId, failure: AgentFailure) {
+        let usage = self.operation.shared().last_usage();
         let termination = match kernel::transition(
             &self.state,
             kernel::KernelInput::TerminationRequested {
@@ -113,6 +116,7 @@ impl TurnCx<'_> {
             &termination.observations,
             self.operation.operation_id(),
             self.operation.turn_id(),
+            usage,
         ) {
             Ok(value) => value,
             Err(_) => {

@@ -411,6 +411,7 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
                 SessionEntryKind::OperationSettled {
                     operation_id: operation,
                     outcome: SessionOperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         ))

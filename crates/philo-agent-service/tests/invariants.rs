@@ -108,6 +108,7 @@ async fn seed_session(store: &MemorySessionStore, session_id: &str) {
                 SessionEntryKind::OperationSettled {
                     operation_id: philo_session::OperationId::new("op-seed"),
                     outcome: OperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         ))

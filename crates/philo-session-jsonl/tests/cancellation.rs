@@ -113,6 +113,7 @@ fn cancel_transaction(revision: u64) -> SessionTransaction {
                 outcome: OperationOutcome::Cancelled {
                     reason: CancelReason::User,
                 },
+                usage: None,
             },
         ],
     )

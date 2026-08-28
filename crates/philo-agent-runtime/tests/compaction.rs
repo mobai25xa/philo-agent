@@ -108,6 +108,7 @@ async fn seed_turn(store: &dyn SessionStore, index: usize, user: &str, assistant
                 SessionEntryKind::OperationSettled {
                     operation_id,
                     outcome: philo_session::OperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         ))

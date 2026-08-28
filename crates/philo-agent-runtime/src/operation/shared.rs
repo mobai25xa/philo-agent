@@ -4,7 +4,7 @@ use crate::error::DriverExit;
 use crate::transient::{TransientDriverState, is_transient_agent};
 use crate::{
     AgentEvent, AgentFailure, DiagnosticId, OperationId, OperationOutcome, OperationPhase,
-    OperationStatus, SettlementRevision, TurnId,
+    OperationStatus, SettlementRevision, TokenUsage, TurnId,
 };
 use philo_session::CancelReason;
 use philo_tools::ToolCancel;
@@ -68,6 +68,10 @@ pub(crate) struct OperationShared {
     events: mpsc::Sender<DriverEvent>,
     transient: TransientDriverState,
     settlement_revision: Mutex<Option<SettlementRevision>>,
+    /// Latest token usage observed for this operation's model call(s).
+    /// Captured from `ModelUsageUpdated` before the transient store
+    /// drains it, so settlement entries can persist the value.
+    last_usage: Mutex<Option<TokenUsage>>,
 }
 
 impl OperationShared {
@@ -91,6 +95,7 @@ impl OperationShared {
             events,
             transient: TransientDriverState::new(),
             settlement_revision: Mutex::new(None),
+            last_usage: Mutex::new(None),
         }
     }
 
@@ -103,6 +108,9 @@ impl OperationShared {
 
     pub(crate) async fn publish(&self, event: AgentEvent) {
         if is_transient_agent(&event) {
+            if let AgentEvent::ModelUsageUpdated { usage, .. } = &event {
+                *lock(&self.last_usage) = Some(*usage);
+            }
             self.transient.publish_agent(event);
             return;
         }
@@ -238,6 +246,12 @@ impl OperationShared {
 
     pub(crate) fn settlement_revision(&self) -> Option<SettlementRevision> {
         *lock(&self.settlement_revision)
+    }
+
+    /// Returns the latest token usage observed for this operation, if any.
+    /// Does not clear the slot; settlement reads it once.
+    pub(crate) fn last_usage(&self) -> Option<TokenUsage> {
+        *lock(&self.last_usage)
     }
 
     pub(crate) fn has_committed_settlement(&self) -> bool {

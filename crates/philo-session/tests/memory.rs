@@ -81,6 +81,7 @@ fn success_transaction(
             OperationSettled {
                 operation_id: operation_id.clone(),
                 outcome: OperationOutcome::Succeeded,
+                usage: None,
             },
         ],
     )
@@ -107,6 +108,7 @@ fn failure_transaction(
             OperationSettled {
                 operation_id: operation_id.clone(),
                 outcome: OperationOutcome::Failed,
+                usage: None,
             },
         ],
     )

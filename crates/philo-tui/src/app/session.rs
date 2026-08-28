@@ -491,6 +491,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         let tool_cells: Vec<&TranscriptLine> =
@@ -532,6 +533,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         // An Error card is a header cell plus a red failure line.
@@ -568,6 +570,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         let card_headers: Vec<&crate::app::transcript::CardHeader> =
@@ -603,6 +606,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         let card_headers: Vec<&crate::app::transcript::CardHeader> =
@@ -651,6 +655,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         let card_headers: Vec<&crate::app::transcript::CardHeader> =
@@ -704,6 +709,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         let card_headers: Vec<&crate::app::transcript::CardHeader> =
@@ -739,6 +745,7 @@ mod tests {
             open_turns: Vec::new(),
             settled_turn_boundaries: Vec::new(),
             latest_compaction_boundary: None,
+            usage: None,
         };
         let lines = history_lines(&view);
         let card_headers: Vec<&crate::app::transcript::CardHeader> =

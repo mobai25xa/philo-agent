@@ -537,10 +537,12 @@ async fn settle_success(
     observations: &[kernel::KernelObservation],
     text: String,
 ) {
+    let usage = cx.operation.shared().last_usage();
     let final_entries = match success_entries(
         observations,
         cx.operation.operation_id(),
         cx.operation.turn_id(),
+        usage,
     ) {
         Ok(entries) => entries,
         Err(failure) => {

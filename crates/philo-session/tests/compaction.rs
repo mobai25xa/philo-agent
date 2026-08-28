@@ -67,6 +67,7 @@ fn successful_turn(revision: SessionRevision, number: usize) -> SessionTransacti
             SessionEntryKind::OperationSettled {
                 operation_id,
                 outcome: OperationOutcome::Succeeded,
+                usage: None,
             },
         ],
     )

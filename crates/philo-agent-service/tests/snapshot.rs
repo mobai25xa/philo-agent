@@ -130,6 +130,7 @@ async fn commit_turn(
                 SessionEntryKind::OperationSettled {
                     operation_id: philo_session::OperationId::new(operation_id),
                     outcome: OperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         ))
@@ -193,6 +194,7 @@ async fn commit_turn_finish(
                 SessionEntryKind::OperationSettled {
                     operation_id: philo_session::OperationId::new(operation_id),
                     outcome: OperationOutcome::Succeeded,
+                    usage: None,
                 },
             ],
         ))

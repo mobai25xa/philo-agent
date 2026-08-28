@@ -937,8 +937,18 @@ fn telemetry_spans(usage: &str) -> Vec<Span<'static>> {
             })
             .map(|(position, _)| position)
             .unwrap_or(group.len());
-        let (label, value) = group.split_at(split_at.min(group.len()));
-        spans.push(Span::styled(label.to_owned(), theme::telemetry_label()));
+        let split_at = split_at.min(group.len());
+        // Groups that don't start with a label glyph (e.g. the `ctx%/window`
+        // tail like `2.2%/500k`) have no label prefix — the whole group is
+        // the value.
+        let (label, value) = if group.starts_with(['↑', '↓', 'R', 'C']) {
+            group.split_at(split_at)
+        } else {
+            ("", group)
+        };
+        if !label.is_empty() {
+            spans.push(Span::styled(label.to_owned(), theme::telemetry_label()));
+        }
         spans.push(Span::styled(value.to_owned(), telemetry_value_style(value)));
     }
     spans

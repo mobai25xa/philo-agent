@@ -211,10 +211,17 @@ fn spans_width(spans: &[ProseSpan]) -> usize {
 }
 
 /// Block-level role of one answer row (prose-typography plan P0/P2).
+///
+/// Headings gain a dedicated variant (P4 block-gap support) so the
+/// projection can place breathing rows around them without re-parsing. The
+/// span styling still flows through pulldown-cmark in `parse_prose`; the
+/// variant only marks structure for `block_gap` and any future anchors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BlockRole {
     /// Ordinary prose.
     Plain,
+    /// An ATX heading (`#` … `######`), any level.
+    Heading,
     /// A fence delimiter line itself (` ``` ` opener or closer): dim chrome.
     FenceEdge,
     /// A body row inside the fence opened with this language tag.
@@ -260,6 +267,8 @@ pub(crate) fn classify(answer: &str) -> Vec<LogicalLine> {
                 if let Some((marker, lang)) = fence_run(&line.text) {
                     line.role = BlockRole::FenceEdge;
                     fence = Some((marker, lang));
+                } else if is_atx_heading(&line.text) {
+                    line.role = BlockRole::Heading;
                 }
             }
             Some((marker, lang)) => {
@@ -329,8 +338,22 @@ pub(crate) fn project_answer(answer: &str, width: usize) -> Vec<ProjectedRow> {
 
     let mut rows = Vec::new();
     let mut index = 0;
+    let mut prev_role: Option<BlockRole> = None;
     while index < lines.len() {
         let line = &lines[index];
+        if let Some(n) = block_gap_rows(prev_role.as_ref(), &line.role) {
+            // Idempotent: don't amplify a blank the author already wrote.
+            let last_blank = rows
+                .last()
+                .map(|row: &ProjectedRow| row.text.is_empty())
+                .unwrap_or(true);
+            if !last_blank {
+                for _ in 0..n {
+                    rows.push(ProjectedRow::plain(String::new()));
+                }
+            }
+        }
+        prev_role = Some(line.role.clone());
         match &line.role {
             BlockRole::TableHeader => {
                 let end = table_run_end(&lines, index);
@@ -401,6 +424,35 @@ pub(crate) fn project_answer(answer: &str, width: usize) -> Vec<ProjectedRow> {
         }
     }
     rows
+}
+
+/// Collapses a [`BlockRole`] into a coarse structural category so the
+/// fence and the table each read as one block (no internal gaps even though
+/// their edge/body/delim rows carry distinct variants).
+fn block_category(role: &BlockRole) -> &'static str {
+    match role {
+        BlockRole::Plain => "plain",
+        BlockRole::Heading => "heading",
+        BlockRole::FenceEdge | BlockRole::FenceBody { .. } => "fence",
+        BlockRole::TableHeader | BlockRole::TableDelim | BlockRole::TableBody => "table",
+    }
+}
+
+/// How many `GAP_BLOCK` blank rows to insert between `prev` and `cur`.
+/// Returns `None` (= 0) for same-category transitions and the very first
+/// row — so consecutive prose lines, fence interiors, and table interiors
+/// stay tight. Cross-category transitions (prose↔heading, prose↔fence,
+/// prose↔table, heading↔table, …) get one breathing row.
+///
+/// The caller enforces idempotence over source blank lines (it skips the
+/// insert when the last emitted row was already blank), so an author's
+/// `\n\n` is never amplified into two blanks.
+fn block_gap_rows(prev: Option<&BlockRole>, cur: &BlockRole) -> Option<usize> {
+    let prev = prev?;
+    if block_category(prev) == block_category(cur) {
+        return None;
+    }
+    Some(crate::render::theme::GAP_BLOCK)
 }
 
 // ---------------------------------------------------------------------------
@@ -917,6 +969,21 @@ fn closes_fence(text: &str, marker: char) -> bool {
     matches!(fence_run(text), Some((found, rest)) if found == marker && rest.is_empty())
 }
 
+/// ATX heading detection for block-gap structure: 1–6 leading `#` followed
+/// by a space or end-of-line (`# Title`, `## Mid`, `#### `). Setext
+/// underlines (`===`/`---`) are intentionally not flagged — `---` also means
+/// a thematic break, and pulldown-cmark already emits the heading span via
+/// `parse_prose`, so we only need the structural marker for `block_gap`.
+fn is_atx_heading(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return false;
+    }
+    let rest = trimmed[hashes..].chars().next();
+    matches!(rest, None | Some(' ') | Some('\t'))
+}
+
 fn is_pipe_row(text: &str) -> bool {
     let trimmed = text.trim();
     !trimmed.is_empty() && trimmed.contains('|')
@@ -949,7 +1016,7 @@ mod tests {
     fn prose_without_blocks_stays_plain() {
         assert_eq!(
             roles("# Title\nbody text\n- item"),
-            vec![BlockRole::Plain, BlockRole::Plain, BlockRole::Plain]
+            vec![BlockRole::Heading, BlockRole::Plain, BlockRole::Plain]
         );
     }
 
@@ -1113,14 +1180,15 @@ mod tests {
     fn fragments_carry_their_role_across_wraps() {
         let rows = project_answer("before\n```\n中文二 very long body line\n```", 8);
         // The one-digit number slot plus `│ ` gutter reserve 3 cells, so the
-        // body wraps inside 5.
+        // body wraps inside 5. A block-gap now separates `before` (plain)
+        // from the fence opener (cross-category transition, GAP_BLOCK).
         assert_eq!(
             texts(&rows),
             [
-                "before", "```", "中文", "二 ve", "ry lo", "ng bo", "dy li", "ne", "```"
+                "before", "", "```", "中文", "二 ve", "ry lo", "ng bo", "dy li", "ne", "```"
             ]
         );
-        for row in &rows[2..8] {
+        for row in &rows[3..9] {
             assert_eq!(
                 row.role,
                 BlockRole::FenceBody {
@@ -1129,8 +1197,8 @@ mod tests {
                 "every fragment of one logical line keeps the role"
             );
         }
-        assert_eq!(rows[2].code_line.as_deref(), Some("1"), "head carries the number");
-        for row in &rows[3..8] {
+        assert_eq!(rows[3].code_line.as_deref(), Some("1"), "head carries the number");
+        for row in &rows[4..9] {
             assert_eq!(
                 row.code_line.as_deref(),
                 Some(" "),
@@ -1138,7 +1206,8 @@ mod tests {
             );
         }
         assert_eq!(rows[0].role, BlockRole::Plain);
-        assert_eq!(rows[1].role, BlockRole::FenceEdge);
+        assert_eq!(rows[1].role, BlockRole::Plain);
+        assert_eq!(rows[2].role, BlockRole::FenceEdge);
     }
 
     #[test]
@@ -1146,6 +1215,84 @@ mod tests {
         let rows = project_answer("one\n\ntwo", 20);
         assert_eq!(texts(&rows), ["one", "", "two"]);
         assert!(rows.iter().all(|row| row.spans.is_some()));
+    }
+
+    /// Headings classify into [`BlockRole::Heading`] (P4 block-gap
+    /// support) instead of staying Plain — the structural marker the gap
+    /// strategy keys off of, while `parse_prose` still owns the span
+    /// styling.
+    #[test]
+    fn atx_headings_classify_into_the_heading_role() {
+        assert_eq!(roles("# H1"), vec![BlockRole::Heading]);
+        assert_eq!(roles("###### Deepest"), vec![BlockRole::Heading]);
+        assert_eq!(roles("####### Too many"), vec![BlockRole::Plain], "7 hashes is not a heading");
+        assert_eq!(roles("no space after#hash"), vec![BlockRole::Plain]);
+        // Setext and thematic breaks stay Plain (pulldown-cmark still
+        // styles the heading span; we only need the structural marker).
+        assert_eq!(roles("---"), vec![BlockRole::Plain]);
+        // Inside a fence, a `#` line is a code body, never a heading.
+        assert_eq!(
+            roles("```rust\n# comment\n```"),
+            [
+                BlockRole::FenceEdge,
+                BlockRole::FenceBody { lang: "rust".to_owned() },
+                BlockRole::FenceEdge,
+            ]
+        );
+    }
+
+    /// Cross-category transitions insert one GAP_BLOCK blank row between
+    /// structural blocks; same-category rows stay tight. This is the
+    /// density fix — without it, headings, fences, and tables hugged the
+    /// surrounding prose.
+    #[test]
+    fn block_gap_inserts_between_structural_categories() {
+        // Plain → Heading → Plain: gaps on both sides of the heading.
+        let rows = project_answer("intro\n# Title\nafter", 80);
+        assert_eq!(texts(&rows), ["intro", "", "▍ Title", "", "after"]);
+
+        // Plain → Fence (and back): gaps around the fence. The fence body's
+        // line-number slot rides `code_line`, not `text`, so `texts()`
+        // returns just the code.
+        let rows = project_answer("before\n```\nx\n```\nafter", 80);
+        assert_eq!(texts(&rows), ["before", "", "```", "x", "```", "", "after"]);
+
+        // Plain → Table (and back): gaps around the table. The table
+        // projects 5 rows (top, header, sep, body, bottom).
+        let rows = project_answer("lead\n| a | b |\n|---|---|\n| 1 | 2 |\ntail", 80);
+        let rendered = texts(&rows);
+        assert_eq!(rendered[0], "lead");
+        assert_eq!(rendered[1], "", "gap before the table");
+        assert_eq!(rendered[6], "╰───┴───╯", "table bottom frame");
+        assert_eq!(rendered[7], "", "gap after the table");
+        assert_eq!(rendered[8], "tail");
+    }
+
+    /// The block gap is idempotent over source blank lines: an author's
+    /// `\n\n` is never amplified into two blanks. The projection skips the
+    /// insert when the last emitted row is already blank.
+    #[test]
+    fn block_gap_is_idempotent_over_author_blank_lines() {
+        // `para\n\n# H` — the author already wrote a blank line; the gap
+        // strategy does not add another.
+        let rows = project_answer("para\n\n# H", 80);
+        assert_eq!(texts(&rows), ["para", "", "▍ H"]);
+
+        // Two author blanks stay two blanks (the strategy never adds on
+        // top of an existing blank; it does not collapse the author's
+        // own spacing either — idempotence means "no amplification").
+        let rows = project_answer("para\n\n\n# H", 80);
+        let rendered = texts(&rows);
+        let blanks = rendered.iter().filter(|r| r.is_empty()).count();
+        assert_eq!(blanks, 2, "two author blanks preserved, none added: {rendered:?}");
+
+        // Back-to-back headings share a category, so the strategy keeps
+        // them tight (the gap fires on category *changes*, not between
+        // same-category rows — consecutive headings stay a tight ladder).
+        let rows = project_answer("# A\n# B", 80);
+        let rendered = texts(&rows);
+        let blanks = rendered.iter().filter(|r| r.is_empty()).count();
+        assert_eq!(blanks, 0, "same-category headings stay tight: {rendered:?}");
     }
 
     // -- P2: baked spans ---------------------------------------------------
@@ -1499,9 +1646,12 @@ mod tests {
     #[test]
     fn quote_bar_rides_dark_gray_and_headers_step_white() {
         let rows = project_answer("> quoted\n## Sub", 80);
+        // Plain→Heading opens a block gap, so `## Sub` lands at row 2 (the
+        // inserted blank rides GAP_BLOCK).
         let quote_spans = rows[0].spans.as_ref().expect("styled");
         assert_eq!(quote_spans[0].style.color, ProseColor::DarkGray);
-        let sub_spans = rows[1].spans.as_ref().expect("styled");
+        assert_eq!(rows[1].text, "");
+        let sub_spans = rows[2].spans.as_ref().expect("styled");
         assert!(sub_spans[0].style.bold);
         assert_eq!(sub_spans[0].style.color, ProseColor::White, "H2 is bold white");
     }

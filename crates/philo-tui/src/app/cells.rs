@@ -726,11 +726,28 @@ pub(crate) fn wrap_line(
     width: usize,
     prev: Option<LineKind>,
 ) -> Vec<ProjectedRow> {
+    // Compute the gap once so every branch (card header/body rows included)
+    // honors it. The card branches used to return early and skip the gap,
+    // so the `select.rs` preview path and the test helpers lost the
+    // breathing row on Answer→Card boundaries — the same class of bug as
+    // the one fixed in `project_cell`.
+    let leading_gap = needs_leading_gap(prev, cell);
+    let insert_gap = |rows: &mut Vec<ProjectedRow>| {
+        if leading_gap && !rows.is_empty() {
+            for _ in 0..crate::render::theme::GAP_CELL {
+                rows.insert(0, ProjectedRow::plain(String::new()));
+            }
+        }
+    };
     if let Some(header) = &cell.header {
-        return vec![project_card_header(header, width)];
+        let mut rows = vec![project_card_header(header, width)];
+        insert_gap(&mut rows);
+        return rows;
     }
     if let Some(body) = &cell.body {
-        return project_card_body(body, width, false);
+        let mut rows = project_card_body(body, width, false);
+        insert_gap(&mut rows);
+        return rows;
     }
     let mut rows = match cell.kind {
         // User rows reserve the two cells of the ❯ prefix so wrapped
@@ -741,9 +758,7 @@ pub(crate) fn wrap_line(
         LineKind::Reasoning => plain_rows(text::wrap_reasoning(&cell.text, width)),
         _ => plain_rows(text::wrap(&cell.text, width)),
     };
-    if needs_leading_gap(prev, cell) && !rows.is_empty() {
-        rows.insert(0, ProjectedRow::plain(String::new()));
-    }
+    insert_gap(&mut rows);
     rows
 }
 
@@ -1099,7 +1114,19 @@ fn project_cell(
         if cell.header.is_none() && cell.body.is_none() {
             return wrap_line(cell, width, prev);
         }
+        // P3 cards (card_cell / header_line + body_line) took a shortcut
+        // that bypassed `needs_leading_gap`, so every Answer→Card and
+        // Card→Answer boundary lost its breathing row (v4.0 tightness bug).
+        // The fix is one check at the top, mirroring `wrap_line`'s own
+        // guard: insert GAP_CELL blank rows before the card when the prior
+        // cell warrants one. Card *internal* spacing stays untouched
+        // (header→body→fold→tail stays tight, per P3 §2).
         let mut rows = Vec::new();
+        if needs_leading_gap(prev, cell) {
+            for _ in 0..crate::render::theme::GAP_CELL {
+                rows.push(ProjectedRow::plain(String::new()));
+            }
+        }
         if let Some(header) = &cell.header {
             rows.push(project_card_header(header, width));
         }
@@ -1121,18 +1148,45 @@ fn project_cell(
     wrap_line(cell, width, prev)
 }
 
-/// Blank rows separate visual blocks. Cards own their inner spacing
-/// explicitly, so plain tool rows stay gap-free; only a new card header
-/// (`Tone::Title`) opens a gap after previous content — except after user
-/// strips, which already carry their own trailing separator.
+/// Whether a `GAP_CELL` blank row should precede `cell` given the prior
+/// cell's kind. The single cell-level breathing strategy — leading-only
+/// (never double-counts), the first cell never gaps, and `User` strips own
+/// their own trailing separator so they never need one before them and the
+/// cells after them don't add another.
+///
+/// Covers the full transition matrix the v4.0 tightness bug exposed: the
+/// pre-P3 table only knew about the `Tool(Title)→…` and `…→Answer` cases
+/// and missed Card→Answer, Reasoning→Answer, Meta/Error→Card/Answer, plus
+/// the Tool-card branch in [`project_cell`] bypassed this entirely (now
+/// fixed). Plain tool detail rows (`Tone != Title`) stay gap-free — they
+/// live inside a card's own spacing budget (P3 §2).
 fn needs_leading_gap(prev: Option<LineKind>, cell: &TranscriptLine) -> bool {
+    let Some(prev) = prev else {
+        return false;
+    };
+    // User strips carry their own blank rows (transcript::user_block).
+    if prev == LineKind::User || cell.kind == LineKind::User {
+        return false;
+    }
     match cell.kind {
-        LineKind::Tool => {
-            cell.tone == super::transcript::Tone::Title
-                && !matches!(prev, None | Some(LineKind::User))
-        }
-        LineKind::Answer => matches!(prev, Some(LineKind::Tool | LineKind::Answer)),
-        _ => false,
+        // A new card header opens a visual block. Plain Tool rows (card
+        // bodies / detail rows) never gap — they belong to the card above.
+        LineKind::Tool => cell.tone == super::transcript::Tone::Title,
+        // Answers gap after anything but a fresh User strip (which owns its
+        // own trailing separator) — including after a Tool card and after
+        // another Answer's continuation (two Answer cells back-to-back means
+        // a new model call opened, which deserves separation).
+        LineKind::Answer => true,
+        // Reasoning, notices, errors, and meta lines stay gap-free by
+        // design (pinned by `user_and_reasoning_boundaries_stay_gap_free`):
+        // think belongs to the same call as its Answer, and meta/notice rows
+        // are turn footer chrome that hugs the body. Tightening those would
+        // split a call's visual unit apart with no spec basis.
+        LineKind::Reasoning
+        | LineKind::Notice
+        | LineKind::Error
+        | LineKind::Meta
+        | LineKind::User => false,
     }
 }
 
@@ -1714,5 +1768,161 @@ mod tests {
             "open never advances closed cache"
         );
         assert_eq!(row_texts(&store.wrap_rows()[4]), ["中文", "live"]);
+    }
+
+    /// Pin the full cell-level gap transition matrix so future kinds or
+    /// tone edits can't silently regress breathing room. The bug this
+    /// guards: P3 cards bypassed `needs_leading_gap`, so Card→Answer and
+    /// Answer→Card lost their gap; this table nails the intent.
+    #[test]
+    fn needs_leading_gap_covers_the_full_transition_matrix() {
+        use crate::app::transcript::{Tone, card_cell, CardBody, CardHeader, HeaderPiece};
+        let plain = |kind: LineKind, text: &str| line(kind, text);
+        let card = |tone: Tone, text: &str| TranscriptLine {
+            kind: LineKind::Tool,
+            text: text.to_owned(),
+            tone,
+            header: None,
+            body: None,
+        };
+
+        // First cell never gaps (prev = None).
+        assert!(!needs_leading_gap(None, &plain(LineKind::Answer, "x")));
+        assert!(!needs_leading_gap(None, &card(Tone::Title, "h")));
+
+        // User strips own their separator: no gap into or out of User.
+        assert!(!needs_leading_gap(Some(LineKind::Answer), &plain(LineKind::User, "u")));
+        assert!(!needs_leading_gap(Some(LineKind::User), &plain(LineKind::Answer, "a")));
+
+        // A card header (Tool + Title) opens a gap after anything non-User.
+        assert!(needs_leading_gap(
+            Some(LineKind::Answer),
+            &card(Tone::Title, "▎ Read …")
+        ));
+        assert!(needs_leading_gap(
+            Some(LineKind::Tool),
+            &card(Tone::Title, "▎ Next …")
+        ));
+        assert!(needs_leading_gap(Some(LineKind::Meta), &card(Tone::Title, "▎ Run …")));
+
+        // A card body / detail row (Tool, non-Title) never gaps — it lives
+        // inside the card's own spacing budget (P3 §2).
+        assert!(!needs_leading_gap(
+            Some(LineKind::Tool),
+            &card(Tone::Detail, "  subject row")
+        ));
+        assert!(!needs_leading_gap(
+            Some(LineKind::Tool),
+            &card(Tone::Plain, "  body row")
+        ));
+
+        // Answers gap after anything non-User (card body, meta, another
+        // answer from a new call, …) — the density fix.
+        assert!(needs_leading_gap(Some(LineKind::Tool), &plain(LineKind::Answer, "a")));
+        assert!(needs_leading_gap(
+            Some(LineKind::Answer),
+            &plain(LineKind::Answer, "a2")
+        ));
+        assert!(needs_leading_gap(Some(LineKind::Meta), &plain(LineKind::Answer, "a")));
+
+        // Reasoning hugs its Answer (same model call) — gap-free — and
+        // stays gap-free after other cells too (the think block's header
+        // already reads as its own visual unit, pinned by the gap-free
+        // boundary test).
+        assert!(!needs_leading_gap(
+            Some(LineKind::Answer),
+            &plain(LineKind::Reasoning, "think")
+        ));
+        assert!(!needs_leading_gap(
+            Some(LineKind::Reasoning),
+            &plain(LineKind::Reasoning, "  more")
+        ));
+        assert!(!needs_leading_gap(
+            Some(LineKind::Tool),
+            &plain(LineKind::Reasoning, "think")
+        ));
+
+        // Meta/Notice/Error stay gap-free (turn-footer chrome hugs body).
+        assert!(!needs_leading_gap(
+            Some(LineKind::Answer),
+            &plain(LineKind::Meta, "· turn finished · 12s")
+        ));
+        assert!(!needs_leading_gap(Some(LineKind::Meta), &plain(LineKind::Notice, "x")));
+
+        // A real P3 card_cell (header + body) projects a leading gap when
+        // it follows an Answer — the exact regression this fix closes.
+        let header = CardHeader {
+            bar: HeaderPiece {
+                text: "▎".to_owned(),
+                color: crate::app::transcript::SegColor::Green,
+                bold: false,
+            },
+            action: HeaderPiece {
+                text: "Read".to_owned(),
+                color: crate::app::transcript::SegColor::Gray,
+                bold: true,
+            },
+            target: None,
+            stats: None,
+            status: HeaderPiece {
+                text: "✓ done".to_owned(),
+                color: crate::app::transcript::SegColor::Green,
+                bold: false,
+            },
+            time: None,
+        };
+        let body = CardBody {
+            lines: vec![vec![crate::app::transcript::SegSpan::plain("  output")]],
+            threshold: 8,
+            fold_default_collapsed: true,
+            fold_count: 0,
+            fold_label: "行已折叠".to_owned(),
+            fold_hint: true,
+            fold_all: false,
+        };
+        let cell = card_cell(header, body);
+        assert!(needs_leading_gap(Some(LineKind::Answer), &cell));
+        assert!(!needs_leading_gap(None, &cell));
+        assert!(!needs_leading_gap(Some(LineKind::User), &cell));
+    }
+
+    /// The end-to-end projection of a card following an Answer emits the
+    /// GAP_CELL blank rows between them — the regression test for the P3
+    /// bypass fix.
+    #[test]
+    fn card_after_answer_projects_a_leading_blank() {
+        let answer = line(LineKind::Answer, "looking into it");
+        let card = crate::app::transcript::header_line(crate::app::transcript::CardHeader {
+            bar: crate::app::transcript::HeaderPiece {
+                text: "▎".to_owned(),
+                color: crate::app::transcript::SegColor::Green,
+                bold: false,
+            },
+            action: crate::app::transcript::HeaderPiece {
+                text: "Read".to_owned(),
+                color: crate::app::transcript::SegColor::Gray,
+                bold: true,
+            },
+            target: None,
+            stats: None,
+            status: crate::app::transcript::HeaderPiece {
+                text: "✓ done".to_owned(),
+                color: crate::app::transcript::SegColor::Green,
+                bold: false,
+            },
+            time: None,
+        });
+        let cells = vec![answer, card];
+        let scroll = ScrollState::follow();
+        let slice = visible_slice(&cells, 40, 8, &scroll);
+        let rendered = texts(&slice);
+        // The card header projects into one dot-filled row; the signal is
+        // the leading blank the fix inserts between Answer and the card.
+        assert_eq!(rendered[0], "looking into it");
+        assert_eq!(rendered[1], "", "GAP_CELL blank precedes the card");
+        assert!(
+            rendered[2].starts_with("▎ Read") && rendered[2].ends_with("✓ done"),
+            "the header cell projects the card header: {rendered:?}"
+        );
     }
 }

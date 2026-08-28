@@ -1,5 +1,6 @@
 ---
 source: crates/philo-tui/src/tests/matrix.rs
+assertion_line: 191
 expression: matrix_render(build)
 ---
 40 columns
@@ -8,9 +9,9 @@ expression: matrix_render(build)
       make it blue                     │
                                        │
     ▎ Thought for 8s   (按  Space 查     │
+                                       │
     The guard belongs right before     │
     the redirect.                      │
-                                       │
                                        │
                                        │
                                        │
@@ -33,8 +34,8 @@ expression: matrix_render(build)
     ❯ Find the homepage button and make it blue                                │
                                                                                │
     ▎ Thought for 8s ·····································  (按  Space 查 看 )    │
-    The guard belongs right before the redirect.                               │
                                                                                │
+    The guard belongs right before the redirect.                               │
                                                                                │
                                                                                │
                                                                                │
@@ -59,8 +60,8 @@ expression: matrix_render(build)
     ❯ Find the homepage button and make it blue                                                                        │
                                                                                                                        │
     ▎ Thought for 8s ·············································································  (按  Space 查 看 )    │
-    The guard belongs right before the redirect.                                                                       │
                                                                                                                        │
+    The guard belongs right before the redirect.                                                                       │
                                                                                                                        │
                                                                                                                        │
                                                                                                                        │

@@ -9,6 +9,8 @@ expression: "render(&[\"# Title\", \"## Middle\", \"### Smaller\", \"plain parag
   -> "▍ Middle"{rgb(201, 210, 221),bold}
 ▍ Smaller
   -> "▍ Smaller"{bold}
+
+  -> ""
 plain paragraph text
   -> "plain paragraph text"
 • first item

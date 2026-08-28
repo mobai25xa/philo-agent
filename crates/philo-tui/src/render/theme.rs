@@ -739,6 +739,16 @@ pub(crate) const MENU_MAX_ROWS: usize = 10;
 /// Milliseconds a scrollbar thumb keeps its "recently scrolled" highlight.
 pub(crate) const SCROLL_ACTIVE_MS: u64 = 800;
 
+/// Vertical breathing room between transcript cells (Answer/Tool/Reasoning
+/// boundaries). The single knob for cell-level density — v4.0 收紧后整体
+/// 太密，这里集中调度；改一处全 TUI 节奏联动（与固定色板哲学同构）。
+pub(crate) const GAP_CELL: usize = 1;
+
+/// Vertical breathing room inside one answer cell, around structural prose
+/// blocks (headings, fenced code, tables). Idempotent over source blank
+/// lines: the projection never amplifies a `\n\n` the author already wrote.
+pub(crate) const GAP_BLOCK: usize = 1;
+
 /// Proportional sizing of the session/model picker dialogs (v0.37 §4.2).
 pub(crate) const PICKER_SHARE: u32 = 3;
 pub(crate) const PICKER_TOTAL_SHARE: u32 = 4;

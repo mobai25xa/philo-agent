@@ -1,20 +1,21 @@
 ---
 source: crates/philo-tui/src/tests/matrix.rs
+assertion_line: 292
 expression: matrix_render(build)
 ---
 40 columns
+    (page > limit)                     │
                                        │
-    ▎ Grep "page" ········ ✓ done      │
-      src/routes/users.ts:12: if       │
-    (page > limit)                     █
-    ▎ Read src/routes/users.ts✓ ...    █
-      src/routes/users.test.ts         █
+    ▎ Read src/routes/users.ts✓ ...    │
+      src/routes/users.test.ts         │
+                                       │
     ▎ Edit src/routes/users.ts✓ ...    █
       -  6│ const limit = page *       █
           10;                          █
       +  6│ const limit =              █
           Math.min(page * 10, 50);     █
          7│ return paginate(page)      █
+                                       █
     ▎ Run pnpm test ······ ✓ done      █
       ok                               █
       passed                           █
@@ -29,24 +30,24 @@ expression: matrix_render(build)
   D:\…\Pi      ↑11k  ↓4.8k  2.2%/500k
 
 80 columns
-                                                                               │
     ❯ 页 码 大 于  5 时  /api/users 返 回 空 列 表 ， 帮 我 修 一 下                           │
-                                                                               │
-    ▎ Grep "page" 1 search ······································· ✓ done      │
-      src/routes/users.ts:12: if (page > limit)                                │
-    ▎ Read src/routes/users.ts 2 files ··························· ✓ done      │
-      src/routes/users.test.ts                                                 │
-    ▎ Edit src/routes/users.ts ··································· ✓ done      │
-      -  6│ const limit = page * 10;                                           │
-      +  6│ const limit = Math.min(page * 10, 50);                             │
-         7│ return paginate(page)                                              │
-    ▎ Run pnpm test 1 command ···································· ✓ done      │
-      ok                                                                       │
-      passed                                                                   │
-                                                                               │
-    All three paginated endpoints now clamp the page size.                     │
-                                                                               │
-                                                                               │
+                                                                               █
+    ▎ Grep "page" 1 search ······································· ✓ done      █
+      src/routes/users.ts:12: if (page > limit)                                █
+                                                                               █
+    ▎ Read src/routes/users.ts 2 files ··························· ✓ done      █
+      src/routes/users.test.ts                                                 █
+                                                                               █
+    ▎ Edit src/routes/users.ts ··································· ✓ done      █
+      -  6│ const limit = page * 10;                                           █
+      +  6│ const limit = Math.min(page * 10, 50);                             █
+         7│ return paginate(page)                                              █
+                                                                               █
+    ▎ Run pnpm test 1 command ···································· ✓ done      █
+      ok                                                                       █
+      passed                                                                   █
+                                                                               █
+    All three paginated endpoints now clamp the page size.                     █
 ───────────────────────────────────────────────────────────────────────────────
   ● Ready                                                      gpt-5.2 · high
 ╭─────────────────────────────────────────────────────────────────────────────╮
@@ -55,24 +56,24 @@ expression: matrix_render(build)
   D:\Code\Zed\Year2026\Jul0706\Pi        ↑11k  ↓4.8k  R14k  C51.3%  2.2%/500k
 
 120 columns
-                                                                                                                       │
     ❯ 页 码 大 于  5 时  /api/users 返 回 空 列 表 ， 帮 我 修 一 下                                                                   │
-                                                                                                                       │
-    ▎ Grep "page" 1 search ··············································································· ✓ done      │
-      src/routes/users.ts:12: if (page > limit)                                                                        │
-    ▎ Read src/routes/users.ts 2 files ··································································· ✓ done      │
-      src/routes/users.test.ts                                                                                         │
-    ▎ Edit src/routes/users.ts ··········································································· ✓ done      │
-      -  6│ const limit = page * 10;                                                                                   │
-      +  6│ const limit = Math.min(page * 10, 50);                                                                     │
-         7│ return paginate(page)                                                                                      │
-    ▎ Run pnpm test 1 command ············································································ ✓ done      │
-      ok                                                                                                               │
-      passed                                                                                                           │
-                                                                                                                       │
-    All three paginated endpoints now clamp the page size.                                                             │
-                                                                                                                       │
-                                                                                                                       │
+                                                                                                                       █
+    ▎ Grep "page" 1 search ··············································································· ✓ done      █
+      src/routes/users.ts:12: if (page > limit)                                                                        █
+                                                                                                                       █
+    ▎ Read src/routes/users.ts 2 files ··································································· ✓ done      █
+      src/routes/users.test.ts                                                                                         █
+                                                                                                                       █
+    ▎ Edit src/routes/users.ts ··········································································· ✓ done      █
+      -  6│ const limit = page * 10;                                                                                   █
+      +  6│ const limit = Math.min(page * 10, 50);                                                                     █
+         7│ return paginate(page)                                                                                      █
+                                                                                                                       █
+    ▎ Run pnpm test 1 command ············································································ ✓ done      █
+      ok                                                                                                               █
+      passed                                                                                                           █
+                                                                                                                       █
+    All three paginated endpoints now clamp the page size.                                                             █
 ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ● Ready                                                                                              gpt-5.2 · high
 ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮

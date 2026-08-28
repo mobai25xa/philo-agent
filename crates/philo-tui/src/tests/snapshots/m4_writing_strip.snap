@@ -1,14 +1,15 @@
 ---
 source: crates/philo-tui/src/tests/streaming.rs
+assertion_line: 148
 expression: rendered
 ---
                                                                                │
     ❯ Find the homepage button and make it blue                                │
                                                                                │
     ▎ Thought for 8s ·····································  (按  Space 查 看 )    │
+                                                                               │
     Looking at the middleware, I can see the refresh path skips expired        │
     tokens when a session cookie is still valid.                               │
-                                                                               │
                                                                                │
                                                                                │
                                                                                │

@@ -1861,9 +1861,9 @@ fn copy_includes_open_text_via_display_cell_indices() {
     assert_eq!(last.text, "live tail");
     assert_eq!(last.cell_index, 3);
 
-    app.on_action(Action::SelectStart { x: 0, y: 3 });
-    app.on_action(Action::SelectDrag { x: 11, y: 3 });
-    app.on_action(Action::SelectEnd { x: 11, y: 3 });
+    app.on_action(Action::SelectStart { x: 0, y: 4 });
+    app.on_action(Action::SelectDrag { x: 11, y: 4 });
+    app.on_action(Action::SelectEnd { x: 11, y: 4 });
     assert_eq!(
         app.on_action(Action::CtrlC),
         vec![Effect::WriteClipboard("live tail".to_owned())]

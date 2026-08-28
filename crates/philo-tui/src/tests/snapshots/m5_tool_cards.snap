@@ -1,5 +1,6 @@
 ---
 source: crates/philo-tui/src/tests/tool_cards.rs
+assertion_line: 270
 expression: rendered
 ---
                                                                                │
@@ -9,8 +10,10 @@ expression: rendered
       src/routes/users.ts:12: if (page > limit)                                │
       src/routes/users.ts:14: return []                                        │
       src/routes/users.test.ts:8: expect(users).toHaveLength(0)                │
+                                                                               │
     ▎ Read src/routes/users.ts 2 files ··························· ✓ done      │
       src/routes/users.test.ts                                                 │
+                                                                               │
     ▎ Edit src/routes/users.ts (+3 -2) ························ ✓ applied      │
       -  12│ if (page > limit)                                                 │
       -  13│   return []                                                       │
@@ -18,14 +21,12 @@ expression: rendered
       +  13│ if (page > size)                                                  │
       +  14│   return clampPage(page)                                          │
          15│ return users                                                      │
+                                                                               │
     ▎ Run pnpm test 1 command ···································· ✓ done      │
       ok                                                                       │
       passed                                                                   │
                                                                                │
     All three paginated endpoints now clamp the page size.                     │
-                                                                               │
-                                                                               │
-                                                                               │
                                                                                │
                                                                                │
                                                                                │

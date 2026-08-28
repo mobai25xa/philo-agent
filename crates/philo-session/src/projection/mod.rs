@@ -131,6 +131,7 @@ impl SessionProjection {
             settled_turn_boundaries: self.context.settled_boundary_ids(),
             latest_compaction_boundary: self.context.latest_compaction_boundary(),
             latest_usage: self.context.latest_usage(),
+            latest_generation: self.context.latest_generation().cloned(),
         }
     }
 

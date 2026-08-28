@@ -121,6 +121,7 @@ pub(crate) struct AgentServiceActor<R, S> {
     sessions: Arc<dyn SessionStore>,
     assembler: Arc<dyn GenerationAssembler>,
     generation: CurrentGeneration,
+    session_generations: crate::generation_cache::SessionGenerationCache,
     live: LiveOperationSnapshot,
     queued: Vec<QueuedOperationSummary>,
     maintenance: Option<FrontendMaintenance>,
@@ -171,6 +172,7 @@ where
             sessions,
             assembler,
             generation: CurrentGeneration::new(initial_generation),
+            session_generations: crate::generation_cache::SessionGenerationCache::new(8),
             live: LiveOperationSnapshot::new(),
             queued: Vec::new(),
             maintenance: None,
@@ -1105,6 +1107,21 @@ where
 
     fn current_lease_generation(&self) -> Option<FrontendLeaseGeneration> {
         self.attached.as_ref().map(|active| active.generation)
+    }
+
+    /// Returns the generation bound to `session_id`, or the bootstrap
+    /// (`generation.current()`) when the session is not in the cache yet.
+    fn session_generation(
+        &mut self,
+        session_id: &str,
+    ) -> std::sync::Arc<philo_agent_runtime::RuntimeGeneration> {
+        if let Some(generation) = self.session_generations.get(session_id) {
+            return generation;
+        }
+        let bootstrap = self.generation.current();
+        self.session_generations
+            .put(session_id.to_owned(), bootstrap.clone());
+        bootstrap
     }
 
     fn deny_all_confirmations(&mut self) {

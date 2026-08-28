@@ -82,6 +82,7 @@ fn success_transaction(
                 operation_id: operation_id.clone(),
                 outcome: OperationOutcome::Succeeded,
                 usage: None,
+                generation: None,
             },
         ],
     )
@@ -109,6 +110,7 @@ fn failure_transaction(
                 operation_id: operation_id.clone(),
                 outcome: OperationOutcome::Failed,
                 usage: None,
+                generation: None,
             },
         ],
     )

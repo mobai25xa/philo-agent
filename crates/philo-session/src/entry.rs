@@ -1,5 +1,6 @@
 //! Durable identifiers, entry payloads, transactions and commit results.
 
+use crate::generation_choice::SessionGenerationChoice;
 use crate::tool_entry::{SessionToolCall, SessionToolResult};
 use crate::usage::SessionTokenUsage;
 
@@ -217,6 +218,12 @@ pub enum SessionEntryKind {
         /// [`crate::SessionContextView`]; earlier turns keep the durable
         /// fact but do not surface it.
         usage: Option<SessionTokenUsage>,
+        /// The generation choice used for this turn, when known. Only the
+        /// newest settled turn's choice is projected by
+        /// [`crate::SessionContextView`]; earlier turns keep the durable
+        /// fact but do not surface it. The wire name is the persistent
+        /// identity; the runtime `display_name` is not persisted.
+        generation: Option<SessionGenerationChoice>,
     },
     /// Replaces the model-visible prefix through a settled operation with a
     /// durable summary. Original entries remain unchanged and replayable.

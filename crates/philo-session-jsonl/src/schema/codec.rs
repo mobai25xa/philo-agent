@@ -2,16 +2,18 @@
 
 use philo_session::{
     CancelReason, EntryId, OperationId, OperationOutcome, SessionAssistantBlock, SessionEntry,
-    SessionEntryKind, SessionToolCall, SessionToolResult, SessionUserPart, ToolBatchId, ToolCallId,
-    ToolResultOutcome, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    SessionEntryKind, SessionGenerationChoice, SessionToolCall, SessionToolResult,
+    SessionUserPart, ToolBatchId, ToolCallId, ToolResultOutcome, TurnFailure, TurnFailureKind,
+    TurnId, TurnOutcome,
 };
 
 use crate::artifact::sha256_hex;
 
 use super::record::{
     AssistantBlockRecord, AssistantMessageRecord, AssistantToolCallBatchRecord, EntryRecord,
-    FailureKindRecord, FailureRecord, KindRecord, OutcomeRecord, ReasonRecord, TokenUsageRecord,
-    ToolOutcomeRecord, ToolResultRecord, UserMessageRecord, UserPartRecord,
+    FailureKindRecord, FailureRecord, GenerationChoiceRecord, KindRecord, OutcomeRecord,
+    ReasonRecord, TokenUsageRecord, ToolOutcomeRecord, ToolResultRecord, UserMessageRecord,
+    UserPartRecord,
 };
 
 /// An artifact newly referenced by the transaction being encoded.
@@ -57,6 +59,22 @@ fn decode_usage(usage: TokenUsageRecord) -> philo_session::SessionTokenUsage {
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
         reasoning_tokens: usage.reasoning_tokens,
+    }
+}
+
+fn encode_generation(choice: SessionGenerationChoice) -> GenerationChoiceRecord {
+    GenerationChoiceRecord {
+        provider: choice.provider,
+        model_id: choice.model_id,
+        reasoning_effort: choice.reasoning_effort,
+    }
+}
+
+fn decode_generation(record: GenerationChoiceRecord) -> SessionGenerationChoice {
+    SessionGenerationChoice {
+        provider: record.provider,
+        model_id: record.model_id,
+        reasoning_effort: record.reasoning_effort,
     }
 }
 
@@ -217,6 +235,7 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
             operation_id,
             outcome,
             usage,
+            generation,
         } => {
             let (outcome, reason) = match outcome {
                 OperationOutcome::Succeeded => (OutcomeRecord::Succeeded, None),
@@ -230,6 +249,7 @@ fn encode_kind(kind: &SessionEntryKind, pending: &mut Vec<PendingArtifact>) -> K
                 outcome,
                 reason,
                 usage: usage.map(encode_usage),
+                generation: generation.clone().map(encode_generation),
             }
         }
         SessionEntryKind::Compaction {
@@ -350,6 +370,7 @@ fn decode_kind(
             outcome,
             reason,
             usage,
+            generation,
         } => SessionEntryKind::OperationSettled {
             operation_id: OperationId::new(operation_id),
             outcome: match outcome {
@@ -360,6 +381,7 @@ fn decode_kind(
                 },
             },
             usage: usage.map(decode_usage),
+            generation: generation.map(decode_generation),
         },
         KindRecord::Compaction {
             summary,

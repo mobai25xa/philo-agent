@@ -131,6 +131,7 @@ async fn commit_turn(
                     operation_id: philo_session::OperationId::new(operation_id),
                     outcome: OperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))
@@ -195,6 +196,7 @@ async fn commit_turn_finish(
                     operation_id: philo_session::OperationId::new(operation_id),
                     outcome: OperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))

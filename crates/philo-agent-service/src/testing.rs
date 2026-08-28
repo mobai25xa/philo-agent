@@ -57,7 +57,9 @@ pub fn test_generation(model_name: &str) -> Arc<RuntimeGeneration> {
         tools: empty_tools(),
         runtime_config: RuntimeConfig::default(),
         display: GenerationDisplay {
+            provider: None,
             model_name: model_name.to_owned(),
+            model_id: model_name.to_owned(),
             image_input: true,
         },
     })
@@ -195,7 +197,9 @@ impl GenerationAssembler for FakeAssembler {
                 model: self.model.clone(),
                 tools: self.tools.clone(),
                 runtime_config: self.config.clone(),
-                model_name: request.name,
+                model_name: request.name.clone(),
+                provider: None,
+                model_id: request.name,
                 image_input: true,
             })
         })

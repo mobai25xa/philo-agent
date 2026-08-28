@@ -879,9 +879,9 @@ struct StateBadge {
     warning: bool,
 }
 
-/// Badge row, right side: `{model} · {effort}` with BLUE+BOLD and
-/// YELLOW+BOLD tokens around a DARK_GRAY separator. Provider annotation is
-/// retired with the v3 dashboard.
+/// Badge row, right side: `({provider}) {model} · {effort}` with provider in
+/// meta gray, model in BLUE+BOLD, effort in YELLOW+BOLD around DARK_GRAY
+/// separators. Provider and effort degrade out before the model truncates.
 fn draw_model_corner(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column: Rect) {
     let Some(corner) = app.status.model_corner_for(usize::from(column.width)) else {
         return;
@@ -892,6 +892,10 @@ fn draw_model_corner(frame: &mut ratatui::Frame<'_>, app: &App, row: u16, column
         width += text::width(effort) + 3;
         spans.push(Span::styled(" · ".to_owned(), theme::corner_meta()));
         spans.push(Span::styled(effort.clone(), theme::model_effort()));
+    }
+    if let Some(provider) = &corner.provider {
+        width += text::width(provider) + 3;
+        spans.insert(0, Span::styled(format!("({provider}) "), theme::corner_meta()));
     }
     paint_right_aligned(frame, spans, width, row, column);
 }
@@ -1655,8 +1659,8 @@ mod tests {
             "model · effort share the badge row: {badge_row:?}"
         );
         assert!(
-            !badge_row.contains("(openai)"),
-            "provider annotation is retired: {badge_row:?}"
+            badge_row.contains("(openai)"),
+            "provider annotation shows on the badge row: {badge_row:?}"
         );
         crate::tests::assert_tui_snapshot!("m3_writing_state", rendered);
 

@@ -16,6 +16,7 @@ use super::tasks::{PendingTasks, TaskCompletion};
 /// returns to fair selection with terminal/control sources.
 pub(crate) const MAX_UPDATES_PER_ROUND: usize = 64;
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Step {
     Update(philo_agent_service::FrontendUpdate),
     UpdatesDisconnected,

@@ -74,6 +74,7 @@ fn successful_turn(revision: SessionRevision, number: usize) -> SessionTransacti
                 operation_id,
                 outcome: OperationOutcome::Succeeded,
                 usage: None,
+                generation: None,
             },
         ],
     )

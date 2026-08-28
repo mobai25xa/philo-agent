@@ -411,8 +411,8 @@ fn degradation_ladders_fire_in_contract_order() {
         "the arrows drop ({arrows_gone}) before the ctx/window fraction ({ctx_gone})"
     );
 
-// Top-right: effort drops, then the model truncates; the provider
-    // annotation is retired (P2), so it never appears.
+// Top-right: effort drops, then the provider, then the model truncates
+    // (§8 degradation order).
     let effort_gone = drop_at(&has("· high"));
     let model_gone = drop_at(&has("gpt-5.2"));
     assert!(
@@ -420,8 +420,8 @@ fn degradation_ladders_fire_in_contract_order() {
         "model ladder out of order: effort {effort_gone}, model {model_gone}"
     );
     assert!(
-        !render(&build(), 80).contains("(openai)"),
-        "the provider annotation is gone at full width"
+        render(&build(), 80).contains("(openai)"),
+        "the provider annotation shows at full width"
     );
 
     // The bottom corners survive at the supported floor (§8: last to go).

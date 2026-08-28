@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/app/state/tests.rs
-assertion_line: 860
 expression: "rows.join(\"\\n\")"
 ---
 ▶ /help                                                       commands an...

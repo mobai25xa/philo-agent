@@ -10,6 +10,7 @@ mod confirmation;
 mod error;
 mod frontend;
 mod generation;
+mod generation_cache;
 mod ids;
 mod live;
 mod mapping;
@@ -33,13 +34,13 @@ pub use frontend::{
     AttachError, ConfirmationDecision, DetachError, DetachReport, DurableSessionView,
     FrontendAssistantBlock, FrontendAttachment, FrontendAvailability, FrontendClient,
     FrontendCommand, FrontendConfigEntry, FrontendContextMessage, FrontendFailure,
-    FrontendGeneration, FrontendLease, FrontendLeaseGeneration, FrontendMaintenance,
-    FrontendMaintenancePhase, FrontendModelListing, FrontendOpenTurn, FrontendOperationEvent,
-    FrontendReasoningEffort, FrontendSessionSummary, FrontendSnapshot, FrontendStatus,
-    FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing, FrontendToolResult,
-    FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUpdate, FrontendUpdateKind,
-    FrontendUserPart, PendingConfirmationView, QueuedOperationSummary, ResyncRequired,
-    ServiceHealth, SupervisorCommand,
+    FrontendGeneration, FrontendGenerationChoice, FrontendLease, FrontendLeaseGeneration,
+    FrontendMaintenance, FrontendMaintenancePhase, FrontendModelListing, FrontendOpenTurn,
+    FrontendOperationEvent, FrontendReasoningEffort, FrontendSessionSummary, FrontendSnapshot,
+    FrontendStatus, FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing,
+    FrontendToolResult, FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUpdate,
+    FrontendUpdateKind, FrontendUserPart, PendingConfirmationView, QueuedOperationSummary,
+    ResyncRequired, ServiceHealth, SupervisorCommand,
 };
 pub use generation::{
     AssembleError, AssembleRequest, AssembledGeneration, GenerationAssembler, ModelListingEntry,

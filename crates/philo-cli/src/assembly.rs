@@ -106,6 +106,14 @@ impl AssemblerState {
         // the catalog is the only deployment source, so unmatched names fail.
         let (deployment, wire_model) = crate::config::deployment_for(&settings, &request.name)
             .map_err(|error| AssembleError::new(error.0))?;
+        // display_name falls back to the wire name (the composite id) when the
+        // config omits it; the model catalog entry is the single source of truth.
+        let display_name = settings
+            .models
+            .iter()
+            .find(|choice| choice.id == deployment.model)
+            .map(|choice| choice.display_name.clone())
+            .unwrap_or_else(|| request.name.clone());
         let runtime_config =
             runtime_config_for(&self.flags.to_cli(), &settings, &deployment, &request.name)
                 .map_err(|error| AssembleError::new(error.0))?;
@@ -125,7 +133,9 @@ impl AssemblerState {
             model,
             tools,
             runtime_config,
-            model_name: request.name,
+            model_name: display_name,
+            provider: Some(deployment.provider.clone()),
+            model_id: deployment.model.clone(),
             image_input: deployment.image_input,
         })
     }
@@ -365,7 +375,7 @@ impl GenerationAssembler for CliGenerationAssembler {
             .map(|choice| ModelListingEntry {
                 id: choice.id.clone(),
                 provider: choice.provider_id.clone(),
-                model: choice.model.clone(),
+                model: choice.display_name.clone(),
                 reasoning_tiers: choice
                     .reasoning_tiers
                     .iter()
@@ -407,7 +417,9 @@ pub(crate) fn bootstrap(cli: &Cli, settings: Settings) -> Result<Bootstrap, Usag
         tools: assembled.tools,
         runtime_config: assembled.runtime_config,
         display: GenerationDisplay {
+            provider: assembled.provider,
             model_name: assembled.model_name,
+            model_id: assembled.model_id,
             image_input: assembled.image_input,
         },
     });
@@ -957,6 +969,7 @@ mod tests {
                 default_reasoning: None,
                 image_input: true,
                 cache_policy: philo_model::ModelCachePolicy::default(),
+                display_name: model.to_owned(),
             }],
             aliases: Vec::new(),
             data_dir: dir.to_path_buf(),

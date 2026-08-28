@@ -294,6 +294,7 @@ impl LifecycleProjection {
                 operation_id,
                 outcome,
                 usage: _,
+                generation: _,
             } => {
                 let operation = self.active_operation(operation_id)?;
                 let Some(turn_id) = operation.turn_id.clone() else {

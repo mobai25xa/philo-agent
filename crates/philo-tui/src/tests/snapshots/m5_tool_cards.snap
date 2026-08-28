@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/tests/tool_cards.rs
-assertion_line: 270
 expression: rendered
 ---
                                                                                │

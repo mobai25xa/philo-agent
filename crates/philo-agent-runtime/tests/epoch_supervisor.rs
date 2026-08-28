@@ -209,6 +209,7 @@ async fn seed_turn(store: &dyn SessionStore, index: usize) {
                     operation_id: philo_session::OperationId::new(format!("seed-op-{index}")),
                     outcome: philo_session::OperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))

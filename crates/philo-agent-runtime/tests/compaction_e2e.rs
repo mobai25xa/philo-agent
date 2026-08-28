@@ -92,6 +92,7 @@ async fn seed_turn(store: &dyn SessionStore, index: usize) -> String {
                     operation_id,
                     outcome: StoredOperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))

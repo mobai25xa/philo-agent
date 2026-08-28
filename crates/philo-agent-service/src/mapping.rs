@@ -12,10 +12,10 @@ use philo_tools::{EffectClass, ToolDefinition, ToolDisplay, ToolResult};
 use crate::frontend::command::{FrontendAttachment, FrontendReasoningEffort};
 use crate::frontend::snapshot::{
     DurableSessionView, FrontendAssistantBlock, FrontendAvailability, FrontendConfigEntry,
-    FrontendContextMessage, FrontendFailure, FrontendGeneration, FrontendOpenTurn,
-    FrontendOperationEvent, FrontendStatus, FrontendTokenUsage, FrontendToolDisplay,
-    FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome, FrontendUnfilledBatch,
-    FrontendUserPart,
+    FrontendContextMessage, FrontendFailure, FrontendGeneration, FrontendGenerationChoice,
+    FrontendOpenTurn, FrontendOperationEvent, FrontendStatus, FrontendTokenUsage,
+    FrontendToolDisplay, FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome,
+    FrontendUnfilledBatch, FrontendUserPart,
 };
 use crate::live::LiveOperationSnapshot;
 use philo_agent_runtime::RuntimeGeneration;
@@ -52,6 +52,11 @@ pub fn durable_session_view(view: &SessionContextView) -> DurableSessionView {
             .latest_compaction_boundary()
             .map(|id| id.as_str().to_owned()),
         usage: view.latest_usage().map(session_usage_to_frontend),
+        generation: view.latest_generation().map(|choice| FrontendGenerationChoice {
+            provider: choice.provider.clone(),
+            model_name: choice.model_id.clone(),
+            reasoning_effort: choice.reasoning_effort.clone(),
+        }),
     }
 }
 
@@ -516,6 +521,7 @@ fn effect_class(class: EffectClass) -> String {
 pub fn frontend_generation(generation: &RuntimeGeneration) -> FrontendGeneration {
     FrontendGeneration {
         generation_id: generation.generation_id.to_string(),
+        provider: generation.display.provider.clone(),
         model_name: generation.display.model_name.clone(),
         reasoning_effort: generation
             .runtime_config
@@ -597,6 +603,7 @@ mod tests {
                     operation_id: OperationId::new("op-1"),
                     outcome: OperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         )))

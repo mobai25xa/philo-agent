@@ -412,6 +412,7 @@ async fn history_with_invalid_raw_arguments_replays_degraded() {
                     operation_id: operation,
                     outcome: SessionOperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))

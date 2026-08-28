@@ -53,6 +53,7 @@ impl TurnCx<'_> {
         // part of the durable terminal facts; the kernel never sees it.
         let reason = self.operation.cancel_reason();
         let usage = self.operation.shared().last_usage();
+        let generation = crate::mapping::session_generation_choice(self.ctx.generation.as_ref());
         let mut entries = completion_marks;
         entries.push(session::SessionEntryKind::TurnTerminated {
             turn_id: session::TurnId::new(self.operation.turn_id().as_str()),
@@ -62,6 +63,7 @@ impl TurnCx<'_> {
             operation_id: session::OperationId::new(self.operation.operation_id().as_str()),
             outcome: session::OperationOutcome::Cancelled { reason },
             usage: usage.map(crate::mapping::session_usage),
+            generation: Some(generation),
         });
         let commit = self
             .ctx
@@ -112,11 +114,13 @@ impl TurnCx<'_> {
                 return;
             }
         };
+        let generation = crate::mapping::session_generation_choice(self.ctx.generation.as_ref());
         let entries = match failure_entries(
             &termination.observations,
             self.operation.operation_id(),
             self.operation.turn_id(),
             usage,
+            &generation,
         ) {
             Ok(value) => value,
             Err(_) => {

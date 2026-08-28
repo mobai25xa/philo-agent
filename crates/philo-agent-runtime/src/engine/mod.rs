@@ -538,11 +538,13 @@ async fn settle_success(
     text: String,
 ) {
     let usage = cx.operation.shared().last_usage();
+    let generation = crate::mapping::session_generation_choice(cx.ctx.generation.as_ref());
     let final_entries = match success_entries(
         observations,
         cx.operation.operation_id(),
         cx.operation.turn_id(),
         usage,
+        &generation,
     ) {
         Ok(entries) => entries,
         Err(failure) => {

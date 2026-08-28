@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::entry::{EntryId, SessionEntry, SessionEntryKind};
 use crate::error::{SessionError, SessionValidationError, validation};
+use crate::generation_choice::SessionGenerationChoice;
 use crate::usage::SessionTokenUsage;
 use crate::view::ContextMessage;
 
@@ -14,6 +15,9 @@ pub(super) struct ContextProjection {
     latest_compaction: Option<CompactionState>,
     /// Newest settled turn's usage; `None` until the first settled turn.
     latest_usage: Option<SessionTokenUsage>,
+    /// Newest settled turn's generation choice; `None` until the first
+    /// settled turn with a recorded choice.
+    latest_generation: Option<SessionGenerationChoice>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +53,10 @@ impl ContextProjection {
         self.latest_usage
     }
 
+    pub(super) fn latest_generation(&self) -> Option<&SessionGenerationChoice> {
+        self.latest_generation.as_ref()
+    }
+
     pub(super) fn accept(
         &mut self,
         entry: &SessionEntry,
@@ -82,7 +90,9 @@ impl ContextProjection {
                     outcome: result.outcome().clone(),
                 });
             }
-            SessionEntryKind::OperationSettled { usage, .. } => {
+            SessionEntryKind::OperationSettled {
+                usage, generation, ..
+            } => {
                 self.settled_boundaries.insert(
                     entry.id().clone(),
                     SettledBoundary {
@@ -91,6 +101,7 @@ impl ContextProjection {
                     },
                 );
                 self.latest_usage = *usage;
+                self.latest_generation = generation.clone();
             }
             SessionEntryKind::Compaction {
                 summary,

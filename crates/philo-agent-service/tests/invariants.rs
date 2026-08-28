@@ -109,6 +109,7 @@ async fn seed_session(store: &MemorySessionStore, session_id: &str) {
                     operation_id: philo_session::OperationId::new("op-seed"),
                     outcome: OperationOutcome::Succeeded,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))
@@ -514,6 +515,7 @@ async fn submit_assigns_request_identity_and_freezes_current_generation() {
 fn frontend_generation_still_has_model_name() {
     let display = FrontendGeneration {
         generation_id: "g-1".into(),
+        provider: None,
         model_name: "base".into(),
         reasoning_effort: None,
         image_input: true,
@@ -791,7 +793,9 @@ async fn image_attachments_are_rejected_when_the_model_has_no_image_input() {
         tools: philo_agent_service::testing::empty_tools(),
         runtime_config: Default::default(),
         display: GenerationDisplay {
+            provider: None,
             model_name: "text-only".to_owned(),
+            model_id: "text-only".to_owned(),
             image_input: false,
         },
     });

@@ -4,6 +4,7 @@ use crate::entry::{
     EntryId, OperationId, SessionAssistantBlock, SessionId, SessionRevision, SessionUserPart,
     ToolBatchId, ToolCallId, TurnId,
 };
+use crate::generation_choice::SessionGenerationChoice;
 use crate::tool_entry::ToolResultOutcome;
 use crate::usage::SessionTokenUsage;
 
@@ -91,6 +92,7 @@ pub struct SessionContextView {
     pub(crate) settled_turn_boundaries: Vec<EntryId>,
     pub(crate) latest_compaction_boundary: Option<EntryId>,
     pub(crate) latest_usage: Option<SessionTokenUsage>,
+    pub(crate) latest_generation: Option<SessionGenerationChoice>,
 }
 
 impl SessionContextView {
@@ -148,5 +150,13 @@ impl SessionContextView {
     /// not report usage.
     pub fn latest_usage(&self) -> Option<SessionTokenUsage> {
         self.latest_usage
+    }
+
+    /// Returns the generation choice recorded at the newest settled turn,
+    /// if any. `None` for sessions with no settled turns or when the choice
+    /// was not recorded (legacy logs). Used for cross-process recovery to
+    /// rebuild the session's `RuntimeGeneration`.
+    pub fn latest_generation(&self) -> Option<&SessionGenerationChoice> {
+        self.latest_generation.as_ref()
     }
 }

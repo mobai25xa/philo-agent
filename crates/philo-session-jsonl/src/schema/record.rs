@@ -63,6 +63,11 @@ pub(crate) enum KindRecord {
         /// field, backward-compatible via `#[serde(default)]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsageRecord>,
+        /// Generation choice recorded at this settled turn boundary. Absent
+        /// on legacy logs; additive v2 field, backward-compatible via
+        /// `#[serde(default)]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<GenerationChoiceRecord>,
     },
     Compaction {
         summary: String,
@@ -185,4 +190,19 @@ pub(crate) struct TokenUsageRecord {
     pub cache_write_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
+}
+
+/// Durable generation choice recorded at each settled turn boundary.
+/// Additive v2 record, backward-compatible.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct GenerationChoiceRecord {
+    /// Owning provider id (display), when known. Additive: legacy entries
+    /// without this field decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Stable model identity (`{provider}/{model}` wire name).
+    pub model_id: String,
+    /// Frozen reasoning effort label (lowercase), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }

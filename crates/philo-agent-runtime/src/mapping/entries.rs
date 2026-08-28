@@ -47,6 +47,7 @@ pub(crate) fn success_entries(
     operation_id: &OperationId,
     turn_id: &TurnId,
     usage: Option<crate::TokenUsage>,
+    generation: &philo_session::SessionGenerationChoice,
 ) -> Result<Vec<session::SessionEntryKind>, AgentFailure> {
     let Some(output) = observations
         .iter()
@@ -89,6 +90,7 @@ pub(crate) fn success_entries(
             operation_id: session::OperationId::new(operation_id.as_str()),
             outcome: session::OperationOutcome::Succeeded,
             usage: usage.map(session_usage),
+            generation: Some(generation.clone()),
         },
     ])
 }
@@ -98,6 +100,7 @@ pub(crate) fn failure_entries(
     operation_id: &OperationId,
     turn_id: &TurnId,
     usage: Option<crate::TokenUsage>,
+    generation: &philo_session::SessionGenerationChoice,
 ) -> Result<Vec<session::SessionEntryKind>, AgentFailure> {
     let Some(failure) = observations
         .iter()
@@ -121,6 +124,7 @@ pub(crate) fn failure_entries(
             operation_id: session::OperationId::new(operation_id.as_str()),
             outcome: session::OperationOutcome::Failed,
             usage: usage.map(session_usage),
+            generation: Some(generation.clone()),
         },
     ])
 }

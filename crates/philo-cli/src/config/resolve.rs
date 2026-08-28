@@ -57,6 +57,9 @@ pub struct ModelChoice {
     pub image_input: bool,
     /// Cache identity policy shared by every request to this provider.
     pub cache_policy: ModelCachePolicy,
+    /// TUI-friendly display name. Falls back to the wire name (`self.model`)
+    /// when the config omits `display_name`. Never a secret.
+    pub display_name: String,
 }
 
 /// Where a deployment's API key comes from. The literal form only exists for
@@ -800,6 +803,11 @@ fn model_choices(file: &FileConfig) -> Result<Vec<ModelChoice>, UsageError> {
                 default_reasoning,
                 image_input,
                 cache_policy,
+                display_name: model
+                    .display_name
+                    .as_ref()
+                    .map(|sourced| sourced.value.clone())
+                    .unwrap_or_else(|| name.clone()),
             });
         }
     }

@@ -29,7 +29,12 @@ pub fn generation(
         model,
         tools,
         runtime_config: config,
-        display: GenerationDisplay { model_name, image_input: true },
+        display: GenerationDisplay {
+            provider: None,
+            model_name: model_name.clone(),
+            model_id: model_name,
+            image_input: true,
+        },
     })
 }
 

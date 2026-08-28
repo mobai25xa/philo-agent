@@ -33,6 +33,11 @@ pub struct AssembledGeneration {
     pub runtime_config: RuntimeConfig,
     /// User-facing model name. Never a secret.
     pub model_name: String,
+    /// Owning provider id (display), when known.
+    pub provider: Option<String>,
+    /// Stable model identity (`{provider}/{model}` wire name). Persisted as
+    /// the durable generation identity.
+    pub model_id: String,
     /// Whether the model accepts image input parts.
     pub image_input: bool,
 }
@@ -143,7 +148,9 @@ impl CurrentGeneration {
             tools: assembled.tools,
             runtime_config: assembled.runtime_config,
             display: GenerationDisplay {
+                provider: assembled.provider,
                 model_name: assembled.model_name,
+                model_id: assembled.model_id,
                 image_input: assembled.image_input,
             },
         });
@@ -156,24 +163,24 @@ impl CurrentGeneration {
         self.is_current_install(request_id)
     }
 
-    /// Installs a same-ports generation that differs only by reasoning effort.
-    pub(crate) fn install_reasoning(
+    /// Builds a same-ports generation that differs only by reasoning effort,
+    /// sourced from the given `current` generation rather than the global
+    /// cell. Used for per-session reasoning switches.
+    pub(crate) fn install_reasoning_for(
         &mut self,
         effort: philo_agent_runtime::ReasoningEffort,
+        current: &Arc<RuntimeGeneration>,
     ) -> Arc<RuntimeGeneration> {
-        let current = self.current();
         let mut runtime_config = current.runtime_config.clone();
         runtime_config.generation.reasoning_effort = Some(effort);
         let generation_id = self.next_id();
-        let next = Arc::new(RuntimeGeneration {
+        Arc::new(RuntimeGeneration {
             generation_id,
             model: current.model.clone(),
             tools: current.tools.clone(),
             runtime_config,
             display: current.display.clone(),
-        });
-        self.current = next.clone();
-        next
+        })
     }
 }
 
@@ -188,6 +195,8 @@ mod tests {
             tools: empty_tools(),
             runtime_config: RuntimeConfig::default(),
             model_name: name.to_owned(),
+            provider: None,
+            model_id: name.to_owned(),
             image_input: true,
         }
     }

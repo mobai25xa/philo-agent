@@ -54,8 +54,9 @@ where
         };
         // Image attachments are a model capability: reject them up front when
         // the active generation's model does not declare image input.
-        if !attachments.is_empty() && !self.generation.current().display.image_input {
-            let model = self.generation.current().display.model_name.clone();
+        let session_gen = self.session_generation(&session_id);
+        if !attachments.is_empty() && !session_gen.display.image_input {
+            let model = session_gen.display.model_name.clone();
             self.emit(
                 Some(request_id),
                 FrontendUpdateKind::CommandRejected {
@@ -81,7 +82,7 @@ where
         let spec = OperationSpec {
             session_id: mapping::session_runtime_id(&session_id),
             user_message,
-            generation: self.generation.current(),
+            generation: session_gen,
             service_request_id: Some(request_id.to_string()),
         };
         let runtime = self.runtime.clone();
@@ -101,9 +102,24 @@ where
         request_id: FrontendRequestId,
         effort: FrontendReasoningEffort,
     ) {
-        let next = self
-            .generation
-            .install_reasoning(mapping::reasoning_effort(effort));
+        let session_id = match self.snapshot.current_session.clone() {
+            Some(id) => id,
+            None => {
+                self.emit(
+                    Some(request_id),
+                    FrontendUpdateKind::CommandRejected {
+                        reason: CommandReject::NoCurrentSession,
+                    },
+                );
+                return;
+            }
+        };
+        let current = self.session_generation(&session_id);
+        let next = self.generation.install_reasoning_for(
+            mapping::reasoning_effort(effort),
+            &current,
+        );
+        self.session_generations.put(session_id.clone(), next.clone());
         self.emit(
             Some(request_id),
             FrontendUpdateKind::GenerationInstalled {
@@ -187,6 +203,11 @@ where
         match result {
             Ok(assembled) => {
                 if let Some(next) = self.generation.install_success(request_id, assembled) {
+                    // Update the per-session cache so the next submit uses the
+                    // new generation; also keeps the global cell as a fallback.
+                    if let Some(session_id) = self.snapshot.current_session.clone() {
+                        self.session_generations.put(session_id, next.clone());
+                    }
                     self.emit(
                         Some(request_id),
                         FrontendUpdateKind::GenerationInstalled {
@@ -279,7 +300,7 @@ where
         }
         let spec = CompactionSpec {
             session_id: mapping::session_runtime_id(&session_id),
-            generation: self.generation.current(),
+            generation: self.session_generation(&session_id),
         };
         let runtime = self.runtime.clone();
         self.spawn_work(request_id, async move {

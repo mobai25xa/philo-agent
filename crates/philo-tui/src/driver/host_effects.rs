@@ -121,6 +121,7 @@ mod tests {
             HostRequest::RebuildModel { name, effort } => FrontendUpdateKind::GenerationInstalled {
                 display: FrontendGeneration {
                     generation_id: "g-1".to_owned(),
+                    provider: None,
                     model_name: name,
                     reasoning_effort: effort.map(|effort| format!("{effort:?}")),
                     image_input: true,
@@ -130,6 +131,7 @@ mod tests {
             HostRequest::SetReasoning(effort) => FrontendUpdateKind::GenerationInstalled {
                 display: FrontendGeneration {
                     generation_id: "g-1".to_owned(),
+                    provider: None,
                     model_name: app.status.model.clone(),
                     reasoning_effort: Some(format!("{effort:?}")),
                     image_input: true,
@@ -155,6 +157,7 @@ mod tests {
                 queued: 0,
                 generation: FrontendGeneration {
                     generation_id: "g-1".to_owned(),
+                    provider: None,
                     model_name: app.status.model.clone(),
                     reasoning_effort: None,
                     image_input: true,

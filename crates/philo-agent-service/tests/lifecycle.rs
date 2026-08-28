@@ -238,7 +238,9 @@ fn start_real_runtime_service(
             ..RuntimeConfig::default()
         },
         display: philo_agent_runtime::GenerationDisplay {
+            provider: None,
             model_name: "fake".into(),
+            model_id: "fake".into(),
             image_input: true,
         },
     });

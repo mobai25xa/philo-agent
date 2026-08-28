@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 224
 expression: "render(&[\"| plan | latency | notes |\", \"|---|---|---|\",\n\"| fast | 2ms | cached path |\",\n\"| slow | 200ms | hits the network every single time |\", \"\",\n\"back to prose\",])"
 ---
 ╭──────┬─────────┬────────────────────────────────────╮

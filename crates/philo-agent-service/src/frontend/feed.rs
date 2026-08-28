@@ -337,6 +337,7 @@ mod tests {
                 availability: FrontendAvailability::Idle,
                 generation: FrontendGeneration {
                     generation_id: "test".into(),
+                    provider: None,
                     model_name: "test".into(),
                     reasoning_effort: None,
                     image_input: true,

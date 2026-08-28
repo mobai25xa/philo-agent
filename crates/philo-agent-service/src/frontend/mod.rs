@@ -19,12 +19,12 @@ pub use lease::{
 };
 pub use snapshot::{
     DurableSessionView, FrontendAssistantBlock, FrontendAvailability, FrontendConfigEntry,
-    FrontendContextMessage, FrontendFailure, FrontendGeneration, FrontendMaintenance,
-    FrontendMaintenancePhase, FrontendModelListing, FrontendOpenTurn, FrontendOperationEvent,
-    FrontendSessionSummary, FrontendSnapshot, FrontendStatus, FrontendTokenUsage,
-    FrontendToolDisplay, FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome,
-    FrontendUnfilledBatch, FrontendUserPart, PendingConfirmationView, QueuedOperationSummary,
-    ServiceHealth,
+    FrontendContextMessage, FrontendFailure, FrontendGeneration, FrontendGenerationChoice,
+    FrontendMaintenance, FrontendMaintenancePhase, FrontendModelListing, FrontendOpenTurn,
+    FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot, FrontendStatus,
+    FrontendTokenUsage, FrontendToolDisplay, FrontendToolListing, FrontendToolResult,
+    FrontendToolResultOutcome, FrontendUnfilledBatch, FrontendUserPart,
+    PendingConfirmationView, QueuedOperationSummary, ServiceHealth,
 };
 pub use update::{FrontendUpdate, FrontendUpdateKind};
 

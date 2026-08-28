@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 207
 expression: "render(&[\"```rust\", \"fn main() {}\", \"```\", \"between blocks\",\n\"```not-a-language\", \"* not a list *\", \"```\", \"after\",])"
 ---
 ```rust

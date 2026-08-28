@@ -39,6 +39,7 @@ pub(crate) fn session_view(id: &str) -> DurableSessionView {
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
         usage: None,
+        generation: None,
     }
 }
 
@@ -60,6 +61,7 @@ pub(crate) fn image_session_view(id: &str) -> DurableSessionView {
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
         usage: None,
+        generation: None,
     }
 }
 
@@ -73,12 +75,14 @@ pub(crate) fn empty_session_view(id: &str) -> DurableSessionView {
         settled_turn_boundaries: Vec::new(),
         latest_compaction_boundary: None,
         usage: None,
+        generation: None,
     }
 }
 
 fn test_generation() -> FrontendGeneration {
     FrontendGeneration {
         generation_id: "g-1".to_owned(),
+        provider: None,
         model_name: "m".to_owned(),
         reasoning_effort: None,
         image_input: true,

@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/render/frame.rs
-assertion_line: 1452
 expression: rendered
 ---
     ╭─────────────────────────────────────────────────────────────────────╮

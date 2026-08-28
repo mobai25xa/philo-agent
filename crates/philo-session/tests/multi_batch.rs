@@ -122,6 +122,7 @@ fn two_rounds_project_interleaved_in_source_order() {
                 operation_id: OperationId::new("o"),
                 outcome: OperationOutcome::Succeeded,
                 usage: None,
+                generation: None,
             },
         ],
     )

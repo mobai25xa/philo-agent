@@ -2,6 +2,7 @@
 
 mod entry;
 mod error;
+mod generation_choice;
 mod memory;
 mod projection;
 mod store;
@@ -16,6 +17,7 @@ pub use entry::{
     TurnFailureKind, TurnId, TurnOutcome,
 };
 pub use error::{SessionError, SessionValidationError};
+pub use generation_choice::SessionGenerationChoice;
 pub use memory::MemorySessionStore;
 pub use projection::{AppliedTransaction, SessionProjection};
 pub use store::{SessionFuture, SessionStore, SessionSummary};

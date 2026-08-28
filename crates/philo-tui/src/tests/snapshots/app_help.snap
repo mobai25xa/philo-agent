@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/app/state/tests.rs
-assertion_line: 486
 expression: "texts(&appended(&run(&mut app, \"/help\"))).join(\"\\n\")"
 ---
 /help

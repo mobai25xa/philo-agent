@@ -2,9 +2,10 @@
 
 use philo_agent_service::{
     DurableSessionView, FrontendAvailability, FrontendConfigEntry, FrontendContextMessage,
-    FrontendGeneration, FrontendMaintenance, FrontendMaintenancePhase, FrontendModelListing,
-    FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot, FrontendUpdate,
-    FrontendUpdateKind as Kind, FrontendUserPart, LiveOperationSnapshot, ServiceHealth,
+    FrontendGeneration, FrontendGenerationChoice, FrontendMaintenance, FrontendMaintenancePhase,
+    FrontendModelListing, FrontendOperationEvent, FrontendSessionSummary, FrontendSnapshot,
+    FrontendUpdate, FrontendUpdateKind as Kind, FrontendUserPart, LiveOperationSnapshot,
+    ServiceHealth,
 };
 
 use super::App;
@@ -91,6 +92,14 @@ impl App {
     pub(crate) fn begin_session(&mut self, session_id: &str) {
         self.status.session = session_id.to_owned();
         self.status.usage = self.usage_cache.get(session_id).copied();
+        // Per-session model/effort restore: hot sessions already in the cache
+        // refresh the top-right corner; cold sessions fall back to whatever
+        // `apply_session_loaded`/`apply_snapshot` set last.
+        if let Some(choice) = self.model_cache.get(session_id) {
+            self.status.model = choice.model_name.clone();
+            self.status.effort = choice.reasoning_effort.clone();
+            self.status.provider = choice.provider.clone();
+        }
         self.transcript = crate::app::transcript::Transcript::new(self.show_reasoning);
         self.run_state.clear();
         self.clear_stream();
@@ -682,6 +691,15 @@ impl App {
             self.status.usage = Some(usage);
             self.usage_cache.insert(session_id.to_owned(), usage);
         }
+        // Cross-process model/effort restore: the durable session view
+        // carries the last settled turn's generation choice, so the
+        // top-right corner shows the saved model immediately on load.
+        if let Some(choice) = &view.generation {
+            self.status.model = choice.model_name.clone();
+            self.status.effort = choice.reasoning_effort.clone();
+            self.status.provider = choice.provider.clone();
+            self.model_cache.insert(session_id.to_owned(), choice.clone());
+        }
         match intent {
             SessionLoadIntent::New => self.ingest_appends(vec![Effect::Append(vec![line(
                 LineKind::Meta,
@@ -711,7 +729,20 @@ impl App {
         let previous = self.status.model.clone();
         self.status.model.clone_from(&display.model_name);
         self.status.effort = effort_value(display.reasoning_effort.as_deref());
+        self.status.provider = display.provider.clone();
         self.pending_model_switch = false;
+        // Record the installed model/effort for the current session so a
+        // switch-back restores it without a store round-trip.
+        if !self.status.session.is_empty() {
+            self.model_cache.insert(
+                self.status.session.clone(),
+                FrontendGenerationChoice {
+                    provider: display.provider.clone(),
+                    model_name: display.model_name.clone(),
+                    reasoning_effort: display.reasoning_effort.clone(),
+                },
+            );
+        }
         let text = if previous != display.model_name {
             format!("model: {}", display.model_name)
         } else if let Some(effort) = display
@@ -790,6 +821,11 @@ impl App {
                     self.status.usage = Some(usage);
                     self.usage_cache.insert(session_id.clone(), usage);
                 }
+                // Cross-process model/effort restore on resync.
+                if let Some(choice) = &view.generation {
+                    self.model_cache
+                        .insert(session_id.clone(), choice.clone());
+                }
                 let history = session::history_lines(view);
                 if !history.is_empty() {
                     self.cells.push_closed(history);
@@ -800,6 +836,10 @@ impl App {
             if let Some(usage) = view.usage {
                 self.status.usage = Some(usage);
                 self.usage_cache.insert(view.session_id.clone(), usage);
+            }
+            if let Some(choice) = &view.generation {
+                self.model_cache
+                    .insert(view.session_id.clone(), choice.clone());
             }
             let history = session::history_lines(view);
             if !history.is_empty() {
@@ -815,6 +855,7 @@ impl App {
             .model
             .clone_from(&snapshot.generation.model_name);
         self.status.effort = effort_value(snapshot.generation.reasoning_effort.as_deref());
+        self.status.provider = snapshot.generation.provider.clone();
         if let Some(front) = snapshot.pending_confirmations.first() {
             self.sync_confirmation(Some((
                 front.confirmation_id,

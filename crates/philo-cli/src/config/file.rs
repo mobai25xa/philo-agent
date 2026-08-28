@@ -65,6 +65,9 @@ pub(super) struct ModelFile {
     pub(super) input: Option<Sourced<Vec<String>>>,
     /// Output modalities; only `text` is supported by the runtime.
     pub(super) output: Option<Sourced<Vec<String>>>,
+    /// TUI-friendly display name. Unset falls back to the wire name
+    /// (the `[providers.<id>.models.<model>]` map key) at resolution time.
+    pub(super) display_name: Option<Sourced<String>>,
 }
 
 /// One `[providers.<id>.cache]` section: how cache identity and breakpoints
@@ -548,6 +551,9 @@ fn apply_providers(
                                 "reasoning" => model.reasoning = Some(reader.string_array()?),
                                 "input" => model.input = Some(reader.string_array()?),
                                 "output" => model.output = Some(reader.string_array()?),
+                                "display_name" => {
+                                    model.display_name = Some(reader.string()?);
+                                }
                                 _ => config.warnings.push(format!(
                                     "{}: unknown key [providers.{id}.models.{name}].\
                                      {field}; ignored",

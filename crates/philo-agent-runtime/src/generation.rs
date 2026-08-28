@@ -6,7 +6,14 @@ use std::sync::Arc;
 /// Display metadata for a generation. Must not contain secrets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GenerationDisplay {
+    /// Owning provider id (display), e.g. `"openai"`. `None` only for legacy
+    /// generations assembled before the field was tracked.
+    pub provider: Option<String>,
+    /// User-facing model name (display_name or wire name).
     pub model_name: String,
+    /// Stable model identity (`{provider}/{model}` wire name). Persisted as
+    /// the durable identity; `model_name` may be a friendlier alias.
+    pub model_id: String,
     /// Whether the model accepts image input parts. Submits carrying image
     /// attachments are rejected while this is `false`.
     pub image_input: bool,

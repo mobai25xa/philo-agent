@@ -112,6 +112,7 @@ async fn seal_stale_turns_with(
             operation_id: open.operation_id().clone(),
             outcome: session::OperationOutcome::Cancelled { reason },
             usage: None,
+            generation: None,
         });
         let commit = ctx
             .sessions

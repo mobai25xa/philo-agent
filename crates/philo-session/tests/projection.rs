@@ -95,6 +95,7 @@ fn settle_transaction(revision: SessionRevision) -> SessionTransaction {
                 operation_id: OperationId::new("op-1"),
                 outcome: OperationOutcome::Succeeded,
                 usage: None,
+                generation: None,
             },
         ],
     )
@@ -369,6 +370,7 @@ fn context_view_exposes_latest_settled_usage() {
                 operation_id: OperationId::new("op-1"),
                 outcome: OperationOutcome::Succeeded,
                 usage: Some(usage),
+                generation: None,
             },
         ],
     );

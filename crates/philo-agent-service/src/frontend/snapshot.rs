@@ -11,6 +11,8 @@ use crate::live::LiveOperationSnapshot;
 pub struct FrontendGeneration {
     /// Generation id.
     pub generation_id: String,
+    /// Owning provider id (display), when known.
+    pub provider: Option<String>,
     /// User-facing model name.
     pub model_name: String,
     /// Frozen reasoning effort label, if any.
@@ -72,8 +74,25 @@ pub struct DurableSessionView {
     pub latest_compaction_boundary: Option<String>,
     /// Latest token usage recorded at the newest settled turn, if any.
     pub usage: Option<FrontendTokenUsage>,
+    /// Latest generation choice recorded at the newest settled turn, if
+    /// any. Used by the frontend to restore the model/effort corner when
+    /// switching back to a history session.
+    pub generation: Option<FrontendGenerationChoice>,
 }
 
+/// Durable generation choice for frontend display: provider, display name,
+/// and effort. The `provider` field disambiguates models that share a
+/// `display_name` across providers so the frontend corner never routes to
+/// the wrong one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendGenerationChoice {
+    /// Owning provider id (display), when known.
+    pub provider: Option<String>,
+    /// User-facing model name (display_name or wire name).
+    pub model_name: String,
+    /// Reasoning effort label (lowercase), when known.
+    pub reasoning_effort: Option<String>,
+}
 /// One entry of the session catalog: identity plus advisory display facts.
 /// Frontends fall back to the id when the title is `None`, and render the
 /// timestamp only when it is known.

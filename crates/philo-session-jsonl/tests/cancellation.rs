@@ -114,6 +114,7 @@ fn cancel_transaction(revision: u64) -> SessionTransaction {
                     reason: CancelReason::User,
                 },
                 usage: None,
+                generation: None,
             },
         ],
     )

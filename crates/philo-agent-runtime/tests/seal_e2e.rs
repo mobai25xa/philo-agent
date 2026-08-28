@@ -248,6 +248,7 @@ async fn placeholders_add_nothing_to_the_durable_log() {
                     operation_id: philo_session::OperationId::new("stale-op"),
                     outcome: philo_session::OperationOutcome::Failed,
                     usage: None,
+                    generation: None,
                 },
             ],
         ))

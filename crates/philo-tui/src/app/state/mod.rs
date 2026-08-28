@@ -26,7 +26,7 @@ use super::overlay::{ConfirmPrompt, OverlayFrame, Picker};
 use super::pacer::{PacedPiece, StreamPacer};
 use super::run_state::{CornerWord, RunState};
 use super::select::{BandLayout, Selection};
-use philo_agent_service::FrontendTokenUsage;
+use philo_agent_service::{FrontendGenerationChoice, FrontendTokenUsage};
 use super::status::StatusData;
 use super::submit::SubmitState;
 use super::transcript::{InfoLevel, LineKind, Transcript, TranscriptLine};
@@ -98,6 +98,11 @@ pub(crate) struct App {
     /// only; cleared on compaction; survives a session round-trip but not a
     /// process restart.
     usage_cache: HashMap<String, FrontendTokenUsage>,
+    /// Per-session generation choice cache so switching back to a history
+    /// session restores the top-right model/effort corner to its last value.
+    /// In-process only; survives a session round-trip but not a process
+    /// restart (cross-process restore reads `DurableSessionView.generation`).
+    model_cache: HashMap<String, FrontendGenerationChoice>,
     /// Transcript cells for the TUI-owned viewport.
     pub(crate) cells: TranscriptStore,
     scroll: ScrollState,
@@ -157,6 +162,7 @@ impl App {
             run_state: RunState::default(),
             pacer: StreamPacer::default(),
             usage_cache: HashMap::new(),
+            model_cache: HashMap::new(),
             cells: TranscriptStore::new(),
             scroll: ScrollState::follow(),
             reasoning_manually_expanded: HashSet::new(),

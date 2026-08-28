@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/tests/attachments.rs
-assertion_line: 84
 expression: "rendered.join(\"\\n\")"
 ---
 /image shots/diagram.png

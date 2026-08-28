@@ -23,3 +23,20 @@ pub(crate) fn session_usage(usage: TokenUsage) -> SessionTokenUsage {
         reasoning_tokens: usage.reasoning_tokens,
     }
 }
+
+/// Builds a durable generation choice from a frozen runtime generation.
+/// The wire name (`display.model_id`) is the persistent identity; the
+/// reasoning effort label is lowercased to match the session convention.
+pub(crate) fn session_generation_choice(
+    generation: &crate::RuntimeGeneration,
+) -> philo_session::SessionGenerationChoice {
+    philo_session::SessionGenerationChoice {
+        provider: generation.display.provider.clone(),
+        model_id: generation.display.model_id.clone(),
+        reasoning_effort: generation
+            .runtime_config
+            .generation
+            .reasoning_effort
+            .map(|effort| format!("{effort:?}").to_lowercase()),
+    }
+}

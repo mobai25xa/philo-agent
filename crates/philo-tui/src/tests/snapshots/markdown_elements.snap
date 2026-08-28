@@ -1,6 +1,5 @@
 ---
 source: crates/philo-tui/src/render/markdown.rs
-assertion_line: 183
 expression: "render(&[\"# Title\", \"## Middle\", \"### Smaller\", \"plain paragraph text\",\n\"- first item\", \"  - nested item\", \"1. ordered item\", \"- [x] done deal\",\n\"- [ ] open item\", \"> quoted remark\",\n\"text with **bold**, *italic*, ~~struck~~ and `inline code`\",\n\"see [docs](https://example.test/guide)\", \"open src/utils/jwt.ts now\", \"---\",\n\"\",])"
 ---
 ▍ Title

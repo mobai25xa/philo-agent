@@ -115,6 +115,7 @@ fn settle_transaction(revision: u64) -> SessionTransaction {
                 operation_id: OperationId::new("op-1"),
                 outcome: OperationOutcome::Succeeded,
                 usage: None,
+                generation: None,
             },
         ],
     )
@@ -238,6 +239,7 @@ async fn golden_operation_settled_with_usage_serializes_and_round_trips() {
                 operation_id: OperationId::new("op-1"),
                 outcome: OperationOutcome::Succeeded,
                 usage: Some(usage),
+                generation: None,
             },
         ],
     );

@@ -125,6 +125,7 @@ fn terminal_entries(reason: CancelReason) -> Vec<SessionEntryKind> {
             operation_id: operation_id(),
             outcome: OperationOutcome::Cancelled { reason },
                 usage: None,
+                generation: None,
         },
     ]
 }
@@ -456,6 +457,7 @@ fn turn_and_operation_reasons_must_agree() {
                         reason: CancelReason::User,
                     },
                     usage: None,
+                    generation: None,
                 },
             ],
         ))
@@ -551,6 +553,7 @@ fn open_turns_is_empty_for_cleanly_terminated_sessions() {
                         operation_id: operation_id(),
                         outcome: OperationOutcome::Succeeded,
                 usage: None,
+                generation: None,
                     },
                 ],
             ),

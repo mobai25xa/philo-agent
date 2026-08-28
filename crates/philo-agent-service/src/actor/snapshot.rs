@@ -664,6 +664,14 @@ where
             SessionViewKind::Load => {
                 self.snapshot.commit_current(token.session_id.clone());
                 self.drop_foreign_live();
+                // Pre-fill the per-session generation cache so the next submit
+                // uses a bound generation. Hot sessions already in the cache
+                // keep their Arc; cold sessions fall back to the bootstrap
+                // generation until the user reinstalls the persisted model.
+                if self.session_generations.get(&token.session_id).is_none() {
+                    self.session_generations
+                        .put(token.session_id.clone(), self.generation.current());
+                }
                 self.emit(
                     token.request_id,
                     FrontendUpdateKind::SessionLoaded {

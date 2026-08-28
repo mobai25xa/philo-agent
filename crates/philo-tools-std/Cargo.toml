@@ -9,6 +9,7 @@ license.workspace = true
 # mature regex/globset engines models already expect semantically.
 [dependencies]
 philo-tools = { path = "../philo-tools" }
+philo-session = { path = "../philo-session" }
 globset = "0.4"
 regex = "1"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }

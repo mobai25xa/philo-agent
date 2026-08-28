@@ -390,6 +390,13 @@ pub(crate) fn running_cell(
 
 /// A cancelled card: red `✗ cancelled` header, no body (§2 priority).
 pub(crate) fn cancelled_cell(tool_name: &str, arguments: &str) -> TranscriptLine {
+    stopped_cell(tool_name, arguments, "✗ cancelled")
+}
+
+/// A stopped card with a caller-chosen red status word (`✗ cancelled` for
+/// live cancellation, `✗ interrupted` for replay of an interrupted outcome).
+/// No body: the outcome is fully expressed by the header (§2 priority).
+pub(crate) fn stopped_cell(tool_name: &str, arguments: &str, status: &str) -> TranscriptLine {
     let target = primary_target(arguments).map(|(target, kind)| HeaderPiece {
         text: preview(&target, KEY_WIDTH),
         color: kind_color(kind),
@@ -409,7 +416,7 @@ pub(crate) fn cancelled_cell(tool_name: &str, arguments: &str) -> TranscriptLine
         target,
         stats: None,
         status: HeaderPiece {
-            text: "✗ cancelled".to_owned(),
+            text: status.to_owned(),
             color: SegColor::Red,
             bold: false,
         },

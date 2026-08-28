@@ -1827,6 +1827,7 @@ dependencies = [
  "philo-session",
  "philo-session-jsonl",
  "philo-tools",
+ "philo-tools-std",
  "tokio",
 ]
 
@@ -1902,6 +1903,7 @@ name = "philo-tools-std"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "philo-session",
  "philo-tools",
  "regex",
  "tokio",

@@ -86,10 +86,11 @@ impl App {
     }
 
     /// Starts rendering a different session: fresh transcript, cells, and
-    /// usage. Native scrollback is no longer the history store.
+    /// usage. The usage cache restores the last-seen telemetry for sessions
+    /// already visited in this process; new sessions start at `-`.
     pub(crate) fn begin_session(&mut self, session_id: &str) {
         self.status.session = session_id.to_owned();
-        self.status.usage = None;
+        self.status.usage = self.usage_cache.get(session_id).copied();
         self.transcript = crate::app::transcript::Transcript::new(self.show_reasoning);
         self.run_state.clear();
         self.clear_stream();
@@ -122,6 +123,7 @@ impl App {
         match event {
             FrontendOperationEvent::ModelUsageUpdated { usage, .. } => {
                 self.status.usage = Some(*usage);
+                self.usage_cache.insert(self.status.session.clone(), *usage);
             }
             FrontendOperationEvent::ContextCompactionStarted => {
                 self.automatic_compacting = true;
@@ -129,7 +131,7 @@ impl App {
             }
             FrontendOperationEvent::ContextCompactionCompleted { .. } => {
                 self.automatic_compacting = false;
-                self.status.usage = None;
+                self.clear_usage();
                 self.sync_compacting_status();
             }
             FrontendOperationEvent::ContextCompactionFailed { .. } => {
@@ -890,22 +892,31 @@ impl App {
             ),
             Some(message) => {
                 if let Some(boundary) = parse_compacted_boundary(message) {
-                    self.status.usage = None;
+                    self.clear_usage();
                     line(
                         LineKind::Meta,
                         format!("context compacted through {boundary}"),
                     )
                 } else {
-                    self.status.usage = None;
+                    self.clear_usage();
                     line(LineKind::Meta, format!("context compacted: {message}"))
                 }
             }
             None => {
-                self.status.usage = None;
+                self.clear_usage();
                 line(LineKind::Meta, "context compacted")
             }
         };
         self.ingest_appends(vec![Effect::Append(vec![text])])
+    }
+
+    /// Drops the live usage and its cached copy for the current session.
+    /// Compaction rewrites the context window, so the prior token counts no
+    /// longer apply; the cache is cleared so a switch-back does not resurrect
+    /// a stale telemetry value.
+    fn clear_usage(&mut self) {
+        self.status.usage = None;
+        self.usage_cache.remove(&self.status.session);
     }
 
     fn clear_manual_compaction(&mut self) {

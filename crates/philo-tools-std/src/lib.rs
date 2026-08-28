@@ -53,6 +53,7 @@ mod list;
 mod mutation;
 mod path;
 mod read;
+pub mod replay;
 mod shell;
 mod write;
 

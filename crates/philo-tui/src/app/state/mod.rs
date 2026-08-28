@@ -12,7 +12,7 @@ mod select;
 mod tests;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::action::Action;
 use super::attachment::Attachments;
@@ -26,6 +26,7 @@ use super::overlay::{ConfirmPrompt, OverlayFrame, Picker};
 use super::pacer::{PacedPiece, StreamPacer};
 use super::run_state::{CornerWord, RunState};
 use super::select::{BandLayout, Selection};
+use philo_agent_service::FrontendTokenUsage;
 use super::status::StatusData;
 use super::submit::SubmitState;
 use super::transcript::{InfoLevel, LineKind, Transcript, TranscriptLine};
@@ -92,6 +93,11 @@ pub(crate) struct App {
     /// Stream smoothing valve (v2.2): live deltas queue here and animation
     /// ticks release them into the cells at an even cadence.
     pacer: StreamPacer,
+    /// Per-session token-usage cache so switching back to a history session
+    /// restores the right-bottom telemetry to its last value. In-process
+    /// only; cleared on compaction; survives a session round-trip but not a
+    /// process restart.
+    usage_cache: HashMap<String, FrontendTokenUsage>,
     /// Transcript cells for the TUI-owned viewport.
     pub(crate) cells: TranscriptStore,
     scroll: ScrollState,
@@ -150,6 +156,7 @@ impl App {
             automatic_compacting: false,
             run_state: RunState::default(),
             pacer: StreamPacer::default(),
+            usage_cache: HashMap::new(),
             cells: TranscriptStore::new(),
             scroll: ScrollState::follow(),
             reasoning_manually_expanded: HashSet::new(),

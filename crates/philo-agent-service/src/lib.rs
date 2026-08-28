@@ -46,7 +46,7 @@ pub use generation::{
 };
 pub use ids::{FrontendEpoch, FrontendInstanceId, FrontendRequestId, FrontendRevision};
 pub use live::{LiveOperationSnapshot, LiveToolProgress};
-pub use mapping::{failure_dto, operation_event};
+pub use mapping::{derive_display_for_replay, failure_dto, operation_event};
 pub use philo_agent_runtime::{
     AdmissionError, CancelResult, ChannelBounds, CompactionSpec, FailureDomain, FailureStage,
     ForcedSettlement, GenerationDisplay, GenerationId, MaintenanceAccepted, MaintenanceError,

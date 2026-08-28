@@ -1111,6 +1111,124 @@ fn usage_events_update_the_usage_corner() {
 }
 
 #[test]
+fn usage_cache_restores_telemetry_when_switching_back() {
+    let mut app = app();
+    // app() starts on session "s".
+    let usage_s = FrontendTokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(20),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-1".to_owned(),
+        usage: usage_s,
+    });
+    assert_eq!(app.status.usage, Some(usage_s));
+    assert!(app.usage_cache.get("s") == Some(&usage_s));
+
+    // Switch away to "s-other": usage is fresh (no telemetry yet recorded).
+    app.begin_session("s-other");
+    assert_eq!(app.status.usage, None, "fresh session has no telemetry");
+
+    // Drive a different usage on the other session.
+    let usage_other = FrontendTokenUsage {
+        input_tokens: Some(300),
+        output_tokens: Some(40),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-2".to_owned(),
+        usage: usage_other,
+    });
+    assert_eq!(app.status.usage, Some(usage_other));
+    assert!(app.usage_cache.get("s-other") == Some(&usage_other));
+
+    // Switch back to "s": the cached telemetry is restored.
+    app.begin_session("s");
+    assert_eq!(
+        app.status.usage,
+        Some(usage_s),
+        "switching back restores the cached telemetry"
+    );
+}
+
+#[test]
+fn usage_cache_is_cleared_on_compaction_so_stale_values_do_not_resurface() {
+    let mut app = app();
+    let usage = FrontendTokenUsage {
+        input_tokens: Some(500),
+        output_tokens: Some(80),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-1".to_owned(),
+        usage,
+    });
+    assert!(app.usage_cache.get("s") == Some(&usage));
+
+    // Automatic compaction completes: the cache for the current session is
+    // dropped so a switch-back does not resurrect a stale telemetry value.
+    app.on_operation_event(&FrontendOperationEvent::ContextCompactionStarted);
+    app.on_operation_event(&FrontendOperationEvent::ContextCompactionCompleted {
+        covers_up_to: "boundary-1".to_owned(),
+    });
+    assert!(!app.usage_cache.contains_key("s"), "compaction clears the cache");
+    assert_eq!(app.status.usage, None, "live usage is also reset");
+}
+
+#[test]
+fn new_turn_usage_overwrites_the_cached_value() {
+    let mut app = app();
+    let first = FrontendTokenUsage {
+        input_tokens: Some(10),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-1".to_owned(),
+        usage: first,
+    });
+    // A later turn reports a new usage; the cache is overwritten in place.
+    let second = FrontendTokenUsage {
+        input_tokens: Some(999),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-2".to_owned(),
+        usage: second,
+    });
+    assert!(app.usage_cache.get("s") == Some(&second));
+    app.begin_session("s");
+    assert_eq!(app.status.usage, Some(second), "the latest usage wins");
+}
+
+#[test]
+fn usage_cache_is_per_session_and_does_not_leak_between_sessions() {
+    let mut app = app();
+    let usage_a = FrontendTokenUsage {
+        input_tokens: Some(1),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-1".to_owned(),
+        usage: usage_a,
+    });
+    app.begin_session("s-b");
+    let usage_b = FrontendTokenUsage {
+        input_tokens: Some(2),
+        ..FrontendTokenUsage::default()
+    };
+    app.on_operation_event(&FrontendOperationEvent::ModelUsageUpdated {
+        model_call_id: "m-2".to_owned(),
+        usage: usage_b,
+    });
+    // Each session keeps its own value.
+    app.begin_session("s");
+    assert_eq!(app.status.usage, Some(usage_a));
+    app.begin_session("s-b");
+    assert_eq!(app.status.usage, Some(usage_b));
+}
+
+#[test]
 fn config_reload_applies_show_reasoning_and_reports_success() {
     use philo_agent_service::FrontendConfigEntry;
     let mut app = app();

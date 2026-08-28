@@ -1,5 +1,6 @@
 ---
 source: crates/philo-tui/src/driver/host_effects.rs
+assertion_line: 303
 expression: "format!(\"FIRST\\n{first}\\n\\nSECOND\\n{second}\\n\\nSWITCHED\\n{}\",\nhistory.join(\"\\n\"))"
 ---
 FIRST
@@ -35,6 +36,5 @@ session s-2
 
 count the files
 
-▸ read_file  path: src/main.rs
-  └ ok · fn main() {}
+
 one file

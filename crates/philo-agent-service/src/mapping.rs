@@ -294,6 +294,39 @@ fn tool_display(display: &ToolDisplay) -> FrontendToolDisplay {
     }
 }
 
+/// Replay display derivation: reconstructs a transient display-channel
+/// projection from the durable model-channel facts the session store keeps
+/// (tool `name`, raw `arguments`, and the durable `outcome`). The output is
+/// structurally identical to the live `FrontendToolDisplay` the same tool
+/// emits, so the TUI replay path routes through the exact same `default_card`
+/// projection live cards use.
+///
+/// Each of the six standard tools dispatches to one static rule in
+/// `philo-tools-std`. Unknown tool names return `None`; the TUI degrades to a
+/// status-only card. Cancelled / Interrupted outcomes carry no display and
+/// also return `None`. See `docs/philo-agent/suggest/tui-tools/00-replay-derivation-plan.md`.
+pub fn derive_display_for_replay(
+    tool_name: &str,
+    arguments: &str,
+    outcome: &FrontendToolResultOutcome,
+) -> Option<FrontendToolDisplay> {
+    let session_outcome = match outcome {
+        FrontendToolResultOutcome::Success { content } => {
+            ToolResultOutcome::Success {
+                content: content.clone(),
+            }
+        }
+        FrontendToolResultOutcome::Error { code, message } => ToolResultOutcome::Error {
+            code: code.clone(),
+            message: message.clone(),
+        },
+        FrontendToolResultOutcome::Cancelled => ToolResultOutcome::Cancelled,
+        FrontendToolResultOutcome::Interrupted => ToolResultOutcome::Interrupted,
+    };
+    philo_tools_std::replay::derive_display_for_replay(tool_name, arguments, &session_outcome)
+        .map(|display| tool_display(&display))
+}
+
 /// Maps a runtime [`AgentFailure`] onto the stable-label failure DTO.
 pub fn failure_dto(failure: &AgentFailure) -> FrontendFailure {
     FrontendFailure {
@@ -570,5 +603,102 @@ mod tests {
             &dto.messages[0],
             FrontendContextMessage::User { .. }
         ));
+    }
+
+    #[test]
+    fn derive_display_for_replay_maps_six_tools_and_unknown() {
+        let ok = FrontendToolResultOutcome::Success {
+            content: "    1|fn main() {}".to_owned(),
+        };
+        let read = derive_display_for_replay("read", r#"{"path":"src/main.rs"}"#, &ok)
+            .expect("read derives a display");
+        assert_eq!(read.detail, "");
+        assert!(read.facts.iter().any(|(name, _)| name == "title" && read
+            .facts
+            .iter()
+            .any(|(n, v)| n == "subject" && v == "src/main.rs")));
+
+        let grep = derive_display_for_replay(
+            "grep",
+            r#"{"pattern":"hit"}"#,
+            &FrontendToolResultOutcome::Success {
+                content: "src/lib.rs:1: hit".to_owned(),
+            },
+        )
+        .expect("grep derives a display");
+        assert_eq!(grep.detail, "src/lib.rs:1: hit");
+
+        let list = derive_display_for_replay(
+            "list",
+            r#"{"path":"."}"#,
+            &FrontendToolResultOutcome::Success {
+                content: "file\tmain.rs".to_owned(),
+            },
+        )
+        .expect("list derives a display");
+        assert!(list.facts.iter().any(|(n, v)| n == "entries_total" && v == "1"));
+
+        let write = derive_display_for_replay(
+            "write",
+            r#"{"path":"src/a.rs","content":"hello"}"#,
+            &FrontendToolResultOutcome::Success {
+                content: "created src/a.rs".to_owned(),
+            },
+        )
+        .expect("write derives a display");
+        assert_eq!(write.detail, "+hello");
+        assert!(write.facts.iter().any(|(n, v)| n == "added" && v == "1"));
+
+        let edit = derive_display_for_replay(
+            "edit",
+            r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#,
+            &FrontendToolResultOutcome::Success {
+                content: "edited src/lib.rs".to_owned(),
+            },
+        )
+        .expect("edit derives a display");
+        assert_eq!(edit.detail, "-a\n+b");
+        assert!(!edit.detail.contains("@@"));
+
+        let shell = derive_display_for_replay(
+            "shell",
+            r#"{"command":"pnpm test"}"#,
+            &FrontendToolResultOutcome::Success {
+                content: "exit_code: 0\nok".to_owned(),
+            },
+        )
+        .expect("shell derives a display");
+        assert_eq!(shell.detail, "exit_code: 0\nok");
+
+        // Unknown tool name → None (TUI degrades to a status-only card).
+        assert!(derive_display_for_replay(
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+            &ok
+        )
+        .is_none());
+
+        // Cancelled / Interrupted / Error outcomes → None.
+        assert!(derive_display_for_replay(
+            "read",
+            r#"{"path":"src/main.rs"}"#,
+            &FrontendToolResultOutcome::Cancelled,
+        )
+        .is_none());
+        assert!(derive_display_for_replay(
+            "read",
+            r#"{"path":"src/main.rs"}"#,
+            &FrontendToolResultOutcome::Interrupted,
+        )
+        .is_none());
+        assert!(derive_display_for_replay(
+            "read",
+            r#"{"path":"src/main.rs"}"#,
+            &FrontendToolResultOutcome::Error {
+                code: "not_found".to_owned(),
+                message: "missing".to_owned(),
+            },
+        )
+        .is_none());
     }
 }

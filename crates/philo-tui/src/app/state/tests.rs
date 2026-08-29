@@ -2148,10 +2148,53 @@ fn browse_toggle_fold_hits_tool_card_bodies() {
     app.on_action(Action::BrowseStep(1));
     assert_eq!(app.browse_cursor(), Some((2, 0)));
     assert!(app.tool_card_collapsed_at(2), "bodies fold past the threshold");
-    app.on_action(Action::BrowseToggleFold);
+app.on_action(Action::BrowseToggleFold);
     assert!(!app.tool_card_collapsed_at(2), "Space opens the body");
     app.on_action(Action::BrowseToggleFold);
     assert!(app.tool_card_collapsed_at(2), "Space refolds the body");
+}
+
+#[test]
+fn plain_click_on_a_tool_card_body_toggles_it() {
+    use crate::app::transcript::{CardBody, SegSpan};
+    let mut app = app();
+    app.cells.push_closed(vec![
+        crate::app::transcript::line(LineKind::Meta,"before"),
+        crate::app::transcript::line(LineKind::Meta,"head"),
+        TranscriptLine {
+            kind: LineKind::Tool,
+            text: String::new(),
+            tone: Tone::Plain,
+            header: None,
+            body: Some(CardBody {
+                lines:(0..4)
+                    .map(|i| vec![SegSpan::plain(format!("line-{i}"))])
+                    .collect(),
+                threshold: 2,
+                fold_default_collapsed: true,
+                fold_count: 2,
+                fold_label:"行已折叠".to_owned(),
+                fold_hint: true,
+                fold_all: false,
+            }),
+        },
+        crate::app::transcript::line(LineKind::Meta,"after"),
+    ]);
+    app.note_history_layout(80, 10);
+    assert!(app.tool_card_collapsed_at(2), "bodies fold past the threshold");
+    // Click a visible body row (the folded body paints its second row at y=3):
+    // press and release at the same cell, no drag — toggles the fold.
+
+    app.on_action(Action::SelectStart { x: 5, y: 3 });
+    app.on_action(Action::SelectEnd { x:  5, y:  3 });
+    assert!(!app.tool_card_collapsed_at(2), "a plain click opens the body");
+    assert!(!app.has_selection(), "the click toggled instead of selecting");
+    // Click a body row again: refolds.
+
+
+    app.on_action(Action::SelectStart { x:  5, y:  3 });
+    app.on_action(Action::SelectEnd { x:  5, y:  3 });
+    assert!(app.tool_card_collapsed_at(2), "a second click refolds the body");
 }
 
 #[test]

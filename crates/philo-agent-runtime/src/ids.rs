@@ -37,6 +37,12 @@ pub trait IdSource: Send + Sync {
     fn next_turn_id(&self) -> TurnId;
 }
 
+/// Process-local sequential ids. The counters reset on every process boot,
+/// so these collide with same-named ids an earlier run already persisted in a
+/// durable session store. Intended for tests and short-lived demo drivers;
+/// production should inject an [`IdSource`] that embeds a per-process nonce in
+/// its ids (the CLI's `ProcessIdSource` is the reference pattern), so ids
+/// stay unique across restarts.
 #[derive(Debug, Default)]
 pub struct SequentialIdSource {
     next_operation: AtomicU64,

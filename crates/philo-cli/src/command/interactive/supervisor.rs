@@ -389,9 +389,23 @@ fn launch_config(
     interrupt: watch::Receiver<u64>,
     recovery: Option<TuiRecovery>,
 ) -> TuiLaunchConfig {
+    // The corner's model slot takes the catalog display name (contract
+    // §8); `Deployment.model` is the stable composite id `{provider}/{model}`,
+    // so falling back strips the provider prefix back to the wire name..
+    let model_name = bootstrap
+        .settings
+        .models
+        .iter()
+        .find(|choice| choice.id == bootstrap.settings.deployment.model)
+        .map(|choice| choice.display_name.clone())
+        .unwrap_or_else(|| {
+            let composite = bootstrap.settings.deployment.model.as_str();
+            let prefix = format!("{}/", bootstrap.settings.deployment.provider);
+            composite.strip_prefix(&prefix).unwrap_or(composite).to_owned()
+        });
     TuiLaunchConfig {
         session_id,
-        model_name: bootstrap.settings.deployment.model.clone(),
+        model_name,
         verbose: bootstrap.settings.verbosity == Verbosity::Verbose,
         show_reasoning: bootstrap.settings.show_reasoning,
         context_window: bootstrap.settings.context_window,

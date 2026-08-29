@@ -1,6 +1,8 @@
 //! Session catalog: durable `SessionStore` summaries plus one ephemeral
 //! current session, and manual renames via `TitleSet` transactions.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use philo_session::{
     SessionEntryKind, SessionError, SessionStore, SessionSummary, SessionTransaction,
 };
@@ -16,6 +18,19 @@ use super::{AgentServiceActor, ServiceTaskResult};
 
 /// One bounded re-read after a rename loses a revision race.
 const RENAME_CONFLICT_RETRY_MAX: usize = 1;
+
+fn mint_session_id(seq: u64, nonce: u64, millis: u128) -> String {
+    format!(
+        "sess-service-{millis:x}-{}-{nonce:x}-{seq}",
+        std::process::id()
+    )
+}
+
+pub(super) fn boot_nonce() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish()
+}
 
 impl<R, S> AgentServiceActor<R, S>
 where
@@ -144,7 +159,11 @@ where
             return;
         }
         self.session_seq += 1;
-        let session_id = format!("sess-service-{}", self.session_seq);
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let session_id = mint_session_id(self.session_seq, self.session_nonce, millis);
         self.start_session_load(request_id, session_id);
     }
 }
@@ -239,7 +258,9 @@ mod tests {
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
 
-    use super::{catalog_error_reason, compose_session_catalog, rename_session_once};
+    use super::{
+        catalog_error_reason, compose_session_catalog, mint_session_id, rename_session_once,
+    };
     use crate::frontend::snapshot::FrontendSessionSummary;
     use philo_session::{
         MemorySessionStore, OperationId, SessionEntryKind, SessionError, SessionId,
@@ -347,17 +368,35 @@ mod tests {
     }
 
     #[test]
+    fn minted_session_ids_are_unique_and_filesystem_friendly() {
+        let first = mint_session_id(1, 0xbeef, 0x1234);
+        let second = mint_session_id(2, 0xbeef, 0x1234);
+        let third = mint_session_id(1, 0xbeef, 0x1234 + 1);
+        let other_boot = mint_session_id(1, 0xbeef + 1, 0x1234);
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        assert_ne!(first, other_boot);
+        for id in [&first, &second, &third, &other_boot] {
+            assert!(id.starts_with("sess-service-"));
+            assert!(
+                id.bytes()
+                    .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+            );
+        }
+    }
+
+    #[test]
     fn compose_merges_uncommitted_current_once() {
         let ids = compose_session_catalog(
             vec![summary("sess-z", None), summary("sess-a", None)],
-            Some("sess-service-1"),
+            Some("sess-x"),
             None,
         );
         assert_eq!(
             ids.iter()
                 .map(|s| s.session_id.as_str())
                 .collect::<Vec<_>>(),
-            ["sess-a", "sess-service-1", "sess-z"]
+            ["sess-a", "sess-x", "sess-z"]
         );
     }
 
@@ -384,11 +423,11 @@ mod tests {
     #[test]
     fn compose_empty_store_keeps_only_current() {
         assert_eq!(
-            compose_session_catalog(Vec::new(), Some("sess-service-1"), None)
+            compose_session_catalog(Vec::new(), Some("sess-x"), None)
                 .iter()
                 .map(|s| s.session_id.as_str())
                 .collect::<Vec<_>>(),
-            ["sess-service-1"]
+            ["sess-x"]
         );
     }
 

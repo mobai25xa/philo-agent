@@ -813,6 +813,7 @@ impl App {
 
     fn apply_snapshot(&mut self, snapshot: &FrontendSnapshot) -> Vec<Effect> {
         self.session_load_intent = Some(SessionLoadIntent::Snapshot);
+        let mut restored: Option<FrontendGenerationChoice> = None;
         if let Some(session_id) = &snapshot.current_session_id {
             self.begin_session(session_id);
             if let Some(view) = &snapshot.durable_session_view {
@@ -825,6 +826,9 @@ impl App {
                 if let Some(choice) = &view.generation {
                     self.model_cache
                         .insert(session_id.clone(), choice.clone());
+                    restored = Some(choice.clone());
+                } else if let Some(choice) = self.model_cache.get(session_id).cloned() {
+                    restored = Some(choice);
                 }
                 let history = session::history_lines(view);
                 if !history.is_empty() {
@@ -840,6 +844,9 @@ impl App {
             if let Some(choice) = &view.generation {
                 self.model_cache
                     .insert(view.session_id.clone(), choice.clone());
+                restored = Some(choice.clone());
+            } else if let Some(choice) = self.model_cache.get(&view.session_id).cloned() {
+                restored = Some(choice);
             }
             let history = session::history_lines(view);
             if !history.is_empty() {
@@ -856,6 +863,13 @@ impl App {
             .clone_from(&snapshot.generation.model_name);
         self.status.effort = effort_value(snapshot.generation.reasoning_effort.as_deref());
         self.status.provider = snapshot.generation.provider.clone();
+        // §8: never surface the global generation while a session owns the
+        // corner: the restored session choice is the final word..
+        if let Some(choice) = restored {
+            self.status.model = choice.model_name;
+            self.status.effort = choice.reasoning_effort;
+            self.status.provider = choice.provider;
+        }
         if let Some(front) = snapshot.pending_confirmations.first() {
             self.sync_confirmation(Some((
                 front.confirmation_id,

@@ -115,11 +115,11 @@ where
             }
         };
         let current = self.session_generation(&session_id);
-        let next = self.generation.install_reasoning_for(
-            mapping::reasoning_effort(effort),
-            &current,
-        );
-        self.session_generations.put(session_id.clone(), next.clone());
+        let next = self
+            .generation
+            .install_reasoning_for(mapping::reasoning_effort(effort), &current);
+        self.session_generations
+            .put(session_id.clone(), next.clone());
         self.emit(
             Some(request_id),
             FrontendUpdateKind::GenerationInstalled {

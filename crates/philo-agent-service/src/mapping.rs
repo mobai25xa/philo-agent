@@ -1,5 +1,7 @@
 //! Maps Session / Runtime / Tools types onto frontend DTOs.
 
+use std::collections::HashMap;
+
 use philo_agent_runtime::{
     AgentAvailability, AgentEvent, AgentFailure, FailureDomain, FailureStage, ReasoningEffort,
     RetryDisposition, TokenUsage, UserMessage, UserPart,
@@ -17,11 +19,20 @@ use crate::frontend::snapshot::{
     FrontendToolDisplay, FrontendToolListing, FrontendToolResult, FrontendToolResultOutcome,
     FrontendUnfilledBatch, FrontendUserPart,
 };
+use crate::generation::ModelListingEntry;
 use crate::live::LiveOperationSnapshot;
 use philo_agent_runtime::RuntimeGeneration;
 
 /// Maps a store view into a frontend DTO. Does not wrap or paginate.
-pub fn durable_session_view(view: &SessionContextView) -> DurableSessionView {
+/// The session store persists only the wire identity (`{provider}/{model}`)
+/// plus the owning provider; display names are a transient catalog fact,so
+/// `display_names` (composite id → display name) resolves the saved model id
+/// onto the corner's `{model}` slot, falling back to the provider-stripped
+/// wire name when the catalog cannot answer (tui.md §8).
+pub fn durable_session_view(
+    view: &SessionContextView,
+    display_names: &HashMap<String, String>,
+) -> DurableSessionView {
     DurableSessionView {
         session_id: view.session_id().as_str().to_owned(),
         revision: view.revision().get(),
@@ -54,10 +65,36 @@ pub fn durable_session_view(view: &SessionContextView) -> DurableSessionView {
         usage: view.latest_usage().map(session_usage_to_frontend),
         generation: view.latest_generation().map(|choice| FrontendGenerationChoice {
             provider: choice.provider.clone(),
-            model_name: choice.model_id.clone(),
+            model_name: display_names
+                .get(&choice.model_id)
+                .cloned()
+                .unwrap_or_else(|| wire_name(&choice.model_id, choice.provider.as_deref())),
             reasoning_effort: choice.reasoning_effort.clone(),
         }),
     }
+}
+
+/// The `{provider}/{model}` wire id without its provider prefix — the
+/// contract's "wire name" fallback for the corner's model slot when the
+/// catalog cannot resolve a display name.
+fn wire_name(model_id: &str, provider: Option<&str>) -> String {
+    match provider {
+        Some(provider) => model_id
+            .strip_prefix(&format!("{provider}/"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| model_id.to_owned()),
+        None => model_id.to_owned(),
+    }
+}
+
+/// Builds the composite-id → display-name lookup (`ModelListingEntry.id` →
+/// `ModelListingEntry.model`) used to project a saved session generation
+/// onto the frontend corner.
+pub fn model_display_lookup(models: &[ModelListingEntry]) -> HashMap<String, String> {
+    models
+        .iter()
+        .map(|entry| (entry.id.clone(), entry.model.clone()))
+        .collect()
 }
 
 /// Maps the session's `SessionTokenUsage` into the frontend DTO.
@@ -609,7 +646,7 @@ mod tests {
         )))
         .unwrap();
         let view = block_on(store.context_view(&session_id)).unwrap();
-        let dto = durable_session_view(&view);
+        let dto = durable_session_view(&view, &HashMap::new());
         assert_eq!(dto.messages.len(), view.messages().len());
         assert_eq!(dto.messages.len(), 2);
         assert_eq!(view.settled_turns().len(), 1);
@@ -623,6 +660,70 @@ mod tests {
             &dto.messages[0],
             FrontendContextMessage::User { .. }
         ));
+    }
+
+    #[test]
+    fn saved_session_generation_resolves_display_name_or_falls_back_to_wire_name() {
+        let store = MemorySessionStore::new();
+        let session_id = philo_session::SessionId::new("map-gen");
+        block_on(store.commit(SessionTransaction::linear(
+            session_id.clone(),
+            SessionRevision::ZERO,
+            vec![
+                SessionEntryKind::OperationStarted {
+                    operation_id: OperationId::new("op-1"),
+                },
+                SessionEntryKind::TurnStarted {
+                    operation_id: OperationId::new("op-1"),
+                    turn_id: TurnId::new("turn-1"),
+                },
+                SessionEntryKind::UserMessage {
+                    turn_id: TurnId::new("turn-1"),
+                    parts: SessionUserPart::text_parts("hello"),
+                },
+                SessionEntryKind::AssistantMessage {
+                    turn_id: TurnId::new("turn-1"),
+                    blocks: vec![SessionAssistantBlock::Text {
+                        text: "world".into(),
+                    }],
+                },
+                SessionEntryKind::TurnTerminated {
+                    turn_id: TurnId::new("turn-1"),
+                    outcome: TurnOutcome::Succeeded,
+                },
+                SessionEntryKind::OperationSettled {
+                    operation_id: OperationId::new("op-1"),
+                    outcome: OperationOutcome::Succeeded,
+                    usage: None,
+                    generation: Some(philo_session::SessionGenerationChoice {
+                        provider: Some("openai".to_owned()),
+                        model_id: "openai/gpt-5.2".to_owned(),
+                        reasoning_effort: Some("high".to_owned()),
+                    }),
+                },
+            ],
+        )))
+        .unwrap();
+        let view = block_on(store.context_view(&session_id)).unwrap();
+        // A catalog entry resolves the composite wire id onto the display name;
+        // the corner then renders `(openai) gpt-5.2 · high`, not `openai/gpt-5.2`.
+        let lookup = model_display_lookup(&[ModelListingEntry {
+            id: "openai/gpt-5.2".to_owned(),
+            provider: "openai".to_owned(),
+            model: "gpt-5.2".to_owned(),
+            reasoning_tiers: Vec::new(),
+        }]);
+        let dto = durable_session_view(&view, &lookup);
+        let choice = dto.generation.expect("saved generation projects");
+        assert_eq!(choice.provider.as_deref(), Some("openai"));
+        assert_eq!(choice.model_name, "gpt-5.2");
+        assert_eq!(choice.reasoning_effort.as_deref(), Some("high"));
+        // Without a catalog, the wire id falls back to the provider-stripped
+        // wire name — never the raw composite..
+        let bare = durable_session_view(&view, &std::collections::HashMap::new());
+        assert_eq!(bare.generation.unwrap().model_name, "gpt-5.2");
+        assert_eq!(wire_name("legacy-model", Some("openai")), "legacy-model");
+        assert_eq!(wire_name("legacy-model", None), "legacy-model");
     }
 
     #[test]

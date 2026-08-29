@@ -424,7 +424,10 @@ where
                     Some(request_id),
                     FrontendUpdateKind::SessionPreviewed {
                         session_id,
-                        view: mapping::durable_session_view(&view),
+                        view: mapping::durable_session_view(
+                            &view,
+                            &mapping::model_display_lookup(&self.assembler.list_models()),
+                        ),
                     },
                 );
             }
@@ -676,12 +679,18 @@ where
                     token.request_id,
                     FrontendUpdateKind::SessionLoaded {
                         session_id: token.session_id,
-                        view: mapping::durable_session_view(&view),
+                        view: mapping::durable_session_view(
+                            &view,
+                            &mapping::model_display_lookup(&self.assembler.list_models()),
+                        ),
                     },
                 );
             }
             SessionViewKind::Snapshot => {
-                let durable = mapping::durable_session_view(&view);
+                let durable = mapping::durable_session_view(
+                    &view,
+                    &mapping::model_display_lookup(&self.assembler.list_models()),
+                );
                 let live = self.live_for_snapshot(&view);
                 let snapshot = self.compose_snapshot(Some(durable), live);
                 self.emit_snapshot(token.request_id, snapshot);

@@ -84,8 +84,11 @@ impl App {
             }
         }
         if self.selection.is_some_and(Selection::is_collapsed) {
+            // Plain click (press and release at the same cell, no drag):
+            // think headers fold/unfold their block, tool-card body rows fold/
+            // unfold their body (P5 §6); drags keep the selection path..
             let anchor = self.selection.unwrap().anchor;
-            self.toggle_reasoning_block(anchor.cell, anchor.row);
+            self.toggle_fold_at(anchor.cell, anchor.row);
             self.clear_selection();
         }
         vec![]

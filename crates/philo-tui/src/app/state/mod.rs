@@ -240,8 +240,8 @@ impl App {
     }
 
     /// Fold/unfold a tool-card body by its cell index. Returns whether the
-    /// cell actually was a foldable card (P3 §6 state API; Space/o wiring
-    /// belongs to P5 — exercised by tests until then).
+    /// cell actually was a foldable card (P3 §6 state API; wired to
+    /// browse-mode `Space`/`o` and the plain mouse click by P5).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn toggle_tool_card_fold(&mut self, index: usize) -> bool {
         let Some(line) = self.cells.cell_at(index) else {
@@ -486,22 +486,29 @@ impl App {
         self.browse_step(delta * page)
     }
 
-    /// `Space` / `o`: toggle the foldable element under the cursor — a
+/// `Space` / `o`: toggle the foldable element under the cursor — a
     /// think header, or any body row of a foldable tool card. Rows that are
-    /// neither leave the transcript untouched.
+    /// neither leave the transcript untouched..
     fn browse_toggle_fold(&mut self) -> Vec<Effect> {
         let (cell, row) = self.browse_cursor;
-        let toggled = if self.is_think_head(cell, row) {
+        if self.toggle_fold_at(cell, row) {
+            self.rewrap_cursor();
+        }
+        vec![]
+    }
+
+    /// Toggle the foldable element at a logical position — a think header row,
+    /// or any body row of a foldable tool card (P5: shared by the browse-mode
+    /// `Space`/`o` chord and the plain mouse click on a card body). Returns
+    /// whether the position actually owned a foldable element.
+    fn toggle_fold_at(&mut self, cell: usize, row: usize) -> bool {
+        if self.is_think_head(cell, row) {
             self.toggle_reasoning_block(cell, row)
         } else if self.is_tool_card_body(cell, row) {
             self.toggle_tool_card_fold(cell)
         } else {
             false
-        };
-        if toggled {
-            self.rewrap_cursor();
         }
-        vec![]
     }
 
     /// `Home` in browse mode: jump the viewport and cursor to the head.

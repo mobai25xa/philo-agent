@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use philo_agent_service::testing::{FakeAssembler, start_test_service_with};
 use philo_agent_service::{
-    CommandDispatch, FrontendCommand, FrontendSessionSummary, FrontendUpdate,
+    CommandDispatch, DurableSessionView, FrontendCommand, FrontendSessionSummary, FrontendUpdate,
     FrontendUpdateKind, RecvOutcome,
 };
 use philo_session::{
@@ -220,6 +220,30 @@ fn listed_ids(sessions: &[FrontendSessionSummary]) -> Vec<String> {
         .collect()
 }
 
+fn create_session(
+    client: &philo_agent_service::FrontendClient,
+) -> philo_agent_service::FrontendRequestId {
+    match client.try_command(FrontendCommand::CreateSession) {
+        CommandDispatch::Enqueued(id) => id,
+        other => panic!("create session {other:?}"),
+    }
+}
+
+async fn recv_session_loaded(
+    client: &philo_agent_service::FrontendClient,
+    request_id: philo_agent_service::FrontendRequestId,
+) -> (String, DurableSessionView) {
+    let update = recv_matching(client, |update| {
+        update.request_id == Some(request_id)
+            && matches!(update.kind, FrontendUpdateKind::SessionLoaded { .. })
+    })
+    .await;
+    match update.kind {
+        FrontendUpdateKind::SessionLoaded { session_id, view } => (session_id, view),
+        other => panic!("expected SessionLoaded, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_store_lists_empty_without_creating_a_session() {
     let (service, client, _runtime) =
@@ -300,7 +324,10 @@ async fn uncommitted_current_session_appears_at_most_once() {
     assert_ne!(first_id, second_id);
 
     let listed = recv_session_list(&client, list_sessions(&client)).await;
-    assert_eq!(listed_ids(&listed), ["sess-a", second_id.as_str(), "sess-z"]);
+    assert_eq!(
+        listed_ids(&listed),
+        ["sess-a", second_id.as_str(), "sess-z"]
+    );
     assert_eq!(
         listed
             .iter()
@@ -315,6 +342,31 @@ async fn uncommitted_current_session_appears_at_most_once() {
             .count(),
         1
     );
+    drop(service);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_after_service_restart_mints_a_fresh_id() {
+    let store = ControllableSessionStore::new(MemorySessionStore::new());
+
+    let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store.clone());
+    let first = create_session(&client);
+    let (first_id, _) = recv_session_loaded(&client, first).await;
+    assert!(first_id.starts_with("sess-service-"));
+    drop(service);
+
+    let (service, client, _runtime) = start_test_service_with(FakeAssembler::new(), store);
+    let second = create_session(&client);
+    let (second_id, second_view) = recv_session_loaded(&client, second).await;
+    assert_ne!(
+        first_id, second_id,
+        "a restarted service must mint a fresh id, not reuse the durable one"
+    );
+    assert_eq!(
+        second_view.revision, 0,
+        "a fresh session loads with no durable history"
+    );
+    assert!(second_view.messages.is_empty());
     drop(service);
 }
 
